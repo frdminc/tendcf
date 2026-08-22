@@ -4,6 +4,36 @@
 
 ---
 
+## RESTART EXECUTED 2026-08-22 (evening) — first submission under the new protocol
+
+On specific operator instruction (satisfying rules 2–4 of the banner below),
+the one-bug-one-PR restart requested in
+[core#6293's closure comment](https://github.com/cfengine/core/pull/6293#issuecomment-5340989869)
+was executed today:
+
+- **Bug**: simulate mode reports both removal and install of the same package —
+  `MapRemove()` after `name_arch = NULL` in `DiffPkgOperations()` /
+  `ManifestPkgOperations()`. Pre-existing on master; found while building
+  `--simulate-json`. Fork records: issue
+  [djbclark/core#24](https://github.com/djbclark/core/issues/24), three-zoom
+  writeup [#26](https://github.com/djbclark/core/issues/26).
+- **Ticket**: [CFE-4742](https://northerntech.atlassian.net/browse/CFE-4742)
+  (filed via API with operator's account; includes the operator's personal
+  disclosure that they reviewed the logic with AI guidance but cannot vouch
+  for the C, with the regression test + CI as the correctness case).
+- **PR**: [cfengine/core#6332](https://github.com/cfengine/core/pull/6332)
+  (one commit `5ddb6d97b` on upstream master `b14a380d0`; fix + discriminating
+  regression test, fails-before/passes-after on x86_64 Linux CI, Ubuntu 24.04
+  arm64/dash, macOS arm64). Fork CI evidence:
+  [djbclark/core#25](https://github.com/djbclark/core/pull/25) (all 8
+  workflows green — the fork's first-ever CI runs; Actions enabled today).
+- **Next**: await review. The `--simulate-json` question is deliberately NOT
+  raised in this PR — it comes as a short question after review, per plan
+  (memory: `simulate-json-is-the-point`). Consolidated judgment calls staged
+  upstream-facing at [djbclark/core#23](https://github.com/djbclark/core/issues/23).
+
+---
+
 ## SUPERSEDED 2026-08-22 — read this before anything below
 
 **Everything below this banner describes an upstream-first regime that no
