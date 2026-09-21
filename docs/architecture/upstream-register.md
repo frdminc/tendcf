@@ -4,6 +4,20 @@
 
 ---
 
+## PR1 MERGED 2026-09-02
+
+[cfengine/core#6332](https://github.com/cfengine/core/pull/6332) (CFE-4742) was
+merged by larsewi on 2026-09-02 as `cef66778f`, reviewed "the core fix is
+correct", and backported in
+[#6338](https://github.com/cfengine/core/pull/6338) and
+[#6339](https://github.com/cfengine/core/pull/6339). The requested squash and
+sign-off were not applied; it merged as two commits. Fork PR
+[#25](https://github.com/djbclark/core/pull/25) and issue
+[#24](https://github.com/djbclark/core/issues/24) closed 2026-09-20. **Next:**
+the short `--simulate-json` probe question (operator approves the text first).
+
+---
+
 ## RESTART EXECUTED 2026-08-22 (evening) — first submission under the new protocol
 
 On specific operator instruction (satisfying rules 2–4 of the banner below),

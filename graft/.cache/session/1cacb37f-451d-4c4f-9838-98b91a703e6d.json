@@ -1,0 +1,12 @@
+{
+  "lastQuery": "Start with step 1",
+  "perAgentQuery": {},
+  "graftReads": 0,
+  "sourceReads": 0,
+  "savedTokens": 0,
+  "injectedPointers": [],
+  "nudges": 0,
+  "inputCostMicros": 220401,
+  "inputTokensBilled": 495279,
+  "lastBillingUuid": "a575860e-8409-406b-bf14-931d63459744"
+}
