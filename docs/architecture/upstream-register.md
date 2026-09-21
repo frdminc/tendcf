@@ -14,7 +14,12 @@ correct", and backported in
 sign-off were not applied; it merged as two commits. Fork PR
 [#25](https://github.com/djbclark/core/pull/25) and issue
 [#24](https://github.com/djbclark/core/issues/24) closed 2026-09-20. **Next:**
-the short `--simulate-json` probe question (operator approves the text first).
+the `--simulate-json` probe question was POSTED 2026-09-20 on
+[core#6332](https://github.com/cfengine/core/pull/6332#issuecomment-5754799717)
+(names CFE-4716 as history; CFE-4716 was closed in the 2026-08-19 bulk cleanup,
+not on merits, and stays closed). **Next:** wait for the answer. Yes -> file a NEW
+small ticket for the first slice (file changes only), linking CFE-4716; no ->
+fork-only, cut comms.
 
 ---
 
