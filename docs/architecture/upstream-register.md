@@ -2,6 +2,12 @@
 
 **Living document. Update it in the same commit that changes an item's state.**
 
+> **The standing contribution rules now live in
+> [`~/src/cfengine-all/AGENTS.md`](../../../cfengine-all/AGENTS.md)** (section
+> "Upstream contributions"), so every CFEngine tree sees them. The banners and
+> sections below stay as the history and evidence behind those rules; if one
+> conflicts with that file, that file wins. Change the rules there, not here.
+
 ---
 
 ## PR1 MERGED 2026-09-02
