@@ -90,6 +90,15 @@ def git_out(repo: Path | str, *args: str, **kw) -> str:
     return git(repo, *args, **kw).stdout.decode().strip()
 
 
+def git_path(repo: Path | str, name: str) -> Path:
+    """Where `$GIT_DIR/<name>` really is. In a linked worktree or a cow
+    pasture `.git` is a file and the per-worktree state (rebase-apply,
+    rebase-merge) lives under the main repo's `.git/worktrees/<id>/`, so
+    `<checkout>/.git/<name>` would silently never exist."""
+    p = Path(git_out(repo, "rev-parse", "--git-path", name))
+    return p if p.is_absolute() else Path(repo) / p
+
+
 def identity_args(repo: Path) -> list[str]:
     """`git am`/`commit` need a committer; supply one only if the repo has none."""
     have = git(repo, "config", "user.email", check=False).returncode == 0
@@ -313,15 +322,25 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
     dirty = git_out(checkout, "status", "--porcelain", "--untracked-files=no")
     if dirty:
         raise Finding(f"{name}: {checkout} has uncommitted changes; refusing to `git am` onto them")
-    if (checkout / ".git" / "rebase-apply").exists():
-        raise Finding(f"{name}: {checkout} has a `git am` in progress; resolve or abort it first")
+    rebase_apply = git_path(checkout, "rebase-apply")
+    for busy in (rebase_apply, git_path(checkout, "rebase-merge")):
+        if busy.exists():
+            raise Finding(f"{name}: {checkout} has a `git am` or rebase in progress ({busy}); resolve or abort it first")
     paths = patch_paths(overlay, name, comp)
     r = git(checkout, *identity_args(checkout), "am", "--whitespace=nowarn", *map(str, paths), check=False)
     if r.returncode != 0:
         err = r.stderr.decode().strip() + "\n" + r.stdout.decode().strip()
-        ab = git(checkout, *identity_args(checkout), "am", "--abort", check=False)
-        abort_note = (f"aborted, checkout restored to {head[:12]}" if ab.returncode == 0 else
-                      f"and `git am --abort` ALSO failed ({ab.returncode}): {ab.stderr.decode().strip()} {ab.stdout.decode().strip()}")
+        # Abort only the am session this invocation started: rebase-apply was
+        # absent above, so if it exists now it is ours, unless our am refused
+        # because someone else's session appeared in between ("still exists").
+        if not rebase_apply.exists():
+            abort_note = f"no am session was left behind; checkout still at {head[:12]}"
+        elif "still exists" in err:
+            abort_note = f"another `git am` or rebase session ({rebase_apply}) appeared meanwhile; left it alone"
+        else:
+            ab = git(checkout, *identity_args(checkout), "am", "--abort", check=False)
+            abort_note = (f"aborted, checkout restored to {head[:12]}" if ab.returncode == 0 else
+                          f"and `git am --abort` ALSO failed ({ab.returncode}): {ab.stderr.decode().strip()} {ab.stdout.decode().strip()}")
         raise Finding("\n".join(report + [
             f"DRIFT: `git am` failed in {checkout}; {abort_note}:",
             *("    " + ln for ln in err.splitlines() if ln.strip()),
@@ -454,13 +473,35 @@ def self_test() -> list[str]:
             apply_series(overlay, "sample", clone, allow_mismatch=True)
         except Finding as e:
             status = git_out(clone, "status", "--porcelain")
-            in_progress = (clone / ".git" / "rebase-apply").exists()
+            in_progress = git_path(clone, "rebase-apply").exists()
             head_now = git_out(clone, "rev-parse", "HEAD")
             ok("apply --allow-base-mismatch: `git am` conflict fails loudly and leaves the checkout clean",
                "DRIFT" in str(e) and status == "" and not in_progress and head_now == drifted,
                f"status={status!r} rebase-apply={in_progress} HEAD={head_now[:12]} expected={drifted[:12]}\n{e}")
         else:
             ok("apply --allow-base-mismatch: `git am` conflict fails loudly", False)
+
+        # 3b. A user's own `git am`, stopped in a linked worktree (where `.git`
+        # is a file), is refused and left alone, never aborted by us.
+        wt = tmp_path / "linked-worktree"
+        git(clone, "worktree", "add", "-q", "--detach", str(wt), drifted)
+        first_patch = overlay / "sample" / data["components"]["sample"]["patches"][0]["file"]
+        user_am = git(wt, *ident, "am", str(first_patch), check=False)
+        user_session = git_path(wt, "rebase-apply")
+        ok("linked worktree: the user's own `git am` stopped, its session outside <worktree>/.git/",
+           user_am.returncode != 0 and user_session.exists() and (wt / ".git").is_file()
+           and not (wt / ".git" / "rebase-apply").exists(),
+           f"am rc={user_am.returncode} session={user_session} exists={user_session.exists()}")
+        try:
+            apply_series(overlay, "sample", wt, allow_mismatch=True)
+        except Finding as e:
+            ok("apply: refuses a linked worktree with a `git am` in progress and leaves that session intact",
+               "in progress" in str(e) and user_session.exists() and git_out(wt, "rev-parse", "HEAD") == drifted,
+               f"session exists={user_session.exists()}\n{e}")
+        else:
+            ok("apply: refuses a linked worktree with a `git am` in progress", False)
+        git(wt, *ident, "am", "--abort")
+        git(clone, "worktree", "remove", "--force", str(wt))
 
         # 4. The series applies for real, with `git am`, onto the base.
         git(clone, "checkout", "-q", base)
