@@ -1221,6 +1221,15 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   implementation has something to agree with.
 - **A first generic bundle** (`policy/tendcf_services.cf`), launchd only —
   the first thing here that CFEngine actually executes (§16.C).
+- **A patch overlay on libntech and cfengine/core** (`overlay/`,
+  `bin/overlay.py`): the six fork commits that bundle depends on (§19),
+  pinned to one upstream commit per component, with a lint, a self-test, a
+  drift check against upstream, and a retirement check, so the "correct
+  build" the bundle was verified against is reproducible from this
+  repository alone.
+- **A design for the change process** — lockfile, release, rollback, CI
+  gates — in `docs/architecture/change-process.md`. Design only: the
+  resolver and the release pipeline are Step 6 code.
 
 **Not built — this is still most of it**
 

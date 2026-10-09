@@ -941,12 +941,12 @@ Each step leaves a coherent system. Not a schedule.
 | Step | What |
 | --- | --- |
 | 0 | Schemas in **tendcf** (`schema/`, `examples/`, `bin/schema_lint.py` — provides/requires, interlocks, comprehensive, report-row). Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
-| 1 | macOS services adapter. Dry-run default. No nix-darwin. |
-| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. |
-| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs steps 1–2). |
+| 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)). |
+| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Not started** as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
+| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs steps 1–2). **Blocked on step 2**, as decided on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` is a README. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
-| 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. |
+| 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. |
 | 7 | Optional Mac substrate (nix-darwin) if §14.1 says yes. |
 | 8 | Pull / self-update. |
 | 9 | Consent surface + default prompt + advisor slot. |
@@ -1106,6 +1106,11 @@ with full mesh) is **D38**.
   Model B does **not** fix.
 - `cfengine-feasibility-of-diff-plan-2026-08-15.md` — the feasibility
   evidence D43 rests on; its addendum controls over its body.
+- `change-process.md` — the lockfile / release / rollback / CI-gate design
+  for requirement #2 (D19 made concrete); binding on Step 6.
+- `upstream-overlay.md` — the patch overlay on libntech and cfengine/core
+  (`overlay/`, `bin/overlay.py`) for issue #3; `upstream-register.md`
+  stays the record of the defects behind it.
 - Dated `*-2026-08-13.md` research notes in this directory — evidence
   trail; the guide wins on conflict.
 - `docs/paper/tendcf-architecture-paper.md` — technical paper; the guide

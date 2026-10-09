@@ -19,7 +19,9 @@ living document disagrees on the current design, **the guide wins**.
 | [`docs/architecture/architecture-DEFINITIVE-v3.md`](docs/architecture/architecture-DEFINITIVE-v3.md) | Implementer map (decisions, build order, protection). Must agree with the guide. |
 | [`docs/paper/tendcf-architecture-paper.md`](docs/paper/tendcf-architecture-paper.md) | Technical paper |
 | [`schema/`](schema/), [`examples/`](examples/), [`bin/schema_lint.py`](bin/schema_lint.py) | Site Model contract, fixtures, lint |
-| [`examples/broken/`](examples/broken/) | Twelve deliberately broken fixtures the lint must catch |
+| [`examples/broken/`](examples/broken/), [`examples/broken-bytes/`](examples/broken-bytes/), [`examples/broken-projection/`](examples/broken-projection/) | Ninety-two deliberately broken fixtures (59 + 6 + 27) the lint must catch |
+| [`docs/architecture/change-process.md`](docs/architecture/change-process.md) | How a change lands: lockfile, release, rollback, CI gates (issue #2) |
+| [`overlay/`](overlay/), [`bin/overlay.py`](bin/overlay.py), [`docs/architecture/upstream-overlay.md`](docs/architecture/upstream-overlay.md) | Patch overlay on libntech / cfengine/core that the generic bundle depends on (issue #3) |
 | [frdminc/nix2cf](https://github.com/frdminc/nix2cf) | Compiler (Site Model → CFEngine Augments). Not this repo. |
 
 Nothing described here is deployed. Some data formats exist and are

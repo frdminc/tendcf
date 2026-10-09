@@ -17,6 +17,13 @@ Contested vocabulary — words with two senses, or whose referent moved under
 a decision: [`GLOSSARY.md`](GLOSSARY.md). It defines nothing; it points at
 whichever document is authoritative for each term.
 
+Two living design notes that the map and the guide point at:
+[`change-process.md`](change-process.md) (lockfile, release, rollback, CI
+gates — issue #2) and [`upstream-overlay.md`](upstream-overlay.md) (the
+patch overlay on libntech / cfengine/core in [`../../overlay/`](../../overlay/)
+— issue #3). [`upstream-register.md`](upstream-register.md) is the living
+record of every CFEngine/libntech defect and contribution.
+
 Site Model contract (JSON Schema, fixtures, lint):
 [`../../schema/`](../../schema/), [`../../examples/`](../../examples/),
 [`../../bin/schema_lint.py`](../../bin/schema_lint.py).
