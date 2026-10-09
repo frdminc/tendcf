@@ -1,0 +1,542 @@
+From 90cf8cc08ca5d7a470978846d601f9972ef1fd72 Mon Sep 17 00:00:00 2001
+From: Daniel JB Clark <djbclark@gmail.com>
+Date: Mon, 17 Aug 2026 13:02:39 -0400
+Subject: [PATCH 1/2] Fix non-conformant \uXXXX handling in the JSON string
+ codec
+
+Both halves of the string codec handled \uXXXX escapes per byte instead
+of per Unicode code point (RFC 8259 section 7), and were exact inverses
+of each other, so the library round-tripped its own output while
+miscommunicating with every conformant implementation:
+
+- JsonEncodeStringWriter() escaped each non-printable-ASCII *byte* as
+  \u%04x of the byte value, so a conformant reader decoded the UTF-8
+  string "\xe4\xb8\xad\xe5\x9b\xbd" (U+4E2D U+56FD, Chinese "zhongguo")
+  as six mojibake characters.
+- JsonDecodeStringWriter() decoded \u escapes at or below U+00FF to a
+  single raw byte - Latin-1, not UTF-8, so "caf\u00e9" decoded to
+  "caf" plus the invalid UTF-8 byte e9 - and silently corrupted every
+  other \u escape into literal text: HexStringToChar() rejected values
+  above 0xFF, and the caller then fell through without advancing the
+  cursor, dropping the backslash, so "\u4e2d\u56fd" decoded to the
+  ten-character literal "u4e2du56fd".  Surrogate pairs were not handled
+  at all.
+
+The encoder now decodes its input as UTF-8 - with strict validation:
+overlong encodings, encoded surrogates, code points beyond U+10FFFF,
+stray continuation bytes and truncated sequences are all rejected - and
+escapes the denoted code point, emitting a UTF-16 surrogate pair for
+code points outside the Basic Multilingual Plane.  Output remains pure
+ASCII, and is unchanged for ASCII input.  Input bytes that are not
+valid UTF-8 have no faithful representation in a JSON string; they keep
+the historical per-byte \u00XX escape, which keeps the output valid
+JSON and the byte value visible (a conformant reader decodes such an
+escape as U+00XX).
+
+The decoder now decodes \uXXXX across the whole BMP, emits UTF-8, and
+combines a high surrogate escape immediately followed by a low
+surrogate escape into one code point.  An unpaired surrogate, or a \u
+not followed by four hexadecimal digits, becomes U+FFFD REPLACEMENT
+CHARACTER (logged at debug level) instead of being corrupted into
+literal text: JsonDecodeString() has no error channel and the parser
+calls it unconditionally, so substitution keeps previously-parseable
+documents parseable while making the damage visible.  HexStringToChar()
+is replaced by FourHexDigitsToInt(), which checks bytes one at a time
+and needs neither strlen() nor alloca().
+
+Compatibility: documents written by the old encoder contain per-byte
+escapes, and the fixed decoder reads them per code point, as conformant
+readers always did - old encoder output "\u00e4\u00b8\u00ad" (written
+for the UTF-8 bytes e4 b8 ad, U+4E2D) now decodes to U+00E4 U+00B8
+U+00AD instead of reconstituting the original three bytes.  Old
+non-ASCII output therefore no longer round-trips through the fixed
+library; it never round-tripped through anything else.
+
+The new unit tests deliberately assert against hard-coded expected
+values derived from a conformant implementation (python3's json module,
+commands cited in the test comments) instead of round-tripping through
+libntech's own codec: the old encoder and decoder were exact inverses,
+so a write-then-read test passed even on the broken code.
+
+Changelog: Title
+Ticket: CFE-4730
+
+diff --git a/libutils/json.c b/libutils/json.c
+index e46e0716629a4e6ff54d6166e2d466c3bc332cf5..3289fb8f832f2bb0c6e34920b093e408b95dbb4f 100644
+--- a/libutils/json.c
++++ b/libutils/json.c
+@@ -977,6 +977,134 @@ JsonElement *JsonObjectCreate(const size_t initialCapacity)
+         JSON_CONTAINER_TYPE_OBJECT, NULL, initialCapacity);
+ }
+ 
++/**
++  @brief Decode a single UTF-8 sequence.
++
++  Strictly validates the sequence: overlong encodings, encoded UTF-16
++  surrogates (U+D800..U+DFFF), code points beyond U+10FFFF, stray
++  continuation bytes and truncated sequences are all rejected.  Bytes are
++  checked one at a time, so a NUL terminator is never read past.
++
++  @param str [in] Start of the candidate UTF-8 sequence
++  @param codepoint [out] The decoded code point, only written on success
++  @return The number of bytes consumed (1 to 4), or 0 if @c str does not
++          start with a valid UTF-8 sequence
++ */
++static size_t Utf8DecodeCodePoint(
++    const char *const str, uint32_t *const codepoint)
++{
++    assert(str != NULL);
++    assert(codepoint != NULL);
++
++    const unsigned char *const s = (const unsigned char *) str;
++
++    if (s[0] < 0x80)
++    {
++        *codepoint = s[0];
++        return 1;
++    }
++
++    size_t length;
++    uint32_t value;
++    unsigned char second_min = 0x80;
++    unsigned char second_max = 0xbf;
++
++    if (s[0] >= 0xc2 && s[0] <= 0xdf)
++    {
++        length = 2;
++        value = s[0] & 0x1f;
++    }
++    else if (s[0] >= 0xe0 && s[0] <= 0xef)
++    {
++        length = 3;
++        value = s[0] & 0x0f;
++        if (s[0] == 0xe0)
++        {
++            second_min = 0xa0; // reject overlong encodings of U+0000..U+07FF
++        }
++        else if (s[0] == 0xed)
++        {
++            second_max = 0x9f; // reject encoded surrogates U+D800..U+DFFF
++        }
++    }
++    else if (s[0] >= 0xf0 && s[0] <= 0xf4)
++    {
++        length = 4;
++        value = s[0] & 0x07;
++        if (s[0] == 0xf0)
++        {
++            second_min = 0x90; // reject overlong encodings of U+0000..U+FFFF
++        }
++        else if (s[0] == 0xf4)
++        {
++            second_max = 0x8f; // reject code points beyond U+10FFFF
++        }
++    }
++    else
++    {
++        /* 0x80..0xc1: stray continuation byte, or lead byte of an overlong
++         * 2-byte sequence; 0xf5..0xff: lead byte of a sequence beyond
++         * U+10FFFF. */
++        return 0;
++    }
++
++    if (s[1] < second_min || s[1] > second_max)
++    {
++        return 0;
++    }
++    value = (value << 6) | (s[1] & 0x3f);
++
++    for (size_t i = 2; i < length; i++)
++    {
++        if (s[i] < 0x80 || s[i] > 0xbf)
++        {
++            return 0;
++        }
++        value = (value << 6) | (s[i] & 0x3f);
++    }
++
++    *codepoint = value;
++    return length;
++}
++
++/**
++  @brief Append the UTF-8 encoding of a Unicode code point to a writer.
++
++  @param codepoint [in] A Unicode scalar value, i.e. at most U+10FFFF and
++                        not a UTF-16 surrogate (U+D800..U+DFFF)
++  @param writer [in] The Writer to append to
++ */
++static void Utf8EncodeCodePointWriter(
++    const uint32_t codepoint, Writer *const writer)
++{
++    assert(writer != NULL);
++    assert(codepoint <= 0x10ffff);
++    assert(!(codepoint >= 0xd800 && codepoint <= 0xdfff));
++
++    if (codepoint < 0x80)
++    {
++        WriterWriteChar(writer, (char) codepoint);
++    }
++    else if (codepoint < 0x800)
++    {
++        WriterWriteChar(writer, (char) (0xc0 | (codepoint >> 6)));
++        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
++    }
++    else if (codepoint < 0x10000)
++    {
++        WriterWriteChar(writer, (char) (0xe0 | (codepoint >> 12)));
++        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 6) & 0x3f)));
++        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
++    }
++    else
++    {
++        WriterWriteChar(writer, (char) (0xf0 | (codepoint >> 18)));
++        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 12) & 0x3f)));
++        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 6) & 0x3f)));
++        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
++    }
++}
++
+ void JsonEncodeStringWriter(
+     const char *const unescaped_string, Writer *const writer)
+ {
+@@ -1012,14 +1140,48 @@ void JsonEncodeStringWriter(
+             WriterWriteChar(writer, 't');
+             break;
+         default:
++        {
+             if (CharIsPrintableAscii(*c))
+             {
+                 WriterWriteChar(writer, *c);
++                break;
+             }
+-            else
++
++            /* A \uXXXX escape denotes a Unicode code point, not a byte
++             * (RFC 8259 section 7), so decode the UTF-8 sequence and
++             * escape the code point it denotes.  The output stays pure
++             * ASCII, as it always has been. */
++            uint32_t codepoint;
++            const size_t length = Utf8DecodeCodePoint(c, &codepoint);
++            if (length == 0)
+             {
++                /* Not valid UTF-8.  JSON strings carry Unicode text, so
++                 * an arbitrary byte has no faithful representation;
++                 * escape the byte's value, which keeps the output valid
++                 * JSON and the value visible.  A conformant reader (ours
++                 * included) decodes this escape as U+00XX. */
+                 WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
+             }
++            else if (codepoint < 0x10000)
++            {
++                WriterWriteF(writer, "\\u%04x", (unsigned int) codepoint);
++                c += length - 1;
++            }
++            else
++            {
++                /* Code points outside the Basic Multilingual Plane are
++                 * escaped as a UTF-16 surrogate pair (RFC 8259
++                 * section 7). */
++                const uint32_t reduced = codepoint - 0x10000;
++                WriterWriteF(
++                    writer,
++                    "\\u%04x\\u%04x",
++                    (unsigned int) (0xd800 + (reduced >> 10)),
++                    (unsigned int) (0xdc00 + (reduced & 0x3ff)));
++                c += length - 1;
++            }
++            break;
++        }
+         }
+     }
+ }
+@@ -1033,39 +1195,46 @@ char *JsonEncodeString(const char *const unescaped_string)
+     return StringWriterClose(writer);
+ }
+ 
+-static bool HexStringToChar(const char *hex_string, char *res)
+-{
+-    assert(hex_string != NULL);
++/**
++  @brief Parse exactly four hexadecimal digits, e.g. from a \uXXXX escape.
+ 
+-    const int hex_len = 4;
+-    if (strlen(hex_string) < hex_len)
+-    {
+-        return false;
+-    }
++  Bytes are checked one at a time, so a NUL terminator is never read past.
+ 
+-    char *tmp;
+-    tmp = alloca(hex_len + 1);
+-    memcpy(tmp, hex_string, hex_len);
+-    tmp[hex_len] = '\0';
++  @param hex [in] String expected to start with four hexadecimal digits
++  @param value [out] The parsed value, only written on success
++  @return True if @c hex starts with four hexadecimal digits
++ */
++static bool FourHexDigitsToInt(const char *const hex, uint32_t *const value)
++{
++    assert(hex != NULL);
++    assert(value != NULL);
+ 
+-    for (int i = 0; i < hex_len; ++i)
++    uint32_t result = 0;
++    for (int i = 0; i < 4; i++)
+     {
+-        if (!isdigit(tmp[i]) &&
+-          !(tmp[i] >= 'A' && tmp[i] <= 'F') &&
+-          !(tmp[i] >= 'a' && tmp[i] <= 'f'))
++        const char digit = hex[i];
++        uint32_t nibble;
++        if (digit >= '0' && digit <= '9')
+         {
++            nibble = digit - '0';
++        }
++        else if (digit >= 'a' && digit <= 'f')
++        {
++            nibble = digit - 'a' + 10;
++        }
++        else if (digit >= 'A' && digit <= 'F')
++        {
++            nibble = digit - 'A' + 10;
++        }
++        else
++        {
++            // not a hexadecimal digit (this also catches a NUL terminator)
+             return false;
+         }
++        result = (result << 4) | nibble;
+     }
+ 
+-    char *end;
+-    long c = strtol(tmp, &end, 16);
+-    if ((*end != '\0') || (c > 255) || (c < 0))
+-    {
+-        return false;
+-    }
+-
+-    *res = (unsigned char) c;
++    *value = result;
+     return true;
+ }
+ 
+@@ -1106,18 +1275,59 @@ static void JsonDecodeStringWriter(
+                 c++;
+                 break;
+             case 'u':
+-                if (c[2] == '\0')
++            {
++                uint32_t codepoint;
++                if (!FourHexDigitsToInt(c + 2, &codepoint))
+                 {
++                    /* Not a valid JSON \u escape.  Substitute U+FFFD
++                     * REPLACEMENT CHARACTER for the "\u" introducer
++                     * rather than corrupting it into literal text;
++                     * whatever follows was never part of a valid escape
++                     * and is kept as-is. */
++                    Log(LOG_LEVEL_DEBUG,
++                        "Replacing malformed JSON \\u escape '%.6s' with U+FFFD",
++                        c);
++                    Utf8EncodeCodePointWriter(0xfffd, w);
++                    c += 1;
+                     break;
+                 }
+ 
+-                char d;
+-                if (HexStringToChar(c + 2, &d))
++                size_t consumed = 5; // "\uXXXX" minus the loop's increment
++                if (codepoint >= 0xd800 && codepoint <= 0xdbff)
+                 {
+-                    WriterWriteF(w, "%c", (unsigned char) d);
+-                    c += 5;
++                    /* A high surrogate is only valid immediately followed
++                     * by a low surrogate escape; together they denote one
++                     * code point outside the Basic Multilingual Plane
++                     * (RFC 8259 section 7). */
++                    uint32_t low;
++                    if (c[6] == '\\' && c[7] == 'u' &&
++                        FourHexDigitsToInt(c + 8, &low) &&
++                        low >= 0xdc00 && low <= 0xdfff)
++                    {
++                        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
++                                    (low - 0xdc00);
++                        consumed = 11; // "\uXXXX\uXXXX" minus the increment
++                    }
++                    else
++                    {
++                        Log(LOG_LEVEL_DEBUG,
++                            "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
++                            c);
++                        codepoint = 0xfffd;
++                    }
++                }
++                else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
++                {
++                    Log(LOG_LEVEL_DEBUG,
++                        "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
++                        c);
++                    codepoint = 0xfffd;
+                 }
++
++                Utf8EncodeCodePointWriter(codepoint, w);
++                c += consumed;
+                 break;
++            }
+             default:
+                 WriterWriteChar(w, *c);
+                 break;
+diff --git a/tests/unit/json_test.c b/tests/unit/json_test.c
+index 200478a85ac52ac8aba35752c531c35a289b8f98..9a173cf530f3ea1163d0c03930942a816e1f838c 100644
+--- a/tests/unit/json_test.c
++++ b/tests/unit/json_test.c
+@@ -1875,6 +1875,139 @@ static void test_string_escape(void)
+     assert_json_strings_eq(unescaped_invalid_hex, escaped_invalid_hex);
+ }
+ 
++#define assert_encodes_to(input, expected)         \
++    {                                              \
++        char *const out = JsonEncodeString(input); \
++        assert_string_equal(out, expected);        \
++        free(out);                                 \
++    }
++
++#define assert_decodes_to(input, expected)         \
++    {                                              \
++        char *const out = JsonDecodeString(input); \
++        assert_string_equal(out, expected);        \
++        free(out);                                 \
++    }
++
++/* The expectations below are hard-coded rather than round-tripped through
++ * libntech's own codec on purpose: the encoder and decoder used to be exact
++ * inverses of each other's non-conformance (CFE-4730), so a write-then-read
++ * test passed even on broken code.  Every expected value was derived from a
++ * known conformant implementation, e.g.:
++ *
++ *   $ python3 -c "import json; print(json.dumps('\u4e2d\u56fd'))"
++ *   "\u4e2d\u56fd"
++ *   $ python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())"
++ *   e4b8ade59bbd
++ */
++static void test_string_encode_unicode(void)
++{
++    // U+4E2D U+56FD (Chinese "zhongguo"), UTF-8 e4 b8 ad e5 9b bd
++    assert_encodes_to("\xe4\xb8\xad\xe5\x9b\xbd", "\\u4e2d\\u56fd");
++
++    // U+00E9 (e with acute accent), UTF-8 c3 a9
++    assert_encodes_to("caf\xc3\xa9", "caf\\u00e9");
++
++    // U+1F600 (emoji), UTF-8 f0 9f 98 80: outside the Basic Multilingual
++    // Plane, escaped as a UTF-16 surrogate pair (RFC 8259 section 7)
++    assert_encodes_to("\xf0\x9f\x98\x80", "\\ud83d\\ude00");
++
++    // UTF-8 sequence length boundaries
++    assert_encodes_to("\x7f", "\\u007f");             // U+007F
++    assert_encodes_to("\xc2\x80", "\\u0080");         // U+0080
++    assert_encodes_to("\xdf\xbf", "\\u07ff");         // U+07FF
++    assert_encodes_to("\xe0\xa0\x80", "\\u0800");     // U+0800
++    assert_encodes_to("\xef\xbf\xbf", "\\uffff");     // U+FFFF
++    assert_encodes_to("\xf0\x90\x80\x80", "\\ud800\\udc00"); // U+10000
++    assert_encodes_to("\xf4\x8f\xbf\xbf", "\\udbff\\udfff"); // U+10FFFF
++
++    // the escapes JSON requires are unaffected
++    assert_encodes_to("say \"hi\"", "say \\\"hi\\\"");
++    assert_encodes_to("a\\b", "a\\\\b");
++    assert_encodes_to("\x01\x1f", "\\u0001\\u001f");
++
++    /* Input that is not valid UTF-8 has no faithful representation in a
++     * JSON string; each such byte is escaped by value.  Note that this
++     * makes the stray byte e9 and valid UTF-8 U+00E9 (c3 a9) encode to
++     * the same escape - inherent, since JSON strings carry Unicode code
++     * points, not bytes. */
++    assert_encodes_to("\x80", "\\u0080");         // stray continuation byte
++    assert_encodes_to("\xe9x", "\\u00e9x");       // lead byte, no continuation
++    assert_encodes_to("caf\xc3", "caf\\u00c3");   // truncated at end of string
++    assert_encodes_to("\xc0\xaf", "\\u00c0\\u00af"); // overlong encoding
++    // CESU-8 style encoded UTF-16 surrogate is not valid UTF-8 either:
++    assert_encodes_to("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
++    assert_encodes_to("\xf5\x80", "\\u00f5\\u0080"); // beyond U+10FFFF
++}
++
++static void test_string_decode_unicode(void)
++{
++    // python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())" -> e4b8ade59bbd
++    assert_decodes_to("\\u4e2d\\u56fd", "\xe4\xb8\xad\xe5\x9b\xbd");
++    assert_decodes_to("\\u4E2D", "\xe4\xb8\xad"); // upper-case hex digits
++    assert_decodes_to("caf\\u00e9", "caf\xc3\xa9");
++    assert_decodes_to("\\u0041", "A");
++
++    // surrogate pair -> U+1F600, UTF-8 f0 9f 98 80
++    assert_decodes_to("\\ud83d\\ude00", "\xf0\x9f\x98\x80");
++
++    // UTF-8 sequence length boundaries
++    assert_decodes_to("\\u007f", "\x7f");
++    assert_decodes_to("\\u0080", "\xc2\x80");
++    assert_decodes_to("\\u07ff", "\xdf\xbf");
++    assert_decodes_to("\\u0800", "\xe0\xa0\x80");
++    assert_decodes_to("\\uffff", "\xef\xbf\xbf");
++
++    /* An unpaired surrogate denotes no character; it becomes U+FFFD
++     * REPLACEMENT CHARACTER (UTF-8 ef bf bd) instead of being corrupted
++     * into literal text. */
++    assert_decodes_to("\\ud83d", "\xef\xbf\xbd");   // lone high surrogate
++    assert_decodes_to("\\ude00", "\xef\xbf\xbd");   // lone low surrogate
++    assert_decodes_to("a\\ud83dz", "a\xef\xbf\xbd" "z");
++    assert_decodes_to("\\ud83d\\u0041", "\xef\xbf\xbd" "A");
++    assert_decodes_to("\\ud800\\ud800", "\xef\xbf\xbd" "\xef\xbf\xbd");
++
++    /* A \u escape not followed by four hex digits is malformed JSON; the
++     * "\u" introducer becomes U+FFFD and the characters after it, which
++     * were never a valid escape, are kept as-is. */
++    assert_decodes_to("\\u", "\xef\xbf\xbd");
++    assert_decodes_to("ab\\u12", "ab\xef\xbf\xbd" "12");
++    assert_decodes_to("\\u12zz", "\xef\xbf\xbd" "12zz");
++
++    // ordinary escapes still work alongside \u escapes
++    assert_decodes_to("\\t\\u4e2d", "\t\xe4\xb8\xad");
++}
++
++static void test_parse_unicode_strings(void)
++{
++    {
++        // \uXXXX escapes in parsed documents must decode to UTF-8
++        const char *data =
++            "{\"city\": \"\\u4e2d\\u56fd\","
++            " \"cafe\": \"caf\\u00e9\","
++            " \"emoji\": \"\\ud83d\\ude00\"}";
++        JsonElement *json = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
++        assert_string_equal(
++            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
++        assert_string_equal(
++            JsonObjectGetAsString(json, "cafe"), "caf\xc3\xa9");
++        assert_string_equal(
++            JsonObjectGetAsString(json, "emoji"), "\xf0\x9f\x98\x80");
++        JsonDestroy(json);
++    }
++
++    {
++        // raw UTF-8 in a parsed document passes through unmodified
++        const char *data = "{\"city\": \"\xe4\xb8\xad\xe5\x9b\xbd\"}";
++        JsonElement *json = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
++        assert_string_equal(
++            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
++        JsonDestroy(json);
++    }
++}
++
+ #define assert_json5_data_eq(_size, unescaped, escaped)           \
+     {                                                             \
+         Slice data = {.data = (void *) unescaped, .size = _size}; \
+@@ -2554,6 +2687,9 @@ int main()
+         unit_test(test_show_object_simple),
+         unit_test(test_show_string),
+         unit_test(test_string_escape),
++        unit_test(test_string_encode_unicode),
++        unit_test(test_string_decode_unicode),
++        unit_test(test_parse_unicode_strings),
+         unit_test(test_string_escape_json5),
+         unit_test(test_json_null_not_null),
+         unit_test(test_json_object_merge_deep),

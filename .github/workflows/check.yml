@@ -5,10 +5,14 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly overlay drift check (the `overlay-drift` job only).
+    - cron: "17 6 * * 1"
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,4 +34,46 @@ jobs:
       # reference rather than the 52-finding backlog it used to report.
       - name: Cross-reference lint
         run: bin/xref_lint.py
+
+      # The patch overlay on libntech/cfengine (overlay/, issue #3): the
+      # manifest agrees with the patch files, and the mechanism itself is
+      # proven on a synthetic repository — a sample series applies, a
+      # conflicting upstream change fails loudly, a cherry-picked patch is
+      # reported as retirable. Hermetic: no upstream clone.
+      - name: Overlay lint and self-test
+        run: |
+          bin/overlay.py lint
+          bin/overlay.py self-test
+
+  # Drift against upstream is NOT hermetic, so it runs on a schedule and on
+  # demand rather than on every push: shallow-clone each upstream and prove
+  # the pinned series still applies to its master (and to the newest 3.27.x
+  # tag for core), and that no patch has been retired by upstream carrying
+  # it. A failure here is the overlay asking to be rebased or shrunk; see
+  # docs/architecture/upstream-overlay.md §5–§6.
+  overlay-drift:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Fetch upstreams (history back to the pinned bases)
+        run: |
+          set -eu
+          base_libntech=$(python3 -c 'import json;print(json.load(open("overlay/overlay.json"))["components"]["libntech"]["base"])')
+          base_core=$(python3 -c 'import json;print(json.load(open("overlay/overlay.json"))["components"]["core"]["base"])')
+          git clone -q --filter=blob:none https://github.com/NorthernTechHQ/libntech /tmp/libntech
+          git -C /tmp/libntech fetch -q origin "$base_libntech"
+          git clone -q --filter=blob:none https://github.com/cfengine/core /tmp/core
+          git -C /tmp/core fetch -q origin "$base_core"
+      - name: libntech still applies and nothing is retired
+        run: |
+          bin/overlay.py check libntech --repo /tmp/libntech --against origin/master
+          bin/overlay.py retired libntech --repo /tmp/libntech --against origin/master --strict
+      - name: core still applies and nothing is retired
+        run: |
+          bin/overlay.py check core --repo /tmp/core --against origin/master
+          tag=$(git -C /tmp/core tag -l '3.27.*' --sort=-v:refname | head -1)
+          [ -n "$tag" ] && bin/overlay.py check core --repo /tmp/core --against "$tag"
+          bin/overlay.py retired core --repo /tmp/core --against origin/master --strict
 

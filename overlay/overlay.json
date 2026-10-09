@@ -1,0 +1,109 @@
+{
+  "components": {
+    "core": {
+      "base": "a0bca6aaf310515f69fef60e6c56b3e60bd337ac",
+      "base_described": "upstream master as of 2026-08-15 (merge of #6276)",
+      "fork": "https://github.com/djbclark/core",
+      "patches": [
+        {
+          "commit": "958d13949d5be46bdbc149658e740eb0849dcc96",
+          "file": "0001-Rejected-CMDB-data-now-names-the-offending-entry-and.patch",
+          "fork_ref": "fix/cmdb-name-offending-key",
+          "jira": "CFE-4719",
+          "register": "B-5a",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "carrier",
+          "subject": "Rejected CMDB data now names the offending entry and the file",
+          "upstream_pr": "https://github.com/cfengine/core/pull/6315",
+          "upstream_pr_state": "closed unmerged 2026-08-19",
+          "why": "B-5b is stacked on it; it names the offending CMDB entry and file in the rejection message"
+        },
+        {
+          "acceptance_test": "tests/acceptance/00_basics/06_host_specific_data/16-variable-references-good-entry-survives.cf",
+          "commit": "8f0076b814e8a0d69e48baeab8e637926e4d111a",
+          "file": "0002-Fixed-one-bad-CMDB-entry-discarding-every-entry-in-i.patch",
+          "fork_issue": "https://github.com/djbclark/core/issues/9",
+          "fork_ref": "fix/cmdb-one-bad-entry-skips-only-that-entry",
+          "jira": "CFE-4720",
+          "load_bearing_for": [
+            "host_specific.json is loaded by core's CMDB loader; one malformed entry used to drop its whole section"
+          ],
+          "register": "B-5b",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Fixed one bad CMDB entry discarding every entry in its section",
+          "upstream_pr": "https://github.com/cfengine/core/pull/6320",
+          "upstream_pr_state": "closed unmerged 2026-08-19"
+        }
+      ],
+      "upstream": "https://github.com/cfengine/core"
+    },
+    "libntech": {
+      "base": "0c0620d6c5f8f8d1cae212f084b021cff0b86ce6",
+      "base_described": "upstream master as of 2026-08-15 (merge of #289); exactly the libntech submodule pin of core's base a0bca6aaf, so the two components are one coherent tree",
+      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 5cbd6f7425fa, identical to the local merge 45c816c)",
+      "fork": "https://github.com/djbclark/libntech",
+      "patches": [
+        {
+          "commit": "90cf8cc08ca5d7a470978846d601f9972ef1fd72",
+          "file": "0001-Fix-non-conformant-uXXXX-handling-in-the-JSON-string.patch",
+          "fork_ref": "fix/json-string-codec",
+          "jira": "CFE-4730",
+          "register": "B-13",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "carrier",
+          "subject": "Fix non-conformant \\uXXXX handling in the JSON string codec",
+          "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/293",
+          "upstream_pr_state": "closed unmerged 2026-08-19",
+          "why": "B-14 is stacked on it; not itself load-bearing for shipped policy, but the encoder half changes what cf-agent writes for non-ASCII (code-point escapes)"
+        },
+        {
+          "commit": "3c9e4573a595cbe64a1b732c14a946ed0dcddbfd",
+          "file": "0002-Fixed-the-JSON-string-parser-decoding-backslash-esca.patch",
+          "fork_issue": "https://github.com/djbclark/libntech/issues/7",
+          "fork_ref": "fix/json-double-decode",
+          "jira": "CFE-4731",
+          "load_bearing_for": [
+            "any host_specific.json string containing a backslash (env values, argv) read by policy/tendcf_services.cf"
+          ],
+          "register": "B-14",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Fixed the JSON string parser decoding backslash escapes twice",
+          "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/297",
+          "upstream_pr_state": "closed unmerged 2026-08-19"
+        },
+        {
+          "commit": "1b16ae80cc61b76ee1eb4387fb5875dbf527c1c3",
+          "file": "0003-Added-unit-tests-for-MustacheRender.patch",
+          "fork_ref": "test/mustache-coverage",
+          "register": "B-22",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "carrier",
+          "subject": "Added unit tests for MustacheRender()",
+          "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/296",
+          "upstream_pr_state": "closed unmerged 2026-08-19",
+          "why": "B-23 is stacked on it; tests only (17 cases for MustacheRender), no runtime change"
+        },
+        {
+          "commit": "2f584b09184f92ccf56b7d5dc8f6262bb6b4ebea",
+          "file": "0004-Fixed-a-log-truncation-format-bug-and-an-OOB-pointer.patch",
+          "fork_issue": "https://github.com/djbclark/libntech/issues/8",
+          "fork_ref": "fix/mustache-minor-defects",
+          "jira": "CFE-4740",
+          "load_bearing_for": [
+            "policy/tendcf_services.cf renders every launchd plist with template_method => mustache"
+          ],
+          "register": "B-23",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Fixed a log-truncation format bug and an OOB pointer construction",
+          "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/298",
+          "upstream_pr_state": "closed unmerged 2026-08-19"
+        }
+      ],
+      "upstream": "https://github.com/NorthernTechHQ/libntech"
+    }
+  },
+  "schema_version": 1
+}

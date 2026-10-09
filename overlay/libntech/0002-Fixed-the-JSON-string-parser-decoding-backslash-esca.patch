@@ -1,0 +1,222 @@
+From 3c9e4573a595cbe64a1b732c14a946ed0dcddbfd Mon Sep 17 00:00:00 2001
+From: Daniel JB Clark <djbclark@gmail.com>
+Date: Tue, 18 Aug 2026 18:39:06 -0400
+Subject: [PATCH 2/2] Fixed the JSON string parser decoding backslash escapes
+ twice
+
+JsonParseAsString() already unescaped \\, \", \/, \b\f\n\r\t while
+parsing, leaving only \u verbatim. The three call sites then ran the
+result through JsonDecodeString() again, which re-scanned any backslash
+that pass one had produced (e.g. from \\) as a fresh escape, corrupting
+strings that contained an escaped backslash: `"C:\\temp\\new"` decoded
+to `C:<TAB>emp<NL>ew` instead of `C:\temp\new`.
+
+\u handling (with the surrogate-pair and malformed-escape logic from
+CFE-4730) moves into JsonParseAsString() itself, and the redundant
+JsonDecodeString() calls are removed. Object property names, which
+never called JsonDecodeString() at all, now get \u decoded too instead
+of keeping six literal characters.
+
+Verified by reverting the fix: the two new tests fail with the exact
+corruption above; full unit suite (37 binaries) passes with the fix
+applied.
+
+Changelog: Title
+Ticket: CFE-4731
+
+diff --git a/libutils/json.c b/libutils/json.c
+index 3289fb8f832f2bb0c6e34920b093e408b95dbb4f..1376623851acc6af1443c413c798227ea3d25440 100644
+--- a/libutils/json.c
++++ b/libutils/json.c
+@@ -2443,13 +2443,66 @@ static JsonParseError JsonParseAsString(
+                 WriterWriteChar(writer, '\t');
+                 continue;
+ 
++            case 'u':
++            {
++                // *data points at the 'u'; the hex digits follow it.
++                const char *const u = *data;
++                uint32_t codepoint;
++                if (!FourHexDigitsToInt(u + 1, &codepoint))
++                {
++                    /* Not a valid JSON \u escape.  Substitute U+FFFD
++                     * REPLACEMENT CHARACTER for the "\u" introducer
++                     * rather than corrupting it into literal text;
++                     * whatever follows was never part of a valid escape
++                     * and is kept as-is. */
++                    Log(LOG_LEVEL_DEBUG,
++                        "Replacing malformed JSON \\u escape '%.6s' with U+FFFD",
++                        u - 1); // Include the \ in the displayed escape
++                    Utf8EncodeCodePointWriter(0xfffd, writer);
++                    continue;
++                }
++
++                size_t consumed = 4; // the four hex digits after 'u'
++                if (codepoint >= 0xd800 && codepoint <= 0xdbff)
++                {
++                    /* A high surrogate is only valid immediately followed
++                     * by a low surrogate escape; together they denote one
++                     * code point outside the Basic Multilingual Plane
++                     * (RFC 8259 section 7). */
++                    uint32_t low;
++                    if (u[5] == '\\' && u[6] == 'u' &&
++                        FourHexDigitsToInt(u + 7, &low) &&
++                        low >= 0xdc00 && low <= 0xdfff)
++                    {
++                        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
++                                    (low - 0xdc00);
++                        consumed = 10; // both \uXXXX\uXXXX hex runs
++                    }
++                    else
++                    {
++                        Log(LOG_LEVEL_DEBUG,
++                            "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
++                            u - 1);
++                        codepoint = 0xfffd;
++                    }
++                }
++                else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
++                {
++                    Log(LOG_LEVEL_DEBUG,
++                        "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
++                        u - 1);
++                    codepoint = 0xfffd;
++                }
++
++                Utf8EncodeCodePointWriter(codepoint, writer);
++                *data = *data + consumed;
++                continue;
++            }
++
+             default:
+-                /* Unrecognised escape sequence.
+-                 *
+-                 * For example, we fail to handle Unicode escapes -
+-                 * \u{hex digits} - we have no way to represent the
+-                 * character they denote.  So keep them verbatim, for
+-                 * want of any other way to handle them; but warn. */
++                /* Unrecognised escape sequence: not one of the ones JSON
++                 * defines. Keep it verbatim, for want of any other way to
++                 * handle it; but warn. */
+                 Log(LOG_LEVEL_DEBUG,
+                     "Keeping verbatim unrecognised JSON escape '%.6s'",
+                     *data - 1); // Include the \ in the displayed escape
+@@ -2611,9 +2664,8 @@ static JsonParseError JsonParseAsPrimitive(
+         {
+             return err;
+         }
+-        *json_out = JsonElementCreatePrimitive(
+-            JSON_PRIMITIVE_TYPE_STRING, JsonDecodeString(value));
+-        free(value);
++        *json_out =
++            JsonElementCreatePrimitive(JSON_PRIMITIVE_TYPE_STRING, value);
+         return JSON_PARSE_OK;
+     }
+     else
+@@ -2685,9 +2737,7 @@ static JsonParseError JsonParseAsArray(
+             }
+             JsonArrayAppendElement(
+                 array,
+-                JsonElementCreatePrimitive(
+-                    JSON_PRIMITIVE_TYPE_STRING, JsonDecodeString(value)));
+-            free(value);
++                JsonElementCreatePrimitive(JSON_PRIMITIVE_TYPE_STRING, value));
+         }
+         break;
+ 
+@@ -2874,9 +2924,7 @@ static JsonParseError JsonParseAsObject(
+                     object,
+                     property_name,
+                     JsonElementCreatePrimitive(
+-                        JSON_PRIMITIVE_TYPE_STRING,
+-                        JsonDecodeString(property_value)));
+-                free(property_value);
++                        JSON_PRIMITIVE_TYPE_STRING, property_value));
+                 free(property_name);
+                 property_name = NULL;
+             }
+diff --git a/tests/unit/json_test.c b/tests/unit/json_test.c
+index 9a173cf530f3ea1163d0c03930942a816e1f838c..e2b87e7fa443fa4f44934c842812f122516ad546 100644
+--- a/tests/unit/json_test.c
++++ b/tests/unit/json_test.c
+@@ -751,6 +751,71 @@ static void test_parse_object_escaped(void)
+     JsonDestroy(obj);
+ }
+ 
++/* CFE-4731: JsonParseAsString() and JsonDecodeString() used to both
++ * unescape backslash sequences, run one after the other over the same
++ * text. Any backslash JsonParseAsString() produced (from a \\ escape, or
++ * from a still-verbatim \uXXXX before that was folded in) was then
++ * re-interpreted as an escape introducer by JsonDecodeString(), silently
++ * corrupting any string containing an escaped backslash. These parse a
++ * full JSON document (unlike the JsonDecodeString()-only cases above) so
++ * they exercise the double-decode integration bug specifically. */
++static void test_parse_string_not_double_decoded(void)
++{
++    // A Windows path: the escaped backslashes must stay literal
++    // backslashes, not be re-decoded as \t and \n escape introducers.
++    {
++        const char *data = "{\"p\": \"C:\\\\temp\\\\new\"}";
++        JsonElement *obj = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
++        assert_string_equal(JsonObjectGetAsString(obj, "p"), "C:\\temp\\new");
++        JsonDestroy(obj);
++    }
++
++    // An escaped backslash immediately followed by 'u0041' must stay as
++    // literal text, not be re-decoded as if it were the \u0041 escape.
++    {
++        const char *data = "{\"p\": \"\\\\u0041\"}";
++        JsonElement *obj = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
++        assert_string_equal(JsonObjectGetAsString(obj, "p"), "\\u0041");
++        JsonDestroy(obj);
++    }
++
++    // An escaped backslash immediately followed by 't' must stay literal,
++    // not be re-decoded into a real tab character.
++    {
++        const char *data = "{\"p\": \"a\\\\tb\"}";
++        JsonElement *obj = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
++        assert_string_equal(JsonObjectGetAsString(obj, "p"), "a\\tb");
++        JsonDestroy(obj);
++    }
++
++    // A genuine \u escape (single backslash) in a string VALUE must still
++    // decode correctly now that JsonParseAsString() owns \u handling.
++    {
++        const char *data = "{\"p\": \"caf\\u00e9\"}";
++        JsonElement *obj = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
++        assert_string_equal(JsonObjectGetAsString(obj, "p"), "caf\xc3\xa9");
++        JsonDestroy(obj);
++    }
++}
++
++/* CFE-4731 side effect: object property NAMES go through
++ * JsonParseAsString() but were never passed to JsonDecodeString(), so a
++ * \u escape in a key was left as six literal characters instead of being
++ * decoded. Moving \u handling into JsonParseAsString() fixes this for
++ * free, since keys and values now share the same decoding path. */
++static void test_parse_object_key_unicode_escape(void)
++{
++    const char *data = "{\"\\u0041\": \"value\"}";
++    JsonElement *obj = NULL;
++    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
++    assert_string_equal(JsonObjectGetAsString(obj, "A"), "value");
++    JsonDestroy(obj);
++}
++
+ static void test_parse_tzz_evil_key(void)
+ {
+     const char *data =
+@@ -2655,6 +2720,8 @@ int main()
+         unit_test(test_parse_empty_containers),
+         unit_test(test_parse_empty_string),
+         unit_test(test_parse_escaped_string),
++        unit_test(test_parse_string_not_double_decoded),
++        unit_test(test_parse_object_key_unicode_escape),
+         unit_test(test_parse_big_numbers),
+         unit_test(test_parse_good_numbers),
+         unit_test(test_parse_object_compound),
