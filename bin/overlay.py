@@ -319,9 +319,11 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
     r = git(checkout, *identity_args(checkout), "am", "--whitespace=nowarn", *map(str, paths), check=False)
     if r.returncode != 0:
         err = r.stderr.decode().strip() + "\n" + r.stdout.decode().strip()
-        git(checkout, "am", "--abort", check=False)
+        ab = git(checkout, *identity_args(checkout), "am", "--abort", check=False)
+        abort_note = (f"aborted, checkout restored to {head[:12]}" if ab.returncode == 0 else
+                      f"and `git am --abort` ALSO failed ({ab.returncode}): {ab.stderr.decode().strip()} {ab.stdout.decode().strip()}")
         raise Finding("\n".join(report + [
-            f"DRIFT: `git am` failed in {checkout}; aborted, checkout restored to {head[:12]}:",
+            f"DRIFT: `git am` failed in {checkout}; {abort_note}:",
             *("    " + ln for ln in err.splitlines() if ln.strip()),
         ]))
     new_head = git_out(checkout, "rev-parse", "HEAD")
@@ -451,9 +453,12 @@ def self_test() -> list[str]:
         try:
             apply_series(overlay, "sample", clone, allow_mismatch=True)
         except Finding as e:
-            clean = git_out(clone, "status", "--porcelain") == "" and not (clone / ".git" / "rebase-apply").exists()
+            status = git_out(clone, "status", "--porcelain")
+            in_progress = (clone / ".git" / "rebase-apply").exists()
+            head_now = git_out(clone, "rev-parse", "HEAD")
             ok("apply --allow-base-mismatch: `git am` conflict fails loudly and leaves the checkout clean",
-               "DRIFT" in str(e) and clean and git_out(clone, "rev-parse", "HEAD") == drifted, str(e))
+               "DRIFT" in str(e) and status == "" and not in_progress and head_now == drifted,
+               f"status={status!r} rebase-apply={in_progress} HEAD={head_now[:12]} expected={drifted[:12]}\n{e}")
         else:
             ok("apply --allow-base-mismatch: `git am` conflict fails loudly", False)
 
