@@ -49,8 +49,14 @@ jobs:
       - uses: ./.github/actions/build-fork
       - name: Generic-bundle tests
         run: tests/policy/run.sh --bindir /tmp/cf/bin
+      # librsync (and its libb2) is a build-time pick of core's configure
+      # and not part of a minimal Debian; pastebin lacked it (2026-10-29).
+      # Everything else cf-agent links is in the Debian base. Run with
+      # LD_LIBRARY_PATH=<tree>/lib, or extract to /tmp/cf to match the rpath.
       - name: Package the install tree for pastebin (T3)
-        run: tar -C /tmp -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz cf
+        run: |
+          cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /tmp/cf/lib/
+          tar -C /tmp -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz cf
       - uses: actions/upload-artifact@v4
         with:
           name: cfengine-fork-debian13

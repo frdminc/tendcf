@@ -36,7 +36,7 @@ is a derivation kept in the host flake, not in this repo.
 | 4 | One `schema_version` bump from an adapter prototype: richer goal-file systemd flavour (scope, restart, install target, externally-written unit), writer vocabulary with `dpkg`, `nixos` and `nix-darwin`, and an inventory schema carrying `supervisor` and distro family. |
 | 5 | systemd branch of the generic bundle, enforce tests on T1. |
 | 6 | nix2cf: systemd renderer (supervisor from inventory), the Linux-relevant `TODO(operator)` markers, the `tendcf.lock` consumer. nix2cf emits only the goal file; Augments stay on the device (`projector.py`). |
-| 7 | T3 dry-run, then one enforced service. |
+| 7 | T3 dry-run, then one enforced service. **Dry-run done 2026-10-29:** the `debian:13` CI artifact (`cfengine-fork-debian13`, fork `7363abf43`) installed under `~/cf` on pastebin as the unprivileged user; `tests/policy/run.sh` passes all five checks there, and `cf-agent -n` on `examples/host_specific.json` refuses both entries by name (interlock unmet: the example's caddy path is a Mac path; service: `launchd` flavour on `debian_13`) and touches nothing. Found on the way: the artifact needed `librsync`/`libb2` bundled (now done) and the harness had to own its umask (pastebin is 002). The enforced service waits on step 5 (systemd branch) and a sudo plan for the host. |
 | 8 | T4: the NixOS passthrough adapter (§5), dry-run first. Then T5/T6/T7. |
 
 ## 4. Consequences of deferring Android
