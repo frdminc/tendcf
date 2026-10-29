@@ -46,6 +46,13 @@ Not in the overlay, by that rule:
 
 The overlay is therefore small by construction, and it shrinks: §6.
 
+**Ruling, 2026-10-29 (operator):** the Linux CI and hosts ([`linux-targets.md`](linux-targets.md))
+run the full fork build, including the security fixes and `--simulate-json`,
+not upstream plus the overlay. The manifest above still lists what shipped
+policy depends on, but it no longer bounds the tested artifact. The rule
+that keeps `--simulate-json` out of the overlay stands; the fork build
+carries it anyway. Every Linux result must name the fork revision it ran.
+
 ## 3. Format and location
 
 ```

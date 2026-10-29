@@ -59,9 +59,10 @@ Two other goals sit alongside that:
 - The generic machinery is publishable. Someone else should be able to
   supply their own facts and run the same code.
 - The installed OS on a new Linux box is an ordinary distribution, not
-  [NixOS](https://nixos.org/). Nix is used for builds and (later) as an
-  optional way to *write* site data. It is not the thing a stranger has to
-  install as their operating system.
+  [NixOS](https://nixos.org/). Nix is used for builds, as one of two equal
+  ways to *write* site data, and verbatim where a host already runs NixOS
+  or nix-darwin. It is not the thing a stranger has to install as their
+  operating system.
 
 ---
 
@@ -167,11 +168,15 @@ supervisor (launchd label, systemd instance, runit service, Jobber job).
 Two tools writing the same unit is a class of outage this file is meant to
 make impossible. launchd is one adapter, not the model.
 
-The Site Model may later be *authored* in the Nix module system
-(`mkOption`, `mkIf`, `mkDefault`) and rendered to the same JSON everything
-else consumes. That is an authoring frontend only. Nobody adopting the
-project has to know Nix. Until that frontend exists, the files are written
-as YAML.
+The Site Model has two equal authoring frontends: YAML, and the Nix module
+system (`mkOption`, `mkIf`, `mkDefault`), each rendered to the same JSON
+everything else consumes. Nobody adopting the project has to know Nix.
+Anyone who does can write a site in it and have it rendered for a Mac or a
+Debian box that has no Nix at all; and a host that already runs NixOS or
+nix-darwin keeps its configuration verbatim, tendcf adding only
+distribution, consent and reporting around it (decided 2026-10-29,
+[`linux-targets.md`](../architecture/linux-targets.md) §5). The Nix
+frontend is not built yet; until it is, the files are written as YAML.
 
 Every schema is paired with a concrete example file, except schemas that
 hold only shared definitions and describe no document of their own; those
@@ -250,7 +255,8 @@ The pairing here is Site Model into CFEngine Augments, because of
 multi-owner operation — not because the compiler mechanism is new.
 
 **Where it runs:** operator machine or CI. Consented devices receive a
-signed artifact. They do not run Nix or nix2cf.
+signed artifact. They do not run nix2cf; Nix runs on a device only where
+it already is that host's configuration system (NixOS, nix-darwin).
 
 ---
 
@@ -1250,7 +1256,7 @@ coherent, describable state):
 | 4 | Linux reference path | A stock distro, not NixOS. Distro choice is open until this step; Ubuntu Server is the working default. |
 | 5 | First real Linux host | A second node that can hold backup roles. Proves that roles are data. |
 | 6 | Signed releases, push-only | TUF-subset ceremony; goal-file render and diff; the on-device validator. Operator hosts only. |
-| 7 | Mac substrate (optional) | nix-darwin + home-manager if that path is chosen. Reversible. Services remain CFEngine from step 1. |
+| 7 | Mac substrate (optional) | nix-darwin + home-manager on the primary workstation if that path is chosen. Reversible. Services remain CFEngine from step 1. A Mac already on nix-darwin is the passthrough case (§3), not this step. |
 | 8 | Pull | Any host with the role self-updates. The no-control-node end state, reached by editing `roles.yml`. |
 | 9 | Consent / sovereignty | Advisor slot + default prompt. Their AI, our accept/reject. |
 | 10+ | Demand-driven | Builder/cache, reproducible APK provenance, WoT as advisor tools, extracting the publishable layer when a second person runs it. |

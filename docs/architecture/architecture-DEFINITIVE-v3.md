@@ -29,10 +29,11 @@ cannot start its own privileged helper”).
    and safe when they conflict. Token spend is the cost that matters
    (§13).
 2. **The reference target is a stock Linux distro on bare metal**, not
-   NixOS. Nix is used for builds, optional Site Model authoring, and
-   (maybe) Mac substrate — never as the installed OS a stranger must
-   adopt. Ubuntu Server LTS is the working default; the distro name is
-   open until Step 4.
+   NixOS. Nix is used for builds, as one of two equal Site Model authoring
+   languages, and verbatim on hosts that already run NixOS or nix-darwin
+   (D12, [`linux-targets.md`](linux-targets.md) §5) — never as the
+   installed OS a stranger must adopt. Ubuntu Server LTS is the working
+   default; the distro name is open until Step 4.
 3. **The trust/consent layer is the point.** A person should understand a
    proposed change in ordinary language, refuse it, and keep a personal
    branch — using **their** AI, not ours.
@@ -909,9 +910,10 @@ agent evaluates.
 ## 12. Platforms
 
 **macOS (adapter #1).** Services as CFEngine promises from `services.yml`
-via the launchd adapter. Dry-run default. nix-darwin / home-manager are
-**substrate only**, Step 7, gated on §14.1. Unit-writers lint is the
-safety rail on a live daily driver.
+via the launchd adapter. Dry-run default. A Mac that already runs
+nix-darwin keeps that configuration verbatim (passthrough, D12); whether
+the primary workstation adopts nix-darwin is Step 7, gated on §14.1.
+Unit-writers lint is the safety rail on a live daily driver.
 
 **Android (adapter #2).** Same Site Model vocabulary. Runtime: Termux +
 tendcf-agent + Shizuku-class helper + CFEngine. Agent owns logs (§8).
@@ -920,6 +922,11 @@ Peer actions cover devices that need external ADB help.
 **Linux (adapter #3, adoptability keystone).** Stock distro; mise
 toolchains + CFEngine everything else. Distro choice open until this
 step.
+
+**NixOS / nix-darwin (passthrough).** The host's existing Nix
+configuration, unchanged; tendcf supplies distribution, consent and
+reporting around it ([`linux-targets.md`](linux-targets.md) §5, Step 8
+there). First host: vps-primary.
 
 Future classes (extension points, no build-out): OpenWrt; consented
 iPhone/wearables that consume artifacts; firmware as Nix-built
@@ -942,12 +949,12 @@ Each step leaves a coherent system. Not a schedule.
 | --- | --- |
 | 0 | Schemas in **tendcf** (`schema/`, `examples/`, `bin/schema_lint.py` — provides/requires, interlocks, comprehensive, report-row). Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
 | 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)). |
-| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Not started** as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
-| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs steps 1–2). **Blocked on step 2**, as decided on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` is a README. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
+| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Deferred** (operator, 2026-10-29): Linux comes first, see [`linux-targets.md`](linux-targets.md). Not started as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
+| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` has `buildfile` only. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
 | 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. |
-| 7 | Optional Mac substrate (nix-darwin) if §14.1 says yes. |
+| 7 | Mac substrate on the primary workstation (nix-darwin) if §14.1 says yes. The nix-darwin passthrough adapter itself is [`linux-targets.md`](linux-targets.md) Step 8 and does not wait on §14.1. |
 | 8 | Pull / self-update. |
 | 9 | Consent surface + default prompt + advisor slot. |
 | 10+ | Demand: builder/cache, APK provenance, WoT-as-advisor-tools, extracting the publishable layer when a second person runs it. |
@@ -990,10 +997,10 @@ Older “superseded by” archaeology lives in
 | # | Decision | Resolution |
 | --- | --- | --- |
 | D2 | Site Model formality | Schemas at Step 0; writer-lint immediate. |
-| D6 | Nix on bare metal | No. Builds / dev shells / optional Mac substrate / optional authoring frontend only. |
+| D6 | Nix on bare metal | No. Builds / dev shells / authoring language / passthrough where a host already runs NixOS or nix-darwin. Never the OS a stranger must install. |
 | D8 | Trust layer | Build it, gated. Sovereignty is the point. |
 | D10 | Task runner | `just` for humans; mise for toolchains. |
-| D12 | Authoring frontend | Nix modules MAY author the Site Model; YAML/JSON remains the wire format and the stranger path. |
+| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. |
 | D13 | Service owner | CFEngine promises everywhere; mise toolchains only. |
 | D14 | Deployment shape | Git-synced policy; `cf-serverd` on every host; push and pull are one mechanism. |
 | D15 | Compile target | CFEngine Augments, not freehand `.cf`. |
@@ -1003,7 +1010,7 @@ Older “superseded by” archaeology lives in
 | D19 | Composition | Private-site lockfile pins inputs (DAG). Signed release is the deploy artifact. No sibling-repo tag lockstep. |
 | D20 | Nix store locality | Single writer per host. |
 | D21 | Schema home | **tendcf** owns schemas/types. nix2cf is the compiler. |
-| D22 | Platform sequence | macOS, Android, Linux. |
+| D22 | Platform sequence | macOS, Linux. Android deferred by the operator on 2026-10-29 ([`linux-targets.md`](linux-targets.md)). |
 | D23 | YAML canonicalize | Parse, re-serialize, diff on the YAML path. |
 | D24 / D40 | Lookup + auto-provide | Registry/token CLI; default `service:<name>`; compile errors teach names. |
 | D25 | Schema/example pairing | Lint fails if unpaired. |
