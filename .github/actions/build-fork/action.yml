@@ -1,0 +1,81 @@
+name: Build and self-test the CFEngine fork
+description: >-
+  Fetch djbclark/core at the commit pinned in overlay/fork.json (libntech from
+  the fork at core's submodule pointer), build it, install under `prefix`,
+  record the revision in the job summary, then run the fork's own unit tests
+  and the acceptance directories covering the hand-merged areas of
+  tendcf-integration (CMDB loader, simulate mode, exec_timeout).
+
+inputs:
+  prefix:
+    description: Install prefix for the built tools.
+    default: /tmp/cf
+
+outputs:
+  core-commit:
+    value: ${{ steps.pin.outputs.core }}
+  libntech-commit:
+    value: ${{ steps.pin.outputs.libntech }}
+
+runs:
+  using: composite
+  steps:
+    - id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        core_repo=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["core"]["repo"])')
+        core=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["core"]["commit"])')
+        libntech_repo=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["libntech"]["repo"])')
+        git init -q /tmp/core
+        git -C /tmp/core remote add origin "$core_repo"
+        timeout 600 git -C /tmp/core fetch -q --depth 1 origin "$core"
+        git -C /tmp/core checkout -q FETCH_HEAD
+        libntech=$(git -C /tmp/core rev-parse HEAD:libntech)
+        git init -q /tmp/core/libntech
+        git -C /tmp/core/libntech remote add origin "$libntech_repo"
+        timeout 600 git -C /tmp/core/libntech fetch -q --depth 1 origin "$libntech"
+        git -C /tmp/core/libntech checkout -q FETCH_HEAD
+        echo "core=$core" >> "$GITHUB_OUTPUT"
+        echo "libntech=$libntech" >> "$GITHUB_OUTPUT"
+
+    - name: Build dependencies (core's own script; Debian/Ubuntu branch)
+      shell: bash
+      run: /tmp/core/ci/dependencies.sh
+
+    - name: Configure and build
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd /tmp/core
+        # configure auto-detects systemctl and then `make install` writes unit
+        # files to /usr/lib/systemd/system, root-owned on the VMs; this build
+        # is a tool tree under prefix, not a host install.
+        ./autogen.sh --enable-debug --prefix="${{ inputs.prefix }}" --with-systemd-service=no
+        make -j"$(nproc)" CFLAGS="-Wall"
+        make install
+
+    - name: Record the revision
+      shell: bash
+      run: |
+        {
+          echo "### CFEngine fork build"
+          echo
+          echo "- core: \`${{ steps.pin.outputs.core }}\` (${{ runner.os }} ${{ runner.arch }})"
+          echo "- libntech: \`${{ steps.pin.outputs.libntech }}\`"
+          echo "- $("${{ inputs.prefix }}/bin/cf-agent" --version | head -1)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        "${{ inputs.prefix }}/bin/cf-agent" --version
+
+    - name: Fork unit tests
+      shell: bash
+      run: make -C /tmp/core/tests/unit check
+
+    - name: Fork acceptance tests (CMDB, simulate mode, exec_timeout)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd /tmp/core/tests/acceptance
+        chmod -R go-w .
+        ./testall --printlog --tests=common,errorlog,errorexit,errorpass \
+          00_basics/06_host_specific_data 29_simulate_mode 08_commands/04_exec_timeout

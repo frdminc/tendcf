@@ -1,0 +1,11 @@
+{
+  "_comment": "The CFEngine build Linux CI and Linux hosts run (upstream-overlay.md §2, ruling 2026-10-29): the full fork at this exact commit, never a branch tip. libntech is taken from core's submodule pointer at that commit, fetched from the libntech fork. Bump = a commit here; every Linux result names this revision.",
+  "core": {
+    "repo": "https://github.com/djbclark/core",
+    "branch": "tendcf-integration",
+    "commit": "7363abf435fa9037433d1454741561b99079b3c1"
+  },
+  "libntech": {
+    "repo": "https://github.com/djbclark/libntech"
+  }
+}

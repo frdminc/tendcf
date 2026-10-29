@@ -52,12 +52,24 @@ not upstream plus the overlay. The manifest above still lists what shipped
 policy depends on, but it no longer bounds the tested artifact. The rule
 that keeps `--simulate-json` out of the overlay stands; the fork build
 carries it anyway. Every Linux result must name the fork revision it ran.
+That revision is pinned by commit in `overlay/fork.json` (`core.commit` on
+the fork's `tendcf-integration` branch; libntech follows core's submodule
+pointer, fetched from the libntech fork). `.github/workflows/linux.yml`
+builds it on every Linux CI target through `.github/actions/build-fork`,
+writes core and libntech commits plus `cf-agent --version` to the job
+summary, and runs `tests/policy/run.sh` on the result. Moving the pin is a
+commit here, reviewed like any other. `tendcf-integration` itself is
+refreshed by merging fork `master` and every current fix branch
+([`upstream-register.md`](upstream-register.md) "Branch layout"), never
+rebased.
+
 
 ## 3. Format and location
 
 ```
 overlay/
   overlay.json          manifest (canonical JSON: sorted keys, 2-space indent)
+  fork.json             the full-fork commit Linux CI builds (§2 ruling)
   libntech/0001-….patch  git format-patch output, applied in order onto libntech.base
   core/0001-….patch      the same for cfengine/core
 bin/overlay.py          lint · status · check · retired · apply · export · self-test

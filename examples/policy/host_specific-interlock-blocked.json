@@ -6,7 +6,7 @@
         "bundle": "gated",
         "defines_class": "gate_ok",
         "pre_action": {
-          "command": ["/bin/false"],
+          "command": ["/usr/bin/false"],
           "expect_exit": 0,
           "timeout_seconds": 5
         },
