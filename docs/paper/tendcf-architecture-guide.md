@@ -1059,13 +1059,23 @@ than chosen, and neither was guessed:
   combine without any join against the service list. That is §12’s
   “enclosing-bundle” constant, made mechanical.
 
-**The refusal was tested for real.**
+**The refusal was tested for real; the pass was not, and it was broken.**
 [`examples/policy/host_specific-interlock-blocked.json`](../../examples/policy/host_specific-interlock-blocked.json)
 declares a service whose bundle carries an interlock whose check is
-`/bin/false` — a command that genuinely fails, not a mocked failure — and a
-real, non-dry-run `cf-agent` run confirms the gated service’s promises are
-skipped and the refusal reported. It is a small result. It is also the only
-place in this guide where a mechanism is demonstrated rather than described.
+`/usr/bin/false` — a command that genuinely fails, not a mocked failure —
+and a real, non-dry-run `cf-agent` run confirms the gated service’s
+promises are skipped and the refusal reported. On 2026-10-29 the twin run,
+`/usr/bin/true`, refused too: CFEngine evaluates every `classes:` section
+of a bundle before any `commands:` in each pass and never undefines a
+class, so a verdict computed in the same bundle as the check is fixed
+before the check runs. The check now lives in its own bundle
+(`tendcf_interlocks`, sequenced first, namespace-scoped outcome classes)
+and `tendcf_services` reads a final verdict; dry-run stays fail-closed
+because a check that never ran defines nothing.
+[`tests/policy/run.sh`](../../tests/policy/run.sh) runs both paths against
+a real `cf-agent` on every Linux CI target and on the Mac. It is a small
+result, and the only place in this guide where a mechanism is demonstrated
+rather than described; the first demonstration was half of one.
 
 Three limits, since v1 invites over-reading. It is **launchd-only**. It
 renders the plist through mustache templating, which does **not** do
@@ -1250,7 +1260,7 @@ coherent, describable state):
 | Step | What | Notes |
 | --- | --- | --- |
 | 0 | Schemas in tendcf | Existing contract is `schema/` + `examples/` + `bin/schema_lint.py`. Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
-| 1 | macOS services adapter | **Started.** `policy/tendcf_services.cf` renders and loads launchd services from projected data, with interlocks enforced (§16.C). Still open in this step: package and file promises, environment rendering, the unit-writer detector. Dry-run default. Not in this step: nix-darwin. |
+| 1 | macOS services adapter | **Started.** `policy/tendcf_services.cf` renders and loads launchd services from projected data, with interlocks enforced (§16.C; the interlock verdict was split into its own bundle on 2026-10-29 after the pass path was found never to open). Still open in this step: package and file promises, environment rendering, the unit-writer detector. Dry-run default. Not in this step: nix-darwin. |
 | 2 | Android under the Site Model | Same vocabulary. Agent owns JSONL+SQLite in app-private storage. |
 | 3 | `nix2cf` compiler | “What would device X receive?” first, then conflict check, extra-entry reporting, then inference. Inference waits until types exist on two platforms. |
 | 4 | Linux reference path | A stock distro, not NixOS. Distro choice is open until this step; Ubuntu Server is the working default. |

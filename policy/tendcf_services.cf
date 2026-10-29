@@ -23,6 +23,19 @@
 # per distinct `bundle` tag (interlock_blocked_<tag>), computed once and
 # checked by every entry carrying that tag.
 #
+# Two bundles, sequenced `tendcf_interlocks` then `tendcf_services`, and
+# that order is load-bearing. CFEngine evaluates every `classes:` section
+# of a bundle before any `commands:` section in each pass, and a class
+# once defined is never undefined, so a verdict class computed in the same
+# bundle as the pre_action command is fixed in pass 1 before the command
+# has run (found 2026-10-29 with a real build: `interlock_blocked_demo`
+# defined, THEN `/usr/bin/true` executed, THEN `interlock_ok_demo_check`
+# set, refusal anyway). The commands therefore live in their own bundle
+# with namespace-scoped outcome classes, and the services bundle reads a
+# final verdict. Fail-closed is kept: a pre_action that never ran (dry-run
+# `-n`, missing executable, timeout) leaves `interlock_ok_*` undefined and
+# the bundle blocked.
+#
 # Entry ids and bundle tags are NOT valid CFEngine class-name fragments as
 # written: the schema allows `.`/`-`/`@` (service ids can be a launchd
 # label like "com.tendcf.caddy.main"; bundle tags are lowercase-kebab).
@@ -31,6 +44,44 @@
 # Every id/tag that becomes PART OF a class name goes through canonify()
 # into its own variable first; raw ids are kept for data lookups and the
 # rendered plist Label, where the real, uncanonified value is required.
+
+bundle agent tendcf_interlocks
+{
+  vars:
+      "interlock_ids"
+        slist => getindices("data:variables.tendcf_interlock");
+
+      "interlock_canon[$(interlock_ids)]"
+        string => canonify("$(interlock_ids)");
+
+      # commands: promise runs <promiser> <arglist...>, and non-scalar
+      # attributes (arglist, template_data below) can't take an indexed
+      # data-container element directly -- CFEngine rejects "container
+      # assigned to an indexed variable name" for that, and neither `@()`
+      # nor bare `$()` accept a bracket path as a full non-scalar rvalue
+      # (confirmed against a real build; both give parse errors, not just
+      # a hunch). join() over the container path (a proven idiom: pass
+      # the path as a plain string, CFEngine resolves it) sidesteps that,
+      # at the cost of shell-quoting argv back together -- acceptable
+      # here since pre_action.command comes from our own schema-validated
+      # goal file, not attacker input, but a real limitation worth
+      # flagging: an argv element containing a space or shell
+      # metacharacter is not currently isolated.
+      "pre_action_cmd[$(interlock_ids)]"
+        string => join(" ",
+          "data:variables.tendcf_interlock[$(interlock_ids)][pre_action][command]");
+
+  commands:
+      # pre_action: run the interlock's check under its own timeout, and
+      # classify strictly by the entry's own expect_exit -- not bare
+      # zero, since the schema allows any code 0-255.
+      "$(pre_action_cmd[$(interlock_ids)])"
+        contain => tendcf_interlock_contain(
+          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][timeout_seconds])"),
+        classes => tendcf_interlock_result(
+          "interlock_ok_$(interlock_canon[$(interlock_ids)])",
+          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][expect_exit])");
+}
 
 bundle agent tendcf_services
 {
@@ -63,39 +114,11 @@ bundle agent tendcf_services
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
                               "present");
 
-  vars:
-      # commands: promise runs <promiser> <arglist...>, and non-scalar
-      # attributes (arglist, template_data below) can't take an indexed
-      # data-container element directly -- CFEngine rejects "container
-      # assigned to an indexed variable name" for that, and neither `@()`
-      # nor bare `$()` accept a bracket path as a full non-scalar rvalue
-      # (confirmed against a real build; both give parse errors, not just
-      # a hunch). join() over the container path (a proven idiom: pass
-      # the path as a plain string, CFEngine resolves it) sidesteps that,
-      # at the cost of shell-quoting argv back together -- acceptable
-      # here since pre_action.command comes from our own schema-validated
-      # goal file, not attacker input, but a real limitation worth
-      # flagging: an argv element containing a space or shell
-      # metacharacter is not currently isolated.
-      "pre_action_cmd[$(interlock_ids)]"
-        string => join(" ",
-          "data:variables.tendcf_interlock[$(interlock_ids)][pre_action][command]");
-
-  commands:
-      # pre_action: run the interlock's check under its own timeout, and
-      # classify strictly by the entry's own expect_exit -- not bare
-      # zero, since the schema allows any code 0-255.
-      "$(pre_action_cmd[$(interlock_ids)])"
-        contain => tendcf_interlock_contain(
-          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][timeout_seconds])"),
-        classes => tendcf_interlock_result(
-          "interlock_ok_$(interlock_canon[$(interlock_ids)])",
-          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][expect_exit])");
-
-  classes:
       # Bundle-scoped blast radius: named by the interlock's OWN bundle
       # tag, not by which service references it, so N interlocks sharing
       # one tag OR together with no join against the service list.
+      # interlock_ok_* is final here: tendcf_interlocks ran to completion
+      # before this bundle started (see the header).
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"
         expression => "!interlock_ok_$(interlock_canon[$(interlock_ids)])";
 
@@ -140,6 +163,8 @@ body delete tendcf_tidy
 
 body classes tendcf_interlock_result(class, code)
 {
+      # namespace: the verdict is read by tendcf_services, a later bundle.
+      scope                => "namespace";
       kept_returncodes     => { "$(code)" };
       repaired_returncodes => { "$(code)" };
       promise_kept         => { "$(class)" };

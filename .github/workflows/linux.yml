@@ -1,0 +1,57 @@
+name: Linux
+
+# Builds the CFEngine fork pinned in overlay/fork.json on every Linux target
+# of docs/architecture/linux-targets.md §1 that CI can reach (T1: GitHub
+# ubuntu VMs, x86_64 plus one arm64 row; T2: a debian:13 container matching
+# pastebin, T3), and runs the generic-bundle tests (tests/policy/run.sh) on
+# the result. The debian:13 install tree is uploaded for the T3 dry-run.
+#
+# Hosted ubuntu runners are full VMs with systemd as PID 1, so the systemd
+# branch of the bundle (linux-targets.md §3 step 5) can be tested in enforce
+# mode here when it exists. Explicit runner labels, not ubuntu-latest, since
+# that label moves (26.04 from November 2026).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vm:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-fork
+      - name: Generic-bundle tests
+        run: tests/policy/run.sh --bindir /tmp/cf/bin
+
+  debian-13:
+    runs-on: ubuntu-24.04
+    container: debian:13
+    steps:
+      # The image has no git or python; the composite action needs both
+      # before checkout can even use git. fakeroot is testall's default
+      # gainroot (the ubuntu images ship it).
+      - name: Container prerequisites
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates python3 sudo fakeroot
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-fork
+      - name: Generic-bundle tests
+        run: tests/policy/run.sh --bindir /tmp/cf/bin
+      - name: Package the install tree for pastebin (T3)
+        run: tar -C /tmp -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz cf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfengine-fork-debian13
+          path: /tmp/cfengine-fork-debian13-*.tar.gz
+          retention-days: 14

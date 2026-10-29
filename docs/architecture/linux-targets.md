@@ -31,7 +31,7 @@ is a derivation kept in the host flake, not in this repo.
 | # | Step |
 | --- | --- |
 | 1 | Record these decisions. |
-| 2 | In parallel: CI builds the fork's `cf-agent` on T1/T2 and runs the generic-bundle tests on Linux; read-only probe of T3 (os-release, glibc, systemd version, unit paths and owners). |
+| 2 | In parallel: CI builds the fork's `cf-agent` on T1/T2 and runs the generic-bundle tests on Linux; read-only probe of T3 (os-release, glibc, systemd version, unit paths and owners). **Started 2026-10-29:** `.github/workflows/linux.yml` builds the commit pinned in `overlay/fork.json` on ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm and a `debian:13` container (install tree uploaded for T3), then runs `tests/policy/run.sh` (cf-promises wiring against `examples/host_specific.json`; enforce-mode interlock refusal with no actuation, and the satisfied twin that exposed the 2026-10-29 verdict-ordering defect, fixed in the same change). The pin follows the refreshed `tendcf-integration` (fork `master` + every current fix branch + the `simulate-json` series), see [`upstream-overlay.md`](upstream-overlay.md) §2. T3 probe done (§1). |
 | 3 | Fail-closed guard in `policy/tendcf_services.cf`: refuse any unit flavour the bundle does not implement, with a negative test. Today it is launchd-only and would render a systemd entry as a `LaunchDaemons` plist. |
 | 4 | One `schema_version` bump from an adapter prototype: richer goal-file systemd flavour (scope, restart, install target, externally-written unit), writer vocabulary with `dpkg`, `nixos` and `nix-darwin`, and an inventory schema carrying `supervisor` and distro family. |
 | 5 | systemd branch of the generic bundle, enforce tests on T1. |
