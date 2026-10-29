@@ -942,8 +942,8 @@ Each step leaves a coherent system. Not a schedule.
 | --- | --- |
 | 0 | Schemas in **tendcf** (`schema/`, `examples/`, `bin/schema_lint.py` — provides/requires, interlocks, comprehensive, report-row). Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
 | 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)). |
-| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Not started** as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
-| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs steps 1–2). **Blocked on step 2**, as decided on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` is a README. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
+| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Deferred** (operator, 2026-10-29): Linux comes first, see [`linux-targets.md`](linux-targets.md). Not started as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
+| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` has `buildfile` only. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
 | 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. |
@@ -1003,7 +1003,7 @@ Older “superseded by” archaeology lives in
 | D19 | Composition | Private-site lockfile pins inputs (DAG). Signed release is the deploy artifact. No sibling-repo tag lockstep. |
 | D20 | Nix store locality | Single writer per host. |
 | D21 | Schema home | **tendcf** owns schemas/types. nix2cf is the compiler. |
-| D22 | Platform sequence | macOS, Android, Linux. |
+| D22 | Platform sequence | macOS, Linux. Android deferred by the operator on 2026-10-29 ([`linux-targets.md`](linux-targets.md)). |
 | D23 | YAML canonicalize | Parse, re-serialize, diff on the YAML path. |
 | D24 / D40 | Lookup + auto-provide | Registry/token CLI; default `service:<name>`; compile errors teach names. |
 | D25 | Schema/example pairing | Lint fails if unpaired. |
