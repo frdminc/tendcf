@@ -21,6 +21,17 @@
 #      passes on a bundle that refuses everything. Services are left out so
 #      the satisfied path never reaches the launchd promises on Linux; the
 #      render itself is Mac-only until the systemd branch exists.
+#   4. flavour guard, enforce mode: a satisfied interlock and a present
+#      service whose unit flavour is systemd. v1 implements launchd only,
+#      so the entry must be refused by name and nothing rendered, on every
+#      host (linux-targets.md step 3: the fail-closed guard, with this as
+#      its negative test).
+#   5. host guard, enforce mode, non-Darwin only: a satisfied interlock and
+#      two present launchd services. launchd exists only on darwin, so a
+#      Linux host must refuse both, write nothing under /Library and run no
+#      launchctl. This is the wrong-platform actuation the Opus review
+#      ranked highest (F1). Skipped on Darwin, where the same fixture is the
+#      real render path and needs root.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -106,9 +117,39 @@ check "pre_action executed" \
 check "no refusal reported for the satisfied interlock" \
     bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
 
+echo "# 4. flavour guard: systemd entry refused on every host"
+cp "$repo/tests/policy/fixtures/flavour-refused.json" "$work/data/host_specific.json"
+out="$work/flavour.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "systemd entry refused by name" \
+    grep -q "tendcf: service 'demo-unit.service' refused: unit flavour 'systemd' is not implemented on this host" "$out"
+check "no interlock refusal (the interlock passed)" \
+    bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+check "nothing rendered for the systemd entry" \
+    bash -c "! grep -q 'LaunchDaemons/demo-unit' '$out'"
+check "no launchctl invocation" \
+    bash -c "! grep -q launchctl '$out'"
+
+if [ "$(uname)" != Darwin ]; then
+    echo "# 5. host guard: launchd entries refused on $(uname)"
+    cp "$repo/tests/policy/fixtures/launchd-present.json" "$work/data/host_specific.json"
+    out="$work/host.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "both launchd entries refused by name" \
+        bash -c "[ \"\$(grep -c \"refused: unit flavour 'launchd' is not implemented on this host\" '$out')\" = 2 ]"
+    check "nothing rendered under /Library" \
+        bash -c "! grep -q 'LaunchDaemons/com.tendcf.demo' '$out'"
+    check "no launchctl invocation" \
+        bash -c "! grep -q launchctl '$out'"
+else
+    echo "# 5. host guard: skipped on Darwin (launchd fixture is the real render path there)"
+fi
+
 if [ "$fail" != 0 ]; then
-    echo; echo "--- cf-agent output (refused) ---"; cat "$work/refused.out"
-    echo; echo "--- cf-agent output (satisfied) ---"; cat "$work/satisfied.out"
+    for f in refused satisfied flavour host; do
+        [ -f "$work/$f.out" ] || continue
+        echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
+    done
     exit 1
 fi
 echo; echo "all policy tests passed"

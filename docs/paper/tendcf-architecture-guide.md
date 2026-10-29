@@ -1077,7 +1077,11 @@ a real `cf-agent` on every Linux CI target and on the Mac. It is a small
 result, and the only place in this guide where a mechanism is demonstrated
 rather than described; the first demonstration was half of one.
 
-Three limits, since v1 invites over-reading. It is **launchd-only**. It
+Three limits, since v1 invites over-reading. It is **launchd-only**, and
+since 2026-10-29 it says so instead of pretending otherwise: a present
+entry is actuated only when its unit flavour is launchd and the host is
+darwin, anything else is refused and reported by name (the flavour guard,
+[`linux-targets.md`](../architecture/linux-targets.md) step 3). It
 renders the plist through mustache templating, which does **not** do
 CFEngine’s own `$()` substitution, so anything needing expansion must be
 expanded before it reaches the template. And the interlock’s command is
