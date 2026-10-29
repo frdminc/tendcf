@@ -10,7 +10,7 @@
 | T1 | GitHub CI | `ubuntu-24.04`, `ubuntu-26.04` | x86_64; arm64 as smoke row (`-arm` labels) | builds and tests; full VMs with systemd as PID 1, so the adapter runs in enforce mode there |
 | T2 | CI, Debian | `debian:13` container job | x86_64 | builds the Debian package, matches T3 |
 | T3 | pastebin.xvm.mit.edu | Debian 13 (trixie), kernel 6.12, systemd | x86_64 | first live Linux host: dry-run, then one stateless service enforced |
-| T4 | vps-primary | NixOS 26.05, kernel 6.18, systemd | x86_64 | **not in the first milestone** (operator); later observe-only |
+| T4 | vps-primary | NixOS 26.05, kernel 6.18, systemd | x86_64 | **not in the first milestone** (operator); the first passthrough host (§5) |
 | T5 | get.sipb.cloud | NixOS today (Hyades libkrun microVM) | x86_64 only | revived later as a stripped-down podman image |
 | T6 | podman images | NixOS, Debian 13, Ubuntu 24.04 | x86_64 | on Hyades, as needed |
 | T7 | Apple `container` | NixOS, aarch64 | aarch64 | optional local iteration only; prefer CI over Mac resources |
@@ -33,11 +33,11 @@ is a derivation kept in the host flake, not in this repo.
 | 1 | Record these decisions. |
 | 2 | In parallel: CI builds the fork's `cf-agent` on T1/T2 and runs the generic-bundle tests on Linux; read-only probe of T3 (os-release, glibc, systemd version, unit paths and owners). |
 | 3 | Fail-closed guard in `policy/tendcf_services.cf`: refuse any unit flavour the bundle does not implement, with a negative test. Today it is launchd-only and would render a systemd entry as a `LaunchDaemons` plist. |
-| 4 | One `schema_version` bump from an adapter prototype: richer goal-file systemd flavour (scope, restart, install target, externally-written unit), writer vocabulary with `dpkg` and `nixos`, and an inventory schema carrying `supervisor` and distro family. |
+| 4 | One `schema_version` bump from an adapter prototype: richer goal-file systemd flavour (scope, restart, install target, externally-written unit), writer vocabulary with `dpkg`, `nixos` and `nix-darwin`, and an inventory schema carrying `supervisor` and distro family. |
 | 5 | systemd branch of the generic bundle, enforce tests on T1. |
 | 6 | nix2cf: systemd renderer (supervisor from inventory), the Linux-relevant `TODO(operator)` markers, the `tendcf.lock` consumer. nix2cf emits only the goal file; Augments stay on the device (`projector.py`). |
 | 7 | T3 dry-run, then one enforced service. |
-| 8 | T4 observe-only; decide whether nix2cf emits NixOS modules. Then T5/T6/T7. |
+| 8 | T4: the NixOS passthrough adapter (§5), dry-run first. Then T5/T6/T7. |
 
 ## 4. Consequences of deferring Android
 
@@ -49,3 +49,46 @@ is a derivation kept in the host flake, not in this repo.
 3. D18 (agent-owned JSONL report rows) needs a Linux writer. Open.
 4. Secrets on a headless host: a secretspec provider must be chosen
    before any `Environment=` is rendered.
+
+## 5. Nix (ruling 2026-10-29)
+
+> Operator goal, 2026-10-29: a person brings their existing NixOS or
+> nix-darwin configuration to tendcf **verbatim**, and a person who knows
+> the Nix language writes tendcf configuration in it for hosts that are not
+> Nix at all (macOS, Debian).
+
+D12 is amended from "Nix modules MAY author the Site Model" to two paths,
+both first-class:
+
+1. **Passthrough.** On a host that already runs NixOS or nix-darwin,
+   tendcf hands the host's Nix configuration to Nix unchanged. Services,
+   packages and files stay Nix's; the unit writer for them is `nixos` or
+   `nix-darwin`, not CFEngine. tendcf adds only the thin layer Nix does not
+   do: distribution (lockfile, signed release, consent diff, pull),
+   reporting, and whatever the configuration leaves out. No rewrite of a
+   working configuration is ever required.
+2. **Nix as an authoring language.** The Site Model's types are also Nix
+   module options (`mkOption`, `mkIf`, `mkDefault`). A site authored in Nix
+   evaluates (`nix eval --json --store dummy://`) to the same
+   schema-validated goal file as one authored in YAML, and nix2cf renders it
+   for a launchd or systemd host with no Nix installed. The person's Nix
+   knowledge carries over; Nix the runtime is not needed on the target (D6
+   unchanged).
+
+YAML and Nix are equal frontends: each fixture authored in Nix has a YAML
+twin, and the two must render to byte-identical goal files. Nobody has to
+learn Nix; nobody has to abandon it.
+
+Consequences:
+
+1. T4 is a named milestone (Step 8), still after the Debian milestone.
+2. nix-darwin on the primary workstation (`architecture-DEFINITIVE-v3.md`
+   §14.1) is only about that one host. The nix-darwin passthrough adapter
+   is required either way and shares the Step 8 design.
+3. The Step 4 schema bump adds `nix-darwin` to the writer vocabulary next
+   to `nixos`.
+4. Open, decided at Step 8: how a passthrough host's goal file carries the
+   Nix side so that the consent diff (`architecture-DEFINITIVE-v3.md` §9)
+   still renders in ordinary language. Candidates: the evaluated
+   configuration's JSON, or the flake lock plus a Nix-side diff. The Nix
+   frontend (path 2) is not built; until it is, the files are YAML.

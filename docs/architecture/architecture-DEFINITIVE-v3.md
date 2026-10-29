@@ -29,10 +29,11 @@ cannot start its own privileged helper”).
    and safe when they conflict. Token spend is the cost that matters
    (§13).
 2. **The reference target is a stock Linux distro on bare metal**, not
-   NixOS. Nix is used for builds, optional Site Model authoring, and
-   (maybe) Mac substrate — never as the installed OS a stranger must
-   adopt. Ubuntu Server LTS is the working default; the distro name is
-   open until Step 4.
+   NixOS. Nix is used for builds, as one of two equal Site Model authoring
+   languages, and verbatim on hosts that already run NixOS or nix-darwin
+   (D12, [`linux-targets.md`](linux-targets.md) §5) — never as the
+   installed OS a stranger must adopt. Ubuntu Server LTS is the working
+   default; the distro name is open until Step 4.
 3. **The trust/consent layer is the point.** A person should understand a
    proposed change in ordinary language, refuse it, and keep a personal
    branch — using **their** AI, not ours.
@@ -909,9 +910,10 @@ agent evaluates.
 ## 12. Platforms
 
 **macOS (adapter #1).** Services as CFEngine promises from `services.yml`
-via the launchd adapter. Dry-run default. nix-darwin / home-manager are
-**substrate only**, Step 7, gated on §14.1. Unit-writers lint is the
-safety rail on a live daily driver.
+via the launchd adapter. Dry-run default. A Mac that already runs
+nix-darwin keeps that configuration verbatim (passthrough, D12); whether
+the primary workstation adopts nix-darwin is Step 7, gated on §14.1.
+Unit-writers lint is the safety rail on a live daily driver.
 
 **Android (adapter #2).** Same Site Model vocabulary. Runtime: Termux +
 tendcf-agent + Shizuku-class helper + CFEngine. Agent owns logs (§8).
@@ -920,6 +922,11 @@ Peer actions cover devices that need external ADB help.
 **Linux (adapter #3, adoptability keystone).** Stock distro; mise
 toolchains + CFEngine everything else. Distro choice open until this
 step.
+
+**NixOS / nix-darwin (passthrough).** The host's existing Nix
+configuration, unchanged; tendcf supplies distribution, consent and
+reporting around it ([`linux-targets.md`](linux-targets.md) §5, Step 8
+there). First host: vps-primary.
 
 Future classes (extension points, no build-out): OpenWrt; consented
 iPhone/wearables that consume artifacts; firmware as Nix-built
@@ -947,7 +954,7 @@ Each step leaves a coherent system. Not a schedule.
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
 | 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. |
-| 7 | Optional Mac substrate (nix-darwin) if §14.1 says yes. |
+| 7 | Mac substrate on the primary workstation (nix-darwin) if §14.1 says yes. The nix-darwin passthrough adapter itself is [`linux-targets.md`](linux-targets.md) Step 8 and does not wait on §14.1. |
 | 8 | Pull / self-update. |
 | 9 | Consent surface + default prompt + advisor slot. |
 | 10+ | Demand: builder/cache, APK provenance, WoT-as-advisor-tools, extracting the publishable layer when a second person runs it. |
@@ -990,10 +997,10 @@ Older “superseded by” archaeology lives in
 | # | Decision | Resolution |
 | --- | --- | --- |
 | D2 | Site Model formality | Schemas at Step 0; writer-lint immediate. |
-| D6 | Nix on bare metal | No. Builds / dev shells / optional Mac substrate / optional authoring frontend only. |
+| D6 | Nix on bare metal | No. Builds / dev shells / authoring language / passthrough where a host already runs NixOS or nix-darwin. Never the OS a stranger must install. |
 | D8 | Trust layer | Build it, gated. Sovereignty is the point. |
 | D10 | Task runner | `just` for humans; mise for toolchains. |
-| D12 | Authoring frontend | Nix modules MAY author the Site Model; YAML/JSON remains the wire format and the stranger path. |
+| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. |
 | D13 | Service owner | CFEngine promises everywhere; mise toolchains only. |
 | D14 | Deployment shape | Git-synced policy; `cf-serverd` on every host; push and pull are one mechanism. |
 | D15 | Compile target | CFEngine Augments, not freehand `.cf`. |
