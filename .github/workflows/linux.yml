@@ -39,11 +39,12 @@ jobs:
     steps:
       # The image has no git or python; the composite action needs both
       # before checkout can even use git. fakeroot is testall's default
-      # gainroot (the ubuntu images ship it).
+      # gainroot (the ubuntu images ship it); procps gives the unit tests
+      # the `ps` they shell out to.
       - name: Container prerequisites
         run: |
           apt-get update -q
-          apt-get install -y -q --no-install-recommends git ca-certificates python3 sudo fakeroot
+          apt-get install -y -q --no-install-recommends git ca-certificates python3 sudo fakeroot procps
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-fork
       - name: Generic-bundle tests

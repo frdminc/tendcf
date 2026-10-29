@@ -48,7 +48,10 @@ runs:
       run: |
         set -euo pipefail
         cd /tmp/core
-        ./autogen.sh --enable-debug --prefix="${{ inputs.prefix }}"
+        # configure auto-detects systemctl and then `make install` writes unit
+        # files to /usr/lib/systemd/system, root-owned on the VMs; this build
+        # is a tool tree under prefix, not a host install.
+        ./autogen.sh --enable-debug --prefix="${{ inputs.prefix }}" --with-systemd-service=no
         make -j"$(nproc)" CFLAGS="-Wall"
         make install
 
