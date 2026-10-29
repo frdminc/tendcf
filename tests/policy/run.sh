@@ -41,6 +41,10 @@
 #   DIR holds cf-agent and cf-promises (default: $PATH). Exit 0 on pass.
 #   Prints the agent version first: every result names the build it ran on.
 set -euo pipefail
+# cf-agent refuses a workdir, state dir or policy file that others can
+# write; a host with umask 002 (pastebin, 2026-10-29) would hand it exactly
+# that. The scratch tree is ours, so its mode is ours too.
+umask 077
 
 bindir=""
 while [ $# -gt 0 ]; do
