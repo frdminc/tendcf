@@ -106,6 +106,15 @@ bundle agent tendcf_services
         string => canonify(
           "$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])");
 
+      # The goal file's `unit` carries exactly one flavour key (goal-file
+      # schema $defs/unit, oneOf launchd/systemd/runit); a tombstone
+      # ({"state": "absent"}) carries none, so this is "" for it.
+      "unit_flavours[$(service_ids)]"
+        slist => getindices("data:variables.tendcf_service[$(service_ids)][unit]");
+
+      "unit_flavour[$(service_ids)]"
+        string => join(",", "unit_flavours[$(service_ids)]");
+
   classes:
       # state dispatch -- the one place this bundle inspects an entry's
       # value to pick a promise, which C-1 says belongs here and nowhere
@@ -122,6 +131,24 @@ bundle agent tendcf_services
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"
         expression => "!interlock_ok_$(interlock_canon[$(interlock_ids)])";
 
+      # Fail-closed flavour/host guard (linux-targets.md step 3). v1
+      # implements one adapter, launchd, and launchd exists only on
+      # darwin. A present entry is actuated only when both hold; anything
+      # else is refused and reported, never rendered through the wrong
+      # adapter (a systemd entry would otherwise become a LaunchDaemons
+      # plist, and a launchd entry on Linux would be written to /Library
+      # and handed to a launchctl that is not there). A later adapter
+      # adds its own `service_*_supported` disjunct; nothing here is
+      # removed.
+      "service_$(service_canon[$(service_ids)])_launchd"
+        expression => strcmp("$(unit_flavour[$(service_ids)])", "launchd");
+
+      "service_$(service_canon[$(service_ids)])_supported"
+        expression => "service_$(service_canon[$(service_ids)])_launchd.darwin";
+
+      "service_$(service_canon[$(service_ids)])_refused"
+        expression => "service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_supported";
+
   files:
       "/Library/LaunchDaemons/$(service_ids).plist"
         create => "true",
@@ -129,24 +156,29 @@ bundle agent tendcf_services
         template_method => "mustache",
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)"}'),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_present.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+        ifvarclass => "service_$(service_canon[$(service_ids)])_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
 
+      # A tombstone names no flavour; the launchd adapter owns its cleanup
+      # on darwin and nothing can exist to clean elsewhere.
       "/Library/LaunchDaemons/$(service_ids).plist"
         delete => tendcf_tidy,
-        ifvarclass => "!service_$(service_canon[$(service_ids)])_present";
+        ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
 
   commands:
       "/bin/launchctl"
         arglist => { "load", "-w", "/Library/LaunchDaemons/$(service_ids).plist" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_present.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+        ifvarclass => "service_$(service_canon[$(service_ids)])_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
 
       "/bin/launchctl"
         arglist => { "unload", "/Library/LaunchDaemons/$(service_ids).plist" },
-        ifvarclass => "!service_$(service_canon[$(service_ids)])_present";
+        ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
 
   reports:
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
         "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
+
+      "service_$(service_canon[$(service_ids)])_refused"::
+        "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); v1 adapter is launchd on darwin)";
 }
 
 body contain tendcf_interlock_contain(timeout)
