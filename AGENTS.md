@@ -80,3 +80,16 @@ query it rather than relying on recall:
 Never read `~/kb/raw/learning-cfengine.md`: that is the entire book, ~115k
 tokens. The index exists so you don't have to. Full detail, including how to add
 a book: `site-private/AGENTS.md` ("Book knowledge base").
+
+## Verifying policy and the CFEngine build (2026-10-29)
+
+- `tests/policy/run.sh --bindir DIR` runs the generic bundle against a real
+  `cf-agent`/`cf-promises` (Mac dev build: `~/opt/cfengine-dev/bin`); it is
+  platform-independent and is the test CI runs on Linux. Run it through
+  `~/ops/site-private/bin/bg`.
+- Linux CI (`.github/workflows/linux.yml`) builds the fork at the commit in
+  `overlay/fork.json` and runs the fork's unit/acceptance subsets plus that
+  script on ubuntu-24.04/26.04/24.04-arm and a `debian:13` container. Moving
+  the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
+  `bin/xref_lint.py` and `bin/overlay.py lint`.
+- Plan and status: `docs/architecture/linux-targets.md` §3.

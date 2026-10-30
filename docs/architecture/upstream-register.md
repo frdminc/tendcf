@@ -993,6 +993,22 @@ is measured against. Anything in the corpus that was measured on stock 3.27.1
 and could be affected by one of our fixes must be re-measured and the number
 re-stated, not assumed to have carried over.
 
+**Refreshed 2026-10-29.** `tendcf-integration` is now fork `master`
+(`b0f6da2dd`, fast-forwarded to cfengine/core that day) plus every current
+fix branch and the whole `simulate-json` series, 22 merges; core tip
+`022be6ea4`, libntech `tendcf-integration` `d379dce2c` (new branch, via the
+submodule). `overlay/fork.json` pins the commit Linux CI builds. B-3 was
+retired by upstream `process_macos.c`; one semantic conflict (B-13's
+`\uXXXX` escapes vs `fix/json-encode-raw-utf8`) was decided for raw UTF-8 and
+core's `RestoreUtf8InJson()` workaround removed. The full merge list,
+skipped-branch reasons, every conflict resolution, three unit-test
+regressions the first Linux build exposed and their fixes, and the format
+gate cleanup are in
+[`fork-integration-2026-10-29/`](fork-integration-2026-10-29/1-integration.md)
+(three reports plus the briefs that produced them). Still open there: the
+integration branch conflicts with fork `master` in `cf-agent/simulate_mode.c`
+(upstream merged three simulate-diff fixes after the series was cut).
+
 ## PR-sharing sweep, 2026-08-18
 
 Standing order from the operator: **when in doubt, open a PR and/or issue.**
