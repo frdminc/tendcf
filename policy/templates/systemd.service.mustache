@@ -6,7 +6,8 @@ Description=tendcf service {{id}}
 Type=simple
 User={{run_as}}
 WorkingDirectory={{working_dir}}
+Restart={{unit.systemd.restart}}
 ExecStart={{#command}}"{{{.}}}" {{/command}}
 
 [Install]
-WantedBy=multi-user.target
+WantedBy={{unit.systemd.wanted_by}}

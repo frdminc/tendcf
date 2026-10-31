@@ -194,6 +194,10 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         sysd_run systemd-present.json "$work/sysd1.out"
         check "unit rendered" \
             grep -q 'ExecStart="/usr/bin/sleep" "3600"' "$unit_path"
+        check "Restart and WantedBy rendered from the entry" \
+            bash -c "grep -qx 'Restart=on-failure' '$unit_path' && grep -qx 'WantedBy=multi-user.target' '$unit_path'"
+        check "manager loaded Restart=on-failure" \
+            bash -c "[ \"\$(systemctl show -p Restart --value $unit)\" = on-failure ]"
         check "unit passes systemd-analyze verify" \
             systemd-analyze verify "$unit_path"
         check "unit active after the first run" unit_active
@@ -208,6 +212,8 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         sysd_run systemd-changed.json "$work/sysd3.out"
         check "changed unit re-rendered" \
             grep -q 'ExecStart="/usr/bin/sleep" "3601"' "$unit_path"
+        check "manager loaded the changed Restart=always" \
+            bash -c "[ \"\$(systemctl show -p Restart --value $unit)\" = always ]"
         check "changed unit restarted onto a new process" \
             bash -c "[ \"\$(systemctl show -p MainPID --value $unit)\" != '$pid1' ]"
         check "changed unit still active" unit_active

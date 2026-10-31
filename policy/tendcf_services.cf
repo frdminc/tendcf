@@ -45,14 +45,16 @@
 # into its own variable first; raw ids are kept for data lookups and the
 # rendered plist Label, where the real, uncanonified value is required.
 #
-# systemd adapter (linux-targets.md step 5), a prototype over the current
-# goal-file `unit.systemd` shape, which carries only `enabled`:
+# systemd adapter (linux-targets.md steps 4-5). Goal-file `unit.systemd`
+# carries `enabled`, `restart` and `wanted_by`, all explicit:
 #   - the unit is /etc/systemd/system/<id>, rendered from
-#     templates/systemd.service.mustache (Type=simple, no restart policy,
-#     WantedBy=multi-user.target: nothing in the schema says otherwise);
-#   - every command argv element is double-quoted into ExecStart, so one
-#     containing `"`, `\`, `$`, `%` or a newline would be misread by
-#     systemd. The schema does not forbid them yet; that is step 4's list;
+#     templates/systemd.service.mustache (Type=simple; Restart= and
+#     WantedBy= from the entry);
+#   - every command argv element is double-quoted into ExecStart and
+#     nothing is escaped: the goal-file schema holds a systemd entry's argv
+#     and working_dir to an alphabet with no `"`, `\`, `$`, `%` or control
+#     character, so a value systemd would re-read never reaches the
+#     template (goal-file.schema.json, service_present allOf);
 #   - run order per pass is files (render, or delete after teardown) then
 #     commands: daemon-reload, enable/disable, start, restart, teardown,
 #     reload after removal. State probes are snapshots (see the classes

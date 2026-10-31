@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {
       "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid.",
-      "const": 1
+      "const": 2
     },
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
@@ -115,7 +115,24 @@
         "unit": { "$ref": "#/$defs/unit" }
       },
       "required": ["state", "bundle", "run_as", "command", "working_dir", "unit"],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "A systemd unit is a text file the adapter writes line by line, and systemd re-reads quotes, backslashes, '$' and '%' in an ExecStart argument, and a newline in any value starts a new directive. So a systemd entry's argv and working_dir are held to a safe alphabet instead of being escaped: a value outside it is refused structurally, fail-closed, and nothing is rewritten into a second spelling. Widening the alphabet is a schema_version bump, like any shape change.",
+          "if": {
+            "properties": { "unit": { "required": ["systemd"] } },
+            "required": ["unit"]
+          },
+          "then": {
+            "properties": {
+              "command": {
+                "items": { "pattern": "^[^\"\\\\$%\\u0000-\\u001f\\u007f]+$" }
+              },
+              "working_dir": { "pattern": "^/$|^(/[A-Za-z0-9._+@:-]+)+$" }
+            }
+          }
+        }
+      ]
     },
 
     "unit": {
@@ -143,9 +160,22 @@
             "systemd": {
               "type": "object",
               "properties": {
-                "enabled": { "type": "boolean" }
+                "enabled": {
+                  "description": "The boot link only (systemctl enable/disable). A present service is started either way, as launchd's load -w starts it.",
+                  "type": "boolean"
+                },
+                "restart": {
+                  "description": "Restart= in the unit. 'no' is systemd's own default, stated: an omitted knob would be a hidden default and a second spelling of it (reconciliation §9, F-1).",
+                  "enum": ["no", "on-failure", "always"]
+                },
+                "wanted_by": {
+                  "description": "The target the [Install] section hangs the unit on (WantedBy=). 'multi-user.target' is what a server unit wants; stated, not defaulted.",
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]*[.]target$",
+                  "maxLength": 64
+                }
               },
-              "required": ["enabled"],
+              "required": ["enabled", "restart", "wanted_by"],
               "additionalProperties": false
             }
           },
