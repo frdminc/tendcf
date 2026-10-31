@@ -37,7 +37,19 @@ bind-mount one) must run no `systemctl` and write nothing.
 Each stage ends with output you can read, and none installs anything on the
 host until stage C.
 
-1. **A. Build the fork as a Nix derivation, off the host.** In the host flake,
+1. **A. Build the fork as a Nix derivation, off the host.** **Done 2026-10-31**
+   ([site-djbclark PR #241](https://github.com/djbclark/site-djbclark/pull/241)):
+   `nixos/pkgs/cfengine-tendcf.nix` (fork `b8abf2840`, libntech `d379dce` from the
+   fork, `autoreconfHook`, `--with-workdir=/var/lib/cfengine-tendcf`, compiled-in
+   version `3.29.0a.b8abf2840` via a written `CFVERSION`), module
+   `services.cfengine-tendcf` (`enable` and `execd.enable`, both default off) imported
+   into vps-primary without enabling it, and the workflow `nixos-cfengine-build.yml`
+   (GitHub `ubuntu-latest` with Nix, not the VPS) that builds the package, asserts the
+   version, rebuilds the host toplevel and checks the gating. Two build findings:
+   `libpromises/text2cstring.pl` has a `/usr/bin/perl` shebang (patched), and
+   `cf-agent/verify_users_pam.c` uses `USERMOD` outside its `HAVE_USERMOD` guard
+   (upstream defect; `shadow` on the build PATH bakes store paths in). Written by omp
+   Sonnet 5.5 as a bigteam slice; the two fixes by the orchestrator. Original text: In the host flake,
    a `cfengine-tendcf` package pinned to `overlay/fork.json`'s commit (the same
    `core` commit CI tests; libntech from core's submodule pointer). Build it on
    Forgejo CI or a Linux builder, never on vps-primary (AGENTS.md rule 36: heavy
