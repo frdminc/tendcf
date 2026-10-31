@@ -1,0 +1,12 @@
+# Managed by tendcf; edits are overwritten on the next agent run.
+[Unit]
+Description=tendcf service {{id}}
+
+[Service]
+Type=simple
+User={{run_as}}
+WorkingDirectory={{working_dir}}
+ExecStart={{#command}}"{{{.}}}" {{/command}}
+
+[Install]
+WantedBy=multi-user.target

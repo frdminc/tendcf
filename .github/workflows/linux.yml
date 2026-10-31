@@ -7,9 +7,11 @@ name: Linux
 # the result. The debian:13 install tree is uploaded for the T3 dry-run.
 #
 # Hosted ubuntu runners are full VMs with systemd as PID 1, so the systemd
-# branch of the bundle (linux-targets.md §3 step 5) can be tested in enforce
-# mode here when it exists. Explicit runner labels, not ubuntu-latest, since
-# that label moves (26.04 from November 2026).
+# branch of the bundle (linux-targets.md §3 step 5) runs in enforce mode
+# there (TENDCF_TEST_SYSTEMD=1, passwordless sudo). The debian:13 container
+# has no systemd manager, so it covers the refusal path instead. Explicit
+# runner labels, not ubuntu-latest, since that label moves (26.04 from
+# November 2026).
 
 on:
   push:
@@ -30,7 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-fork
-      - name: Generic-bundle tests
+      - name: Generic-bundle tests (systemd lifecycle in enforce mode)
+        env:
+          TENDCF_TEST_SYSTEMD: "1"
         run: tests/policy/run.sh --bindir /tmp/cf/bin
 
   debian-13:
