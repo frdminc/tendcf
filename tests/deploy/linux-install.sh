@@ -30,8 +30,6 @@ canary="$repo/deploy/linux/canary"
 unit=tendcf.canary.service
 fail=0
 
-wd=/opt/tendcf/var/cfengine
-
 cleanup() {
     "$installer" disable >/dev/null 2>&1 || true
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
@@ -51,6 +49,7 @@ unit_prop() { systemctl show -p "$1" --value "$unit"; }
 
 echo "# 1. install"
 "$installer" install --data "$canary/host_specific.json"
+wd="$("$installer" workdir)"
 check "/opt/tendcf is root-owned and not group/other-writable" owned_by_root_unwritable /opt/tendcf
 check "installed policy is root-owned and not group/other-writable" \
     owned_by_root_unwritable "$wd/inputs"

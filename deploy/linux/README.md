@@ -1,7 +1,7 @@
 # Root-owned tendcf install (linux-targets.md step 7)
 
 The shape is CFEngine's own: root-owned binaries and policy, work directory
-under the same tree, and a root `cf-execd` that runs `cf-agent` on its schedule. No
+under the same tree (read from the binaries, never assumed), and a root `cf-execd` that runs `cf-agent` on its schedule. No
 sudoers rule is left behind; the one privileged session below does all of it.
 Why this and not a `NOPASSWD` rule or an unprivileged agent: an unprivileged
 `cf-agent` cannot write `/etc/systemd/system`, and a passwordless root run is
@@ -14,9 +14,9 @@ What lands on the host:
 | Path | Owner | Content |
 | --- | --- | --- |
 | `/opt/tendcf` | root:root, no group/other write | the CI-built CFEngine fork (`--prefix=/opt/tendcf`), plus `share/tendcf/{policy,deploy,REVISION}` |
-| `/opt/tendcf/var/cfengine` | root | the work directory a `--prefix` source build compiles in: keys (0700), `inputs/`, `data/` (0700), state |
-| `/opt/tendcf/var/cfengine/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
-| `/opt/tendcf/var/cfengine/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of the canary goal file |
+| `/opt/tendcf/var/libntech` | root | the work directory this fork build compiles in (libntech's configure names it; `tendcf-install.sh workdir` prints it): keys (0700), `inputs/`, `data/` (0700), state |
+| `<workdir>/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
+| `<workdir>/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of the canary goal file |
 | `/etc/systemd/system/tendcf.canary.service` | root | rendered by the policy: `sleep infinity` as `nobody`, `Restart=on-failure` |
 | `/etc/systemd/system/tendcf-execd.service` | root | stage B only: runs `cf-execd --no-fork` |
 

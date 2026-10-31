@@ -4,10 +4,11 @@
 #
 # Shape, which is CFEngine's own (the book's ch. 19/21/23, cf-execd and MPF
 # docs): binaries and policy root-owned, the work directory inside the same
-# root-owned tree ($prefix/var/cfengine: a source build with --prefix puts its
-# compiled-in work directory under the prefix), and a root cf-execd that runs
-# cf-agent on a schedule. Nothing here leaves a
-# sudoers rule behind and nothing a non-root user can write is read by root.
+# root-owned tree, and a root cf-execd that runs cf-agent on a schedule. The
+# work directory is whatever the binaries compile in (this fork build:
+# /opt/tendcf/var/libntech, libntech's own configure names it), read from
+# cf-promises, never assumed. Nothing here leaves a sudoers rule behind and
+# nothing a non-root user can write is read by root.
 #
 #   install [--data FILE] [--policy-src DIR]
 #                    make /opt/tendcf root-owned, lay out the work directory, put the
@@ -27,7 +28,7 @@ set -euo pipefail
 umask 022
 
 prefix=/opt/tendcf
-workdir=$prefix/var/cfengine   # the build's compiled-in WORKDIR for --prefix=$prefix
+workdir=""   # set by init_paths
 unit=tendcf-execd.service
 unit_path=/etc/systemd/system/$unit
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,8 +45,24 @@ cf_agent="$prefix/bin/cf-agent"
 cf_promises="$prefix/bin/cf-promises"
 cf_key="$prefix/bin/cf-key"
 cf_execd="$prefix/bin/cf-execd"
-entry="$workdir/inputs/promises.cf"
-data="$workdir/data/host_specific.json"
+entry=""     # set by init_paths
+data=""      # set by init_paths
+
+init_paths() {
+    [ -x "$cf_promises" ] || die "$cf_promises missing: extract the CFEngine tree to $prefix first"
+    local probe out
+    probe="$(mktemp)"
+    printf 'bundle agent main {}\n' > "$probe"
+    out="$("$cf_promises" --show-vars -f "$probe" 2>/dev/null | awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
+    rm -f "$probe"
+    case "$out" in
+        "$prefix"/*) ;;
+        *) die "cannot read the work directory from $cf_promises (got '${out:-nothing}'); it must be under $prefix" ;;
+    esac
+    workdir="$out"
+    entry="$workdir/inputs/promises.cf"
+    data="$workdir/data/host_specific.json"
+}
 
 check_tree() {
     [ -x "$cf_agent" ] || die "$cf_agent missing: extract the CFEngine tree to $prefix first"
@@ -83,9 +100,7 @@ lay_out() {
     fi
     [ -f "$workdir/ppkeys/localhost.pub" ] || {
         ls -la "$workdir" "$workdir/ppkeys" >&2 || true
-        "$cf_key" -g verbose 2>&1 | tail -20 >&2 || true
-        find / -xdev -name 'localhost.pub' 2>/dev/null >&2 || true
-        die "cf-key wrote no key under $workdir/ppkeys (output: ${keyout:-none}): these binaries use a different work directory"
+        die "cf-key wrote no key under $workdir/ppkeys (output: ${keyout:-none})"
     }
 }
 
@@ -143,6 +158,7 @@ cmd_install() {
         esac
     done
     check_tree
+    init_paths
     lay_out
     place_policy
     if [ -n "$datafile" ]; then put_data "$datafile"; fi
@@ -197,10 +213,11 @@ cmd_status() {
 sub="$1"; shift
 case "$sub" in
     install) cmd_install "$@" ;;
-    data) [ $# -eq 1 ] || die "usage: $0 data FILE"; put_data "$1" ;;
-    run-once) cmd_run_once ;;
-    enable) cmd_enable ;;
     disable) cmd_disable ;;
-    status) cmd_status ;;
+    workdir) init_paths; echo "$workdir" ;;
+    data) init_paths; [ $# -eq 1 ] || die "usage: $0 data FILE"; put_data "$1" ;;
+    run-once) init_paths; cmd_run_once ;;
+    enable) init_paths; cmd_enable ;;
+    status) init_paths; cmd_status ;;
     *) die "unknown command: $sub" ;;
 esac
