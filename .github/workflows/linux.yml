@@ -80,6 +80,11 @@ jobs:
           cp -R policy deploy /opt/tendcf/share/tendcf/
           echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
           tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf
+      # After packaging, because the test removes the system librsync/libb2
+      # and needs the bundled copies already in the tree. It reinstalls over
+      # /opt/tendcf, which the tarball above no longer depends on.
+      - name: Bare-host install (no system librsync/libb2)
+        run: tests/deploy/bare-host-libs.sh
       - uses: actions/upload-artifact@v4
         with:
           name: cfengine-fork-debian13

@@ -45,7 +45,10 @@ say() { echo "tendcf-install: $*"; }
 
 [ "$(id -u)" = 0 ] || die "run as root"
 [ "$(uname)" = Linux ] || die "Linux only"
-[ -d /run/systemd/system ] || die "host is not booted by systemd"
+# install, data and run-once need no init system (a container can run them,
+# which is how CI exercises them on a host without system libraries);
+# only the scheduler unit does.
+need_systemd() { [ -d /run/systemd/system ] || die "host is not booted by systemd"; }
 
 cf_agent="$prefix/bin/cf-agent"
 cf_promises="$prefix/bin/cf-promises"
@@ -178,6 +181,7 @@ cmd_run_once() {
 }
 
 cmd_enable() {
+    need_systemd
     [ -f "$entry" ] || die "not installed: run install first"
     cat > "$unit_path.new" <<EOF
 # Written by deploy/linux/tendcf-install.sh
@@ -203,6 +207,7 @@ EOF
 }
 
 cmd_disable() {
+    need_systemd
     systemctl disable --now "$unit" 2>/dev/null || true
     rm -f "$unit_path"
     systemctl daemon-reload
