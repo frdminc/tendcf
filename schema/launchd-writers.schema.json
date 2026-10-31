@@ -33,7 +33,7 @@
         },
         "writer": {
           "description": "The single tool permitted to write labels under this prefix.",
-          "enum": ["cfengine", "mise", "nix-darwin", "homebrew", "apple", "third-party"]
+          "enum": ["cfengine", "mise", "nixos", "nix-darwin", "dpkg", "homebrew", "apple", "third-party"]
         },
         "repo": {
           "description": "Where that writer's definition lives, when it is ours.",

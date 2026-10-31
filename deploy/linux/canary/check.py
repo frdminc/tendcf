@@ -29,8 +29,12 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 
 PAIRS = (
-    ("goal-file.json", "host_specific.json"),
-    ("goal-file-absent.json", "host_specific-absent.json"),
+    (HERE / "goal-file.json", HERE / "host_specific.json"),
+    (HERE / "goal-file-absent.json", HERE / "host_specific-absent.json"),
+    # The NixOS passthrough host (nixos-passthrough-plan.md section 4): the
+    # unit namespace is nixos's, no service entries, so the projection is
+    # empty and cf-agent has nothing to actuate there.
+    (HERE.parent / "passthrough" / "goal-file.json", HERE.parent / "passthrough" / "host_specific.json"),
 )
 
 
@@ -48,16 +52,18 @@ def main() -> int:
     schemas, registry = lint.load_schemas()
     problems: list[str] = []
 
-    for goal_name, data_name in PAIRS:
-        raw = (HERE / goal_name).read_bytes()
-        lint.check_canonical_bytes(raw, f"canary/{goal_name}")
+    for goal_path, data_path in PAIRS:
+        goal_name = goal_path.relative_to(HERE.parent)
+        data_name = data_path.relative_to(HERE.parent)
+        raw = goal_path.read_bytes()
+        lint.check_canonical_bytes(raw, f"deploy/linux/{goal_name}")
         doc = json.loads(raw)
         loaded = {"goal-file.json": doc}
-        lint.validate_loaded(loaded, schemas, registry, label_prefix=f"canary/{goal_name}")
+        lint.validate_loaded(loaded, schemas, registry, label_prefix=f"deploy/linux/{goal_name}")
         lint.check_goal_file_cross_file(loaded, "goal-file.json")
         projected = projector.project(doc)
-        if (HERE / data_name).read_bytes() != projected:
-            problems.append(f"canary/{data_name} is not project(canary/{goal_name})")
+        if data_path.read_bytes() != projected:
+            problems.append(f"deploy/linux/{data_name} is not project(deploy/linux/{goal_name})")
 
     for finding in lint.findings:
         problems.append(str(finding))
