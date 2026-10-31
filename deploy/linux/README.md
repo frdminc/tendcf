@@ -1,7 +1,7 @@
 # Root-owned tendcf install (linux-targets.md step 7)
 
 The shape is CFEngine's own: root-owned binaries and policy, work directory
-`/var/cfengine`, and a root `cf-execd` that runs `cf-agent` on its schedule. No
+under the same tree, and a root `cf-execd` that runs `cf-agent` on its schedule. No
 sudoers rule is left behind; the one privileged session below does all of it.
 Why this and not a `NOPASSWD` rule or an unprivileged agent: an unprivileged
 `cf-agent` cannot write `/etc/systemd/system`, and a passwordless root run is
@@ -14,8 +14,9 @@ What lands on the host:
 | Path | Owner | Content |
 | --- | --- | --- |
 | `/opt/tendcf` | root:root, no group/other write | the CI-built CFEngine fork (`--prefix=/opt/tendcf`), plus `share/tendcf/{policy,deploy,REVISION}` |
-| `/var/cfengine/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
-| `/var/cfengine/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of the canary goal file |
+| `/opt/tendcf/var/cfengine` | root | the work directory a `--prefix` source build compiles in: keys (0700), `inputs/`, `data/` (0700), state |
+| `/opt/tendcf/var/cfengine/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
+| `/opt/tendcf/var/cfengine/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of the canary goal file |
 | `/etc/systemd/system/tendcf.canary.service` | root | rendered by the policy: `sleep infinity` as `nobody`, `Restart=on-failure` |
 | `/etc/systemd/system/tendcf-execd.service` | root | stage B only: runs `cf-execd --no-fork` |
 
@@ -64,13 +65,13 @@ sudo $T/tendcf-install.sh enable                 # tendcf-execd.service, every 5
 sudo $T/tendcf-install.sh data $T/canary/host_specific-absent.json
 sudo $T/tendcf-install.sh run-once               # the tombstone removes tendcf.canary.service
 sudo $T/tendcf-install.sh disable                # stage B off
-sudo rm -rf /opt/tendcf /var/cfengine            # everything the install made
+sudo rm -rf /opt/tendcf                          # everything the install made but the units (removed above)
 ```
 
 ## Proof before the host
 
 `tests/deploy/linux-install.sh` runs this whole sequence, stages A and B and the
 tombstone, as root on the GitHub ubuntu VMs (real systemd as PID 1), including
-a `cf-execd --once` that puts a stopped canary back. It refuses to run where
-`/var/cfengine` exists. `deploy/linux/canary/check.py` keeps the canary goal
+a `cf-execd --once` that puts a stopped canary back. It writes only under
+`/opt/tendcf` and `/etc/systemd/system`. `deploy/linux/canary/check.py` keeps the canary goal
 files schema-valid and their projections byte-identical.

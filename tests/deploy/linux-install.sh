@@ -16,8 +16,8 @@
 #   4. the tombstone: new data, one run, and the unit is gone from the manager.
 #
 # Writes /etc/systemd/system/{tendcf.canary.service,tendcf-execd.service},
-# /var/cfengine and /opt/tendcf, and removes the units again on exit. Never run
-# it on a machine that has a real /var/cfengine.
+# /opt/tendcf (including its work directory), and removes the units again on
+# exit. It takes over /opt/tendcf: run it on a CI VM, not on a host.
 set -euo pipefail
 
 if [ "$(id -u)" != 0 ]; then
@@ -30,10 +30,7 @@ canary="$repo/deploy/linux/canary"
 unit=tendcf.canary.service
 fail=0
 
-if [ -e /var/cfengine/ppkeys ]; then
-    echo "refusing to run: /var/cfengine already exists on this host" >&2
-    exit 2
-fi
+wd=/opt/tendcf/var/cfengine
 
 cleanup() {
     "$installer" disable >/dev/null 2>&1 || true
@@ -56,9 +53,9 @@ echo "# 1. install"
 "$installer" install --data "$canary/host_specific.json"
 check "/opt/tendcf is root-owned and not group/other-writable" owned_by_root_unwritable /opt/tendcf
 check "installed policy is root-owned and not group/other-writable" \
-    owned_by_root_unwritable /var/cfengine/inputs
+    owned_by_root_unwritable "$wd/inputs"
 check "CMDB data is root:root 0600" \
-    bash -c "[ \"\$(stat -c '%U:%G %a' /var/cfengine/data/host_specific.json)\" = 'root:root 600' ]"
+    bash -c "[ \"\$(stat -c '%U:%G %a' $wd/data/host_specific.json)\" = 'root:root 600' ]"
 
 echo "# 2. run-once"
 "$installer" run-once

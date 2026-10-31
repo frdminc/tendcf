@@ -3,12 +3,14 @@
 # (docs/architecture/linux-targets.md, step 7). Run as root.
 #
 # Shape, which is CFEngine's own (the book's ch. 19/21/23, cf-execd and MPF
-# docs): binaries and policy root-owned, the work directory /var/cfengine,
-# and a root cf-execd that runs cf-agent on a schedule. Nothing here leaves a
+# docs): binaries and policy root-owned, the work directory inside the same
+# root-owned tree ($prefix/var/cfengine: a source build with --prefix puts its
+# compiled-in work directory under the prefix), and a root cf-execd that runs
+# cf-agent on a schedule. Nothing here leaves a
 # sudoers rule behind and nothing a non-root user can write is read by root.
 #
 #   install [--data FILE] [--policy-src DIR]
-#                    make /opt/tendcf root-owned, lay out /var/cfengine, put the
+#                    make /opt/tendcf root-owned, lay out the work directory, put the
 #                    policy and promises.cf in place, optionally install the CMDB
 #                    data (a projection, validated by cf-promises first)
 #   data FILE        replace the CMDB data (validated first; the old file is
@@ -25,7 +27,7 @@ set -euo pipefail
 umask 022
 
 prefix=/opt/tendcf
-workdir=/var/cfengine
+workdir=$prefix/var/cfengine   # the build's compiled-in WORKDIR for --prefix=$prefix
 unit=tendcf-execd.service
 unit_path=/etc/systemd/system/$unit
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
