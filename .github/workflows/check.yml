@@ -45,7 +45,7 @@ jobs:
       - name: Canary goal files
         run: deploy/linux/canary/check.py
       - name: Installer shell lint
-        run: shellcheck deploy/linux/tendcf-install.sh tests/deploy/linux-install.sh tests/policy/run.sh
+        run: shellcheck deploy/linux/tendcf-install.sh tests/deploy/linux-install.sh tests/deploy/bare-host-libs.sh tests/policy/run.sh
 
       # The patch overlay on libntech/cfengine (overlay/, issue #3): the
       # manifest agrees with the patch files, and the mechanism itself is
