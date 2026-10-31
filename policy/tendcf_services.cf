@@ -162,8 +162,27 @@ bundle agent tendcf_services
       "tendcf_systemd_booted"
         expression => isdir("/run/systemd/system");
 
+      # The adapter writes /etc/systemd/system. On NixOS that path is a
+      # symlink into the read-only store (/etc/static/systemd/system): a
+      # unit exists there only if the Nix configuration declares it, and
+      # the host's unit writer is `nixos`, never cfengine
+      # (linux-targets.md section 5, nixos-passthrough-plan.md section 2).
+      # Refuse by policy rather than half-fail on the write: a real,
+      # non-symlink directory is required.
+      "tendcf_systemd_units_writable"
+        expression => "tendcf_systemd_units_dir.!tendcf_systemd_units_link";
+
+      "tendcf_systemd_units_dir"
+        expression => isdir("/etc/systemd/system");
+
+      "tendcf_systemd_units_link"
+        expression => islink("/etc/systemd/system");
+
+      "tendcf_systemd_units_elsewhere"
+        expression => "linux.tendcf_systemd_booted.!tendcf_systemd_units_writable";
+
       "tendcf_systemd_host"
-        expression => "linux.tendcf_systemd_booted";
+        expression => "linux.tendcf_systemd_booted.tendcf_systemd_units_writable";
 
       "service_$(service_canon[$(service_ids)])_launchd"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "launchd");
@@ -292,8 +311,11 @@ bundle agent tendcf_services
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
         "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
 
-      "service_$(service_canon[$(service_ids)])_refused"::
+      "service_$(service_canon[$(service_ids)])_refused.!(service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere)"::
         "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
+
+      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere"::
+        "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (unit writer nixos), not by cfengine";
 }
 
 body contain tendcf_interlock_contain(timeout)

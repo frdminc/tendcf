@@ -65,7 +65,11 @@ jobs:
       - uses: ./.github/actions/build-fork
         with:
           prefix: /opt/tendcf
-      - name: Generic-bundle tests
+      # The container runs as root and is not booted by systemd, so it can be
+      # reshaped into a NixOS-like host (check 7) without touching a real manager.
+      - name: Generic-bundle tests (plus the NixOS-shape refusal)
+        env:
+          TENDCF_TEST_NIXOS_SHAPE: "1"
         run: tests/policy/run.sh --bindir /opt/tendcf/bin
       # librsync (and its libb2) is a build-time pick of core's configure
       # and not part of a minimal Debian; pastebin lacked it (2026-10-29).
