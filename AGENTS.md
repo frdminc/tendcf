@@ -60,22 +60,35 @@ re-read whole files.
 After big code changes, refresh the graph with `graft build` (deterministic,
 no API key, $0).
 <!-- graft:end -->
-## CFEngine reference book — query it, don't guess (2026-10-03)
+## CFEngine reference book — Basic Memory first, don't guess (2026-10-03, 2026-10-31)
 
 `Learning CFEngine` (Diego Zamboni, 2nd ed.; covers CFEngine 3.12) is in the
 local book knowledge base as slug `learning-cfengine` — 69 chapters, 210 code
-blocks. **Before writing or reviewing CFEngine policy** — promise semantics,
-`edit_line`, bundle/body syntax, class expressions, normal ordering, testing —
-query it rather than relying on recall:
+blocks. It is **indexed in Basic Memory (project `books`): a cheap, high-value
+source of correct CFEngine information, so use it heavily and early** (operator,
+2026-10-31). Query it **before writing or reviewing policy and before any
+CFEngine design, deployment or privilege question** — promise semantics,
+`edit_line`, bundle/body syntax, class expressions, normal ordering, testing,
+and also how the daemons fit together (`cf-execd`, `cf-serverd`, bootstrapping,
+running as root or not, where policy and work directories live) — rather than
+relying on recall or going straight to web search. A first question costs one
+call and ~1–2k tokens; the answer names the chapter to read.
 
-- `~/ops/site-private/bin/book-kb query '<regex>' learning-cfengine` — exact
-  match, ~0.5–5k tokens. **This is what proves a term is or is not in the book.**
-- `~/ops/site-private/bin/book-kb toc learning-cfengine` — ~2.5k-token chapter
-  index; then read one chapter (~1.2k median). Add `--deep` for `file:line`
-  anchors to every sub-heading.
-- basic-memory `search_notes(project="books", query=…)` — semantic recall when
-  you don't know the author's wording. Ranked by similarity, so a hit is **not**
-  a match; confirm with the exact query above.
+1. **Ask Basic Memory in plain words** (the first move). From a shell, no MCP
+   needed: `bm tool search --project books "<question>"` (~5 s, ranked chapters
+   with excerpts; checked 2026-10-31: "cf-execd runs cf-agent periodically as
+   root" returned ch. 23, 35, 19 and 34). In an MCP session:
+   `search_notes(project="books", query=…)`. Ranked by similarity, so a hit is
+   **not** a match; use it to find the chapter.
+2. **Confirm with the exact index:** `~/ops/site-private/bin/book-kb query
+   '<regex>' learning-cfengine` — ~0.5–5k tokens, and **this is what proves a
+   term is or is not in the book.**
+3. **Read the one chapter:** `~/ops/site-private/bin/book-kb toc learning-cfengine`
+   (~2.5k-token index; `--deep` for `file:line` anchors), then a single chapter
+   (~1.2k median).
+
+The book covers 3.12; for anything newer (`--simulate-json`, 3.2x features, the
+MPF today) say so and check the current docs at docs.cfengine.com.
 
 Never read `~/kb/raw/learning-cfengine.md`: that is the entire book, ~115k
 tokens. The index exists so you don't have to. Full detail, including how to add
@@ -93,3 +106,14 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
   the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
   `bin/xref_lint.py` and `bin/overlay.py lint`.
 - Plan and status: `docs/architecture/linux-targets.md` §3.
+
+## Editing in a worktree: absolute paths only (2026-10-31)
+
+A session's working directory is usually the main checkout (`~/src/tendcf`)
+while the work happens in a claimed worktree (`~/src/tendcf-<name>-wt`). The
+`edit`, `read` and `write` tools resolve a relative path against that working
+directory, so `edit AGENTS.md` lands in the main checkout, not the worktree
+(happened three times on 2026-10-31, each caught only because `git status` in
+the main checkout showed the stray change). **In a worktree, give every
+`edit`/`read`/`write` the worktree's absolute path**, and run `git status` in
+the main checkout before reporting a worktree change done: it must be clean.

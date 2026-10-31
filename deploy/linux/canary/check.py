@@ -1,0 +1,73 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml", "jsonschema>=4.21", "rfc3339-validator", "rfc8785"]
+# ///
+"""Hold the canary goal files and their projections to the same rails as examples/.
+
+The canary is the first service tendcf enforces on a live Linux host
+(linux-targets.md step 7). Its CMDB data is not hand-written: it is
+`project(goal-file.json)`, and the goal file is canonical JCS bytes that
+validate against goal-file.schema.json and pass the lint's cross-entry rules,
+which is where a systemd entry's argv/working_dir alphabet is enforced. This
+script runs that, reusing bin/schema_lint.py's own checks, and then requires
+each `host_specific*.json` here to be byte-identical to the projection of its
+goal file, so the data a host is given cannot drift from the file that was
+reviewed.
+
+Run from anywhere:  deploy/linux/canary/check.py   (exit 0 clean, 1 findings)
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[2]
+
+PAIRS = (
+    ("goal-file.json", "host_specific.json"),
+    ("goal-file-absent.json", "host_specific-absent.json"),
+)
+
+
+def load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main() -> int:
+    lint = load("schema_lint", REPO / "bin" / "schema_lint.py")
+    projector = load("projector", REPO / "bin" / "projector.py")
+    schemas, registry = lint.load_schemas()
+    problems: list[str] = []
+
+    for goal_name, data_name in PAIRS:
+        raw = (HERE / goal_name).read_bytes()
+        lint.check_canonical_bytes(raw, f"canary/{goal_name}")
+        doc = json.loads(raw)
+        loaded = {"goal-file.json": doc}
+        lint.validate_loaded(loaded, schemas, registry, label_prefix=f"canary/{goal_name}")
+        lint.check_goal_file_cross_file(loaded, "goal-file.json")
+        projected = projector.project(doc)
+        if (HERE / data_name).read_bytes() != projected:
+            problems.append(f"canary/{data_name} is not project(canary/{goal_name})")
+
+    for finding in lint.findings:
+        problems.append(str(finding))
+    if problems:
+        for problem in problems:
+            print(f"canary-check: FAIL: {problem}")
+        return 1
+    print(f"canary-check: OK ({len(PAIRS)} goal files, projections byte-identical)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

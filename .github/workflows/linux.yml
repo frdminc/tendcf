@@ -31,11 +31,23 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # The install tree is built at its final, root-owned prefix: the
+      # binaries' runtime library path is then a directory only root can
+      # write, which deploy/linux/tendcf-install.sh requires on a host.
+      - name: Build prefix
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/tendcf
       - uses: ./.github/actions/build-fork
+        with:
+          prefix: /opt/tendcf
       - name: Generic-bundle tests (systemd lifecycle in enforce mode)
         env:
           TENDCF_TEST_SYSTEMD: "1"
-        run: tests/policy/run.sh --bindir /tmp/cf/bin
+        run: tests/policy/run.sh --bindir /opt/tendcf/bin
+      # linux-targets.md step 7: the canonical root-owned install and a root
+      # cf-execd, with the canary service, on a real systemd manager. After
+      # the policy tests: it takes over /var/cfengine.
+      - name: Root-owned install, cf-execd and canary (step 7)
+        run: tests/deploy/linux-install.sh
 
   debian-13:
     runs-on: ubuntu-24.04
@@ -51,16 +63,23 @@ jobs:
           apt-get install -y -q --no-install-recommends git ca-certificates python3 sudo fakeroot procps
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-fork
+        with:
+          prefix: /opt/tendcf
       - name: Generic-bundle tests
-        run: tests/policy/run.sh --bindir /tmp/cf/bin
+        run: tests/policy/run.sh --bindir /opt/tendcf/bin
       # librsync (and its libb2) is a build-time pick of core's configure
       # and not part of a minimal Debian; pastebin lacked it (2026-10-29).
-      # Everything else cf-agent links is in the Debian base. Run with
-      # LD_LIBRARY_PATH=<tree>/lib, or extract to /tmp/cf to match the rpath.
+      # Everything else cf-agent links is in the Debian base. The tree is
+      # built for /opt/tendcf (a root-owned runtime library path), so it is
+      # extracted there as root; it carries the policy, the canary data and
+      # the installer (share/tendcf) so one artifact is the whole deploy.
       - name: Package the install tree for pastebin (T3)
         run: |
-          cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /tmp/cf/lib/
-          tar -C /tmp -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz cf
+          cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /opt/tendcf/lib/
+          mkdir -p /opt/tendcf/share/tendcf
+          cp -R policy deploy /opt/tendcf/share/tendcf/
+          echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
+          tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf
       - uses: actions/upload-artifact@v4
         with:
           name: cfengine-fork-debian13

@@ -39,6 +39,14 @@ jobs:
       - name: Cross-reference lint
         run: bin/xref_lint.py
 
+      # The canary goal files (deploy/linux/canary/) are what a live host is
+      # first given: schema-valid canonical bytes that pass the goal-file
+      # cross-entry rules, and CMDB data byte-identical to their projection.
+      - name: Canary goal files
+        run: deploy/linux/canary/check.py
+      - name: Installer shell lint
+        run: shellcheck deploy/linux/tendcf-install.sh tests/deploy/linux-install.sh tests/policy/run.sh
+
       # The patch overlay on libntech/cfengine (overlay/, issue #3): the
       # manifest agrees with the patch files, and the mechanism itself is
       # proven on a synthetic repository — a sample series applies, a
