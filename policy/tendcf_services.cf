@@ -312,6 +312,7 @@ body edit_defaults tendcf_no_backup
 body perms tendcf_unit_perms
 {
       mode => "0644";
+      rxdirs => "false";
 }
 
 body classes tendcf_unit_rendered(class)

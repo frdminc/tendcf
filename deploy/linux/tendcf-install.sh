@@ -28,6 +28,12 @@ set -euo pipefail
 umask 022
 
 prefix=/opt/tendcf
+# RUNPATH is not inherited by a library's own dependencies: libpromises.so
+# needs librsync/libb2, which the artifact bundles in $prefix/lib, and only
+# a library path finds them on a host that does not have them installed
+# (pastebin, 2026-10-31). Set here, to the root-owned directory, replacing
+# any inherited value so a caller's environment cannot choose what root loads.
+export LD_LIBRARY_PATH="$prefix/lib"
 workdir=""   # set by init_paths
 unit=tendcf-execd.service
 unit_path=/etc/systemd/system/$unit
@@ -181,6 +187,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=LD_LIBRARY_PATH=$prefix/lib
 ExecStart=$cf_execd --no-fork
 Restart=on-failure
 KillMode=process
