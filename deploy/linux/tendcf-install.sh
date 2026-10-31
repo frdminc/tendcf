@@ -83,6 +83,8 @@ lay_out() {
     fi
     [ -f "$workdir/ppkeys/localhost.pub" ] || {
         ls -la "$workdir" "$workdir/ppkeys" >&2 || true
+        "$cf_key" -g verbose 2>&1 | tail -20 >&2 || true
+        find / -xdev -name 'localhost.pub' 2>/dev/null >&2 || true
         die "cf-key wrote no key under $workdir/ppkeys (output: ${keyout:-none}): these binaries use a different work directory"
     }
 }
