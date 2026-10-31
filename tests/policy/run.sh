@@ -183,6 +183,9 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
             cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"
             as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
                 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$2" 2>&1 || true
+            # cf-agent run as root takes the workdir over (found in CI,
+            # 2026-10-31: the next cp got "Permission denied"); give it back.
+            as_root chown -R "$(id -u):$(id -g)" "$work"
         }
         unit_active() { as_root systemctl is-active --quiet "$unit"; }
         unit_enabled() { as_root systemctl is-enabled --quiet "$unit"; }
