@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Fifty-nine deliberately broken overlays, plus six byte-class fixtures in
+Sixty-two deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12) or the goal-file
-family (cases 13-65) stays as in the happy path.
+family (cases 13-72) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -54,7 +54,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 2` | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 3` | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -70,6 +70,9 @@ no other Site Model files to compose against.
 | 26 | `26-double-slash-path` | `working_dir: "/foo//bar"` | schema (`abs_path` pattern) |
 | 27 | `27-two-unit-flavors` | `unit` carrying both `launchd` and `systemd` | schema (`oneOf`) |
 | 28 | `28-missing-launchd-knob` | `launchd` with `run_at_load` but no `keep_alive` | schema (`required`) |
+| 70 | `70-missing-systemd-knob` | `systemd` with `enabled` and `restart` but no `wanted_by` | schema (`required`) |
+| 71 | `71-systemd-argv-shell-char` | a systemd `command` element containing `$` (systemd would expand it) | schema (`pattern`) |
+| 72 | `72-systemd-working-dir-newline` | a systemd `working_dir` with an embedded newline (a second directive) | schema (`pattern`) |
 | 29 | `29-empty-argv` | `command: []` | schema (`minItems`) |
 | 30 | `30-empty-env-map` | `env: {}` | schema (`minProperties`) |
 | 31 | `31-unprefixed-host-key` | `host` with no `ed25519:` prefix | schema (`pattern`) |
