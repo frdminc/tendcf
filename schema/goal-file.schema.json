@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {
       "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid.",
-      "const": 2
+      "const": 3
     },
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
@@ -251,7 +251,8 @@
       "properties": {
         "state": { "const": "present" },
         "writer": {
-          "enum": ["cfengine", "mise", "nix-darwin", "homebrew", "apple", "third-party"]
+          "description": "The one tool allowed to write units under this prefix. `nixos` and `nix-darwin` are the passthrough hosts (linux-targets.md §5): their units exist only in the Nix configuration and CFEngine never renders one; `dpkg` is a Debian package's own unit; `cfengine` is the only writer a comprehensive domain's services may fall under (lint).",
+          "enum": ["cfengine", "mise", "nixos", "nix-darwin", "dpkg", "homebrew", "apple", "third-party"]
         }
       },
       "required": ["state", "writer"],

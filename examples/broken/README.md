@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Sixty-two deliberately broken overlays, plus six byte-class fixtures in
+Sixty-three deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12) or the goal-file
-family (cases 13-72) stays as in the happy path.
+family (cases 13-73) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -54,7 +54,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 3` | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 4` | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -222,6 +222,7 @@ test.
 | 62 | `62-nested-unit-writer-prefix` | `com.tendcf.caddy.main.*` nested in `com.tendcf.caddy.*` | goal cross-file |
 | 63 | `63-service-under-no-prefix` | a `com.rogue.*` service under no declared prefix | goal cross-file |
 | 64 | `64-service-under-non-cfengine-writer` | a comprehensive-domain prefix with `writer: homebrew` | goal cross-file |
+| 73 | `73-unknown-unit-writer` | `writer: ansible`, outside the writer vocabulary | schema (`enum`) |
 | 65 | `65-unit-writer-prefix-twice` | one prefix declared under two state domains | goal cross-file |
 
 Both of those needed a second draft, and the reason is worth keeping. Case

@@ -67,9 +67,15 @@ configuration's JSON and the flake lock plus a Nix-side diff. Stage B already
 produces both (`nix eval --json` of the options tendcf cares about; the
 `diff-closures` text), so stage C can render each next to the real host and the
 choice can be made on an actual diff. The goal file for stage C declares the
-`unit-writer` for the host's whole unit namespace as `nixos` and carries no
+`unit-writer` for the host's unit namespace as `nixos` and carries no
 `service` entries, so `cf-agent -n` has nothing to actuate and should report
-nothing but its own health.
+nothing but its own health. First cut: `deploy/linux/passthrough/goal-file.json`
+(`schema_version: 3`, writer `nixos` on `org.nixos.*`), projecting to
+`{"vars":{}}`. Open, for stage C: the unit-writer prefix pattern is reverse-DNS
+with two labels or more, and NixOS unit names are not (`afsd.service`,
+`sshd.service`); a passthrough host needs either a whole-namespace prefix or a
+host-level `supervisor: nixos` fact (the deferred inventory field), decided
+against the real `systemctl list-unit-files` output.
 
 ## 5. Work this unlocks, in order
 
@@ -79,7 +85,19 @@ nothing but its own health.
    `supervisor`/distro family, needed by the goal file in §4 (schema bump).
 3. Stages A to D in the host flake.
 
-## 6. Decisions for the operator
+## 6. Decisions for the operator (taken 2026-10-31)
+
+1. The derivation and module live in `site-public-djbclark/nixos/`: **yes**.
+2. Stage C runs first on **get.sipb.cloud** (T5: NixOS 26.11, systemd PID 1,
+   `/etc/systemd/system` a read-only store symlink like vps-primary, Nix 2.34
+   with flakes, 4 CPU / 8 GB, `/persist` volume; SSH as `djbclark` on exposed
+   port 14719, `wheel`; no real function, fully backed up, so disposable),
+   then vps-primary. `get.xvm.mit.edu` does not exist; the host is
+   `get.sipb.cloud`.
+3. The writer vocabulary landed as `schema_version: 3` (this PR); inventory
+   fields stay deferred.
+
+Original questions:
 
 1. May the CFEngine derivation and module land in `site-public-djbclark/nixos/`
    (the host flake), as linux-targets.md §2 already says?

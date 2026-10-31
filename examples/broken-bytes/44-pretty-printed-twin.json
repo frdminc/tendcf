@@ -88,5 +88,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 2
+  "schema_version": 3
 }
