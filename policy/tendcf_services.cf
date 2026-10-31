@@ -1,4 +1,4 @@
-# tendcf's generic bundle (v1, launchd only).
+# tendcf's generic bundle (launchd on darwin, systemd on Linux).
 #
 # Reads $(data:variables.tendcf_service) / $(data:variables.tendcf_interlock)
 # -- the data containers CFEngine's CMDB loader (LoadCMDBData/ReadCMDBVars in
@@ -44,6 +44,19 @@
 # Every id/tag that becomes PART OF a class name goes through canonify()
 # into its own variable first; raw ids are kept for data lookups and the
 # rendered plist Label, where the real, uncanonified value is required.
+#
+# systemd adapter (linux-targets.md step 5), a prototype over the current
+# goal-file `unit.systemd` shape, which carries only `enabled`:
+#   - the unit is /etc/systemd/system/<id>, rendered from
+#     templates/systemd.service.mustache (Type=simple, no restart policy,
+#     WantedBy=multi-user.target: nothing in the schema says otherwise);
+#   - every command argv element is double-quoted into ExecStart, so one
+#     containing `"`, `\`, `$`, `%` or a newline would be misread by
+#     systemd. The schema does not forbid them yet; that is step 4's list;
+#   - run order per pass is files (render, or delete after teardown) then
+#     commands: daemon-reload, enable/disable, start, restart, teardown,
+#     reload after removal. State probes are snapshots (see the classes
+#     section), so one run converges and the next does nothing.
 
 bundle agent tendcf_interlocks
 {
@@ -131,23 +144,71 @@ bundle agent tendcf_services
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"
         expression => "!interlock_ok_$(interlock_canon[$(interlock_ids)])";
 
-      # Fail-closed flavour/host guard (linux-targets.md step 3). v1
-      # implements one adapter, launchd, and launchd exists only on
-      # darwin. A present entry is actuated only when both hold; anything
+      # Fail-closed flavour/host guard (linux-targets.md step 3). Two
+      # adapters exist, each tied to the host that can run it: launchd on
+      # darwin, systemd on a Linux host booted by systemd. A present entry
+      # is actuated only when its flavour AND its host both match; anything
       # else is refused and reported, never rendered through the wrong
       # adapter (a systemd entry would otherwise become a LaunchDaemons
       # plist, and a launchd entry on Linux would be written to /Library
-      # and handed to a launchctl that is not there). A later adapter
-      # adds its own `service_*_supported` disjunct; nothing here is
-      # removed.
+      # and handed to a launchctl that is not there). A later adapter adds
+      # its own `service_*_supported` disjunct; nothing here is removed.
+      #
+      # "Booted by systemd" is sd_booted(3): /run/systemd/system is a
+      # directory. A Linux container or chroot without it has a systemctl
+      # binary that cannot reach a manager, so it counts as no host.
+      "tendcf_systemd_booted"
+        expression => isdir("/run/systemd/system");
+
+      "tendcf_systemd_host"
+        expression => "linux.tendcf_systemd_booted";
+
       "service_$(service_canon[$(service_ids)])_launchd"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "launchd");
 
+      "service_$(service_canon[$(service_ids)])_systemd"
+        expression => strcmp("$(unit_flavour[$(service_ids)])", "systemd");
+
+      "service_$(service_canon[$(service_ids)])_systemd_supported"
+        expression => "service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_host";
+
       "service_$(service_canon[$(service_ids)])_supported"
-        expression => "service_$(service_canon[$(service_ids)])_launchd.darwin";
+        expression => "service_$(service_canon[$(service_ids)])_launchd.darwin|service_$(service_canon[$(service_ids)])_systemd_supported";
 
       "service_$(service_canon[$(service_ids)])_refused"
         expression => "service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_supported";
+
+      # systemd actuation gate: the entry's own interlock bundle is met.
+      "service_$(service_canon[$(service_ids)])_systemd_go"
+        expression => "service_$(service_canon[$(service_ids)])_systemd_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+
+      # `enabled` is the boot symlink (systemctl enable/disable); a present
+      # service is started either way, as launchd's load -w starts it.
+      "service_$(service_canon[$(service_ids)])_enabled"
+        expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][unit][systemd][enabled])", "true");
+
+      # Pre-run snapshots of the manager's state. returnszero() results are
+      # cached for the whole run (verified against the dev build), so these
+      # keep the state from BEFORE any command below ran, which is what
+      # lets one run converge without a second restart: a unit that was
+      # inactive is started, not started and then restarted because pass 2
+      # sees it active.
+      "service_$(service_canon[$(service_ids)])_active"
+        expression => returnszero("/usr/bin/systemctl is-active --quiet $(service_ids)", "noshell"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_supported";
+
+      "service_$(service_canon[$(service_ids)])_boot_enabled"
+        expression => returnszero("/usr/bin/systemctl is-enabled --quiet $(service_ids)", "noshell"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_supported";
+
+      # Tombstone on a systemd host: act only when a unit file of that name
+      # is there. launchd labels and runit names fall through untouched.
+      "service_$(service_canon[$(service_ids)])_unit_present"
+        expression => fileexists("/etc/systemd/system/$(service_ids)"),
+        ifvarclass => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present";
+
+      "service_$(service_canon[$(service_ids)])_teardown"
+        expression => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_unit_present";
 
   files:
       "/Library/LaunchDaemons/$(service_ids).plist"
@@ -156,7 +217,18 @@ bundle agent tendcf_services
         template_method => "mustache",
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)"}'),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd.darwin.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+
+      "/etc/systemd/system/$(service_ids)"
+        create => "true",
+        perms => tendcf_unit_perms,
+        edit_defaults => tendcf_no_backup,
+        edit_template => "$(this.promise_dirname)/templates/systemd.service.mustache",
+        template_method => "mustache",
+        template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
+                                    '{"id": "$(service_ids)"}'),
+        classes => tendcf_unit_rendered("service_$(service_canon[$(service_ids)])_unit_changed"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go";
 
       # A tombstone names no flavour; the launchd adapter owns its cleanup
       # on darwin and nothing can exist to clean elsewhere.
@@ -164,27 +236,101 @@ bundle agent tendcf_services
         delete => tendcf_tidy,
         ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
 
+      # Removal waits for the teardown command below (pass 2), because
+      # `systemctl disable` needs the unit file still in place.
+      "/etc/systemd/system/$(service_ids)"
+        delete => tendcf_tidy,
+        classes => tendcf_unit_removed,
+        ifvarclass => "service_$(service_canon[$(service_ids)])_torn_down";
+
   commands:
       "/bin/launchctl"
         arglist => { "load", "-w", "/Library/LaunchDaemons/$(service_ids).plist" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd.darwin.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
 
       "/bin/launchctl"
         arglist => { "unload", "/Library/LaunchDaemons/$(service_ids).plist" },
         ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
+
+      # systemd. The files section ran first in this pass, so a rendered
+      # unit is on disk before the manager is told about it.
+      "/usr/bin/systemctl"
+        arglist => { "daemon-reload" },
+        ifvarclass => "tendcf_systemd_reload";
+
+      "/usr/bin/systemctl"
+        arglist => { "enable", "$(service_ids)" },
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.service_$(service_canon[$(service_ids)])_enabled.!service_$(service_canon[$(service_ids)])_boot_enabled";
+
+      "/usr/bin/systemctl"
+        arglist => { "disable", "$(service_ids)" },
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.!service_$(service_canon[$(service_ids)])_enabled.service_$(service_canon[$(service_ids)])_boot_enabled";
+
+      "/usr/bin/systemctl"
+        arglist => { "start", "$(service_ids)" },
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.!service_$(service_canon[$(service_ids)])_active";
+
+      # Changed unit, already running: restart so the new definition runs.
+      "/usr/bin/systemctl"
+        arglist => { "restart", "$(service_ids)" },
+        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.service_$(service_canon[$(service_ids)])_active.service_$(service_canon[$(service_ids)])_unit_changed";
+
+      "/usr/bin/systemctl"
+        arglist => { "disable", "--now", "$(service_ids)" },
+        classes => tendcf_command_done("service_$(service_canon[$(service_ids)])_torn_down"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_teardown";
+
+      # After a removal. Spelled differently from the first daemon-reload
+      # so a run that already reloaded for a render still reloads again.
+      "/usr/bin/systemctl"
+        arglist => { "--quiet", "daemon-reload" },
+        ifvarclass => "tendcf_systemd_unit_removed";
 
   reports:
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
         "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
 
       "service_$(service_canon[$(service_ids)])_refused"::
-        "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); v1 adapter is launchd on darwin)";
+        "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 }
 
 body contain tendcf_interlock_contain(timeout)
 {
       useshell     => "true";
       exec_timeout => "$(timeout)";
+}
+
+body edit_defaults tendcf_no_backup
+{
+      # The default leaves <unit>.cf-before-edit beside the unit, in the
+      # manager's own directory.
+      edit_backup => "false";
+}
+
+body perms tendcf_unit_perms
+{
+      mode => "0644";
+}
+
+body classes tendcf_unit_rendered(class)
+{
+      scope             => "namespace";
+      promise_repaired  => { "$(class)", "tendcf_systemd_reload" };
+}
+
+body classes tendcf_unit_removed
+{
+      scope             => "namespace";
+      promise_repaired  => { "tendcf_systemd_unit_removed" };
+}
+
+body classes tendcf_command_done(class)
+{
+      scope             => "namespace";
+      kept_returncodes     => { "0" };
+      repaired_returncodes => { "0" };
+      promise_kept         => { "$(class)" };
+      promise_repaired     => { "$(class)" };
 }
 
 body delete tendcf_tidy
