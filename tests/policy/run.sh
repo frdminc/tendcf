@@ -240,8 +240,43 @@ else
     check "no systemctl invocation" no_systemctl "$out"
 fi
 
+# 7. NixOS shape: booted by systemd but /etc/systemd/system is a symlink into a
+#    read-only tree (nixos-passthrough-plan.md section 1). The adapter must refuse
+#    by policy, naming the unit writer, and run no systemctl. Reshapes the host,
+#    so only on request and as root (the debian-13 container in CI); restored on exit.
+if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
+    echo "# 7. NixOS shape: /etc/systemd/system a read-only store symlink"
+    [ "$(id -u)" = 0 ] || { echo "FAIL TENDCF_TEST_NIXOS_SHAPE=1 needs root"; fail=1; }
+    if [ "$(id -u)" = 0 ]; then
+        shape="$(mktemp -d /tmp/tendcf-nixos-shape.XXXXXX)"
+        mkdir -p "$shape/static/systemd/system"
+        had_run=1; [ -d /run/systemd/system ] || { had_run=0; mkdir -p /run/systemd/system; }
+        [ -e /etc/systemd/system ] && mv /etc/systemd/system "$shape/real"
+        ln -s "$shape/static/systemd/system" /etc/systemd/system
+        chmod -R a-w "$shape/static"
+        unshape() {
+            rm -f /etc/systemd/system
+            [ -e "$shape/real" ] && mv "$shape/real" /etc/systemd/system
+            [ "$had_run" = 1 ] || rmdir /run/systemd/system /run/systemd 2>/dev/null || true
+            chmod -R u+w "$shape"; rm -rf "$shape"
+        }
+        trap unshape EXIT
+        cp "$repo/tests/policy/fixtures/systemd-present.json" "$work/data/host_specific.json"
+        out="$work/nixos-shape.out"
+        "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+        check "systemd entry refused naming the nixos unit writer" \
+            grep -q "tendcf: service '$unit' refused: /etc/systemd/system is not a writable directory on this host .*unit writer nixos" "$out"
+        check "generic flavour refusal not also reported" \
+            bash -c "! grep -q \"'$unit' refused: unit flavour\" '$out'"
+        check "nothing written into the store-like unit directory" \
+            bash -c "[ -z \"\$(ls -A '$shape/static/systemd/system')\" ]"
+        check "no systemctl invocation" no_systemctl "$out"
+        unshape; trap - EXIT
+    fi
+fi
+
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied flavour host sysd-host sysd1 sysd2 sysd3 sysd4 sysd5; do
+    for f in refused satisfied flavour host sysd-host sysd1 sysd2 sysd3 sysd4 sysd5 nixos-shape; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done

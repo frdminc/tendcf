@@ -25,7 +25,9 @@ passthrough design (linux-targets.md §5) says services on a Nix host stay Nix's
 so the bundle must refuse a CFEngine-written unit there as a matter of policy,
 not as a side effect of a failed write.
 
-Rule to implement first: the systemd adapter is supported only where
+Rule to implement first (**done 2026-10-31**, `tendcf_systemd_units_writable` in
+`policy/tendcf_services.cf`; `tests/policy/run.sh` check 7 reshapes the debian-13
+container into this layout and proves the refusal): the systemd adapter is supported only where
 `/etc/systemd/system` is a real writable directory (not a symlink into a store),
 and a present `systemd` entry elsewhere is refused by name, with a message that
 says the host's unit writer is `nixos`. Negative test: the same fixture on a
