@@ -74,11 +74,17 @@ lay_out() {
     for f in "$prefix"/bin/cf-*; do
         ln -sfn "$f" "$workdir/bin/$(basename "$f")"
     done
-    if [ ! -f "$workdir/ppkeys/localhost.priv" ]; then
-        "$cf_key" >/dev/null
+    if [ ! -f "$workdir/ppkeys/localhost.priv" ] || [ ! -f "$workdir/ppkeys/localhost.pub" ]; then
+        # A half pair (a build step can leave one file) is not a key: start over.
+        rm -f "$workdir/ppkeys/localhost.priv" "$workdir/ppkeys/localhost.pub"
+        if ! keyout="$("$cf_key" 2>&1)"; then
+            die "cf-key failed: $keyout"
+        fi
     fi
-    [ -f "$workdir/ppkeys/localhost.pub" ] \
-        || die "cf-key wrote no key under $workdir/ppkeys: these binaries use a different work directory"
+    [ -f "$workdir/ppkeys/localhost.pub" ] || {
+        ls -la "$workdir" "$workdir/ppkeys" >&2 || true
+        die "cf-key wrote no key under $workdir/ppkeys (output: ${keyout:-none}): these binaries use a different work directory"
+    }
 }
 
 place_policy() {
