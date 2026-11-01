@@ -204,10 +204,11 @@ Discrimination (F8): delete each new schema rule on its own. Its case must go re
 
 A lock diff alone shows nothing when the host's own `.nix` files change.
 
-**S3 rulings** (recorded verbatim in §1; R-S3-1, R-S3-2 and R-S3-3):
+**S3 rulings** (recorded verbatim in §1; R-S3-1 to R-S3-4):
 - R-S3-1 (operator, 2026-10-31): "Only changes that touch tendcf go through a PR with the required consent job; other pushes stay direct. A direct push touching tendcf paths fails a push-time check (red, visible) but is not blocked."
 - R-S3-2 (operator, 2026-10-31): "The effect block builds base and head toplevels in the consent job on the runner."
 - R-S3-3 (operator, 2026-11-01, branch protection): "site-djbclark gets no GitHub protection (three bot workflows push to master with the workflow token, and a personal repository cannot let the Actions bot bypass a required check); the consent job is required there by convention and the push check is the red backstop; get (Forgejo, no bot pushes to main) gets branch protection with the consent check required, admins exempt, require up to date, dismiss stale approvals."
+- R-S3-4 (operator, 2026-11-01, threat model): the hard checks defend against accidents; a deliberately disguised path to `cf-agent` is out of scope (see hard check 1 below and §7.10).
 
 **Lead decision on S3 review (Fable, site-djbclark#244) finding F3** (not a djbclark ruling; not the F3 of `schema-v4-opinion-fable.md`): a pushed `flake.lock` change gets hard checks 1-2 on the pushed head. This covers the lock bot, whose update is pushed rather than reviewed, so it never meets the consent job. Per R-S3-1 the check is visible and red, and does not block the push.
 
