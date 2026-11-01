@@ -32,6 +32,7 @@ reviewed by Fable 5.1 (approve with changes); those changes are applied.
 | Q10 | `deploy/linux/passthrough/goal-file.json` is a **fixture**, not get's goal file. It carries the example key and digests and is labelled as a fixture until get has a real key. |
 | R-S3-1 | "Only changes that touch tendcf go through a PR with the required consent job; other pushes stay direct. A direct push touching tendcf paths fails a push-time check (red, visible) but is not blocked." |
 | R-S3-2 | "The effect block builds base and head toplevels in the consent job on the runner." |
+| R-S3-3 | Operator decision of 2026-11-01 on branch protection: "site-djbclark gets no GitHub protection (three bot workflows push to master with the workflow token, and a personal repository cannot let the Actions bot bypass a required check); the consent job is required there by convention and the push check is the red backstop; get (Forgejo, no bot pushes to main) gets branch protection with the consent check required, admins exempt, require up to date, dismiss stale approvals." |
 
 ## 2. Schema deltas
 
@@ -172,6 +173,7 @@ bare prose.
 | 106 | `106-nixos-supervision-empty-comprehensive` | nixos base; `supervision` `comprehensive` with no entries | schema `if/then` |
 | 107 | `107-launchd-writers-nixos-writer` | Site Model `launchd-writers.yml` with `writer: nixos` | schema `enum` |
 | 108 | `108-coverage-out-of-unmanaged-ordinary` | added with the ceremony-discrimination PR: overlays `goal-file-baseline.json` (`supervision` `deliberately-unmanaged`), `goal-diff.json` (that as the `old` coverage of `supervision`, no `device-trust` hunk) and both approval records; accept asserts `ordinary`, reject mirror `privileged` | `family (ceremony)` |
+| 109 | `109-coverage-into-unmanaged-ordinary` | added with the ceremony-discrimination PR, the other direction of 108: baseline `supervision` `not-yet-migrated` with the happy entries, hunks deleting them, `goal-file.json` overlaid with `supervision` `deliberately-unmanaged`, both approval records; accept asserts `ordinary`, reject mirror `privileged` | `family (ceremony)` |
 
 Cases 103–107 were added in S1 because the discrimination run (F8) found that, without
 them, removing any one of five rules left the corpus green: the launchd member, the runit
@@ -196,9 +198,10 @@ Discrimination (F8): delete each new schema rule on its own. Its case must go re
 
 A lock diff alone shows nothing when the host's own `.nix` files change.
 
-**S3 rulings** (recorded verbatim in §1; R-S3-1 and R-S3-2):
+**S3 rulings** (recorded verbatim in §1; R-S3-1, R-S3-2 and R-S3-3):
 - R-S3-1: "Only changes that touch tendcf go through a PR with the required consent job; other pushes stay direct. A direct push touching tendcf paths fails a push-time check (red, visible) but is not blocked."
 - R-S3-2: "The effect block builds base and head toplevels in the consent job on the runner."
+- R-S3-3 (operator decision of 2026-11-01, branch protection): "site-djbclark gets no GitHub protection (three bot workflows push to master with the workflow token, and a personal repository cannot let the Actions bot bypass a required check); the consent job is required there by convention and the push check is the red backstop; get (Forgejo, no bot pushes to main) gets branch protection with the consent check required, admins exempt, require up to date, dismiss stale approvals."
 
 **Lead decision on review finding F3** (not a djbclark ruling): a pushed `flake.lock` change gets hard checks 1-2 on the pushed head. This covers the lock bot, whose update is pushed rather than reviewed, so it never meets the consent job. Per R-S3-1 the check is visible and red, and does not block the push.
 
@@ -285,7 +288,7 @@ The systemd renderer itself stays step 6 proper.
 6. **The Q6 consent channel is not cryptographic.** It is a PR review, and it is not an approval record.
 7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
 8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
-9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added case 108 red.
+9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added cases 108 (out of) and 109 (into) red, each direction alone.
 
 ## 8. Where the inputs were wrong
 

@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Seventy-nine deliberately broken overlays, plus six byte-class fixtures in
+Eighty deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (cases 13-73, 93-106, 108) stays as in the happy path.
+family (cases 13-73, 93-106, 108, 109) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -254,7 +254,7 @@ needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
 
-## Schema v4 cases (93-108)
+## Schema v4 cases (93-109)
 
 The numbering is one series across all three fixture directories: `broken/`
 ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
@@ -288,6 +288,7 @@ not apply to schema rules.
 | 106 | `106-nixos-supervision-empty-comprehensive` | `nixos` host, `supervision` `comprehensive` with no entries | schema (`if/then`) |
 | 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
 | 108 | `108-coverage-out-of-unmanaged-ordinary` | `supervision` leaving `deliberately-unmanaged` for `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
+| 109 | `109-coverage-into-unmanaged-ordinary` | `supervision` entering `deliberately-unmanaged` from `not-yet-migrated`, approved `ordinary` | family (ceremony) `approval-record` |
 
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
@@ -308,11 +309,22 @@ happy baseline plus `supervision` as `deliberately-unmanaged`, and its diff is
 the happy diff with that as the `old` coverage, so there is no `device-trust`
 hunk and no retreat from `comprehensive`; the accept record asserts `ordinary`
 and the reject mirror `privileged`, as in case 52. It covers the "out of"
-direction only. "Into" needs a proposed file that is `deliberately-unmanaged`,
-which means overlaying `goal-file.json` and the family hash/apply noise that
-brings. Measured: a rule reduced to `new == "deliberately-unmanaged"` turns
-108 red, and one reduced to `old == "deliberately-unmanaged"` (the "into" half
-dropped) stays green.
+direction only.
+
+Case 109 is the other direction. A first appearance as `deliberately-unmanaged`
+cannot be a diff (`apply_diff` rejects a declared domain no hunk populates), so
+its baseline gives `supervision` the happy entries under `not-yet-migrated`
+(not `comprehensive`, so no retreat), its hunks delete every entry, and its
+proposed `goal-file.json` is the happy one with `supervision` reduced to
+`deliberately-unmanaged`. That overlay is why the family is consistent: the
+diff's `proposed_sha256`, both records' and the applied result all name the
+overlaid file, so no hash/apply noise comes with it. Same asserted classes as
+108.
+
+Measured, one mutant at a time: deleting the rule turns 108 and 109 red;
+reducing it to `new == "deliberately-unmanaged"` (the "out of" half dropped)
+turns 108 red; reducing it to `old == "deliberately-unmanaged"` (the "into"
+half dropped) turns 109 red.
 
 There is deliberately no case for `supervision`'s explicit `entries: false`
 under the `nixos` member. It is redundant with `state_domain`'s own rule

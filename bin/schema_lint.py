@@ -33,7 +33,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the seventy-nine deliberately broken fixtures in examples/broken/
+  6. each of the eighty deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -84,7 +84,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 79
+EXPECTED_BROKEN = 80
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 27
 
