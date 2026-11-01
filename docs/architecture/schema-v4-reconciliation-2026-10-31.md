@@ -171,6 +171,7 @@ bare prose.
 | 105 | `105-nixos-interlock-elsewhere` | nixos base; domain `apps` with an interlock entry | schema `if/then` |
 | 106 | `106-nixos-supervision-empty-comprehensive` | nixos base; `supervision` `comprehensive` with no entries | schema `if/then` |
 | 107 | `107-launchd-writers-nixos-writer` | Site Model `launchd-writers.yml` with `writer: nixos` | schema `enum` |
+| 108 | `108-coverage-out-of-unmanaged-ordinary` | added with the ceremony-discrimination PR: overlays `goal-file-baseline.json` (`supervision` `deliberately-unmanaged`), `goal-diff.json` (that as the `old` coverage of `supervision`, no `device-trust` hunk) and both approval records; accept asserts `ordinary`, reject mirror `privileged` | `family (ceremony)` |
 
 Cases 103–107 were added in S1 because the discrimination run (F8) found that, without
 them, removing any one of five rules left the corpus green: the launchd member, the runit
@@ -284,7 +285,7 @@ The systemd renderer itself stays step 6 proper.
 6. **The Q6 consent channel is not cryptographic.** It is a PR review, and it is not an approval record.
 7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
 8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
-9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, and deleting the coverage-retreat rule turns 53 red.
+9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added case 108 red.
 
 ## 8. Where the inputs were wrong
 

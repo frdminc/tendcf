@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Seventy-eight deliberately broken overlays, plus six byte-class fixtures in
+Seventy-nine deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (cases 13-73, 93-106) stays as in the happy path.
+family (cases 13-73, 93-106, 108) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -254,7 +254,7 @@ needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
 
-## Schema v4 cases (93-107)
+## Schema v4 cases (93-108)
 
 The numbering is one series across all three fixture directories: `broken/`
 ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
@@ -287,6 +287,7 @@ not apply to schema rules.
 | 105 | `105-nixos-interlock-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with an interlock entry | schema (`if/then`) |
 | 106 | `106-nixos-supervision-empty-comprehensive` | `nixos` host, `supervision` `comprehensive` with no entries | schema (`if/then`) |
 | 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
+| 108 | `108-coverage-out-of-unmanaged-ordinary` | `supervision` leaving `deliberately-unmanaged` for `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
 
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
@@ -298,6 +299,20 @@ guards the `supervision` coverage const alone, since case 96 trips the const
 and `entries: false` together and each masks the other there; 107 guards the
 `nixos` removal from `launchd-writers.schema.json`'s enum (case 100 guards the
 goal-file one) and overlays a Site Model YAML file, as cases 1-12 do.
+
+Case 108 guards the `deliberately-unmanaged` rule of the ceremony derivation
+(any coverage transition into or out of it is `privileged`), which deleting on
+its own left the corpus green: every other ceremony case is also privileged by
+a `device-trust` hunk or by a `comprehensive` retreat. Its baseline is the
+happy baseline plus `supervision` as `deliberately-unmanaged`, and its diff is
+the happy diff with that as the `old` coverage, so there is no `device-trust`
+hunk and no retreat from `comprehensive`; the accept record asserts `ordinary`
+and the reject mirror `privileged`, as in case 52. It covers the "out of"
+direction only. "Into" needs a proposed file that is `deliberately-unmanaged`,
+which means overlaying `goal-file.json` and the family hash/apply noise that
+brings. Measured: a rule reduced to `new == "deliberately-unmanaged"` turns
+108 red, and one reduced to `old == "deliberately-unmanaged"` (the "into" half
+dropped) stays green.
 
 There is deliberately no case for `supervision`'s explicit `entries: false`
 under the `nixos` member. It is redundant with `state_domain`'s own rule
