@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Seventy-eight deliberately broken overlays, plus six byte-class fixtures in
+Eighty deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (cases 13-73, 93-106) stays as in the happy path.
+family (cases 13-73, 93-106, 108, 109) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -26,11 +26,12 @@ been masked exactly the way 13-43 would have been — it now is not).
 The class is the cell text with any parenthetical dropped, except under
 `family`, where the parenthetical is the class: `family (hash)`,
 `family (apply)`, and `family (ceremony)` are three different rules and a
-case must name the right one. Under `schema` the parenthetical is the
-keyword or def under test — prose for a reader, since the lint cannot
-produce it — so it is documentation and is not checked. The full
-vocabulary is `RULE_CLASSES` in `bin/schema_lint.py`; a cell naming
-anything else is a lint failure too.
+case must name the right one. A backticked token after either head is a
+machine-checked claim (see "The `Caught by` parentheticals are executable
+too"): under `schema` the keyword or def under test, under
+`family (ceremony)` the approval record that must carry the finding; bare
+words beside one are prose. The full vocabulary is `RULE_CLASSES` in
+`bin/schema_lint.py`; a cell naming anything else is a lint failure too.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
@@ -109,13 +110,35 @@ overlay exists to make: cases 52 and 53 are about one record asserting
 `ordinary` over a privileged change, so their mirrors correctly say
 `privileged` and stay silent.
 
+That asymmetry is what the backticked `approval-record` in the cells of 52,
+53 and 102 checks. The validator derives `privileged` for all three, so the
+**accept** record (`approval-record`, asserting `ordinary`) must carry the
+`family (ceremony)` finding, while the **reject** mirror
+(`approval-record-reject`, asserting `privileged`) stays silent. The claim is
+exclusive, and the lint checks both halves: the evidence of the
+`family (ceremony)` findings must equal the claimed set, so the claimed record
+carries the finding and no other record does. A derivation that went wrong the
+other way would flip the pair and move the finding to `approval-record-reject`;
+one returning a value neither record asserts (measured with `"privileged_"` in
+each of the three `privileged` returns) would put the finding on both, and
+"supported" alone would pass it. Without the claim the case asserted only
+that *some* record mismatched, which is true whatever the derivation returns,
+and the corpus stayed green (`schema-v4-reconciliation` §7.9, now resolved). The `family (ceremony)`
+finding carries the name of the record it was raised on as its evidence.
+
+A case whose class is `family (...)` and that overlays no `goal-file.json` must
+also fire no *other* `family (...)` class: an undeclared second finding there is
+a stale fixture (52 and 53 carried a stale `baseline_sha256` that way until the
+ceremony PR). Cases that overlay `goal-file.json` are exempt, since the happy
+diff and records no longer pair it.
+
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
 | 49 | `49-baseline-hash-mismatch` | `baseline_sha256` naming no fixture on disk | family (hash) |
 | 50 | `50-hunk-inconsistency` | a hunk's `new.working_dir` the proposed file does not carry | family (apply) |
 | 51 | `51-non-empty-migration` | `version_bump` alongside `hunks` | schema (`if/then`) |
-| 52 | `52-ordinary-over-privileged-hunk` | a `device-trust` hunk approved `ordinary` | family (ceremony) |
-| 53 | `53-coverage-retreat-ordinary-class` | a domain leaving `comprehensive`, approved `ordinary` | family (ceremony) |
+| 52 | `52-ordinary-over-privileged-hunk` | a `device-trust` hunk approved `ordinary` | family (ceremony) `approval-record` |
+| 53 | `53-coverage-retreat-ordinary-class` | a domain leaving `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
 | 54 | `54-no-op-hunk` | a hunk stating the same entry as `old` and `new` | family (apply) |
 | 55 | `55-no-op-coverage-change` | `comprehensive → comprehensive` | family (apply) |
 
@@ -165,6 +188,11 @@ checked against what the validator actually objected with. Backticks are the
 notation: a backticked token is a machine-checked claim, and a bare word
 beside one is prose that makes the row read as English — the "pattern" in
 ``schema (`abs_path` pattern)``, the "def" in ``schema (`absent` def)``.
+
+The same notation now reaches `family (ceremony)`: the backticked tail of
+``family (ceremony) `approval-record` `` is cut before the class is looked up
+and kept as the claim, and it is checked against the evidence of the findings
+of the declared class — here the name of the record the finding was raised on.
 
 Keeping those readable names cost something to build, and it was worth it.
 jsonschema resolves `$ref` before reporting, so the `abs_path` violation
@@ -236,7 +264,7 @@ needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
 
-## Schema v4 cases (93-107)
+## Schema v4 cases (93-109)
 
 The numbering is one series across all three fixture directories: `broken/`
 ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
@@ -263,12 +291,14 @@ not apply to schema rules.
 | 99 | `99-nixos-no-supervision-domain` | `nixos` host with no `supervision` domain | schema (`if/then`) |
 | 100 | `100-nixos-writer-retired` | supervisor `launchd`, a unit-writer with `writer: nixos` | schema (`enum`) |
 | 101 | `101-flavour-not-supervisor` | supervisor `systemd`, a present service with a `launchd` unit | schema (`if/then`) |
-| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) |
+| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) `approval-record` |
 | 103 | `103-launchd-supervisor-systemd-unit` | supervisor `launchd`, a present service with a `systemd` unit | schema (`if/then`) |
 | 104 | `104-runit-supervisor-launchd-unit` | supervisor `runit`, a present service with a `launchd` unit | schema (`if/then`) |
 | 105 | `105-nixos-interlock-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with an interlock entry | schema (`if/then`) |
 | 106 | `106-nixos-supervision-empty-comprehensive` | `nixos` host, `supervision` `comprehensive` with no entries | schema (`if/then`) |
 | 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
+| 108 | `108-coverage-out-of-unmanaged-ordinary` | `supervision` leaving `deliberately-unmanaged` for `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
+| 109 | `109-coverage-into-unmanaged-ordinary` | `supervision` entering `deliberately-unmanaged` from `not-yet-migrated`, approved `ordinary` | family (ceremony) `approval-record` |
 
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
@@ -280,6 +310,31 @@ guards the `supervision` coverage const alone, since case 96 trips the const
 and `entries: false` together and each masks the other there; 107 guards the
 `nixos` removal from `launchd-writers.schema.json`'s enum (case 100 guards the
 goal-file one) and overlays a Site Model YAML file, as cases 1-12 do.
+
+Case 108 guards the `deliberately-unmanaged` rule of the ceremony derivation
+(any coverage transition into or out of it is `privileged`), which deleting on
+its own left the corpus green: every other ceremony case is also privileged by
+a `device-trust` hunk or by a `comprehensive` retreat. Its baseline is the
+happy baseline plus `supervision` as `deliberately-unmanaged`, and its diff is
+the happy diff with that as the `old` coverage, so there is no `device-trust`
+hunk and no retreat from `comprehensive`; the accept record asserts `ordinary`
+and the reject mirror `privileged`, as in case 52. It covers the "out of"
+direction only.
+
+Case 109 is the other direction. A first appearance as `deliberately-unmanaged`
+cannot be a diff (`apply_diff` rejects a declared domain no hunk populates), so
+its baseline gives `supervision` the happy entries under `not-yet-migrated`
+(not `comprehensive`, so no retreat), its hunks delete every entry, and its
+proposed `goal-file.json` is the happy one with `supervision` reduced to
+`deliberately-unmanaged`. That overlay is why the family is consistent: the
+diff's `proposed_sha256`, both records' and the applied result all name the
+overlaid file, so no hash/apply noise comes with it. Same asserted classes as
+108.
+
+Measured, one mutant at a time: deleting the rule turns 108 and 109 red;
+reducing it to `new == "deliberately-unmanaged"` (the "out of" half dropped)
+turns 108 red; reducing it to `old == "deliberately-unmanaged"` (the "into"
+half dropped) turns 109 red.
 
 There is deliberately no case for `supervision`'s explicit `entries: false`
 under the `nixos` member. It is redundant with `state_domain`'s own rule

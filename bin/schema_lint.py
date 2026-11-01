@@ -33,7 +33,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the seventy-eight deliberately broken fixtures in examples/broken/
+  6. each of the eighty deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -84,7 +84,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 78
+EXPECTED_BROKEN = 80
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 27
 
@@ -160,9 +160,11 @@ DEFINITION_ONLY_SCHEMAS = {"common.schema.json"}
 # These strings are the README's vocabulary, not a parallel one: whatever
 # is written here is what the table must say. Heads listed in
 # DETAILED_RULE_HEADS carry their parenthetical into the class, because
-# `family` alone would let a hash case pass on a ceremony finding; for
-# `schema` the parenthetical is the keyword or def under test, prose the
-# lint cannot produce, so it is documentation and is not checked.
+# `family` alone would let a hash case pass on a ceremony finding. A backticked
+# token after either head is a claim checked against the evidence of the
+# findings of that class (check_declared_claim): for `schema` the keyword or
+# def under test, for `family (ceremony)` the approval record that must carry
+# the finding. Bare words beside one are prose and are not checked.
 RULE_SCHEMA = "schema"
 RULE_SCHEMA_META = "schema meta"
 RULE_PAIRING = "pairing"
@@ -452,12 +454,30 @@ def read_declared_classes() -> dict[str, str]:
         case, raw_cell = row.group(1), row.group(2)
         cell = raw_cell.replace("`", "")
         head = cell.split(" (", 1)[0]
-        rule = cell if head in DETAILED_RULE_HEADS else head
-        if head == RULE_SCHEMA:
-            claims[case] = frozenset(_CLAIM.findall(raw_cell))
+        claimed = raw_cell
+        if head in DETAILED_RULE_HEADS:
+            # The class is the head and its parenthetical, backticked or not.
+            # Only a backticked tail AFTER the closing parenthesis
+            # (``family (ceremony) `approval-record` ``) is a claim; it is cut
+            # before the membership test and kept as the claim.
+            close = raw_cell.find(")")
+            if close < 0:
+                rule = cell
+            else:
+                head_part, claimed = raw_cell[: close + 1], raw_cell[close + 1 :]
+                rule = " ".join(head_part.replace("`", "").split())
+                if head_part.count("`") % 2:
+                    # The class itself was backticked and its closing tick
+                    # follows the parenthesis; it is not the start of a claim.
+                    claimed = claimed.replace("`", "", 1)
+        else:
+            rule = head
+        if head in (RULE_SCHEMA, *DETAILED_RULE_HEADS):
+            claims[case] = frozenset(_CLAIM.findall(claimed))
         if rule not in RULE_CLASSES:
             fail(
-                f"examples/broken/README.md: {case} is declared {cell!r}, which "
+                f"examples/broken/README.md: {case} is declared {raw_cell!r} "
+                f"(class tested: {rule!r}), which "
                 f"names no rule class this lint can emit ({sorted(RULE_CLASSES)})",
                 rule=RULE_HARNESS,
             )
@@ -472,7 +492,11 @@ def read_declared_classes() -> dict[str, str]:
 
 
 def check_declared_class(
-    label: str, case: str, declared: dict[str, str], found: list[Finding]
+    label: str,
+    case: str,
+    declared: dict[str, str],
+    found: list[Finding],
+    overlays: frozenset[str] = frozenset(),
 ) -> bool:
     """Did the class this case declares actually fire?
 
@@ -497,11 +521,36 @@ def check_declared_class(
             rule=RULE_HARNESS,
         )
         return False
-    return check_declared_claim(label, case, found)
+    # A case that overlays no goal-file.json leaves the family's hashes and
+    # applied result to its own fixtures, so a second `family (...)` finding
+    # is a stale fixture, not noise by construction (52 and 53 carried a stale
+    # baseline_sha256 for exactly that reason). Cases that overlay
+    # goal-file.json are exempt: the happy diff and records no longer pair it.
+    if want.startswith("family (") and "goal-file.json" not in overlays:
+        extra = sorted(
+            {f.rule for f in found if f.rule.startswith("family (")} - {want}
+        )
+        if extra:
+            fail(
+                f"{label}: declares {want!r} but {extra} fired too, and the case "
+                "overlays no goal-file.json — an undeclared second family "
+                "finding is a stale fixture",
+                rule=RULE_HARNESS,
+            )
+            return False
+    return check_declared_claim(label, case, want, found)
 
 
-def check_declared_claim(label: str, case: str, found: list[Finding]) -> bool:
-    """Is the `schema (...)` parenthetical supported by what actually fired?
+def check_declared_claim(
+    label: str, case: str, want_rule: str, found: list[Finding]
+) -> bool:
+    """Is the backticked claim in the "Caught by" cell supported by what fired?
+
+    The claim is read from a `schema (...)` parenthetical or from the backticked
+    tail of a `family (...)` cell, and is compared with the evidence of the
+    findings of the class the cell declares. For a `family (ceremony)` finding
+    that evidence is the name of the approval record it was raised on, which is
+    what lets a case say *which* of its accept/reject pair must carry it.
 
     The "Caught by" head has been executable since dddd31b; the parenthetical
     beside it was still prose, so `schema (`const`)` could sit on a case the
@@ -537,14 +586,34 @@ def check_declared_claim(label: str, case: str, found: list[Finding]) -> bool:
         return True
     evidence: set[str] = set()
     for finding in found:
-        if finding.rule == RULE_SCHEMA:
+        if finding.rule == want_rule:
             evidence |= finding.evidence
     unsupported = sorted(want - evidence)
     if unsupported:
+        if want_rule == RULE_SCHEMA:
+            fail(
+                f"{label}: declares {', '.join(repr(u) for u in unsupported)}, "
+                f"which the validator never objected with — it reported "
+                f"{sorted(evidence) or 'nothing'}",
+                rule=RULE_HARNESS,
+            )
+        else:
+            fail(
+                f"{label}: declares {sorted(want)}, but no {want_rule!r} finding "
+                f"carried {', '.join(repr(u) for u in unsupported)} — that class "
+                f"reported {sorted(evidence) or 'nothing'}",
+                rule=RULE_HARNESS,
+            )
+        return False
+    # A record claim is exclusive. The `schema` claim is only "supported"
+    # (a failing oneOf honestly reports every branch), but a ceremony finding
+    # sits on exactly the records whose asserted class differs from the
+    # derived one: a derivation returning a value NEITHER record asserts
+    # mismatches both, and a "supported" claim would stay green.
+    if want_rule == RULE_FAMILY_CEREMONY and evidence != want:
         fail(
-            f"{label}: declares {', '.join(repr(u) for u in unsupported)}, which "
-            f"the validator never objected with — it reported "
-            f"{sorted(evidence) or 'nothing'}",
+            f"{label}: declares {sorted(want)}, but the {want_rule!r} finding "
+            f"fired on {sorted(evidence)} — the mirror record must stay silent",
             rule=RULE_HARNESS,
         )
         return False
@@ -1250,7 +1319,13 @@ def check_negative_fixtures(
                 "(lint accepted a deliberately broken fixture)",
                 rule=RULE_HARNESS,
             )
-        elif check_declared_class(label, case.name, declared, case_findings):
+        elif check_declared_class(
+            label,
+            case.name,
+            declared,
+            case_findings,
+            frozenset(overlay.name for overlay in overlays),
+        ):
             caught += 1
     return caught
 
@@ -1747,6 +1822,7 @@ def check_goal_file_family(loaded: dict[str, Any]) -> None:
                 f"{label}: ceremony_class {record.get('ceremony_class')!r} is "
                 f"asserted, but the validator derives {derived!r} from the diff",
                 rule=RULE_FAMILY_CEREMONY,
+                evidence=frozenset({label}),
             )
 
         check_refused_paths(diff, record, label)
