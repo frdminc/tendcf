@@ -33,7 +33,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the sixty-three deliberately broken fixtures in examples/broken/
+  6. each of the seventy-three deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -84,7 +84,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 63
+EXPECTED_BROKEN = 73
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 27
 
@@ -412,7 +412,7 @@ def check_family_canonical_bytes() -> None:
 
 BROKEN_README = BROKEN_DIR / "README.md"
 
-# | 13 | `13-schema-version-bump` | `schema_version: 4` | schema (`const`) |
+# | 13 | `13-schema-version-bump` | `schema_version: 5`, one above the current 4 | schema (`const`) |
 _README_ROW = re.compile(r"^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|.*\|\s*(.+?)\s*\|\s*$")
 
 
@@ -1792,7 +1792,7 @@ def check_trust_inexpressible(
     The validator's privilege derivation is positional — "any hunk under
     `device-trust`", and in v1 nothing else (reconciliation §7) — so trust
     content is privileged by WHERE IT SITS, never by what it says. F7
-    measured how little the bytes carry on their own: of the corpus's four
+    measured how little the bytes carry on their own: of the corpus's five
     trust bodies, `trust-policy`'s `{"local_yes_required", "state", "tier"}`
     has nothing in it that a legal service body could not also have. Position
     is therefore the whole of the enforcement, and the schema's promise that
@@ -1806,8 +1806,8 @@ def check_trust_inexpressible(
     of `trust_domain` — and the failure is silent, because nothing downstream
     re-derives it.
 
-    A property rather than fixtures because it must extend itself to a fifth
-    trust kind that does not exist yet. Fixtures would pin the four spellings
+    A property rather than fixtures because it must extend itself to a sixth
+    trust kind that does not exist yet. Fixtures would pin the five spellings
     someone thought to write down, which is the coverage that decays.
     """
     goal = loaded.get("goal-file.json")

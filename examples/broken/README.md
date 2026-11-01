@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Sixty-three deliberately broken overlays, plus six byte-class fixtures in
+Seventy-three deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12) or the goal-file
-family (cases 13-73) stays as in the happy path.
+family (cases 13-73, 93-102) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -54,7 +54,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 4` | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 5`, one above the current 4 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -235,6 +235,42 @@ admits no `unit-writer` kind; expressing "one prefix, two domains" at all
 needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
+
+## Schema v4 cases (93-102)
+
+The numbering is one series across all three fixture directories: `broken/`
+ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
+(`docs/architecture/schema-v4-reconciliation-2026-10-31.md` §4). They are
+the negatives for `supervisor`, the fifth `device-trust` kind, and for the
+rules that read it.
+
+Cases 93-95 and 100-101 start from the happy `goal-file.json`. Cases 96-99
+start from a valid `nixos` goal file: the happy `device-trust` entries with
+supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
+domain. Each case then introduces exactly one defect, so deleting the rule
+it names turns it green alone (F8). The rule-by-rule deletion table is in the
+S1 report; `bin/flag_coverage.py` covers `check_projection()` only, so it does
+not apply to schema rules.
+
+| # | Case | Broken input | Caught by |
+| --- | --- | --- | --- |
+| 93 | `93-unknown-supervisor` | supervisor `name: openrc` | schema (`enum`) |
+| 94 | `94-missing-supervisor` | `device-trust` entries with no `supervisor` | schema (`required`) |
+| 95 | `95-supervisor-not-singleton-id` | supervisor id `main`, not `host` | schema (`propertyNames`) |
+| 96 | `96-nixos-supervision-comprehensive` | `nixos` host, `supervision` `comprehensive` with one service entry | schema (`if/then`) |
+| 97 | `97-nixos-tombstone-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with a service tombstone | schema (`if/then`) |
+| 98 | `98-nixos-unit-writer-elsewhere` | `nixos` host, domain `packaging` with a unit-writer entry | schema (`if/then`) |
+| 99 | `99-nixos-no-supervision-domain` | `nixos` host with no `supervision` domain | schema (`if/then`) |
+| 100 | `100-nixos-writer-retired` | supervisor `launchd`, a unit-writer with `writer: nixos` | schema (`enum`) |
+| 101 | `101-flavour-not-supervisor` | supervisor `systemd`, a present service with a `launchd` unit | schema (`if/then`) |
+| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) |
+
+Case 102 overlays `goal-file-baseline.json` (supervisor `systemd`),
+`goal-diff.json` (the happy hunks plus the supervisor hunk, hashes
+recomputed) and both approval records. As in case 52, the accept record
+asserts `ordinary` and the reject mirror asserts `privileged`, the class the
+validator derives. The baseline holds no services, so supervisor `systemd`
+there does not trip the unit-flavour rule that case 101 exists for.
 
 ## Every class has a fixture
 
