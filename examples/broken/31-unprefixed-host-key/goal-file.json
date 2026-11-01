@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "host": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
   "domains": {
     "device-trust": {
@@ -28,6 +28,12 @@
             "state": "present",
             "version": "ops-v1.0.0",
             "sha256": "sha256:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+          }
+        },
+        "supervisor": {
+          "host": {
+            "state": "present",
+            "name": "launchd"
           }
         }
       }

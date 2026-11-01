@@ -27,6 +27,12 @@
             "state": "present",
             "tier": "consented"
           }
+        },
+        "supervisor": {
+          "host": {
+            "state": "present",
+            "name": "launchd"
+          }
         }
       }
     },
@@ -88,5 +94,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 3
+  "schema_version": 4
 }
