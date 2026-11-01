@@ -94,18 +94,30 @@ Never read `~/kb/raw/learning-cfengine.md`: that is the entire book, ~115k
 tokens. The index exists so you don't have to. Full detail, including how to add
 a book: `site-private/AGENTS.md` ("Book knowledge base").
 
-## Verifying policy and the CFEngine build (2026-10-29)
+## Verifying policy and the CFEngine build (2026-10-29, 2026-10-31)
 
 - `tests/policy/run.sh --bindir DIR` runs the generic bundle against a real
   `cf-agent`/`cf-promises` (Mac dev build: `~/opt/cfengine-dev/bin`); it is
   platform-independent and is the test CI runs on Linux. Run it through
-  `~/ops/site-private/bin/bg`.
+  `~/ops/site-private/bin/bg`. Two checks are opt-in because they reshape the
+  host and need root: `TENDCF_TEST_SYSTEMD=1` (check 6, the real-systemd
+  lifecycle; the ubuntu VM jobs) and `TENDCF_TEST_NIXOS_SHAPE=1` (check 7,
+  `/etc/systemd/system` as a read-only store symlink; the `debian:13` job).
+- `tests/deploy/linux-install.sh` (root, ubuntu VMs) proves the root-owned
+  install, root `cf-execd` and the canary end to end;
+  `tests/deploy/bare-host-libs.sh` (root, `debian:13`) proves the install on a
+  host with no system `librsync`/`libb2`. `deploy/linux/canary/check.py` keeps
+  the canary and passthrough goal files schema-valid and their projections
+  byte-identical. Never run the two root scripts on a real host.
 - Linux CI (`.github/workflows/linux.yml`) builds the fork at the commit in
-  `overlay/fork.json` and runs the fork's unit/acceptance subsets plus that
-  script on ubuntu-24.04/26.04/24.04-arm and a `debian:13` container. Moving
+  `overlay/fork.json` (`--prefix=/opt/tendcf`) and runs the fork's
+  unit/acceptance subsets plus the scripts above on ubuntu-24.04/26.04/24.04-arm
+  and a `debian:13` container, which also uploads the pastebin artifact. Moving
   the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
-  `bin/xref_lint.py` and `bin/overlay.py lint`.
-- Plan and status: `docs/architecture/linux-targets.md` §3.
+  `bin/xref_lint.py`, `bin/overlay.py lint`, the canary check and `shellcheck`.
+- Plan and status: `docs/architecture/linux-targets.md` §3; the NixOS side in
+  `docs/architecture/nixos-passthrough-plan.md`. Live hosts: pastebin (root
+  install, canary enforced), get.sipb.cloud (module installed, nothing scheduled).
 
 ## Editing in a worktree: absolute paths only (2026-10-31)
 
