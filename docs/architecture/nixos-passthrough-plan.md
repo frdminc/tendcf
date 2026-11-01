@@ -56,13 +56,28 @@ host until stage C.
    `core` commit CI tests; libntech from core's submodule pointer). Build it on
    Forgejo CI or a Linux builder, never on vps-primary (AGENTS.md rule 36: heavy
    builds off the VPS). Output: a store path and a build log.
-2. **B. Evaluate the module without activating it.**
+2. **B. Evaluate the module without activating it.** **Done 2026-10-31**
+   ([site-djbclark PR #242](https://github.com/djbclark/site-djbclark/pull/242)): CI builds an
+   `extendModules` twin of vps-primary with the module enabled and diffs closures; the
+   only new store paths are `cfengine-tendcf` (4.3 MiB), `librsync`, `libyaml`, `lmdb`.
+   Original text:
    `nix build .#nixosConfigurations.vps-primary.config.system.build.toplevel`
    with the new module enabled, on the builder, then `nix store diff-closures`
    against the running system. Expected diff: the CFEngine package, one
    systemd unit for `cf-execd`, a tmpfiles entry for the work directory. Anything
    else is a finding. Read-only for the host.
-3. **C. First activation, dry-run only.** `nixos-rebuild test` (activates
+3. **C. First activation, dry-run only.** **Done 2026-10-31 on get.sipb.cloud**
+   (not `nixos-rebuild test`: get is an image, so the module went into its flake,
+   [forgejo djbclark/get `bf3bc63`](https://forgejo.mit.edu/djbclark/get), `:latest` deployed,
+   one reboot; `execd.enable = false`). On the rebooted host: `/etc/systemd/system` is the
+   read-only store symlink, `/var/lib/cfengine-tendcf` exists from tmpfiles, `cf-agent` is
+   `3.29.0a.b8abf2840`. With `deploy/linux/passthrough/host_specific.json` as CMDB data,
+   `cf-promises` accepts the policy and `cf-agent -n -K -I` actuates nothing; with the
+   `systemd-present` fixture it refuses the entry by name with the `nixos` unit-writer
+   message (PR #20's guard), writes nothing, runs no `systemctl`. One finding: CFEngine's OS
+   detection does not know NixOS (`sys.os_name_human` "Unknown" warning; `sys.flavour` is
+   `nixos_26`, so classes work): a fork issue to file. get keeps the package and the work
+   directory; nothing is scheduled there. Original text: `nixos-rebuild test` (activates
    without making it the boot default, so a reboot returns to the old system)
    with `cf-execd` **not** enabled; the module installs the binaries and work
    directory only. Then, as root over SSH, one `cf-agent -n -K -f ...` against
