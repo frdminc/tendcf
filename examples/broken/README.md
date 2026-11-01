@@ -114,13 +114,23 @@ That asymmetry is what the backticked `approval-record` in the cells of 52,
 53 and 102 checks. The validator derives `privileged` for all three, so the
 **accept** record (`approval-record`, asserting `ordinary`) must carry the
 `family (ceremony)` finding, while the **reject** mirror
-(`approval-record-reject`, asserting `privileged`) stays silent. The lint checks
-the first half only: the claim is "this record carries it". A derivation that went wrong the other way
-would flip the pair and move the finding to `approval-record-reject`; without
-the claim the case asserted only that *some* record mismatched, which is true
-whatever the derivation returns, and the corpus stayed green
-(`schema-v4-reconciliation` §7.9, now resolved). The `family (ceremony)`
+(`approval-record-reject`, asserting `privileged`) stays silent. The claim is
+exclusive, and the lint checks both halves: the evidence of the
+`family (ceremony)` findings must equal the claimed set, so the claimed record
+carries the finding and no other record does. A derivation that went wrong the
+other way would flip the pair and move the finding to `approval-record-reject`;
+one returning a value neither record asserts (measured with `"privileged_"` in
+each of the three `privileged` returns) would put the finding on both, and
+"supported" alone would pass it. Without the claim the case asserted only
+that *some* record mismatched, which is true whatever the derivation returns,
+and the corpus stayed green (`schema-v4-reconciliation` §7.9, now resolved). The `family (ceremony)`
 finding carries the name of the record it was raised on as its evidence.
+
+A case whose class is `family (...)` and that overlays no `goal-file.json` must
+also fire no *other* `family (...)` class: an undeclared second finding there is
+a stale fixture (52 and 53 carried a stale `baseline_sha256` that way until the
+ceremony PR). Cases that overlay `goal-file.json` are exempt, since the happy
+diff and records no longer pair it.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
