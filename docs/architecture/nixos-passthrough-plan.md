@@ -50,7 +50,7 @@ host until stage C.
    version, rebuilds the host toplevel and checks the gating. Two build findings:
    `libpromises/text2cstring.pl` has a `/usr/bin/perl` shebang (patched), and
    `cf-agent/verify_users_pam.c` uses `USERMOD` outside its `HAVE_USERMOD` guard
-   (upstream defect; `shadow` on the build PATH bakes store paths in). Written by omp
+   (upstream defect, filed as [djbclark/core#55](https://github.com/djbclark/core/issues/55); `shadow` on the build PATH bakes store paths in). Written by omp
    Sonnet 5.5 as a bigteam slice; the two fixes by the orchestrator. Original text: In the host flake,
    a `cfengine-tendcf` package pinned to `overlay/fork.json`'s commit (the same
    `core` commit CI tests; libntech from core's submodule pointer). Build it on
@@ -76,7 +76,7 @@ host until stage C.
    `systemd-present` fixture it refuses the entry by name with the `nixos` unit-writer
    message (PR #20's guard), writes nothing, runs no `systemctl`. One finding: CFEngine's OS
    detection does not know NixOS (`sys.os_name_human` "Unknown" warning; `sys.flavour` is
-   `nixos_26`, so classes work): a fork issue to file. get keeps the package and the work
+   `nixos_26`, so classes work): filed as [djbclark/core#56](https://github.com/djbclark/core/issues/56). get keeps the package and the work
    directory; nothing is scheduled there. Original text: `nixos-rebuild test` (activates
    without making it the boot default, so a reboot returns to the old system)
    with `cf-execd` **not** enabled; the module installs the binaries and work
