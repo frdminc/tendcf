@@ -12,7 +12,7 @@ runs as an unprivileged, store-only build.
 | No CFEngine anywhere in the running system closure | `nix-store -qR /run/current-system` has no `cfengine` path | nothing to conflict with; the first install is ours |
 | `/etc/systemd/system` is a symlink into `/etc/static` and the store; a write fails with `Read-only file system`; `/nix/store` is mounted read-only | `touch /etc/systemd/system/.probe` | **the generic systemd adapter cannot work here**, by design: on NixOS a unit exists only if the system configuration declares it |
 | `/opt` does not exist; `/var/lib` is writable | `ls` | CFEngine's work directory can live under `/var/lib`; the binaries come from the store, not `/opt/tendcf` |
-| 21 running services; root's SSH keys are declared in the configuration | `systemctl`, `configuration.nix` | tendcf must not touch any of them (writer is `nixos`) |
+| 21 running services; root's SSH keys are declared in the configuration | `systemctl`, `configuration.nix` | tendcf must not touch any of them (supervisor is `nixos`) |
 | The host configuration lives in `site-public-djbclark/nixos/` (flake, `vps-primary/configuration.nix`); deployed from the pushed branch head by `deploy-vps-primary` | repo layout, AGENTS.md rule 36 | the CFEngine derivation and module belong in that flake (linux-targets.md §2), not in this repo |
 
 ## 2. Design consequence: tendcf must refuse, not attempt
@@ -83,35 +83,40 @@ host until stage C.
    directory only. Then, as root over SSH, one `cf-agent -n -K -f ...` against
    the passthrough goal file (below). `-n` makes no change. Output: the refusal
    lines and the report rows.
-4. **D. Stop and read.** No `switch`, no enforcement. Enforcement on this host
-   is a separate, later ruling, because the only things tendcf could enforce
-   here are files and the report channel, never services.
+4. **D. Stop and read.** **Ruled 2026-10-31:** tendcf enforces nothing on a Nix host
+   for now. It only reports and refuses, and `cf-execd` stays off. The only things it
+   could ever enforce here are files and the report channel, never services. Allowing
+   either one needs a later ruling. The schema and consent-diff consequences are in
+   [schema-v4-reconciliation-2026-10-31.md](schema-v4-reconciliation-2026-10-31.md).
 
 ## 4. The passthrough goal file for this host
 
-Open question from linux-targets.md §5, to be settled by stage C's output rather
-than argued in advance: how the Nix side appears in the goal file so the consent
-diff stays in ordinary language. The two candidates are the evaluated
-configuration's JSON and the flake lock plus a Nix-side diff. Stage B already
-produces both (`nix eval --json` of the options tendcf cares about; the
-`diff-closures` text), so stage C can render each next to the real host and the
-choice can be made on an actual diff. The goal file for stage C declares the
-`unit-writer` for the host's unit namespace as `nixos` and carries no
-`service` entries, so `cf-agent -n` has nothing to actuate and should report
-nothing but its own health. First cut: `deploy/linux/passthrough/goal-file.json`
-(`schema_version: 3`, writer `nixos` on `org.nixos.*`), projecting to
-`{"vars":{}}`. Open, for stage C: the unit-writer prefix pattern is reverse-DNS
-with two labels or more, and NixOS unit names are not (`afsd.service`,
-`sshd.service`); a passthrough host needs either a whole-namespace prefix or a
-host-level `supervisor: nixos` fact (the deferred inventory field), decided
-against the real `systemctl list-unit-files` output.
+**Settled 2026-10-31** by
+[schema-v4-reconciliation-2026-10-31.md](schema-v4-reconciliation-2026-10-31.md)
+§1 and §5. Stage C's output (`systemctl list-unit-files` on get) showed 116 service units,
+and none of them fits the reverse-DNS unit-writer prefix. So the passthrough host is
+described by a required host-level `supervisor: nixos` fact (`schema_version: 4`), not
+by a prefix. On such a host, `supervision` is `deliberately-unmanaged`, and no domain
+may carry a service, interlock or unit-writer entry.
+
+The consent diff for the host flake works as follows:
+- The authority is the PR's own diff (with `flake.lock` reduced to
+  `(input, type, rev, narHash)` per changed node), plus the `.nix` diff of each moved
+  input.
+- The evaluated options JSON is a readable summary under it.
+- `diff-closures` shows the effect.
+- djbclark approves it on the host-flake PR, behind a required CI job.
+
+`deploy/linux/passthrough/goal-file.json` is a fixture with the example key, not get's
+goal file. It projects to `{"vars":{}}`.
 
 ## 5. Work this unlocks, in order
 
 1. Bundle guard from §2 plus negative test (this repo, small PR, CI on the VM
    and Debian jobs).
-2. Step 4 slice B's `nixos` and `nix-darwin` writer vocabulary and the inventory
-   `supervisor`/distro family, needed by the goal file in §4 (schema bump).
+2. Step 4 slice B's `nixos` and `nix-darwin` writer vocabulary (`schema_version` 3, done)
+   and the `supervisor` fact (`schema_version` 4, slice S1 of the reconciliation; distro
+   family stays deferred).
 3. Stages A to D in the host flake.
 
 ## 6. Decisions for the operator (taken 2026-10-31)
@@ -125,6 +130,10 @@ against the real `systemctl list-unit-files` output.
    `get.sipb.cloud`.
 3. The writer vocabulary landed as `schema_version: 3` (this PR); inventory
    fields stay deferred.
+4. Stage D (2026-10-31): consent diff = authority plus summary; `supervisor: nixos`
+   with `schema_version: 4`; enforce nothing on a Nix host. The follow-on rulings
+   (Q1-Q10) are in
+   [schema-v4-reconciliation-2026-10-31.md](schema-v4-reconciliation-2026-10-31.md) §1.
 
 Original questions:
 
