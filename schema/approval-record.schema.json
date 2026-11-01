@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {
       "description": "Family version, shared with goal-file and goal-diff (§11).",
-      "const": 3
+      "const": 4
     },
     "host": {
       "description": "The target key this record is valid for — DC-2's per-target validity.",

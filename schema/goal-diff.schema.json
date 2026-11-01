@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {
       "description": "Family version, shared with goal-file and approval-record (§11).",
-      "const": 3
+      "const": 4
     },
     "host": {
       "description": "Device public key, same identity rule as goal-file.schema.json#/properties/host.",
@@ -23,7 +23,7 @@
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "version_bump": {
-      "description": "Present iff this is a migration release — the ONLY header change a diff can carry. When present, `hunks` and `coverage_changes` MUST be absent (§9.4's empty-apart-from-the-bump rule, made mechanical).",
+      "description": "Present iff this is a migration release — the ONLY header change a diff can carry. When present, `hunks` and `coverage_changes` MUST be absent (§9.4's empty-apart-from-the-bump rule, made mechanical). Valid alone only when the baseline rendered at `new` differs from the baseline in `schema_version` only. A bump that adds required content, as v4 does, is a re-adoption (baseline ceremony).",
       "type": "object",
       "properties": {
         "old": {

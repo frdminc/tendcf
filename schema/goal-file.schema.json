@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {
       "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid.",
-      "const": 3
+      "const": 4
     },
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
@@ -28,6 +28,262 @@
   },
   "required": ["schema_version", "host", "domains"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "A nixos host's units are the Nix configuration's, so tendcf describes none of them (D2, D3, R2). Only the three kinds that carry units are forbidden, listed per kind, so a future files or lockfile kind needs no bump to be allowed there. `supervision` must be present and deliberately-unmanaged: the NixOS configuration is the one writer, so extra-entry detection is off (Q3). The explicit `entries: false` on `supervision` does not rely on how that domain is routed.",
+      "if": {
+        "type": "object",
+        "properties": {
+          "domains": {
+            "type": "object",
+            "properties": {
+              "device-trust": {
+                "type": "object",
+                "properties": {
+                  "entries": {
+                    "type": "object",
+                    "properties": {
+                      "supervisor": {
+                        "type": "object",
+                        "properties": {
+                          "host": {
+                            "type": "object",
+                            "properties": { "name": { "const": "nixos" } },
+                            "required": ["name"]
+                          }
+                        },
+                        "required": ["host"]
+                      }
+                    },
+                    "required": ["supervisor"]
+                  }
+                },
+                "required": ["entries"]
+              }
+            },
+            "required": ["device-trust"]
+          }
+        },
+        "required": ["domains"]
+      },
+      "then": {
+        "properties": {
+          "domains": {
+            "required": ["supervision"],
+            "properties": {
+              "device-trust": true,
+              "supervision": {
+                "properties": {
+                  "coverage": { "const": "deliberately-unmanaged" },
+                  "entries": false
+                }
+              }
+            },
+            "additionalProperties": {
+              "properties": {
+                "entries": {
+                  "properties": {
+                    "service": false,
+                    "interlock": false,
+                    "unit-writer": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "On a launchd host every present service's unit flavour must be launchd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction.",
+      "if": {
+        "type": "object",
+        "properties": {
+          "domains": {
+            "type": "object",
+            "properties": {
+              "device-trust": {
+                "type": "object",
+                "properties": {
+                  "entries": {
+                    "type": "object",
+                    "properties": {
+                      "supervisor": {
+                        "type": "object",
+                        "properties": {
+                          "host": {
+                            "type": "object",
+                            "properties": { "name": { "const": "launchd" } },
+                            "required": ["name"]
+                          }
+                        },
+                        "required": ["host"]
+                      }
+                    },
+                    "required": ["supervisor"]
+                  }
+                },
+                "required": ["entries"]
+              }
+            },
+            "required": ["device-trust"]
+          }
+        },
+        "required": ["domains"]
+      },
+      "then": {
+        "properties": {
+          "domains": {
+            "additionalProperties": {
+              "properties": {
+                "entries": {
+                  "properties": {
+                    "service": {
+                      "additionalProperties": {
+                        "if": {
+                          "properties": { "state": { "const": "present" } },
+                          "required": ["state"]
+                        },
+                        "then": {
+                          "properties": { "unit": { "required": ["launchd"] } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "On a systemd host every present service's unit flavour must be systemd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction.",
+      "if": {
+        "type": "object",
+        "properties": {
+          "domains": {
+            "type": "object",
+            "properties": {
+              "device-trust": {
+                "type": "object",
+                "properties": {
+                  "entries": {
+                    "type": "object",
+                    "properties": {
+                      "supervisor": {
+                        "type": "object",
+                        "properties": {
+                          "host": {
+                            "type": "object",
+                            "properties": { "name": { "const": "systemd" } },
+                            "required": ["name"]
+                          }
+                        },
+                        "required": ["host"]
+                      }
+                    },
+                    "required": ["supervisor"]
+                  }
+                },
+                "required": ["entries"]
+              }
+            },
+            "required": ["device-trust"]
+          }
+        },
+        "required": ["domains"]
+      },
+      "then": {
+        "properties": {
+          "domains": {
+            "additionalProperties": {
+              "properties": {
+                "entries": {
+                  "properties": {
+                    "service": {
+                      "additionalProperties": {
+                        "if": {
+                          "properties": { "state": { "const": "present" } },
+                          "required": ["state"]
+                        },
+                        "then": {
+                          "properties": { "unit": { "required": ["systemd"] } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "On a runit host every present service's unit flavour must be runit (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction.",
+      "if": {
+        "type": "object",
+        "properties": {
+          "domains": {
+            "type": "object",
+            "properties": {
+              "device-trust": {
+                "type": "object",
+                "properties": {
+                  "entries": {
+                    "type": "object",
+                    "properties": {
+                      "supervisor": {
+                        "type": "object",
+                        "properties": {
+                          "host": {
+                            "type": "object",
+                            "properties": { "name": { "const": "runit" } },
+                            "required": ["name"]
+                          }
+                        },
+                        "required": ["host"]
+                      }
+                    },
+                    "required": ["supervisor"]
+                  }
+                },
+                "required": ["entries"]
+              }
+            },
+            "required": ["device-trust"]
+          }
+        },
+        "required": ["domains"]
+      },
+      "then": {
+        "properties": {
+          "domains": {
+            "additionalProperties": {
+              "properties": {
+                "entries": {
+                  "properties": {
+                    "service": {
+                      "additionalProperties": {
+                        "if": {
+                          "properties": { "state": { "const": "present" } },
+                          "required": ["state"]
+                        },
+                        "then": {
+                          "properties": { "unit": { "required": ["runit"] } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
 
   "$defs": {
     "coverage": {
@@ -251,8 +507,8 @@
       "properties": {
         "state": { "const": "present" },
         "writer": {
-          "description": "The one tool allowed to write units under this prefix. `nixos` and `nix-darwin` are the passthrough hosts (linux-targets.md §5): their units exist only in the Nix configuration and CFEngine never renders one; `dpkg` is a Debian package's own unit; `cfengine` is the only writer a comprehensive domain's services may fall under (lint).",
-          "enum": ["cfengine", "mise", "nixos", "nix-darwin", "dpkg", "homebrew", "apple", "third-party"]
+          "description": "The one tool allowed to write units under this prefix. `nix-darwin` writes labels in the launchd namespace that Apple, Homebrew and CFEngine share, so it takes a prefix like any other writer; CFEngine never renders one. A NixOS host has no unit-writer entries at all: the host-level `supervisor` fact claims its whole unit namespace (schema v4, D2/Q7). `dpkg` is a Debian package's own unit; `cfengine` is the only writer a comprehensive domain's services may fall under (lint).",
+          "enum": ["cfengine", "mise", "nix-darwin", "dpkg", "homebrew", "apple", "third-party"]
         }
       },
       "required": ["state", "writer"],
@@ -260,7 +516,7 @@
     },
 
     "trust_domain": {
-      "description": "The privileged region as one reserved, always-present, always-comprehensive domain. The validator's privilege derivation is 'any hunk under device-trust', plus the header — and in v1 nothing else, because no state kind carries gate machinery (reconciliation §7). Privilege is derived against the BASELINE's structure, never the proposal's. The validator and agent read their own configuration ONLY from here, so trust content misfiled elsewhere is inert, not covert; the trust kinds are structurally inexpressible outside this domain — measured by schema_lint's check_trust_inexpressible(), because that inexpressibility is a corollary of state_entries' closed kind set and a kind added there would revoke it without editing a word here (projector reconciliation P-8).",
+      "description": "The privileged region as one reserved, always-present, always-comprehensive domain. The validator's privilege derivation is 'any hunk under device-trust', plus the header — and in v1 nothing else, because no state kind carries gate machinery (reconciliation §7). Privilege is derived against the BASELINE's structure, never the proposal's. The validator and agent read their own configuration ONLY from here, so trust content misfiled elsewhere is inert, not covert; the trust kinds are structurally inexpressible outside this domain — measured by schema_lint's check_trust_inexpressible(), because that inexpressibility is a corollary of state_entries' closed kind set and a kind added there would revoke it without editing a word here (projector reconciliation P-8). Five kinds since v4: policy-tree, trust-policy, advisor-key, agent and supervisor. The host's supervisor is the one fact the top-level `allOf` reads: on `nixos` it forbids every service, interlock and unit-writer entry in every domain, and on the other three it requires every present service's unit flavour to equal it.",
       "type": "object",
       "properties": {
         "coverage": {
@@ -273,9 +529,10 @@
             "policy-tree": { "$ref": "#/$defs/policy_tree_map" },
             "trust-policy": { "$ref": "#/$defs/trust_policy_map" },
             "advisor-key": { "$ref": "#/$defs/advisor_key_map" },
-            "agent": { "$ref": "#/$defs/agent_map" }
+            "agent": { "$ref": "#/$defs/agent_map" },
+            "supervisor": { "$ref": "#/$defs/supervisor_map" }
           },
-          "required": ["policy-tree", "trust-policy", "agent"],
+          "required": ["policy-tree", "trust-policy", "agent", "supervisor"],
           "additionalProperties": false,
           "if": {
             "properties": {
@@ -365,6 +622,22 @@
           "sha256": { "$ref": "#/$defs/sha256" }
         },
         "required": ["state", "version", "sha256"],
+        "additionalProperties": false
+      },
+      "minProperties": 1
+    },
+
+    "supervisor_map": {
+      "description": "The host's unit-namespace authority, taken from inventory `supervisor` (schema v4, D2). Singleton, id `host`, and required on every v4 goal file. On `nixos` the NixOS configuration writes every unit, so no domain may carry a service, interlock or unit-writer entry: tendcf only reports and refuses there (D3), and the top-level `allOf` enforces it. On `launchd`, `systemd` and `runit` the per-prefix unit-writer entries still govern, and every present service's unit flavour must equal this value. Residue: on those three the flavour is now written twice, once here and once in each service's `unit`; the equality is checked, not removed (reconciliation 2026-10-31 §7.1).",
+      "type": "object",
+      "propertyNames": { "const": "host" },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "state": { "const": "present" },
+          "name": { "enum": ["launchd", "systemd", "runit", "nixos"] }
+        },
+        "required": ["state", "name"],
         "additionalProperties": false
       },
       "minProperties": 1
