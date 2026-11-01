@@ -133,7 +133,7 @@ Enumerate the files from disk; never use the counts below as a substitute for en
    - Reword the comment at `check.py:34-36` and label the passthrough file a fixture there. Add `deploy/linux/passthrough/README.md`, three lines: it is a fixture, it uses the example key, and it projects to `{"vars":{}}` (Q10).
 6. **Counts and prose.**
    - `EXPECTED_BROKEN` (`bin/schema_lint.py`) and the "Sixty-three" in `bin/schema_lint.py` and `examples/broken/README.md`.
-   - The case ranges in `examples/broken/README.md` ("cases 13-73" becomes "13-73, 93-102").
+   - The case ranges in `examples/broken/README.md` ("cases 13-73" becomes "13-73, 93-106"; Site Model cases "1-12, 107").
    - The root `README.md` fixture total.
    - The "claims version N" notes in the README and the lint.
 7. **Policy strings.** The refusal message at `policy/tendcf_services.cf:318` says "unit writer nixos". It becomes "supervisor nixos". The same change lands in the comment at `:165-169`, in `tests/policy/run.sh` (the check-7 grep and its comments) and in `nixos-passthrough-plan.md` §1 and §2. This lands in S0 (§6), not S1.
@@ -145,7 +145,7 @@ The series is shared across both fixture directories. `broken/` ends at 73 and
 class. Take the exact message and location from a real run of the lint, and correct the
 README row to match.
 
-Cases 96–99 start from a valid nixos goal file: the happy device-trust entries with
+Cases 96–99, 105 and 106 start from a valid nixos goal file: the happy device-trust entries with
 supervisor `nixos`, `supervision: {"coverage": "deliberately-unmanaged"}`, and no other
 domain. Each case then introduces exactly one defect, so deleting its rule turns it
 green alone (F8). A backticked token in a README `schema (…)` cell is machine-checked

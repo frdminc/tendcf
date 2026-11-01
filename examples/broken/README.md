@@ -249,7 +249,7 @@ Cases 96-99, 105 and 106 start from a valid `nixos` goal file: the happy `device
 supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
 domain. Each case then introduces exactly one defect, so deleting the rule
 it names turns it green alone (F8). The rule-by-rule deletion table is in the
-S1 report; `bin/flag_coverage.py` covers `check_projection()` only, so it does
+body of https://github.com/frdminc/tendcf/pull/27; `bin/flag_coverage.py` covers `check_projection()` only, so it does
 not apply to schema rules.
 
 | # | Case | Broken input | Caught by |
@@ -273,7 +273,9 @@ not apply to schema rules.
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
 unit-flavour rule (101 guards systemd); 105 guards the nixos member's
-per-kind `interlock` ban (97 and 98 guard `service` and `unit-writer`); 106
+per-kind `interlock` ban (97 and 98 guard `service` and `unit-writer`; 105 also
+carries a `goal cross-file` finding, unavoidably: no service may exist on a nixos
+host to use the interlock's bundle, and the declared class is what is asserted); 106
 guards the `supervision` coverage const alone, since case 96 trips the const
 and `entries: false` together and each masks the other there; 107 guards the
 `nixos` removal from `launchd-writers.schema.json`'s enum (case 100 guards the
