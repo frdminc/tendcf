@@ -13,7 +13,7 @@ https://github.com/frdminc/tendcf/pull/24 and was reviewed there. Where an input
 wrong, §8 says so; the inputs are not corrected in place. This document was itself
 reviewed by Fable 5.1 (approve with changes); those changes are applied.
 
-## 1. Rulings (djbclark, 2026-10-31; R-S3-3, 2026-11-01)
+## 1. Rulings (djbclark, 2026-10-31; R-S3-3 and R-S3-4, 2026-11-01)
 
 | # | Ruling |
 |---|---|
