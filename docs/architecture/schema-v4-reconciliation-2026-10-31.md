@@ -101,7 +101,7 @@ All three goal-family schemas (`goal-file`, `goal-diff`, `approval-record`) chan
 
 ### 2.2 Other schemas and text
 
-1. `launchd-writers.schema.json`: remove `"nixos"` from the writer enum (Q7). That file is versioned on its own `contract_version` axis, so follow its existing bump rule. **Decided (S1 DECIDED 1, recorded here after the post-merge audit's F5): `contract_version` stays 1 and `examples/launchd-writers.yml` stays at 1.** The rule (`common.schema.json`, `contract_version`) bumps only when an existing field is renamed, retyped or removed; dropping one value from an enum is none of the three, since the `writer` field keeps its name, its type and its presence. It does invalidate an instance carrying `writer: nixos`, but the only one in the repository was changed in the same commit, and the precedent (`f814f1f` added `nixos` to the same enum without a bump) is no-bump in both directions. A reader who counts narrowing as a bump changes the rule in `common.schema.json`, not this one case.
+1. `launchd-writers.schema.json`: remove `"nixos"` from the writer enum (Q7). That file is versioned on its own `contract_version` axis, so follow its existing bump rule. **Decided (in S1, recorded here after the post-merge audit's F5): `contract_version` stays 1 and `examples/launchd-writers.yml` stays at 1.** The rule (`common.schema.json`, `contract_version`) bumps only when an existing field is renamed, retyped or removed; dropping one value from an enum is none of the three, since the `writer` field keeps its name, its type and its presence. It does invalidate an instance carrying `writer: nixos`, but the only one in the repository was changed in the same commit, and the precedent (`f814f1f` added `nixos` to the same enum without a bump) is no-bump in both directions. A reader who counts narrowing as a bump changes the rule in `common.schema.json`, not this one case.
 2. In `goal-diff.schema.json`, add to the `version_bump` description: "valid alone only when the baseline rendered at `new` differs from the baseline in `schema_version` only. A bump that adds required content, as v4 does, is a re-adoption (baseline ceremony)." `derive_ceremony_class` already returns `baseline` for `version_bump`; this records the rule (Fable F5). Mirror the sentence in `goal-file-schema-reconciliation-2026-08-15.md`, in its §11 paragraph that says "A migration diff is `version_bump` alone". The inputs said "§9.4", but that document has no §9.4.
 3. Counts that are stated as measured facts must be corrected:
    - `bin/projector.py` (N-5 digest coverage): from "three of four" device-trust bodies to "three of five". Neither `trust-policy` nor `supervisor` carries a digest.
@@ -143,7 +143,7 @@ Enumerate the files from disk; never use the counts below as a substitute for en
    - The "claims version N" notes in the README and the lint.
 7. **Policy strings.** The refusal message at `policy/tendcf_services.cf:318` says "unit writer nixos". It becomes "supervisor nixos". The same change lands in the comment at `:165-169`, in `tests/policy/run.sh` (the check-7 grep and its comments) and in `nixos-passthrough-plan.md` §1 and §2. This lands in S0 (§6), not S1.
 
-## 4. Negative cases (93–107)
+## 4. Negative cases (93–112; 108–112 added after the S1 migration)
 
 The series is shared across both fixture directories. `broken/` ends at 73 and
 `broken-projection/` ends at 92, so new cases start at 93. Each row names its finding
@@ -176,6 +176,9 @@ bare prose.
 | 107 | `107-launchd-writers-nixos-writer` | Site Model `launchd-writers.yml` with `writer: nixos` | schema `enum` |
 | 108 | `108-coverage-out-of-unmanaged-ordinary` | added with the ceremony-discrimination PR: overlays `goal-file-baseline.json` (`supervision` `deliberately-unmanaged`), `goal-diff.json` (that as the `old` coverage of `supervision`, no `device-trust` hunk) and both approval records; accept asserts `ordinary`, reject mirror `privileged` | `family (ceremony)` |
 | 109 | `109-coverage-into-unmanaged-ordinary` | added with the ceremony-discrimination PR, the other direction of 108: baseline `supervision` `not-yet-migrated` with the happy entries, hunks deleting them, `goal-file.json` overlaid with `supervision` `deliberately-unmanaged`, both approval records; accept asserts `ordinary`, reject mirror `privileged` | `family (ceremony)` |
+| 110 | `110-supervisor-empty` | added after the post-merge audit: `supervisor: {}` | schema `minProperties` |
+| 111 | `111-supervisor-entry-no-name` | added after the post-merge audit: `host` entry without `name` | schema `required` |
+| 112 | `112-supervisor-entry-extra-key` | added after the post-merge audit: `host` entry with an extra key | schema `additionalProperties` |
 
 Cases 103–107 were added in S1 because the discrimination run (F8) found that, without
 them, removing any one of five rules left the corpus green: the launchd member, the runit
@@ -218,7 +221,14 @@ nix eval --json .#nixosConfigurations.get.config.services.cfengine-tendcf --appl
 **Effect.** `nix store diff-closures base head`, which stage B already produces.
 
 **Hard checks.** Each one fails the job:
-1. In the evaluated host config, `config.systemd.services` has no `cfengine-tendcf-execd`, and no unit in `config.systemd.services` or `config.systemd.timers` has an `ExecStart` or `script` naming `cf-execd` or `cf-agent`. This checks the effect, not the knob.
+1. In the evaluated host config, nothing runs `cf-execd` or `cf-agent`. That means no `cfengine-tendcf-execd` unit, and no match for `cf-(execd|agent)` in any of these:
+   - system or user units (services, timers and raw unit text), with their `ExecStart*`, `script` and pre/post fields;
+   - the unit text shipped by `systemd.packages` (on site-djbclark; on get only the package names are checked, and that limit is documented there);
+   - `services.cron.systemCronJobs`;
+   - `system.activationScripts`, `boot.postBootCommands` and `systemd.tmpfiles.rules`;
+   - `environment.etc` entries whose target is under `systemd/`.
+
+   This checks the effect, not the knob. The scope above was widened after the post-merge audit (site-djbclark PR 245, get PR 2).
 2. The **declared** option set under `options.services.cfengine-tendcf` equals `{enable, package, execd.enable}`:
    `nix eval --json .#nixosConfigurations.get.options.services.cfengine-tendcf --apply 'o: { top = builtins.attrNames o; execd = builtins.attrNames o.execd; }'`
    must print `{"execd":["enable"],"top":["enable","execd","package"]}`. A module that grows an option fails until the summary covers it. The draft's version of this check could never fire, because `--apply` projects exactly three keys (Fable F7).

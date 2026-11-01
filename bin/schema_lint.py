@@ -663,6 +663,7 @@ def check_claim_selftest() -> None:
             ("control: one record, claimed", {"approval-record"}, one, True),
             ("ceremony row with no claim", set(), one, False),
             ("ceremony finding on both records", {"approval-record"}, both, False),
+            ("claim names the silent record", {"approval-record-reject"}, one, False),
         ):
             claims[case] = frozenset(claim)
             with capture_findings(silent=True) as inner:
