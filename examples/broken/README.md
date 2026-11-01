@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Seventy-three deliberately broken overlays, plus six byte-class fixtures in
+Seventy-eight deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
-`examples/`. The rest of the Site Model (cases 1-12) or the goal-file
-family (cases 13-73, 93-102) stays as in the happy path.
+`examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
+family (cases 13-73, 93-106) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -236,7 +236,7 @@ needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
 
-## Schema v4 cases (93-102)
+## Schema v4 cases (93-107)
 
 The numbering is one series across all three fixture directories: `broken/`
 ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
@@ -244,8 +244,8 @@ ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
 the negatives for `supervisor`, the fifth `device-trust` kind, and for the
 rules that read it.
 
-Cases 93-95 and 100-101 start from the happy `goal-file.json`. Cases 96-99
-start from a valid `nixos` goal file: the happy `device-trust` entries with
+Cases 93-95, 100, 101, 103 and 104 start from the happy `goal-file.json`.
+Cases 96-99, 105 and 106 start from a valid `nixos` goal file: the happy `device-trust` entries with
 supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
 domain. Each case then introduces exactly one defect, so deleting the rule
 it names turns it green alone (F8). The rule-by-rule deletion table is in the
@@ -264,6 +264,26 @@ not apply to schema rules.
 | 100 | `100-nixos-writer-retired` | supervisor `launchd`, a unit-writer with `writer: nixos` | schema (`enum`) |
 | 101 | `101-flavour-not-supervisor` | supervisor `systemd`, a present service with a `launchd` unit | schema (`if/then`) |
 | 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) |
+| 103 | `103-launchd-supervisor-systemd-unit` | supervisor `launchd`, a present service with a `systemd` unit | schema (`if/then`) |
+| 104 | `104-runit-supervisor-launchd-unit` | supervisor `runit`, a present service with a `launchd` unit | schema (`if/then`) |
+| 105 | `105-nixos-interlock-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with an interlock entry | schema (`if/then`) |
+| 106 | `106-nixos-supervision-empty-comprehensive` | `nixos` host, `supervision` `comprehensive` with no entries | schema (`if/then`) |
+| 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
+
+Cases 103-107 close the discrimination gaps that deleting each rule on its
+own exposed: 103 and 104 guard the launchd and runit members of the
+unit-flavour rule (101 guards systemd); 105 guards the nixos member's
+per-kind `interlock` ban (97 and 98 guard `service` and `unit-writer`); 106
+guards the `supervision` coverage const alone, since case 96 trips the const
+and `entries: false` together and each masks the other there; 107 guards the
+`nixos` removal from `launchd-writers.schema.json`'s enum (case 100 guards the
+goal-file one) and overlays a Site Model YAML file, as cases 1-12 do.
+
+There is deliberately no case for `supervision`'s explicit `entries: false`
+under the `nixos` member. It is redundant with `state_domain`'s own rule
+(a `deliberately-unmanaged` domain cannot carry entries, case 16), by design:
+the nixos member must not depend on how `supervision` is routed (spec F1). Its
+removal alone leaves the corpus green, so it cannot be pinned by a fixture.
 
 Case 102 overlays `goal-file-baseline.json` (supervisor `systemd`),
 `goal-diff.json` (the happy hunks plus the supervisor hunk, hashes
