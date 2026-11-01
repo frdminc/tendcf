@@ -130,6 +130,14 @@ FROZEN: tuple[tuple[str, str], ...] = (
         "corrections register rather than in place, and verified "
         "byte-untouched by the same scope guarantee.",
     ),
+    (
+        "docs/architecture/schema-v4-opinion-*.md",
+        "frozen inputs to schema-v4-reconciliation-2026-10-31.md: the Opus "
+        "draft and the two independent frontier reviews (Fable, Argon), each "
+        "one model's unedited final message. The reconciliation's §8 records "
+        "where each was wrong; correcting them in place would destroy that "
+        "evidence.",
+    ),
 )
 
 # `§5.x` is a literal placeholder ("references of the form E1 §5.x"), not a
