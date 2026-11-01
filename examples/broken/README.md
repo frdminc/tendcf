@@ -26,11 +26,12 @@ been masked exactly the way 13-43 would have been — it now is not).
 The class is the cell text with any parenthetical dropped, except under
 `family`, where the parenthetical is the class: `family (hash)`,
 `family (apply)`, and `family (ceremony)` are three different rules and a
-case must name the right one. Under `schema` the parenthetical is the
-keyword or def under test — prose for a reader, since the lint cannot
-produce it — so it is documentation and is not checked. The full
-vocabulary is `RULE_CLASSES` in `bin/schema_lint.py`; a cell naming
-anything else is a lint failure too.
+case must name the right one. A backticked token after either head is a
+machine-checked claim (see "The `Caught by` parentheticals are executable
+too"): under `schema` the keyword or def under test, under
+`family (ceremony)` the approval record that must carry the finding; bare
+words beside one are prose. The full vocabulary is `RULE_CLASSES` in
+`bin/schema_lint.py`; a cell naming anything else is a lint failure too.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
@@ -109,13 +110,25 @@ overlay exists to make: cases 52 and 53 are about one record asserting
 `ordinary` over a privileged change, so their mirrors correctly say
 `privileged` and stay silent.
 
+That asymmetry is what the backticked `approval-record` in the cells of 52,
+53 and 102 checks. The validator derives `privileged` for all three, so the
+**accept** record (`approval-record`, asserting `ordinary`) must carry the
+`family (ceremony)` finding, while the **reject** mirror
+(`approval-record-reject`, asserting `privileged`) stays silent. The lint checks
+the first half only: the claim is "this record carries it". A derivation that went wrong the other way
+would flip the pair and move the finding to `approval-record-reject`; without
+the claim the case asserted only that *some* record mismatched, which is true
+whatever the derivation returns, and the corpus stayed green
+(`schema-v4-reconciliation` §7.9, now resolved). The `family (ceremony)`
+finding carries the name of the record it was raised on as its evidence.
+
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
 | 49 | `49-baseline-hash-mismatch` | `baseline_sha256` naming no fixture on disk | family (hash) |
 | 50 | `50-hunk-inconsistency` | a hunk's `new.working_dir` the proposed file does not carry | family (apply) |
 | 51 | `51-non-empty-migration` | `version_bump` alongside `hunks` | schema (`if/then`) |
-| 52 | `52-ordinary-over-privileged-hunk` | a `device-trust` hunk approved `ordinary` | family (ceremony) |
-| 53 | `53-coverage-retreat-ordinary-class` | a domain leaving `comprehensive`, approved `ordinary` | family (ceremony) |
+| 52 | `52-ordinary-over-privileged-hunk` | a `device-trust` hunk approved `ordinary` | family (ceremony) `approval-record` |
+| 53 | `53-coverage-retreat-ordinary-class` | a domain leaving `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
 | 54 | `54-no-op-hunk` | a hunk stating the same entry as `old` and `new` | family (apply) |
 | 55 | `55-no-op-coverage-change` | `comprehensive → comprehensive` | family (apply) |
 
@@ -165,6 +178,11 @@ checked against what the validator actually objected with. Backticks are the
 notation: a backticked token is a machine-checked claim, and a bare word
 beside one is prose that makes the row read as English — the "pattern" in
 ``schema (`abs_path` pattern)``, the "def" in ``schema (`absent` def)``.
+
+The same notation now reaches `family (ceremony)`: the backticked tail of
+``family (ceremony) `approval-record` `` is cut before the class is looked up
+and kept as the claim, and it is checked against the evidence of the findings
+of the declared class — here the name of the record the finding was raised on.
 
 Keeping those readable names cost something to build, and it was worth it.
 jsonschema resolves `$ref` before reporting, so the `abs_path` violation
@@ -263,7 +281,7 @@ not apply to schema rules.
 | 99 | `99-nixos-no-supervision-domain` | `nixos` host with no `supervision` domain | schema (`if/then`) |
 | 100 | `100-nixos-writer-retired` | supervisor `launchd`, a unit-writer with `writer: nixos` | schema (`enum`) |
 | 101 | `101-flavour-not-supervisor` | supervisor `systemd`, a present service with a `launchd` unit | schema (`if/then`) |
-| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) |
+| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) `approval-record` |
 | 103 | `103-launchd-supervisor-systemd-unit` | supervisor `launchd`, a present service with a `systemd` unit | schema (`if/then`) |
 | 104 | `104-runit-supervisor-launchd-unit` | supervisor `runit`, a present service with a `launchd` unit | schema (`if/then`) |
 | 105 | `105-nixos-interlock-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with an interlock entry | schema (`if/then`) |

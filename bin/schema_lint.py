@@ -160,9 +160,11 @@ DEFINITION_ONLY_SCHEMAS = {"common.schema.json"}
 # These strings are the README's vocabulary, not a parallel one: whatever
 # is written here is what the table must say. Heads listed in
 # DETAILED_RULE_HEADS carry their parenthetical into the class, because
-# `family` alone would let a hash case pass on a ceremony finding; for
-# `schema` the parenthetical is the keyword or def under test, prose the
-# lint cannot produce, so it is documentation and is not checked.
+# `family` alone would let a hash case pass on a ceremony finding. A backticked
+# token after either head is a claim checked against the evidence of the
+# findings of that class (check_declared_claim): for `schema` the keyword or
+# def under test, for `family (ceremony)` the approval record that must carry
+# the finding. Bare words beside one are prose and are not checked.
 RULE_SCHEMA = "schema"
 RULE_SCHEMA_META = "schema meta"
 RULE_PAIRING = "pairing"
@@ -452,8 +454,14 @@ def read_declared_classes() -> dict[str, str]:
         case, raw_cell = row.group(1), row.group(2)
         cell = raw_cell.replace("`", "")
         head = cell.split(" (", 1)[0]
-        rule = cell if head in DETAILED_RULE_HEADS else head
-        if head == RULE_SCHEMA:
+        if head in DETAILED_RULE_HEADS:
+            # The class is the head and its parenthetical; a backticked tail
+            # after it (``family (ceremony) `approval-record` ``) is a claim,
+            # not part of the class, so it is cut before the membership test.
+            rule = " ".join(_CLAIM.sub("", raw_cell).split())
+        else:
+            rule = head
+        if head in (RULE_SCHEMA, *DETAILED_RULE_HEADS):
             claims[case] = frozenset(_CLAIM.findall(raw_cell))
         if rule not in RULE_CLASSES:
             fail(
@@ -497,11 +505,19 @@ def check_declared_class(
             rule=RULE_HARNESS,
         )
         return False
-    return check_declared_claim(label, case, found)
+    return check_declared_claim(label, case, want, found)
 
 
-def check_declared_claim(label: str, case: str, found: list[Finding]) -> bool:
-    """Is the `schema (...)` parenthetical supported by what actually fired?
+def check_declared_claim(
+    label: str, case: str, want_rule: str, found: list[Finding]
+) -> bool:
+    """Is the backticked claim in the "Caught by" cell supported by what fired?
+
+    The claim is read from a `schema (...)` parenthetical or from the backticked
+    tail of a `family (...)` cell, and is compared with the evidence of the
+    findings of the class the cell declares. For a `family (ceremony)` finding
+    that evidence is the name of the approval record it was raised on, which is
+    what lets a case say *which* of its accept/reject pair must carry it.
 
     The "Caught by" head has been executable since dddd31b; the parenthetical
     beside it was still prose, so `schema (`const`)` could sit on a case the
@@ -537,7 +553,7 @@ def check_declared_claim(label: str, case: str, found: list[Finding]) -> bool:
         return True
     evidence: set[str] = set()
     for finding in found:
-        if finding.rule == RULE_SCHEMA:
+        if finding.rule == want_rule:
             evidence |= finding.evidence
     unsupported = sorted(want - evidence)
     if unsupported:
@@ -1747,6 +1763,7 @@ def check_goal_file_family(loaded: dict[str, Any]) -> None:
                 f"{label}: ceremony_class {record.get('ceremony_class')!r} is "
                 f"asserted, but the validator derives {derived!r} from the diff",
                 rule=RULE_FAMILY_CEREMONY,
+                evidence=frozenset({label}),
             )
 
         check_refused_paths(diff, record, label)
