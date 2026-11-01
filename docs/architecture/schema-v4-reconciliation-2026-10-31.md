@@ -5,9 +5,11 @@ It supersedes its three inputs, which stay frozen as written:
 [the Opus 5.5 draft](schema-v4-opinion-opus-draft.md), the
 [Fable 5.1 review](schema-v4-opinion-fable.md) and the
 [Gemini 4 Argon review](schema-v4-opinion-argon.md). Argon took the seat that the
-standing rule in `AGENTS.md` gives to astra, because astra was short (Codex had 45%
-left, below the 60% `codex:frontier` estimate floor). Where an input is wrong, this
-document says so in §8 and is not corrected in place.
+standing rule gives to astra, because astra was short (Codex had 45% left, below the
+60% `codex:frontier` estimate floor). The standing rule is in `AGENTS.md` on PR
+https://github.com/frdminc/tendcf/pull/24 and was reviewed there. Where an input is
+wrong, §8 says so; the inputs are not corrected in place. This document was itself
+reviewed by Fable 5.1 (approve with changes); those changes are applied.
 
 ## 1. Rulings (djbclark, 2026-10-31)
 
@@ -90,7 +92,7 @@ All three goal-family schemas (`goal-file`, `goal-diff`, `approval-record`) chan
 
        `unit` is already `oneOf` with exactly one flavour, so `required: [X]` is sufficient.
 4. In `unit_writer_entry.writer`, remove `"nixos"`. Rewrite the description so it no longer names `nixos` as a writer. `nix-darwin` stays: it writes labels in the launchd namespace that Apple, Homebrew and CFEngine share.
-5. Update every description that counts trust kinds or names the old passthrough mechanism. These include `trust_domain`, `unit_writer_map`, `unit_writer_entry` and `service_map`.
+5. Update every description that names the old passthrough mechanism (`unit_writer_map`, `unit_writer_entry`, `service_map`), and add the supervisor rule to the `trust_domain` description. The comments that count trust kinds are listed in §2.2(3).
 
 ### 2.2 Other schemas and text
 
@@ -113,7 +115,7 @@ Enumerate the files from disk; never use the counts below as a substitute for en
    - `host_specific.json` stays byte-identical.
 2. **Negative overlays.**
    - Every goal-family overlay gets `schema_version: 4`.
-   - Every overlaid goal file or baseline that has a `device-trust` domain also gets the launchd supervisor entry. Case 18 has `"domains": {}` and gets none.
+   - Every overlaid goal file or baseline that has a `device-trust` domain also gets a supervisor entry whose name equals the flavour of its present services: `systemd` for cases 70–72, `launchd` for all the others. Case 18 has no `device-trust` domain (its `domains` is `{"supervision": …}`) and gets none.
    - Case 13 now claims `5`.
    - Diff and record overlays get recomputed hashes.
 3. **`examples/broken-bytes/`.**
@@ -128,13 +130,13 @@ Enumerate the files from disk; never use the counts below as a substitute for en
      - `schema_version: 4`.
    - All three stay JCS.
    - The passthrough projection must remain exactly `{"vars":{}}`. Prove it by running `deploy/linux/canary/check.py`, not by reasoning about it.
-   - Reword the comment at `check.py:34-36`. Label the passthrough file a fixture in that comment and in `deploy/linux/passthrough/` (Q10).
+   - Reword the comment at `check.py:34-36` and label the passthrough file a fixture there. Add `deploy/linux/passthrough/README.md`, three lines: it is a fixture, it uses the example key, and it projects to `{"vars":{}}` (Q10).
 6. **Counts and prose.**
    - `EXPECTED_BROKEN` (`bin/schema_lint.py`) and the "Sixty-three" in `bin/schema_lint.py` and `examples/broken/README.md`.
    - The case ranges in `examples/broken/README.md` ("cases 13-73" becomes "13-73, 93-102").
    - The root `README.md` fixture total.
    - The "claims version N" notes in the README and the lint.
-7. **Policy strings.** In `policy/tendcf_services.cf`, the refusal message says "unit writer nixos". It becomes "supervisor nixos". This lands in S0 (§6), not S1.
+7. **Policy strings.** The refusal message at `policy/tendcf_services.cf:318` says "unit writer nixos". It becomes "supervisor nixos". The same change lands in the comment at `:165-169`, in `tests/policy/run.sh` (the check-7 grep and its comments) and in `nixos-passthrough-plan.md` §1 and §2. This lands in S0 (§6), not S1.
 
 ## 4. Negative cases (93–102)
 
@@ -143,18 +145,25 @@ The series is shared across both fixture directories. `broken/` ends at 73 and
 class. Take the exact message and location from a real run of the lint, and correct the
 README row to match.
 
+Cases 96–99 start from a valid nixos goal file: the happy device-trust entries with
+supervisor `nixos`, `supervision: {"coverage": "deliberately-unmanaged"}`, and no other
+domain. Each case then introduces exactly one defect, so deleting its rule turns it
+green alone (F8). A backticked token in a README `schema (…)` cell is machine-checked
+(`bin/schema_lint.py`), so write those cells as ``schema (`if/then`)`` with the rest as
+bare prose.
+
 | # | Directory | Broken input | Class (location) |
 |---|---|---|---|
 | 93 | `93-unknown-supervisor` | supervisor `name: openrc` | schema `enum` (`domains/device-trust/entries/supervisor/host/name`) |
 | 94 | `94-missing-supervisor` | device-trust without `supervisor` | schema `required` |
 | 95 | `95-supervisor-not-singleton-id` | supervisor id `main` | schema `propertyNames` (`'host' was expected`) |
-| 96 | `96-nixos-supervision-comprehensive` | nixos; `supervision` `comprehensive` with one service entry | schema `if/then` (const on coverage; `entries` false) |
+| 96 | `96-nixos-supervision-comprehensive` | nixos; `supervision` `comprehensive` with one service entry | schema `if/then` |
 | 97 | `97-nixos-tombstone-elsewhere` | nixos; domain `apps` (`not-yet-migrated`) with a service tombstone | schema `if/then` (`domains/apps/entries`, per-kind form) |
 | 98 | `98-nixos-unit-writer-elsewhere` | nixos; domain `packaging` with a unit-writer entry | schema `if/then` |
-| 99 | `99-nixos-no-supervision-domain` | nixos; `supervision` absent | schema `if/then` (`required`) |
-| 100 | `100-nixos-writer-retired` | supervisor `systemd`; a unit-writer with `writer: nixos` | schema `enum` |
+| 99 | `99-nixos-no-supervision-domain` | nixos; `supervision` absent | schema `if/then` |
+| 100 | `100-nixos-writer-retired` | supervisor `launchd`; a unit-writer with `writer: nixos` | schema `enum` |
 | 101 | `101-flavour-not-supervisor` | supervisor `systemd`; a present service with a `launchd` unit | schema `if/then` (R3) |
-| 102 | `102-supervisor-hunk-ordinary` | a diff whose hunk changes `device-trust/supervisor/host`, with the approval record claiming `ordinary` | `family (ceremony)` |
+| 102 | `102-supervisor-hunk-ordinary` | overlays `goal-file-baseline.json` (supervisor `systemd`), `goal-diff.json` (a `device-trust/supervisor/host` hunk `systemd → launchd`, recomputed hashes) and both approval records; the accept record asserts `ordinary` and the reject mirror asserts `privileged`, as case 52 does | `family (ceremony)` |
 
 Positive checks:
 1. The happy corpus, the canary files and the passthrough fixture are valid.
@@ -165,7 +174,7 @@ Discrimination (F8): delete each new schema rule on its own. Its case must go re
 
 ## 5. The D1 consent diff (S3, host-flake repositories)
 
-**Where it runs.** CI on the PR that changes get's flake (`forgejo.mit.edu/djbclark/get`), and on site-djbclark PRs that touch `nixos/` (`nixos-cfengine-build.yml`). It never runs on the device, which actuates nothing under D3. It is never produced by nix2cf, because nix2cf emits path-2 goal files only.
+**Where it runs.** CI on the PR that changes get's flake (`forgejo.mit.edu/djbclark/get`), and on site-djbclark PRs that touch `nixos/` (`nixos-cfengine-build.yml`). It never runs on the device, which actuates nothing under D3. nix2cf does not produce it either: nix2cf renders the host's service-less goal file (§6.2), and the Nix side is outside its scope.
 
 **Authority** (D1, corrected per Fable F6 and Argon Finding 4):
 1. the PR's own diff of the host-flake repository, `flake.lock` included. Each changed lock node is reduced to `(input, type, rev, narHash)`;
@@ -184,8 +193,12 @@ nix eval --json .#nixosConfigurations.get.config.services.cfengine-tendcf --appl
 **Effect.** `nix store diff-closures base head`, which stage B already produces.
 
 **Hard checks.** Each one fails the job:
-1. On the evaluated host config, `config.systemd.services` has no `cfengine-tendcf-execd`. No unit or timer runs `cf-execd` or `cf-agent`. This checks the effect, not the knob.
-2. The **declared** option set under `options.services.cfengine-tendcf` equals `{enable, package, execd.enable}`. A module that grows an option fails until the summary covers it. The draft's version of this check could never fire, because `--apply` projects exactly three keys (Fable F7).
+1. In the evaluated host config, `config.systemd.services` has no `cfengine-tendcf-execd`, and no unit in `config.systemd.services` or `config.systemd.timers` has an `ExecStart` or `script` naming `cf-execd` or `cf-agent`. This checks the effect, not the knob.
+2. The **declared** option set under `options.services.cfengine-tendcf` equals `{enable, package, execd.enable}`:
+   `nix eval --json .#nixosConfigurations.get.options.services.cfengine-tendcf --apply 'o: { top = builtins.attrNames o; execd = builtins.attrNames o.execd; }'`
+   must print `{"execd":["enable"],"top":["enable","execd","package"]}`. A module that grows an option fails until the summary covers it. The draft's version of this check could never fire, because `--apply` projects exactly three keys (Fable F7).
+
+D3's "enforce nothing" also rests on no CMDB data being deployed to get. No CI check covers that. It holds today because nothing deploys tendcf data there; an installer run on get would itself be an action needing a ruling.
 
 **The question put to djbclark** on the PR, in plain words: "This changes get's NixOS configuration: <authority summary>. CFEngine stays installed and its scheduler stays off; tendcf will still change nothing on this host. Approve?"
 
@@ -213,12 +226,14 @@ As a result, a tombstone on a host where `/etc/systemd/system` is not a writable
   expression => "tendcf_systemd_units_elsewhere.!service_$(service_canon[$(service_ids)])_present";
 ```
 
-Add a report that names the service, the layout and `$(sys.flavour)`. The report must not fire on Darwin or on a normal systemd host. Add check 7b to `tests/policy/run.sh` with a `systemd-absent` fixture under the read-only-store shape (opt-in, `TENDCF_TEST_NIXOS_SHAPE=1`). It asserts:
+Place the class in `classes:` after `service_*_refused` and before the probes. It negates `service_*_present`, and CFEngine never undefines a class, so evaluating it before its operand is defined would leave a class that is never unset (file header, `:26-37`). Put the report next to the existing refusal report.
+
+Add check 7b to `tests/policy/run.sh`: run the `systemd-absent` fixture under the read-only-store shape (opt-in, `TENDCF_TEST_NIXOS_SHAPE=1`) and assert that:
 - the report line appears;
 - `systemctl` is never run;
 - nothing is written.
 
-Test the negative too: on a normal systemd host, the class must not fire.
+Negative checks: the report must not appear on a normal systemd host (check 6, after the tombstone run) or on a host not booted by systemd.
 
 ### 6.2 S4 (nix2cf)
 
@@ -235,7 +250,8 @@ The slice brings it to v4:
    - a refusal of any selected service ("host is nixos-supervised; its units are the Nix configuration's");
    - `supervision: {"coverage": "deliberately-unmanaged"}` instead of the early return that omits `supervision`;
 4. regenerated goldens;
-5. a CI check that fails when `GOAL_FILE_SCHEMA_VERSION` differs from tendcf's schema const.
+5. a CI check that fails when `GOAL_FILE_SCHEMA_VERSION` differs from tendcf's schema const;
+6. a refusal to render a `supervisor: nixos` host at any `schema_version` below 4. The only v3 spelling, `org.nixos.*`, described nothing. Non-nixos hosts may render at 3 by dropping the entry.
 
 The systemd renderer itself stays step 6 proper.
 
@@ -247,6 +263,8 @@ The systemd renderer itself stays step 6 proper.
 4. **No inventory schema exists** (Q8). **The dpkg prefix pattern defect is open** (Q9).
 5. **`deliberately-unmanaged` turns off extra-entry detection on Nix hosts** (Q3). The NixOS configuration is the one writer there.
 6. **The Q6 consent channel is not cryptographic.** It is a PR review, and it is not an approval record.
+7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
+8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
 
 ## 8. Where the inputs were wrong
 
@@ -254,5 +272,5 @@ The systemd renderer itself stays step 6 proper.
 2. **Draft D used the lock diff alone as the authority.** That misses changes to the host's own files (§5).
 3. **Draft D's hard check 2 could never fire** (§5).
 4. **Draft F placed case 97 at `domains/apps/entries`.** The draft's blanket form actually reports `domains/apps`. The per-kind form adopted here (R2) reports `domains/apps/entries`.
-5. **Argon Q5 says the operator already ruled on distro family.** That is correct, and it is the standing "Defer until step 6/8 needs it" ruling of 2026-10-31.
+5. **Draft Q5 said distro family was not ruled.** It was ruled: the standing "Defer until step 6/8 needs it" of 2026-10-31 (handoff `HANDOFF_tendcf-linux-targets-20261029_linux-milestone-through-nixos-stage-c_2026-10-31_f34c.md:95`). Argon's Q5 had this right.
 6. **Argon Finding 1 (HIGH) retracts its own trace.** The `required` placements in the draft's `if` are correct. What survives is the advice to add `"type": "object"` at each level, which §2.1(3) adopts.

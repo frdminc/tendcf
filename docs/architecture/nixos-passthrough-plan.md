@@ -12,7 +12,7 @@ runs as an unprivileged, store-only build.
 | No CFEngine anywhere in the running system closure | `nix-store -qR /run/current-system` has no `cfengine` path | nothing to conflict with; the first install is ours |
 | `/etc/systemd/system` is a symlink into `/etc/static` and the store; a write fails with `Read-only file system`; `/nix/store` is mounted read-only | `touch /etc/systemd/system/.probe` | **the generic systemd adapter cannot work here**, by design: on NixOS a unit exists only if the system configuration declares it |
 | `/opt` does not exist; `/var/lib` is writable | `ls` | CFEngine's work directory can live under `/var/lib`; the binaries come from the store, not `/opt/tendcf` |
-| 21 running services; root's SSH keys are declared in the configuration | `systemctl`, `configuration.nix` | tendcf must not touch any of them (writer is `nixos`) |
+| 21 running services; root's SSH keys are declared in the configuration | `systemctl`, `configuration.nix` | tendcf must not touch any of them (supervisor is `nixos`) |
 | The host configuration lives in `site-public-djbclark/nixos/` (flake, `vps-primary/configuration.nix`); deployed from the pushed branch head by `deploy-vps-primary` | repo layout, AGENTS.md rule 36 | the CFEngine derivation and module belong in that flake (linux-targets.md §2), not in this repo |
 
 ## 2. Design consequence: tendcf must refuse, not attempt
@@ -100,8 +100,9 @@ by a prefix. On such a host, `supervision` is `deliberately-unmanaged`, and no d
 may carry a service, interlock or unit-writer entry.
 
 The consent diff for the host flake works as follows:
-- The authority is the PR's own diff (with `flake.lock` reduced to rev/narHash per
-  input), plus the `.nix` diff of each moved input.
+- The authority is the PR's own diff (with `flake.lock` reduced to
+  `(input, type, rev, narHash)` per changed node), plus the `.nix` diff of each moved
+  input.
 - The evaluated options JSON is a readable summary under it.
 - `diff-closures` shows the effect.
 - djbclark approves it on the host-flake PR, behind a required CI job.
