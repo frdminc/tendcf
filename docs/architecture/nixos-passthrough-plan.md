@@ -74,8 +74,10 @@ host until stage C.
    read-only store symlink, `/var/lib/cfengine-tendcf` exists from tmpfiles, `cf-agent` is
    `3.29.0a.b8abf2840`. With `deploy/linux/passthrough/host_specific.json` as CMDB data,
    `cf-promises` accepts the policy and `cf-agent -n -K -I` actuates nothing; with the
-   `systemd-present` fixture it refuses the entry by name with the `nixos` unit-writer
-   message (PR #20's guard), writes nothing, runs no `systemctl`. One finding: CFEngine's OS
+   `systemd-present` fixture it refuses the entry by name with the `nixos` refusal
+   message (PR #20's guard; worded `supervisor nixos` since
+   https://github.com/frdminc/tendcf/pull/26), writes nothing, runs no `systemctl`. One
+   finding: CFEngine's OS
    detection does not know NixOS (`sys.os_name_human` "Unknown" warning; `sys.flavour` is
    `nixos_26`, so classes work): filed as [djbclark/core#56](https://github.com/djbclark/core/issues/56). get keeps the package and the work
    directory; nothing is scheduled there. Original text: `nixos-rebuild test` (activates

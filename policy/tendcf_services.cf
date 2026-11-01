@@ -169,14 +169,21 @@ bundle agent tendcf_services
       # (linux-targets.md section 5, nixos-passthrough-plan.md section 2).
       # Refuse by policy rather than half-fail on the write: a real,
       # non-symlink directory is required.
-      "tendcf_systemd_units_writable"
-        expression => "tendcf_systemd_units_dir.!tendcf_systemd_units_link";
-
+      #
+      # Operand order is load-bearing (same reason as the header): a class
+      # expression naming a class not yet defined reads it as false, and a
+      # class once set is never re-evaluated. With `_writable` above its
+      # operands, pass 1 set `_elsewhere` on every normal systemd host and
+      # every present entry was reported "refused" while it was rendered in
+      # pass 2 (seen in CI, 2026-11-01; present since the guard landed).
       "tendcf_systemd_units_dir"
         expression => isdir("/etc/systemd/system");
 
       "tendcf_systemd_units_link"
         expression => islink("/etc/systemd/system");
+
+      "tendcf_systemd_units_writable"
+        expression => "tendcf_systemd_units_dir.!tendcf_systemd_units_link";
 
       "tendcf_systemd_units_elsewhere"
         expression => "linux.tendcf_systemd_booted.!tendcf_systemd_units_writable";

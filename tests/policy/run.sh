@@ -192,6 +192,8 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         main_pid() { systemctl show -p MainPID --value "$unit"; }
 
         sysd_run systemd-present.json "$work/sysd1.out"
+        check "no refusal reported on a normal systemd host" \
+            bash -c "! grep -q \"'$unit' refused\" '$work/sysd1.out'"
         check "unit rendered" \
             grep -q 'ExecStart="/usr/bin/sleep" "3600"' "$unit_path"
         check "Restart and WantedBy rendered from the entry" \
@@ -284,8 +286,13 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
         check "no systemctl invocation" no_systemctl "$out"
 
         # 7b. A tombstone has no unit and no flavour, so the refusal above
-        #     cannot see it: it must be reported and never actuated (D3).
+        #     cannot see it: it must be reported and never actuated (D3). A unit
+        #     file stands in the store-like tree first, as if the Nix configuration
+        #     declared it, so a teardown that wrongly ran would have something to
+        #     remove (root ignores the a-w bits; the symlink is what the policy reads).
         echo "# 7b. NixOS shape: tombstone reported, not actuated"
+        printf '[Unit]\nDescription=declared by the system configuration\n' \
+            >"$shape/static/systemd/system/$unit"
         cp "$repo/tests/policy/fixtures/systemd-absent.json" "$work/data/host_specific.json"
         out="$work/nixos-tombstone.out"
         "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
@@ -293,8 +300,8 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
             grep -q "tendcf: service '$unit' tombstone not actuated: /etc/systemd/system is not a writable directory on this host .*supervisor nixos" "$out"
         check "tombstone is not reported as a refusal" \
             bash -c "! grep -q \"'$unit' refused\" '$out'"
-        check "nothing written into the store-like unit directory (tombstone)" \
-            bash -c "[ -z \"\$(ls -A '$shape/static/systemd/system')\" ]"
+        check "the configuration's unit file is left in place (tombstone)" \
+            bash -c "[ -f '$shape/static/systemd/system/$unit' ]"
         check "no systemctl invocation (tombstone)" no_systemctl "$out"
         unshape; trap - EXIT
     fi
