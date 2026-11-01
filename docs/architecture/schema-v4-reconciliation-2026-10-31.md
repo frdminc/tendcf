@@ -97,7 +97,7 @@ All three goal-family schemas (`goal-file`, `goal-diff`, `approval-record`) chan
 ### 2.2 Other schemas and text
 
 1. `launchd-writers.schema.json`: remove `"nixos"` from the writer enum (Q7). That file is versioned on its own `contract_version` axis, so follow its existing bump rule.
-2. In `goal-diff.schema.json`, add to the `version_bump` description: "valid alone only when the baseline rendered at `new` differs from the baseline in `schema_version` only. A bump that adds required content, as v4 does, is a re-adoption (baseline ceremony)." `derive_ceremony_class` already returns `baseline` for `version_bump`; this records the rule (Fable F5). Mirror the sentence in `goal-file-schema-reconciliation-2026-08-15.md` §9.4.
+2. In `goal-diff.schema.json`, add to the `version_bump` description: "valid alone only when the baseline rendered at `new` differs from the baseline in `schema_version` only. A bump that adds required content, as v4 does, is a re-adoption (baseline ceremony)." `derive_ceremony_class` already returns `baseline` for `version_bump`; this records the rule (Fable F5). Mirror the sentence in `goal-file-schema-reconciliation-2026-08-15.md`, in its §11 paragraph that says "A migration diff is `version_bump` alone". The inputs said "§9.4", but that document has no §9.4.
 3. Counts that are stated as measured facts must be corrected:
    - `bin/projector.py` (N-5 digest coverage): from "three of four" device-trust bodies to "three of five". Neither `trust-policy` nor `supervisor` carries a digest.
    - `bin/schema_lint.py`: the comments that say "four trust bodies".
@@ -138,7 +138,7 @@ Enumerate the files from disk; never use the counts below as a substitute for en
    - The "claims version N" notes in the README and the lint.
 7. **Policy strings.** The refusal message at `policy/tendcf_services.cf:318` says "unit writer nixos". It becomes "supervisor nixos". The same change lands in the comment at `:165-169`, in `tests/policy/run.sh` (the check-7 grep and its comments) and in `nixos-passthrough-plan.md` §1 and §2. This lands in S0 (§6), not S1.
 
-## 4. Negative cases (93–102)
+## 4. Negative cases (93–107)
 
 The series is shared across both fixture directories. `broken/` ends at 73 and
 `broken-projection/` ends at 92, so new cases start at 93. Each row names its finding
@@ -164,6 +164,17 @@ bare prose.
 | 100 | `100-nixos-writer-retired` | supervisor `launchd`; a unit-writer with `writer: nixos` | schema `enum` |
 | 101 | `101-flavour-not-supervisor` | supervisor `systemd`; a present service with a `launchd` unit | schema `if/then` (R3) |
 | 102 | `102-supervisor-hunk-ordinary` | overlays `goal-file-baseline.json` (supervisor `systemd`), `goal-diff.json` (a `device-trust/supervisor/host` hunk `systemd → launchd`, recomputed hashes) and both approval records; the accept record asserts `ordinary` and the reject mirror asserts `privileged`, as case 52 does | `family (ceremony)` |
+| 103 | `103-launchd-supervisor-systemd-unit` | supervisor `launchd`; a present service with a `systemd` unit | schema `if/then` (R3) |
+| 104 | `104-runit-supervisor-launchd-unit` | supervisor `runit`; a present service with a `launchd` unit | schema `if/then` (R3) |
+| 105 | `105-nixos-interlock-elsewhere` | nixos base; domain `apps` with an interlock entry | schema `if/then` |
+| 106 | `106-nixos-supervision-empty-comprehensive` | nixos base; `supervision` `comprehensive` with no entries | schema `if/then` |
+| 107 | `107-launchd-writers-nixos-writer` | Site Model `launchd-writers.yml` with `writer: nixos` | schema `enum` |
+
+Cases 103–107 were added in S1 because the discrimination run (F8) found that, without
+them, removing any one of five rules left the corpus green: the launchd member, the runit
+member, the per-kind interlock ban, the coverage const on its own, and the launchd-writers
+enum. `supervision`'s `entries: false` deliberately has no case of its own: it is
+redundant with `state_domain`'s rule, which case 16 guards (F1).
 
 Positive checks:
 1. The happy corpus, the canary files and the passthrough fixture are valid.
@@ -265,6 +276,7 @@ The systemd renderer itself stays step 6 proper.
 6. **The Q6 consent channel is not cryptographic.** It is a PR review, and it is not an approval record.
 7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
 8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
+9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1.
 
 ## 8. Where the inputs were wrong
 
