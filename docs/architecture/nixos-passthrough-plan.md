@@ -30,7 +30,8 @@ Rule to implement first (**done 2026-10-31**, `tendcf_systemd_units_writable` in
 container into this layout and proves the refusal): the systemd adapter is supported only where
 `/etc/systemd/system` is a real writable directory (not a symlink into a store),
 and a present `systemd` entry elsewhere is refused by name, with a message that
-says the host's unit writer is `nixos`. Negative test: the same fixture on a
+says the host's supervisor is `nixos`. A tombstone there is reported
+(`tombstone not actuated`) and never actuated (D3; check 7b). Negative test: the same fixture on a
 host where `/etc/systemd/system` is a read-only symlink (a CI container can
 bind-mount one) must run no `systemctl` and write nothing.
 

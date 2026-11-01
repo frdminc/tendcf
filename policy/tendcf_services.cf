@@ -165,7 +165,7 @@ bundle agent tendcf_services
       # The adapter writes /etc/systemd/system. On NixOS that path is a
       # symlink into the read-only store (/etc/static/systemd/system): a
       # unit exists there only if the Nix configuration declares it, and
-      # the host's unit writer is `nixos`, never cfengine
+      # the host's supervisor is `nixos`, never cfengine
       # (linux-targets.md section 5, nixos-passthrough-plan.md section 2).
       # Refuse by policy rather than half-fail on the write: a real,
       # non-symlink directory is required.
@@ -198,6 +198,12 @@ bundle agent tendcf_services
 
       "service_$(service_canon[$(service_ids)])_refused"
         expression => "service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_supported";
+
+      # A tombstone has no unit, so it has no flavour and `_refused` (which
+      # needs `_present`) cannot see it. Where the units are the system
+      # configuration's, a tombstone is reported and never actuated (D3).
+      "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"
+        expression => "tendcf_systemd_units_elsewhere.!service_$(service_canon[$(service_ids)])_present";
 
       # systemd actuation gate: the entry's own interlock bundle is met.
       "service_$(service_canon[$(service_ids)])_systemd_go"
@@ -315,7 +321,10 @@ bundle agent tendcf_services
         "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 
       "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere"::
-        "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (unit writer nixos), not by cfengine";
+        "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
+
+      "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"::
+        "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
 }
 
 body contain tendcf_interlock_contain(timeout)
