@@ -5,8 +5,10 @@ It supersedes its three inputs, which stay frozen as written:
 [the Opus 5.5 draft](schema-v4-opinion-opus-draft.md), the
 [Fable 5.1 review](schema-v4-opinion-fable.md) and the
 [Gemini 4 Argon review](schema-v4-opinion-argon.md). Argon took the seat that the
-standing rule gives to astra, because astra was short (Codex had 45% left, below the
-60% `codex:frontier` estimate floor). The standing rule is in `AGENTS.md` on PR
+standing rule gives to astra. The lead called astra short by comparing Codex's 45%
+remaining with the 60% `codex:frontier` fallback in the config. That comparison did not
+establish it: the dispatch estimate uses measured history, and an astra review dispatched
+on 2026-11-01 at 41% was admitted. Both reviews are still cross-model. The standing rule is in `AGENTS.md` on PR
 https://github.com/frdminc/tendcf/pull/24 and was reviewed there. Where an input is
 wrong, §8 says so; the inputs are not corrected in place. This document was itself
 reviewed by Fable 5.1 (approve with changes); those changes are applied.
