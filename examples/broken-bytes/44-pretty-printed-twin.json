@@ -21,6 +21,12 @@
             "state": "present"
           }
         },
+        "supervisor": {
+          "host": {
+            "name": "launchd",
+            "state": "present"
+          }
+        },
         "trust-policy": {
           "consent": {
             "local_yes_required": true,
@@ -88,5 +94,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 3
+  "schema_version": 4
 }

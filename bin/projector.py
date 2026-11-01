@@ -71,12 +71,14 @@ Two limits of that checker, stated here rather than discovered later:
 
   - N-5 is enforced as "no container but the two, and nothing spelled like a
     digest in either key or value position". Measured against the corpus's own
-    four device-trust bodies, that catches three: `advisor-key` (digest in the
+    five device-trust bodies, that catches three: `advisor-key` (digest in the
     key), `agent` and `policy-tree` (digest in the value). It does NOT catch
     `trust-policy`, whose body is `{"local_yes_required": true, "state":
     "present", "tier": "consented"}` — no digest anywhere, and nothing in
     those bytes distinguishes it from a legal service body without the schema,
-    which a projection does not carry. Three of four, stated as a number
+    which a projection does not carry — nor `supervisor`, whose body
+    `{"name": "launchd", "state": "present"}` carries no digest either. Three
+    of five, stated as a number
     because the earlier wording said only "trust in a value is not caught" and
     that understated it to one of four (F7).
   - N-9 is enforced by id shape, and shape only catches what no goal file
@@ -169,11 +171,12 @@ SECRETSPEC_NAME = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
 # reached `vars` (N-5).
 TRUST_SHAPED_KEY = re.compile(r"^(ed25519|sha256):")
 
-# F7: key position alone caught ONE of the corpus's four device-trust bodies.
+# F7: key position alone caught ONE of the corpus's then four device-trust bodies
+# (five since schema v4; still one: supervisor's body has no digest).
 # Only `advisor-key` puts its digest in the key; `agent` and `policy-tree`
 # use the key `"sha256"` with the digest in the VALUE, so the agent binary pin
 # projected with zero findings. Values are held to the schema's own digest
-# patterns (goal-file.schema.json:16, :351) rather than to the key rule's bare
+# patterns (goal-file.schema.json host pattern and $defs/sha256) rather than to the key rule's bare
 # prefix: a projection key is a variable name and nothing legitimate is named
 # `sha256:…`, whereas a value is free text where a prefix alone is weak
 # evidence. Restating the full pattern keeps this from being stricter than the

@@ -31,9 +31,10 @@ REPO = HERE.parents[2]
 PAIRS = (
     (HERE / "goal-file.json", HERE / "host_specific.json"),
     (HERE / "goal-file-absent.json", HERE / "host_specific-absent.json"),
-    # The NixOS passthrough host (nixos-passthrough-plan.md section 4): the
-    # unit namespace is nixos's, no service entries, so the projection is
-    # empty and cf-agent has nothing to actuate there.
+    # A FIXTURE, not get's goal file (reconciliation 2026-10-31 Q10): the NixOS
+    # passthrough host (nixos-passthrough-plan.md section 4). Its supervisor is
+    # nixos, so no domain carries a service, interlock or unit-writer entry and
+    # the projection is empty: cf-agent has nothing to actuate there.
     (HERE.parent / "passthrough" / "goal-file.json", HERE.parent / "passthrough" / "host_specific.json"),
 )
 

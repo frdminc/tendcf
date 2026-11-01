@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Sixty-three deliberately broken overlays, plus six byte-class fixtures in
+Seventy-eight deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
-`examples/`. The rest of the Site Model (cases 1-12) or the goal-file
-family (cases 13-73) stays as in the happy path.
+`examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
+family (cases 13-73, 93-106) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -54,7 +54,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 4` | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 5`, one above the current 4 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -235,6 +235,64 @@ admits no `unit-writer` kind; expressing "one prefix, two domains" at all
 needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
+
+## Schema v4 cases (93-107)
+
+The numbering is one series across all three fixture directories: `broken/`
+ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
+(`docs/architecture/schema-v4-reconciliation-2026-10-31.md` §4). They are
+the negatives for `supervisor`, the fifth `device-trust` kind, and for the
+rules that read it.
+
+Cases 93-95, 100, 101, 103 and 104 start from the happy `goal-file.json`.
+Cases 96-99, 105 and 106 start from a valid `nixos` goal file: the happy `device-trust` entries with
+supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
+domain. Each case then introduces exactly one defect, so deleting the rule
+it names turns it green alone (F8). The rule-by-rule deletion table is in the
+body of https://github.com/frdminc/tendcf/pull/27; `bin/flag_coverage.py` covers `check_projection()` only, so it does
+not apply to schema rules.
+
+| # | Case | Broken input | Caught by |
+| --- | --- | --- | --- |
+| 93 | `93-unknown-supervisor` | supervisor `name: openrc` | schema (`enum`) |
+| 94 | `94-missing-supervisor` | `device-trust` entries with no `supervisor` | schema (`required`) |
+| 95 | `95-supervisor-not-singleton-id` | supervisor id `main`, not `host` | schema (`propertyNames`) |
+| 96 | `96-nixos-supervision-comprehensive` | `nixos` host, `supervision` `comprehensive` with one service entry | schema (`if/then`) |
+| 97 | `97-nixos-tombstone-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with a service tombstone | schema (`if/then`) |
+| 98 | `98-nixos-unit-writer-elsewhere` | `nixos` host, domain `packaging` with a unit-writer entry | schema (`if/then`) |
+| 99 | `99-nixos-no-supervision-domain` | `nixos` host with no `supervision` domain | schema (`if/then`) |
+| 100 | `100-nixos-writer-retired` | supervisor `launchd`, a unit-writer with `writer: nixos` | schema (`enum`) |
+| 101 | `101-flavour-not-supervisor` | supervisor `systemd`, a present service with a `launchd` unit | schema (`if/then`) |
+| 102 | `102-supervisor-hunk-ordinary` | a `device-trust/supervisor/host` hunk `systemd` to `launchd`, approved `ordinary` | family (ceremony) |
+| 103 | `103-launchd-supervisor-systemd-unit` | supervisor `launchd`, a present service with a `systemd` unit | schema (`if/then`) |
+| 104 | `104-runit-supervisor-launchd-unit` | supervisor `runit`, a present service with a `launchd` unit | schema (`if/then`) |
+| 105 | `105-nixos-interlock-elsewhere` | `nixos` host, domain `apps` (`not-yet-migrated`) with an interlock entry | schema (`if/then`) |
+| 106 | `106-nixos-supervision-empty-comprehensive` | `nixos` host, `supervision` `comprehensive` with no entries | schema (`if/then`) |
+| 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
+
+Cases 103-107 close the discrimination gaps that deleting each rule on its
+own exposed: 103 and 104 guard the launchd and runit members of the
+unit-flavour rule (101 guards systemd); 105 guards the nixos member's
+per-kind `interlock` ban (97 and 98 guard `service` and `unit-writer`; 105 also
+carries a `goal cross-file` finding, unavoidably: no service may exist on a nixos
+host to use the interlock's bundle, and the declared class is what is asserted); 106
+guards the `supervision` coverage const alone, since case 96 trips the const
+and `entries: false` together and each masks the other there; 107 guards the
+`nixos` removal from `launchd-writers.schema.json`'s enum (case 100 guards the
+goal-file one) and overlays a Site Model YAML file, as cases 1-12 do.
+
+There is deliberately no case for `supervision`'s explicit `entries: false`
+under the `nixos` member. It is redundant with `state_domain`'s own rule
+(a `deliberately-unmanaged` domain cannot carry entries, case 16), by design:
+the nixos member must not depend on how `supervision` is routed (spec F1). Its
+removal alone leaves the corpus green, so it cannot be pinned by a fixture.
+
+Case 102 overlays `goal-file-baseline.json` (supervisor `systemd`),
+`goal-diff.json` (the happy hunks plus the supervisor hunk, hashes
+recomputed) and both approval records. As in case 52, the accept record
+asserts `ordinary` and the reject mirror asserts `privileged`, the class the
+validator derives. The baseline holds no services, so supervisor `systemd`
+there does not trip the unit-flavour rule that case 101 exists for.
 
 ## Every class has a fixture
 
