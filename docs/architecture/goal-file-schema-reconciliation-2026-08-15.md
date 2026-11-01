@@ -949,7 +949,11 @@ equality of a canonical form:
 
 An empty diff is no document (hash equality short-circuits). A migration
 diff is `version_bump` alone — §5.4's "empty apart from the bump" as a
-mechanical predicate. The diff never ships in a release.
+mechanical predicate. `version_bump` is valid alone only when the baseline
+rendered at `new` differs from the baseline in `schema_version` only. A bump
+that adds required content, as v4 does, is a re-adoption (baseline ceremony)
+(`schema-v4-reconciliation-2026-10-31.md` §2.2). The diff never ships in a
+release.
 
 **`approval-record.schema.json`** — the signed object is the **JCS bytes of
 the record with the `signature` member removed** (C-5, replacing E1 §5.1's

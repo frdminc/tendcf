@@ -71,12 +71,14 @@ Two limits of that checker, stated here rather than discovered later:
 
   - N-5 is enforced as "no container but the two, and nothing spelled like a
     digest in either key or value position". Measured against the corpus's own
-    four device-trust bodies, that catches three: `advisor-key` (digest in the
+    five device-trust bodies, that catches three: `advisor-key` (digest in the
     key), `agent` and `policy-tree` (digest in the value). It does NOT catch
     `trust-policy`, whose body is `{"local_yes_required": true, "state":
     "present", "tier": "consented"}` — no digest anywhere, and nothing in
     those bytes distinguishes it from a legal service body without the schema,
-    which a projection does not carry. Three of four, stated as a number
+    which a projection does not carry — nor `supervisor`, whose body
+    `{"name": "launchd", "state": "present"}` carries no digest either. Three
+    of five, stated as a number
     because the earlier wording said only "trust in a value is not caught" and
     that understated it to one of four (F7).
   - N-9 is enforced by id shape, and shape only catches what no goal file
