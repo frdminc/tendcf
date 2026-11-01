@@ -30,7 +30,8 @@ Rule to implement first (**done 2026-10-31**, `tendcf_systemd_units_writable` in
 container into this layout and proves the refusal): the systemd adapter is supported only where
 `/etc/systemd/system` is a real writable directory (not a symlink into a store),
 and a present `systemd` entry elsewhere is refused by name, with a message that
-says the host's unit writer is `nixos`. Negative test: the same fixture on a
+says the host's supervisor is `nixos`. A tombstone there is reported
+(`tombstone not actuated`) and never actuated (D3; check 7b). Negative test: the same fixture on a
 host where `/etc/systemd/system` is a read-only symlink (a CI container can
 bind-mount one) must run no `systemctl` and write nothing.
 
@@ -73,8 +74,10 @@ host until stage C.
    read-only store symlink, `/var/lib/cfengine-tendcf` exists from tmpfiles, `cf-agent` is
    `3.29.0a.b8abf2840`. With `deploy/linux/passthrough/host_specific.json` as CMDB data,
    `cf-promises` accepts the policy and `cf-agent -n -K -I` actuates nothing; with the
-   `systemd-present` fixture it refuses the entry by name with the `nixos` unit-writer
-   message (PR #20's guard), writes nothing, runs no `systemctl`. One finding: CFEngine's OS
+   `systemd-present` fixture it refuses the entry by name with the `nixos` refusal
+   message (PR #20's guard; worded `supervisor nixos` since
+   https://github.com/frdminc/tendcf/pull/26), writes nothing, runs no `systemctl`. One
+   finding: CFEngine's OS
    detection does not know NixOS (`sys.os_name_human` "Unknown" warning; `sys.flavour` is
    `nixos_26`, so classes work): filed as [djbclark/core#56](https://github.com/djbclark/core/issues/56). get keeps the package and the work
    directory; nothing is scheduled there. Original text: `nixos-rebuild test` (activates

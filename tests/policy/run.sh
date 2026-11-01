@@ -192,6 +192,8 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         main_pid() { systemctl show -p MainPID --value "$unit"; }
 
         sysd_run systemd-present.json "$work/sysd1.out"
+        check "no refusal reported on a normal systemd host" \
+            bash -c "! grep -q \"'$unit' refused\" '$work/sysd1.out'"
         check "unit rendered" \
             grep -q 'ExecStart="/usr/bin/sleep" "3600"' "$unit_path"
         check "Restart and WantedBy rendered from the entry" \
@@ -220,6 +222,8 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "enabled:false removed the boot link" bash -c "! systemctl is-enabled --quiet $unit"
 
         sysd_run systemd-absent.json "$work/sysd4.out"
+        check "tombstone_elsewhere report absent on a normal systemd host" \
+            bash -c "! grep -q 'tombstone not actuated' '$work/sysd4.out'"
         check "tombstone removed the unit file" bash -c "[ ! -e '$unit_path' ]"
         check "tombstone stopped the unit" bash -c "! systemctl is-active --quiet $unit"
         check "tombstone reloaded the manager (unit not found)" \
@@ -238,11 +242,20 @@ else
         grep -q "tendcf: service '$unit' refused: unit flavour 'systemd' is not implemented on this host" "$out"
     check "nothing rendered under /etc/systemd/system" bash -c "[ ! -e '$unit_path' ]"
     check "no systemctl invocation" no_systemctl "$out"
+
+    # A tombstone on a host that is not booted by systemd (Darwin, a
+    # container) is not the NixOS layout: no report, nothing run.
+    cp "$repo/tests/policy/fixtures/systemd-absent.json" "$work/data/host_specific.json"
+    out="$work/sysd-host-tomb.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "tombstone_elsewhere report absent on a host not booted by systemd" \
+        bash -c "! grep -q 'tombstone not actuated' '$out'"
+    check "no systemctl invocation for the tombstone" no_systemctl "$out"
 fi
 
 # 7. NixOS shape: booted by systemd but /etc/systemd/system is a symlink into a
 #    read-only tree (nixos-passthrough-plan.md section 1). The adapter must refuse
-#    by policy, naming the unit writer, and run no systemctl. Reshapes the host,
+#    by policy, naming the supervisor, and run no systemctl. Reshapes the host,
 #    so only on request and as root (the debian-13 container in CI); restored on exit.
 if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
     echo "# 7. NixOS shape: /etc/systemd/system a read-only store symlink"
@@ -264,19 +277,38 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
         cp "$repo/tests/policy/fixtures/systemd-present.json" "$work/data/host_specific.json"
         out="$work/nixos-shape.out"
         "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-        check "systemd entry refused naming the nixos unit writer" \
-            grep -q "tendcf: service '$unit' refused: /etc/systemd/system is not a writable directory on this host .*unit writer nixos" "$out"
+        check "systemd entry refused naming the nixos supervisor" \
+            grep -q "tendcf: service '$unit' refused: /etc/systemd/system is not a writable directory on this host .*supervisor nixos" "$out"
         check "generic flavour refusal not also reported" \
             bash -c "! grep -q \"'$unit' refused: unit flavour\" '$out'"
         check "nothing written into the store-like unit directory" \
             bash -c "[ -z \"\$(ls -A '$shape/static/systemd/system')\" ]"
         check "no systemctl invocation" no_systemctl "$out"
+
+        # 7b. A tombstone has no unit and no flavour, so the refusal above
+        #     cannot see it: it must be reported and never actuated (D3). A unit
+        #     file stands in the store-like tree first, as if the Nix configuration
+        #     declared it, so a teardown that wrongly ran would have something to
+        #     remove (root ignores the a-w bits; the symlink is what the policy reads).
+        echo "# 7b. NixOS shape: tombstone reported, not actuated"
+        printf '[Unit]\nDescription=declared by the system configuration\n' \
+            >"$shape/static/systemd/system/$unit"
+        cp "$repo/tests/policy/fixtures/systemd-absent.json" "$work/data/host_specific.json"
+        out="$work/nixos-tombstone.out"
+        "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+        check "tombstone reported as not actuated, naming the nixos supervisor" \
+            grep -q "tendcf: service '$unit' tombstone not actuated: /etc/systemd/system is not a writable directory on this host .*supervisor nixos" "$out"
+        check "tombstone is not reported as a refusal" \
+            bash -c "! grep -q \"'$unit' refused\" '$out'"
+        check "the configuration's unit file is left in place (tombstone)" \
+            bash -c "[ -f '$shape/static/systemd/system/$unit' ]"
+        check "no systemctl invocation (tombstone)" no_systemctl "$out"
         unshape; trap - EXIT
     fi
 fi
 
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied flavour host sysd-host sysd1 sysd2 sysd3 sysd4 sysd5 nixos-shape; do
+    for f in refused satisfied flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 nixos-shape nixos-tombstone; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
