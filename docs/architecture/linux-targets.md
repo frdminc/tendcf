@@ -11,7 +11,7 @@
 | T2 | CI, Debian | `debian:13` container job | x86_64 | builds the Debian package, matches T3 |
 | T3 | pastebin.xvm.mit.edu | Debian 13 (trixie), kernel 6.12, systemd | x86_64 | first live Linux host: dry-run, then one stateless service enforced |
 | T4 | vps-primary | NixOS 26.05, kernel 6.18, systemd | x86_64 | **not in the first milestone** (operator); the first passthrough host (§5) |
-| T5 | get.sipb.cloud | NixOS today (Hyades libkrun microVM) | x86_64 only | revived later as a stripped-down podman image |
+| T5 | get.sipb.cloud | NixOS 26.11 (Hyades libkrun microVM, image `forgejo.mit.edu/djbclark/get`) | x86_64 only | the first NixOS host (step 8 stage C, 2026-10-31): carries the fork as a module, `cf-execd` off; disposable, so it goes before vps-primary |
 | T6 | podman images | NixOS, Debian 13, Ubuntu 24.04 | x86_64 | on Hyades, as needed |
 | T7 | Apple `container` | NixOS, aarch64 | aarch64 | optional local iteration only; prefer CI over Mac resources |
 
