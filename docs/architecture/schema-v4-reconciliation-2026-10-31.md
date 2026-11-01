@@ -204,7 +204,7 @@ Discrimination (F8): delete each new schema rule on its own. Its case must go re
 
 A lock diff alone shows nothing when the host's own `.nix` files change.
 
-**S3 rulings** (recorded verbatim in §1; R-S3-1 to R-S3-4):
+**S3 rulings** (recorded in §1; R-S3-1 to R-S3-4; R-S3-4 is summarized here):
 - R-S3-1 (operator, 2026-10-31): "Only changes that touch tendcf go through a PR with the required consent job; other pushes stay direct. A direct push touching tendcf paths fails a push-time check (red, visible) but is not blocked."
 - R-S3-2 (operator, 2026-10-31): "The effect block builds base and head toplevels in the consent job on the runner."
 - R-S3-3 (operator, 2026-11-01, branch protection): "site-djbclark gets no GitHub protection (three bot workflows push to master with the workflow token, and a personal repository cannot let the Actions bot bypass a required check); the consent job is required there by convention and the push check is the red backstop; get (Forgejo, no bot pushes to main) gets branch protection with the consent check required, admins exempt, require up to date, dismiss stale approvals."
@@ -223,14 +223,14 @@ nix eval --json .#nixosConfigurations.get.config.services.cfengine-tendcf --appl
 **Effect.** `nix store diff-closures base head`, which stage B already produces.
 
 **Hard checks.** Each one fails the job:
-1. In the evaluated host config, nothing runs `cf-execd` or `cf-agent`. That means no `cfengine-tendcf-execd` unit, and no match for `cf-(execd|agent)` in any of these:
+1. In the evaluated host config, reject a `cfengine-tendcf-execd` unit, or a textual match for `cf-(execd|agent)` in any of the following scanned surfaces. Passing this check is not proof that neither executable can run.
    - system or user units (services, timers and raw unit text), with their `ExecStart*`, `script` and pre/post fields;
    - the unit text shipped by `systemd.packages` (on site-djbclark; on get only the package names are checked, and that limit is documented there);
    - `services.cron.systemCronJobs`;
    - `system.activationScripts`, `boot.postBootCommands` and `systemd.tmpfiles.rules`;
    - `environment.etc` entries whose target is under `systemd/`.
 
-   This checks the effect, not the knob. The scope above was widened after the post-merge audit (site-djbclark PR 245, get PR 2). By R-S3-4 it is a tripwire against accidents. A deliberately disguised path is outside it: an executable whose body calls `cf-agent`, a source-backed `environment.etc` file, or generated configuration a launcher reads. A change classified as not touching tendcf also gets no consent artifact, only the hard checks.
+   This checks selected evaluated configuration text, not only the enable options. The scope above was widened after the post-merge audit (site-djbclark PR 245, get PR 2). By R-S3-4 it is a tripwire against accidents. A deliberately disguised path is outside it: an executable whose body calls `cf-agent`, a source-backed `environment.etc` file, or generated configuration a launcher reads. A change classified as not touching tendcf also gets no consent artifact, only the hard checks.
 2. The **declared** option set under `options.services.cfengine-tendcf` equals `{enable, package, execd.enable}`:
    `nix eval --json .#nixosConfigurations.get.options.services.cfengine-tendcf --apply 'o: { top = builtins.attrNames o; execd = builtins.attrNames o.execd; }'`
    must print `{"execd":["enable"],"top":["enable","execd","package"]}`. A module that grows an option fails until the summary covers it. The draft's version of this check could never fire, because `--apply` projects exactly three keys (Fable F7).
@@ -303,7 +303,11 @@ The systemd renderer itself stays step 6 proper.
 7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
 8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
 9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked, exclusively for a record claim (the claimed record carries the finding and no other does), against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added cases 108 (out of) and 109 (into) red, each direction alone.
-10. **The hard checks do not cover a deliberately disguised path to `cf-agent`** (R-S3-4). Examples are wrapper executables, source-backed files and string-built names. This is the ruled boundary, found by the astra review of site-djbclark PR 245 and get PR 2 (finding B3), and it is not a defect to fix.
+10. **Deliberately disguised paths to `cf-agent` or `cf-execd` are outside the hard checks' threat model** (R-S3-4). Finding B3 of astra's review of site-djbclark PR 245 and get PR 2 identified paths the textual scan can miss: file-backed and indirect execution, wrappers, source-backed files and string-built names.
+    - Those mechanisms can also occur in an honest change; using one does not by itself make the change deliberate disguise.
+    - R-S3-4 removes deliberate evasion from the required protection. It does not establish that every accidental activation is detected.
+    - A change classified as not touching tendcf gets no AUTHORITY or EFFECT artifact.
+    - Protection against deliberate evasion is not a defect to fix under this ruling.
 
 ## 8. Where the inputs were wrong
 
