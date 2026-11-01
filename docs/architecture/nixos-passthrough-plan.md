@@ -117,7 +117,7 @@ goal file. It projects to `{"vars":{}}`.
 
 1. Bundle guard from §2 plus negative test (this repo, small PR, CI on the VM
    and Debian jobs).
-2. Step 4 slice B's `nixos` and `nix-darwin` writer vocabulary (`schema_version` 3, done)
+2. Step 4 slice B's `nixos` and `nix-darwin` writer vocabulary (`schema_version` 3, done; the `nixos` value was retired in v4, replaced by `supervisor: nixos`)
    and the `supervisor` fact (`schema_version` 4, slice S1 of the reconciliation; distro
    family stays deferred).
 3. Stages A to D in the host flake.
@@ -131,7 +131,7 @@ goal file. It projects to `{"vars":{}}`.
    port 14719, `wheel`; no real function, fully backed up, so disposable),
    then vps-primary. `get.xvm.mit.edu` does not exist; the host is
    `get.sipb.cloud`.
-3. The writer vocabulary landed as `schema_version: 3` (this PR); inventory
+3. The writer vocabulary landed as `schema_version: 3`; inventory
    fields stay deferred.
 4. Stage D (2026-10-31): consent diff = authority plus summary; `supervisor: nixos`
    with `schema_version: 4`; enforce nothing on a Nix host. The follow-on rulings

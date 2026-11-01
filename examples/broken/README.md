@@ -1,12 +1,12 @@
 # Negative fixtures
 
-Eighty deliberately broken overlays, plus six byte-class fixtures in
+Eighty-three deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (cases 13-73, 93-106, 108, 109) stays as in the happy path.
+family (the goal-file cases of 13-73, 93-106, 108-112) stays as in the happy path.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -126,11 +126,20 @@ that *some* record mismatched, which is true whatever the derivation returns,
 and the corpus stayed green (`schema-v4-reconciliation` §7.9, now resolved). The `family (ceremony)`
 finding carries the name of the record it was raised on as its evidence.
 
-A case whose class is `family (...)` and that overlays no `goal-file.json` must
+A case whose class is `family (...)` and that overlays no `goal-file.json`, or
+that overlays the whole family (`goal-file.json`, `goal-file-baseline.json`,
+`goal-diff.json` and both approval records, as case 109 does), must
 also fire no *other* `family (...)` class: an undeclared second finding there is
 a stale fixture (52 and 53 carried a stale `baseline_sha256` that way until the
-ceremony PR). Cases that overlay `goal-file.json` are exempt, since the happy
-diff and records no longer pair it.
+ceremony PR). Cases that overlay `goal-file.json` without the rest of the
+family are exempt, since the happy diff and records no longer pair it.
+
+A `family (ceremony)` row **must** carry the backticked record tail. Without it
+neither the "supported" nor the exclusivity test would run, and the row would
+pass whichever record fired; the lint reports a row without one as a harness
+finding. The exclusivity half (a ceremony finding on both records fails the
+case) cannot have a corpus case, since such a case is a red lint by design;
+`check_claim_selftest()` feeds it that defect directly.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
@@ -264,7 +273,7 @@ needs a third state domain, which is why the fixture grows a `packaging`
 one. A negative fixture that fails for a reason other than its own is the
 thing this whole section exists to catch, and it caught these.
 
-## Schema v4 cases (93-109)
+## Schema v4 cases (93-112)
 
 The numbering is one series across all three fixture directories: `broken/`
 ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
@@ -272,7 +281,7 @@ ended at 73 and `broken-projection/` at 92, so v4's cases start at 93
 the negatives for `supervisor`, the fifth `device-trust` kind, and for the
 rules that read it.
 
-Cases 93-95, 100, 101, 103 and 104 start from the happy `goal-file.json`.
+Cases 93-95, 100, 101, 103, 104 and 110-112 start from the happy `goal-file.json`.
 Cases 96-99, 105 and 106 start from a valid `nixos` goal file: the happy `device-trust` entries with
 supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
 domain. Each case then introduces exactly one defect, so deleting the rule
@@ -299,6 +308,9 @@ not apply to schema rules.
 | 107 | `107-launchd-writers-nixos-writer` | `launchd-writers.yml` with `writer: nixos` | schema (`enum`) |
 | 108 | `108-coverage-out-of-unmanaged-ordinary` | `supervision` leaving `deliberately-unmanaged` for `comprehensive`, approved `ordinary` | family (ceremony) `approval-record` |
 | 109 | `109-coverage-into-unmanaged-ordinary` | `supervision` entering `deliberately-unmanaged` from `not-yet-migrated`, approved `ordinary` | family (ceremony) `approval-record` |
+| 110 | `110-supervisor-empty` | `supervisor: {}`, no entry at all | schema (`minProperties`) |
+| 111 | `111-supervisor-entry-no-name` | the `supervisor` entry `host` carries `state` and no `name` | schema (`required`) |
+| 112 | `112-supervisor-entry-extra-key` | the `supervisor` entry `host` carries a key beside `state` and `name` | schema (`additionalProperties`) |
 
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
@@ -341,6 +353,16 @@ under the `nixos` member. It is redundant with `state_domain`'s own rule
 (a `deliberately-unmanaged` domain cannot carry entries, case 16), by design:
 the nixos member must not depend on how `supervision` is routed (spec F1). Its
 removal alone leaves the corpus green, so it cannot be pinned by a fixture.
+
+Cases 110-112 close the three `supervisor_map` rules that no other case
+touched, found by deleting each alone and watching the lint stay green. All
+three start from the happy `goal-file.json` and change only the `supervisor`
+domain entry. 110 (`supervisor: {}`) guards `minProperties: 1`: without it an
+empty map satisfies the schema, breaks the required singleton, and slips past
+every `nixos` and flavour `if`, which all key on `supervisor.host.name`. 111
+(`host` has `state` and no `name`) guards the entry's `required`, and 112
+(`host` has a third key) its `additionalProperties: false`. The `state` const
+is not given a case: the happy corpus already pins it.
 
 Case 102 overlays `goal-file-baseline.json` (supervisor `systemd`),
 `goal-diff.json` (the happy hunks plus the supervisor hunk, hashes

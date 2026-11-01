@@ -33,7 +33,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the eighty deliberately broken fixtures in examples/broken/
+  6. each of the eighty-three deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -84,7 +84,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 80
+EXPECTED_BROKEN = 83
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 27
 
@@ -132,6 +132,10 @@ APPROVAL_RECORDS = ("approval-record.json", "approval-record-reject.json")
 # the baseline does not would mean the device already approved something
 # the lint would refuse today.
 GOAL_FILES = ("goal-file.json", "goal-file-baseline.json")
+
+# The whole goal-file family: proposed file, baseline, diff and both approval
+# records. A case overlaying all of them pairs them itself.
+FAMILY_FILES = frozenset((*GOAL_FILES, "goal-diff.json", *APPROVAL_RECORDS))
 
 # Defs the goal-file schema must never $ref: each carries a default, an
 # optional field, or required prose that would reintroduce a second
@@ -524,17 +528,22 @@ def check_declared_class(
     # A case that overlays no goal-file.json leaves the family's hashes and
     # applied result to its own fixtures, so a second `family (...)` finding
     # is a stale fixture, not noise by construction (52 and 53 carried a stale
-    # baseline_sha256 for exactly that reason). Cases that overlay
-    # goal-file.json are exempt: the happy diff and records no longer pair it.
-    if want.startswith("family (") and "goal-file.json" not in overlays:
+    # baseline_sha256 for exactly that reason). A case that overlays
+    # goal-file.json but not the rest of the family is exempt: the happy diff
+    # and records no longer pair it. A case that overlays the whole family
+    # (FAMILY_FILES) supplies both sides of every pairing itself, so it is
+    # held to the same rule as one that overlays none (case 109).
+    if want.startswith("family (") and (
+        "goal-file.json" not in overlays or FAMILY_FILES <= overlays
+    ):
         extra = sorted(
             {f.rule for f in found if f.rule.startswith("family (")} - {want}
         )
         if extra:
             fail(
                 f"{label}: declares {want!r} but {extra} fired too, and the case "
-                "overlays no goal-file.json — an undeclared second family "
-                "finding is a stale fixture",
+                "overlays no goal-file.json or the whole family — an "
+                "undeclared second family finding is a stale fixture",
                 rule=RULE_HARNESS,
             )
             return False
@@ -582,6 +591,18 @@ def check_declared_claim(
     were on the path by construction.
     """
     want = claims.get(case)
+    if want_rule == RULE_FAMILY_CEREMONY and not want:
+        # Required for this class, not optional decoration. A ceremony finding
+        # is raised on one of two records, and with no claim neither the
+        # "supported" test nor the exclusivity test below runs, so the row
+        # would pass whichever record fired (or both).
+        fail(
+            f"{label}: a `family (ceremony)` row must name, in a backticked "
+            "tail, the record that carries the finding "
+            "(`approval-record` or `approval-record-reject`)",
+            rule=RULE_HARNESS,
+        )
+        return False
     if not want:
         return True
     evidence: set[str] = set()
@@ -618,6 +639,43 @@ def check_declared_claim(
         )
         return False
     return True
+
+
+def check_claim_selftest() -> None:
+    """Pin check_declared_claim's own guards, which no corpus case can.
+
+    A corpus case that went red on a guard would be a red lint, so a guard
+    that fires only on a defect the corpus cannot contain is pinned here by
+    feeding it the defect: a `family (ceremony)` row with no claim (F1), and
+    a ceremony finding raised on both records, which the exclusivity test
+    must refuse even though the claim is supported (F4). The control row
+    keeps the test from passing because the function always says no.
+    """
+    case = "selftest"
+    both = [
+        Finding(RULE_FAMILY_CEREMONY, "a", frozenset({"approval-record"})),
+        Finding(RULE_FAMILY_CEREMONY, "b", frozenset({"approval-record-reject"})),
+    ]
+    one = [both[0]]
+    saved = dict(claims)
+    try:
+        for label, claim, found, expect in (
+            ("control: one record, claimed", {"approval-record"}, one, True),
+            ("ceremony row with no claim", set(), one, False),
+            ("ceremony finding on both records", {"approval-record"}, both, False),
+        ):
+            claims[case] = frozenset(claim)
+            with capture_findings(silent=True) as inner:
+                got = check_declared_claim(label, case, RULE_FAMILY_CEREMONY, found)
+            if got != expect or bool(inner) == expect:
+                fail(
+                    f"claim self-test {label!r}: check_declared_claim returned "
+                    f"{got}, expected {expect}",
+                    rule=RULE_HARNESS,
+                )
+    finally:
+        claims.clear()
+        claims.update(saved)
 
 
 def check_class_coverage(declared: dict[str, str]) -> None:
@@ -1988,6 +2046,7 @@ def main() -> int:
         if not findings:
             check_trust_inexpressible(loaded, schemas, registry)
             declared = read_declared_classes()
+            check_claim_selftest()
             caught = check_negative_fixtures(loaded, schemas, registry, declared)
             byte_caught = check_byte_class_fixtures(declared)
             projector = load_projector()
