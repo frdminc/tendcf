@@ -9,7 +9,7 @@ wrong, §8 says so; the inputs are not corrected in place. Q9 is the open item
 [schema v4](schema-v4-reconciliation-2026-10-31.md) left in its §1 and §7.
 
 **What was run for this document (2026-11-02), and what was not:**
-1. **One read-only pastebin probe** (§2.4). Its `dpkg-query` half answered for 2 units only, so most package attributions are **inferred from Debian's published index, not read from pastebin's database**.
+1. **Two read-only reads of pastebin** (§2.4): a probe for the unit list and states, and the lead's ownership query over the unit directories. Package attributions are **read from pastebin's database**, except two rows that stay index-based and say so.
 2. **An assembled v5 schema, in memory, outside the repository.** It applied §2.1 to the real schemas and used the real `schema_evidence` from `bin/schema_lint.py`. The goal-family cross-file rules of §2.2 were prototyped beside it. Every schema regex, class token and overlap row below comes from that run unless marked. Case 145 was not run.
 3. **The live v4 lint and a real `cf-agent`,** for the hazard in §2.2(4).
 4. **Not run:** no detector or classifier exists, and nothing in §3 has run on a systemd host. The `systemctl show` and `dpkg-query` behaviour §3 depends on is listed in §3.5 for slice S1 to prove.
@@ -28,7 +28,7 @@ All three goal-family schemas (`goal-file`, `goal-diff`, `approval-record`) chan
 `schema_version` from `"const": 4` to `"const": 5`. v5 carries Q9 alone. Distro family, `scope` and
 externally-written units stay deferred ([linux-targets](linux-targets.md) row 4; v4 Q5).
 
-**Terms used from here on.** An *artifact* is a file the manager reads for a unit: a fragment, a drop-in, a link (alias or mask), or a generated unit's source. *Owned* means the dpkg database names at least one package for that path. A *vendor fragment* is an owned fragment for that unit name in any load-path directory, including one a local file hides. *Local* means not owned. A package-shipped mask or drop-in is therefore **not** local, wherever it sits (Fable F1).
+**Terms used from here on.** An *artifact* is a file the manager reads for a unit: a fragment, a drop-in, a link (alias or mask), or a generated unit's source. *Owned* means the dpkg database names at least one package for that path. A *vendor fragment* is an owned fragment for that unit name in any load-path directory, including one a local file hides. A generated unit whose source is owned counts as having one, because R2 judges it via that source. *Local* means not owned. A package-shipped mask or drop-in is therefore **not** local, wherever it sits (Fable F1).
 
 ### 2.1 `goal-file.schema.json`
 
@@ -131,7 +131,7 @@ externally-written units stay deferred ([linux-targets](linux-targets.md) row 4;
 3. **Package ids are unique across domains,** as a new rule on the model of case 65 (astra A8). It is not covered by the unit-writer rule.
 4. **Tombstone rule, needed today** (Fable F3, astra A3). Every `state: absent` service in `supervision`, in any coverage that admits entries, must be covered by a same-domain `unit-writer` key with `writer: cfengine`.
    - `supervision` is the one projecting domain (`bin/projector.py`, `PROJECTING_DOMAIN`). The adapter's teardown checks neither coverage nor writer (`policy/tendcf_services.cf:240-245`, `:275-278`).
-   - **Run against the live v4 lint:** the canary goal file plus `"sshd.service": {"state": "absent"}` raises no schema error and no cross-file finding, under `comprehensive` and under `not-yet-migrated`. `sshd.service` exists on pastebin as an alias (§2.4). If its link is in `/etc/systemd/system`, as Fable says and pastebin's probe does not show, teardown would run `systemctl disable --now` on it.
+   - **Run against the live v4 lint:** the canary goal file plus `"sshd.service": {"state": "absent"}` raises no schema error and no cross-file finding, under `comprehensive` and under `not-yet-migrated`. On pastebin `/etc/systemd/system/sshd.service` is an unowned link (measured, §2.4), so `fileexists` is true there. By the policy as read (`:313`, not run on a host), teardown would run `systemctl disable --now` on it and then delete the link.
    - **Run against a real `cf-agent`** (3.29.0a Mac dev build): `fileexists` is true for a plain file, a symlink, a symlink to `/dev/null` and a dangling symlink, while `isplain` is true only for the plain file. The book names `fileexists` (ch. 27) and not `isplain`, and covers 3.12 only, so this is from running.
    - This rule does not make removal safe by itself. See §7 item 3.
 5. **`tendcf-install` names one unit.** A `unit-writer` entry with that writer must have the key `tendcf-execd.service`. Otherwise the value is a second `third-party`.
@@ -157,20 +157,29 @@ externally-written units stay deferred ([linux-targets](linux-targets.md) row 4;
 
 ### 2.4 Pastebin's v5 `supervision` domain, from real data
 
-The one authorized probe, run 2026-11-02:
+Two read-only reads of the host, both 2026-11-02.
+
+**The unit list, with a first ownership attempt:**
 
 ```
 ssh root@pastebin.xvm.mit.edu 'systemctl list-unit-files --no-legend --no-pager; dpkg-query -S /lib/systemd/system/*.service 2>/dev/null | head -200'
 ```
 
-**What came back.** 332 unit-file rows, and **two** ownership lines:
+332 unit-file rows, and two ownership lines:
 
 ```
 tailscale: /lib/systemd/system/tailscale-wait-online.service
 tailscale: /lib/systemd/system/tailscaled.service
 ```
 
-Every other vendor service got no answer. That is what literal path lookup predicts when the database records the `/usr/lib` spelling. `dpkg-query -S` performs a "literal path lookup" for a path with no wildcard (man page), and the remote shell had already expanded the glob. The suppressed stderr hides the misses, so that reading is not proven by this probe. It is why §3.3 queries both spellings: **one host's database holds both.**
+**Measured ownership, run by the lead:** `pastebin-ownership.tsv`, 384 rows of path, owning binary package or `-`, and file or link, over `/usr/lib/systemd/system/*`, `/etc/systemd/system/*` and `/etc/systemd/system/*.d/*`. The lead also reports that `/lib` is a symlink to `usr/lib`. The data file sits in the run's state directory, outside this repository, and does not record the query text. This document uses its rows as given.
+
+| Directory | Owned | Unowned |
+|---|---|---|
+| `/usr/lib/systemd/system` | 308 (286 file, 22 link) | 6 (5 file, 1 link) |
+| `/etc/systemd/system` | 0 | 70 (68 file, 2 link) |
+
+"File" includes the `*.d` and `*.wants` directories. **Nothing under `/etc/systemd/system` is owned.** The rows hold 39 distinct owner strings, which are 36 packages once the three multi-owner strings are split. All three multi-owner rows are `.wants` directories: no unit file has two owners, and no owner carries an architecture qualifier. Of those 36, `systemd-cryptsetup` owns only targets and `.wants` directories here, so it is not declared; `tailscale` is the 36th below instead.
 
 | Unit type | Rows | R2 |
 |---|---|---|
@@ -182,20 +191,31 @@ Every other vendor service got no answer. That is what literal path lookup predi
 
 Among the 230 judged names, states are static 128, enabled 48, disabled 33, alias 10, masked 6, generated 2, enabled-runtime 2, indirect 1. All 5 `transient` rows are `session-*.scope`, so none reaches the detector anyway.
 
-**Attribution method.** Only tailscale is measured. For the rest, `dists/trixie/main/Contents-{all,amd64}.gz` from `deb.debian.org` maps each name to the Debian packages that ship it under `usr/lib/systemd/system/`, or under `etc/init.d/` for a generated unit. **This says what Debian ships under that name, not what is installed or who wrote pastebin's file,** and it covers `main` only. Every line below is a candidate for S1 to confirm.
+**All 230 names are accounted for, and no name has a row in both directories:**
 
-**All 230 names are accounted for:** 204 package tier, 22 name claims, 1 `tendcf-install`, 1 under the `cfengine` prefix, 2 enable-created aliases. The sketch below (37 packages, 24 name claims) validates against the assembled v5 schema and raises no cross-file finding (run).
+| Names | Treatment | Evidence |
+|---|---|---|
+| 201 | package tier | owned at the `/usr/lib` spelling |
+| 2 | package tier, `tailscale` | owned at the `/lib` spelling only (below) |
+| 2 | package tier, `exim4-base` and `zephyr-clients` | **not measured** (below) |
+| 21 | exact `third-party` | 20 unowned regular files in `/etc`; `screen-cleanup.service`, an unowned link in `/usr/lib` |
+| 1 | `tendcf-install` | unowned file in `/etc` |
+| 1 | `cfengine` prefix | unowned file in `/etc` |
+| 2 | enable-created aliases, no claim (§3.2(6)) | unowned links in `/etc`: `sshd.service`, `dbus-org.freedesktop.timesync1.service` |
+
+A further 11 of those names need an exact claim because of a local drop-in (item 5 below). The sketch (38 packages; 34 `unit-writer` keys, 32 of them `third-party`) validates against the assembled v5 schema and raises no cross-file finding (run).
 
 **`unit-package`, each `{"state": "present", "writer": "dpkg"}`:**
 
 | Package (judged names) | Evidence |
 |---|---|
-| `tailscale` (2) | **measured** |
-| `systemd` (128), `udev` (8), `sysstat` (7), `e2fsprogs` (5), `apt` (4), `atop` (4), `openssh-server` (4), `apt-listchanges` (2), `certbot` (2), `console-setup-linux` (2), `dpkg` (2), `logrotate` (2), `lynis` (2), `man-db` (2), `plocate` (2), `systemd-timesyncd` (2), `util-linux` (2), `apparmor` (1), `cron` (1), `dbus` (1), `dbus-system-bus-common` (1), `fail2ban` (1), `grub-common` (1), `libpam-modules-bin` (1), `nftables` (1), `nginx-common` (1), `nullmailer` (1), `openafs-client` (1), `rsync` (1), `systemd-zram-generator` (1), `tinyproxy` (1), `unattended-upgrades` (1) | index, single owner |
-| `ifupdown` (4) | index; `ifup@` and `networking` have alternatives (`ifupdown2`, `ifupdown-ng-compat`), but `ifupdown-pre` and `ifupdown-wait-online` are `ifupdown` alone |
-| `sudo` (1) | index; `sudo-ldap` ships the same name, a guess between the two |
-| `exim4-base` (1) | index, via `etc/init.d/exim4`. `exim4.service` is `generated`, yet the index has `exim4-daemon-*` shipping that fragment, so those daemons look absent, and `nullmailer` is enabled. **A leftover conffile of a removed package is one reading; unproven** (§3.5) |
-| `zephyr-clients` (1) | index, via `etc/init.d/zhm`; `zhm.service` is `generated` |
+| `systemd` (128), `udev` (8), `sysstat` (7), `e2fsprogs` (5), `apt` (4), `atop` (4), `ifupdown` (4), `openssh-server` (4), `apt-listchanges` (2), `certbot` (2), `console-setup-linux` (2), `dpkg` (2), `logrotate` (2), `lynis` (2), `man-db` (2), `plocate` (2), `systemd-timesyncd` (2), `util-linux` (2), `apparmor` (1), `cron` (1), `dbus` (1), `dbus-system-bus-common` (1), `et` (1), `fail2ban` (1), `grub-common` (1), `libpam-modules-bin` (1), `nftables` (1), `nginx-common` (1), `nullmailer` (1), `openafs-client` (1), `rsync` (1), `sudo` (1), `systemd-zram-generator` (1), `tinyproxy` (1), `unattended-upgrades` (1) | measured at `/usr/lib` |
+| `tailscale` (2) | measured at `/lib` |
+| `exim4-base` (1), `zephyr-clients` (1) | **Debian's trixie `main` `Contents` index only,** via `etc/init.d/exim4` and `etc/init.d/zhm`. A candidate for S1 |
+
+**`tailscale` is dpkg-owned under a different path, not installed outside dpkg.** The lead's query has `-` for `/usr/lib/systemd/system/tailscaled.service` and `tailscale-wait-online.service`; the first read has `tailscale` for both under `/lib`. With `/lib` a symlink these are the same files, so the database records this package under `/lib` and the other packages' units under `/usr/lib`: **one host's database holds both spellings.** `dpkg-query -S` performs a "literal path lookup" for a path with no wildcard (man page), which is why each query missed the other's set. The package is absent from Debian `main`, so it comes from elsewhere, most likely Tailscale's own apt repository; the apt source was not read. A query of the `/usr/lib` spelling alone would call `tailscaled.service`, which is enabled, unowned, hence §3.3. `tailscale-online.target` is also `-`; it is outside the four types, and its `/lib` answer was not read.
+
+**The two generated units.** `exim4.service` and `zhm.service` are `generated` in the probe and have no row in either directory, so no fragment lies in the directories queried. Their sources presumably lie in `/etc/init.d`, which the query did not cover. With no `exim4` fragment in `/usr/lib`, the index's `exim4-daemon-*` packages look absent, and `nullmailer` is enabled. **A leftover conffile of a removed package is one reading; unproven** (§3.5).
 
 **`unit-writer`:**
 
@@ -204,26 +224,39 @@ Among the 230 judged names, states are static 128, enabled 48, disabled 33, alia
 "tendcf.canary.*":      {"state": "present", "writer": "cfengine"}
 ```
 
-plus 22 exact `third-party` candidates, the names Debian's `main` index does not ship:
+plus exact `third-party` claims for the 21 local names:
 
 ```
 athena-src-update.service  athena-src-update.timer  athena-tgt-renew.service  athena-tgt-renew.timer
-et.service  failure-mail@.service  oauth2-proxy.service  wastebin.service
+failure-mail@.service  oauth2-proxy.service  wastebin.service
 pb-resource-check.service  pb-resource-check.timer  pb-wastebin-dump.service  pb-wastebin-dump.timer
 pbstats-sample.service  pbstats-sample.timer  pbstats-weekly.service  pbstats-weekly.timer
 tinyproxy-searxng.service  tinyproxy-vpsrelay.service  screen-cleanup.service
 determinate-nixd.socket  nix-daemon.service  nix-daemon.socket
 ```
 
-Each of those is a package claim instead if `dpkg` owns it, as it does tailscale, which is also absent from `main`. `nix-daemon.*` is in the index (`nix-setup-systemd`), but `determinate-nixd.socket` beside it suggests an installer wrote them; that is a guess.
+and for the 11 names with a local drop-in and no local fragment:
+
+```
+apt-daily-upgrade.service  apt-daily.service  certbot.service  fail2ban.service  logrotate.service
+nftables.service  nginx.service  openafs-client.service  ssh.service  systemd-tmpfiles-clean.timer
+zhm.service
+```
 
 **What the real data changes:**
-1. **The draft's falsifier does not fire.** 204 of 230 names fall in the package tier by index, so C4 is not noise-dominated by units outside it.
-2. **"Small" means 37 packages against 230 names,** not a handful (Fable F10c).
-3. **Fable's alias rule needs ownership first.** 8 of the 10 `alias` rows are in the index as shipped links (`autovt@`, `kmod`, `procps`, `udev`, and the `hostname1`, `locale1`, `login1` and `timedate1` D-Bus names). For seven of them the usual target is `static` in the same probe (not `autovt@`, whose usual target `getty@` is enabled; the link targets were not read on the host). `systemctl` defines `static` as having no provision for enabling in `[Install]`, so an `Alias=` test would call those seven extra. Only `sshd.service` and `dbus-org.freedesktop.timesync1.service` are not in the index, so those two look enable-created (§3.2).
-4. **"Mask" needs ownership first too.** 5 of the 6 masked names are in the index as shipped (`cryptdisks`, `cryptdisks-early`, `hwclock` and `x11-common` under `systemd`; `sudo`). They are package-tier files, not R2's local masks. `screen-cleanup.service` is the exception: not in the index, so it needs a name claim. `dpkg-query -S` "will not list extra files created by maintainer scripts" (man page), which is one way to get there.
+1. **The draft's falsifier does not fire.** 203 of 230 names are measured in the package tier, so C4 is not noise-dominated by units outside it.
+2. **"Small" means 38 packages against 230 names,** not a handful (Fable F10c).
+3. **Fable's alias rule needs ownership first.** 8 of the 10 `alias` rows are owned links in `/usr/lib`: `autovt@`, `kmod`, `procps` and the `hostname1`, `locale1`, `login1` and `timedate1` D-Bus names under `systemd`, and `udev` under `udev`. For seven of them the usual target is `static` in the same probe (not `autovt@`, whose usual target `getty@` is enabled; the link targets were not read on the host). `systemctl` defines `static` as having no provision for enabling in `[Install]`, so an `Alias=` test would call those seven extra. The other two are the unowned `/etc` links in the table above.
+4. **"Mask" needs ownership first too, and location does not decide it.** 5 of the 6 masked names are owned links in `/usr/lib` (`cryptdisks`, `cryptdisks-early`, `hwclock` and `x11-common` under `systemd`; `sudo` under `sudo`). They are package-tier files, not R2's local masks. `screen-cleanup.service` is an unowned link in that same directory, so it needs a name claim. `dpkg-query -S` "will not list extra files created by maintainer scripts" (man page), which is one way to get there. No mask is in `/etc`.
+5. **R2's drop-in rule has real load.** `/etc` holds 16 unowned drop-ins on 15 units: `onfailure-mail.conf` on 14, plus `nftables.service.d/ts.conf` and `systemd-tmpfiles-clean.timer.d/override.conf`. Four of the units are already name-claimed. The other 11 report `two-writers` unless they get the exact claims above, ten on owned fragments and `zhm.service` on a generated unit (§2).
+6. **No local copy of a vendor fragment** appears between these two directories, and `/etc` has no type-wide drop-in directory.
 
-**Not visible in this probe:** drop-ins, the location of any file, shadowed vendor fragments, and the real owner of anything but tailscale. A local drop-in on any vendor unit adds a name claim. A local copy of a vendor fragment cannot be made clean at all (§3.4).
+**Not measured:**
+1. `/etc/init.d`, and so the two generated units' sources and owners.
+2. The targets of the two `/etc` alias links and the `[Install] Alias=` lines §3.2(6) tests.
+3. The contents of the 8 owned `*.d` directories in `/usr/lib` (for example `user@.service.d`) and of the 15 `*.wants` directories in `/etc`.
+4. Other load-path directories, such as `/usr/local/lib/systemd/system` and `/run/systemd/system`.
+5. Who wrote any unowned file. "Unowned" says only that the database names no package.
 
 ## 3. Detector contract
 
@@ -258,7 +291,7 @@ No detector exists; this is what one must do. It reads and reports, and it never
 
 ### 3.3 Ownership decides the tier
 
-For each artifact, ask the database about the path under both the `/usr/lib` and `/lib` spellings (§2.4), and take the union (Fable F1).
+**Canonicalise through the merge, then ask under both spellings** (§2.4; Fable F1). `/lib` is a symlink to `usr/lib` on a merged host, so one file has two spellings, and `dpkg-query -S` looks up the literal path. Resolve the artifact's directory through that symlink, so that a path reported as `/lib/...` and one reported as `/usr/lib/...` are one artifact. Never resolve the last component: that would lose the alias or mask identity §3.2(2) keeps. For a canonical path under `/usr/lib`, query both `/usr/lib/...` and `/lib/...`, and take the union. **Canonicalising to `/usr/lib` alone is not enough:** pastebin's database records most units there and tailscale's under `/lib`, so that query calls `tailscaled.service` unowned. A miss under one spelling with a hit under the other is the package tier. Where `/lib` is not that symlink, the spellings are different files, and only the literal path is asked.
 
 | Answer | Treatment |
 |---|---|
@@ -295,9 +328,9 @@ None of this has been run. The draft's F.3 and the reviews rest on recall here t
 1. `systemctl show` on a bare template name (the draft recalls a refusal) and on non-loaded units.
 2. `FragmentPath` on a masked unit: the link path or `/dev/null`.
 3. `SourcePath` on a sysv-generated unit. The D-Bus API documents the property; its value on `exim4.service` and `zhm.service` is unread.
-4. `dpkg-query -S` for a conffile whose package is removed but not purged (pastebin's `exim4` candidate). The contract's reading is that the database's answer stands whatever the package's status, so a declared `exim4-base` makes the unit clean. Change that here if the prototype shows otherwise.
+4. `dpkg-query -S` for a conffile whose package is removed but not purged (pastebin's `exim4` candidate, one of the two attributions still index-based in §2.4). The contract's reading is that the database's answer stands whatever the package's status, so a declared `exim4-base` makes the unit clean. Change that here if the prototype shows otherwise.
 5. `dpkg-query -S` output for multiple owners, architecture qualifiers and diversions, and its exit status with no match.
-6. Whether a type-wide drop-in such as `/etc/systemd/system/service.d/` appears in every unit's `DropInPaths`. If it does, each covered unit is `two-writers`, which is correct and loud.
+6. Whether a type-wide drop-in such as `/etc/systemd/system/service.d/` appears in every unit's `DropInPaths`. If it does, each covered unit is `two-writers`, which is correct and loud. Pastebin's `/etc` has none (§2.4), so this needs a fixture.
 
 ## 4. Migration (one PR, S2)
 
@@ -379,7 +412,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | S1 | tendcf | Read-only classifier prototype of §3 (`linux-targets.md` row 4 calls for a bump from a prototype): §3.5, and the fixtures below | spec merged |
 | S2 | tendcf | §2, §4, §5 in one PR; a bump cannot be split | S0, S1's results read |
 | S3 | nix2cf | §4(11) | S2 merged |
-| S4 | tendcf | The real pastebin declaration, as an ordinary diff on a real owner list | S2; a second probe (§7 item 13) |
+| S4 | tendcf | The real pastebin declaration from §2.4, as an ordinary diff, re-read at that time because the list moves with `apt` | S2; S1's reading of the two index-based rows (§7 item 13) |
 | S5 | tendcf | The detector proper | §7 item 13 ruled |
 
 **S1 fixtures,** on a ubuntu VM (`TENDCF_TEST_SYSTEMD=1`). Each states its result independently (astra A2, A5). Rows naming a vendor unit assume its package is declared unless they say otherwise:
@@ -394,6 +427,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | Shipped alias `kmod.service`; shipped mask `hwclock.service`; package declared | `clean` |
 | `evil.service -> ssh.service` | `extra` |
 | Local drop-in on `ssh.service`: no claim / exact `third-party` | `two-writers` / `clean` |
+| Local drop-in on a generated unit from an owned source (pastebin's `zhm.service` shape): no claim / exact `third-party` | `two-writers` / `clean` |
 | Persistent mask and runtime mask on `ssh.service`: no claim / exact `third-party` / cfengine claim | `two-writers` / `clean` / `two-writers` |
 | Package-shipped drop-in under `/etc`, declared | `clean` |
 | `getty@tty1.service.d/x.conf`: no claim / exact `getty@.service` `third-party` | `two-writers` / `clean` |
@@ -404,7 +438,8 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | Generated unit from an owned source: declared / undeclared | `clean` / `extra` |
 | Generated unit with empty `SourcePath` | `incomplete` |
 | `systemd-run` transient | not judged |
-| Successful lookup, no owner; multiple owners; architecture-qualified output; merged-`/usr` spelling; vendor symlink to a target outside the tree | as §3.3 and §3.2(5) |
+| Owner recorded under `/lib` only, for a file reported under `/usr/lib` (pastebin's `tailscale` shape) | package tier |
+| Successful lookup, no owner; multiple owners; architecture-qualified output; vendor symlink to a target outside the tree | as §3.3 and §3.2(5) |
 | A diversion on the path | `incomplete` |
 | `dpkg-query` removed from `PATH`; no `/run/systemd/system` | `incomplete`, no counts |
 | `supervision` not comprehensive | `not-run` |
@@ -419,19 +454,19 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 3. **`state: absent` cannot be honoured for a name with a vendor fragment** (A3; R2). Removing `/etc/systemd/system/ssh.service` reveals the vendor unit, and disabled is not absent. The device reports `two-writers` and the §2.2(4) rule does not catch it, since a cfengine claim satisfies it. Withdrawal versus absence belongs to the deferred externally-written-unit feature.
 4. **Ownership misses accidental edits** (A5; R3b). A hand-edited package-owned file still counts as owned. R3b chose no hash verification; `dpkg --verify` is the path if that changes. This limits "accidents only" too: not every accident is detected. A deliberate forgery of the database is out of scope.
 5. **Comprehensive means four types on systemd** (A9; R2). On pastebin 102 of 332 rows are not judged. Target dependency edges can activate services and mount operations can run helpers, so excluded types are not harmless, only undescribed.
-6. **Activation links are not classified** (A2; Fable F2). A hand-made `.wants/` link starts a unit without any artifact the detector judges.
+6. **Activation links are not classified** (A2; Fable F2). A hand-made `.wants/` link starts a unit without any artifact the detector judges. Pastebin's `/etc` has 15 `*.wants` directories whose contents were not read.
 7. **Report-only** (B6). No part of v5 prevents a competing write. The adapter cannot enforce these claims, since they do not project.
 
 **Other residue:**
 
 8. **Signed meaning depends on an unsigned local database** (Fable). Two devices with one goal file can cover different unit sets, and any `apt install` on a general-purpose host moves `extra_entries`. Report-only and a fixed-role host make that payable.
 9. **Names outside the grammar.** systemd permits names the key regex does not, such as `\` escapes in a non-template name. A unit with such a name is permanently `extra`. None of pastebin's 230 is affected.
-10. **A hand-made alias has no clean spelling** (§3.2(6)), and a local copy of a vendor fragment has none under any claim (§3.4). Both surface on a host that has them; pastebin's count is unknown.
+10. **A hand-made alias has no clean spelling** (§3.2(6)), and a local copy of a vendor fragment has none under any claim (§3.4). Both surface on a host that has them. On pastebin the second count is zero between `/etc` and `/usr/lib`. The first turns on two links whose targets and `Alias=` lines were not read (§2.4).
 11. **Other scopes.** User managers, and any systemd host without dpkg, which can only ever be `incomplete`. rpm would widen the `unit-package` writer enum in a counted bump. Ubuntu snap units need exact claims, unverified.
 12. **The Site Model has no systemd writer registry** (draft C.5). `launchd-writers` is launchd-only and `services.schema.json` has no writer data, so nix2cf has no source for these claims. A step 6 question under Q8.
 13. **For the operator:**
     - Where the detector lives, and whether §2.3(2) is the row shape (Fable Q-B). The rulings do not cover this. §2.3(2) is the lead's proposal, because R3d needs some shape and `extra_entries` cannot express it.
-    - A second read-only pastebin probe before S4, to replace §2.4's inferences: `dpkg-query -S` over both spellings of the unit directories, and `/etc/systemd/system` for local files and drop-ins. The brief allowed one command, so it was not run.
+    - A further read-only pastebin read before S4, for what §2.4 lists as not measured: `/etc/init.d` ownership for `exim4` and `zhm`, the two alias links, and the other load-path directories. Not run; a further action on a live host needs the operator's go (§6).
     - The canary's `comprehensive` is false today (draft A.2) and stays so until a detector exists. A retreat ceremony on pastebin buys nothing checkable now, so C5 is deferred, not a stopgap (Fable F11).
 
 ## 8. Where the inputs were wrong, and how each finding was resolved
@@ -444,7 +479,7 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 5. **Draft's `maxLength: 128` narrowed v4 keys** (astra A6), and its `anyOf` was needless (Fable F7).
 6. **Draft sketch used `third-party` for `tendcf-execd.service`.** R3a.
 7. **Draft D.3 numbering is superseded.** Draft 113-116 keep their numbers; 117 to 118; 118 to 120; 119 to 121; 120 to 122; 121 to 124; 122 to 128; 123 to 129; 124-126 to 132-134; 127-130 to 135-138; 131 to 142; 132 to 145.
-8. **Fable F2's alias rule, taken alone, would flag shipped links.** It names `dbus-org.freedesktop.login1.service` as postinst-created; Debian's index ships it in `usr/lib/systemd/system`. §3.2(6) puts ownership first. `syslog.service`, its other example, is not on pastebin at all.
+8. **Fable F2's alias rule, taken alone, would flag shipped links.** It names `dbus-org.freedesktop.login1.service` as postinst-created; on pastebin that is a `systemd`-owned link in `/usr/lib/systemd/system` (measured). §3.2(6) puts ownership first. `syslog.service`, its other example, is not on pastebin at all.
 9. **astra A5 made zero owners unverifiable.** With Fable F1's partition, a successful empty answer is the name tier. Only a failed lookup is unverifiable. Both stay never-clean.
 10. **astra A3 and A4 asked for same-domain authorization at the device.** R3c rules otherwise; lint stays same-domain.
 
@@ -481,4 +516,4 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 | Fable Q-A | R3c |
 | Fable Q-B | **Open.** §7 item 13 |
 | Draft C.5 items 1-9 | 1: §7 item 2. 2: §7 item 3. 3: §7 item 4. 4: fixed by F5. 5: §7 item 11. 6: §3.3, §3.5. 7: §7 item 11. 8: §2.2(6). 9: §7 item 12 |
-| Draft F.3 unverified list | pastebin list, package-name pattern, regexes and lint: done here. Ownership, resolution, generated units, snap: §3.5, §7 item 13, §7 item 11 |
+| Draft F.3 unverified list | pastebin list, pastebin ownership in the unit directories, package-name pattern, regexes and lint: done here. Resolution, generated units, snap: §3.5, §7 item 13, §7 item 11 |
