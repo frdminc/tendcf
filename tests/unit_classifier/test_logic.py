@@ -420,16 +420,20 @@ class VerdictTable(unittest.TestCase):
         under a prefix, or under a claim on another unit."""
         def build():
             s = FakeSystem()
-            s._put("/run/systemd/generator.late/g.service", ("file",))
-            s.unit("g.service", frag="/run/systemd/generator.late/g.service", ufs="generated", source="")
+            s._put("/run/systemd/generator.late/gen.service", ("file",))
+            s.unit("gen.service", frag="/run/systemd/generator.late/gen.service", ufs="generated", source="")
             return s
-        out = uc.classify(build(), claims(writers={"g.service": "third-party"}))
+        out = uc.classify(build(), claims(writers={"gen.service": "third-party"}))
         self.assertEqual(out["summary"]["extra_scan"], "complete")
         self.assertEqual((out["units"][0]["verdict"], out["summary"]["extra_entries"], out["summary"]["two_writers"]),
                          ("clean", 0, 0))
+        # The prefix must genuinely cover the unit, or this row would only repeat
+        # "another unit's claim". The schema allows only a cfengine prefix on systemd;
+        # a non-cfengine prefix is a defence-in-depth input the classifier still refuses.
+        self.assertTrue(uc.covers("gen.*", "gen.service"))
         for label, cl in (("no claim", claims()),
-                          ("cfengine claim", claims(writers={"g.service": "cfengine"})),
-                          ("prefix claim", claims(writers={"g-*": "third-party"})),
+                          ("cfengine claim", claims(writers={"gen.service": "cfengine"})),
+                          ("covering non-cfengine prefix claim", claims(writers={"gen.*": "third-party"})),
                           ("another unit's claim", claims(writers={"other.service": "third-party"}))):
             out = uc.classify(build(), cl)
             self.assertEqual(out["summary"]["extra_scan"], "incomplete", label)

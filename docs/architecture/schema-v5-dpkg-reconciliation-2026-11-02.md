@@ -11,7 +11,7 @@ wrong, §8 says so; the inputs are not corrected in place. Q9 is the open item
 
 **What was run for this document (2026-11-02), and what was not:**
 1. **Two read-only reads of pastebin** (§2.4): a probe for the unit list and states, and the lead's ownership query over the unit directories. Package attributions are **read from pastebin's database**, except two rows that stay index-based and say so.
-2. **An assembled v5 schema, in memory, outside the repository.** It applied §2.1 to the real schemas and used the real `schema_evidence` from `bin/schema_lint.py`. The goal-family cross-file rules of §2.2 were prototyped beside it. Every schema regex, class token and overlap row below comes from that run unless marked. The spec-review changes (`overlap`, §2.2(5), cases 126, 127, 129-131 and the report-row cases) were re-run the same way, with cases 129-131 also against the v4 schema on disk. Case 145 was not run.
+2. **An assembled v5 schema, in memory, outside the repository.** It applied §2.1 to the real schemas and used the real `schema_evidence` from `bin/schema_lint.py`. The goal-family cross-file rules of §2.2 were prototyped beside it. Every schema regex, class token and overlap row below comes from that run unless marked. The spec-review changes (`overlap`, §2.2(5), cases 126, 127, 129-131 and the report-row cases) were re-run the same way, with cases 129-131 also against the v4 schema on disk. Case 145 was not run during the original spec prototype; it was run in S2 (§9 item 6).
 3. **The live v4 lint and a real `cf-agent`,** for the hazard in §2.2(4).
 4. **Not run when this document was written:** no detector or classifier existed, and nothing in §3 had run on a systemd host. Slice S1 has since run §3.5 and the §6 fixtures on three ubuntu systemd hosts: §3.6 records the results, and slice S2 folded every place where the contract changed into §3 (the K list in §3.6 is the record; K5 and K13, generator output, were settled by the operator's R9, §1, and folded in the same slice). Nothing has run on Debian 13 or on pastebin, bar R8's read-only probe of pastebin (§3.6).
 
@@ -527,7 +527,7 @@ The series is shared across fixture directories. `broken/` ends at 112 and `brok
 | 142 | `142-unit-package-twice` | one package in two domains | goal cross-file |
 | 143 | `143-incomplete-with-count` | `report-rows.yml`: `extra_scan: incomplete` with `extra_entries: 0` (R3d) | schema (`if/else`) |
 | 144 | `144-complete-without-count` | `report-rows.yml`: `extra_scan: complete` without `extra_entries` | schema (`if/then`) |
-| 145 | `broken-projection/145-unit-package-under-vars.json` | `vars/unit_package`. Not run; it exercises the existing closed-container rule, not a new one (astra A8) | projection |
+| 145 | `broken-projection/145-unit-package-under-vars.json` | `vars/unit_package`. Run in S2 (§9 item 6); it exercises the existing closed-container rule, not a new one (astra A8) | projection |
 | 146 | `146-row-no-extra-scan` | `report-rows.yml`: a `not-run` row without `extra_scan` (astra's spec review, A4; Fable's optional case) | schema (`required`) |
 | 147 | `147-row-bad-extra-scan` | `extra_scan: partial`, no counters | schema (`enum`) |
 | 148 | `148-complete-no-two-writers` | `extra_scan: complete` without `two_writers` | schema (`if/then`) |
@@ -571,7 +571,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 1. **systemd.** `isplain` guards direct teardown of a symlink path. It does not establish who rendered a regular file, prevent vendor shadowing, or guarantee that `systemctl disable` removes no other activation links. The `tests/policy/run.sh` check covers regular-file teardown and refusal on alias, mask and dangling-link paths.
 2. **launchd.** `isplain` is systemd-only by design, because a plist is a plain file whoever wrote it. S0's PR states that launchd relies on the lint rule alone (§2.2(4)).
 3. **Witnesses, all at v4.** 129 and 131 use the canary goal file; 130 uses the launchd happy file. Run against the v4 schema on disk: no schema error, and only the new rule fires. Case 64 without its tombstone fires only the present-service rule.
-4. **Interim counts.** `EXPECTED_BROKEN` goes 83 to 86 in S0, and 86 to 124 in S2. "Eighty-three" becomes "eighty-six" (`bin/schema_lint.py:36`, `examples/broken/README.md:3`). The README's goal-file case list (`:8`) gains 129-131 and says 113-128 are reserved until S2.
+4. **Interim counts.** `EXPECTED_BROKEN` goes 83 to 86 in S0, and 86 to 125 in S2 (the 38 cases of §5 that live in `broken/` make 124, plus R5's case 155; §9 item 1). "Eighty-three" becomes "eighty-six" (`bin/schema_lint.py:36`, `examples/broken/README.md:3`). The README's goal-file case list (`:8`) gains 129-131 and says 113-128 are reserved until S2.
 5. **Deployment.** S0 is the one slice that changes live-host behaviour. Per R6 it merges after CI and review and is deployed to pastebin with the installer, and the canary is checked afterwards.
 
 **S1 fixtures,** on a ubuntu VM (`TENDCF_TEST_SYSTEMD=1`). Each states its result independently (astra A2, A5). Rows naming a vendor unit assume its package is declared unless they say otherwise:
@@ -601,7 +601,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | Claim only in a `not-yet-migrated` domain | `clean` (R3c) |
 | Present in `supervision`, tombstone for the same id in another domain | `incomplete`, naming both addresses |
 | Generated unit from an owned source: declared / undeclared | `clean` / `extra` |
-| Generated unit with empty `SourcePath` | `incomplete` |
+| Generated unit with empty `SourcePath` | `incomplete` without an exact non-cfengine claim on the unit; with one, `clean` subject to the remaining artifact checks (R9) |
 | `systemd-run` transient service (`Transient=yes`) | not judged |
 | Owner recorded under `/lib` only, for a file reported under `/usr/lib` (pastebin's `tailscale` shape) | package tier |
 | Successful lookup, no owner; multiple owners; architecture-qualified output; vendor symlink to a target outside the tree | as §3.3 and §3.2(5) |
