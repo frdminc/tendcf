@@ -46,9 +46,19 @@ is a derivation kept in the host flake, not in this repo.
    for nothing. `runit` also covers Linux distributions that use it.
 2. Android may still change the adapter shape later; that costs a
    `schema_version` bump and a baseline ceremony per device. Accepted.
-3. D18 (agent-owned JSONL report rows) needs a Linux writer. Open.
+3. D18's report rows need a Linux writer. Open. There is no tendcf-agent
+   on Linux (`architecture-DEFINITIVE-v3.md` D45: it is Android-only), and
+   who owns the SQLite index here is one of D45's open points (its §12).
 4. Secrets on a headless host: a secretspec provider must be chosen
    before any `Environment=` is rendered.
+5. **`tendcf-validate`** (`architecture-DEFINITIVE-v3.md` D45, operator
+   2026-11-02): the Linux
+   device-side component, a Python command (`bin/projector.py` promoted)
+   that validates the approved goal file and writes `host_specific.json`
+   before cf-agent reads it; no daemon. It is built after schema v5 lands
+   and before any further host is enforced. pastebin's canary is the only
+   enforced host today; its CMDB data is a projection made in this repo
+   and installed by `deploy/linux/tendcf-install.sh install --data`.
 
 ## 5. Nix (ruling 2026-10-29)
 

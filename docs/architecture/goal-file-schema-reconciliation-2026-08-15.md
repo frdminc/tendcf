@@ -75,6 +75,13 @@ and the losing positions are in §§2–9.
    for golden tests, so there is one implementation (§9 — Grok's
    compiler-shipped sibling is rejected as a consent hole).
 
+   *Amended 2026-11-02 (operator; `architecture-DEFINITIVE-v3.md` D45):*
+   tendcf-agent is Android-only. On Linux and macOS the projector runs in
+   `tendcf-validate`, a Python command promoted from `bin/projector.py`,
+   which CI also calls; the Android agent's Kotlin projector is a port
+   held to the same golden bytes. Device-side and after approval still
+   hold everywhere.
+
 Plus one decision the brief did not number because none of the three opinions
 fully owned it: **removal is a state, not an event** (`state: "absent"`
 tombstones), correcting E1's R4 as literally written — including in
@@ -521,6 +528,18 @@ first-class and Grok's cost argument deserves the answer:
    format's semantics under `schema_version` alone (Fable's reason 1 —
    `host_specific.json` acquiring parsing at 3.18 is itself the proof that
    Augments semantics move with the engine).
+
+*Amended 2026-11-02 (operator; `architecture-DEFINITIVE-v3.md` D45).* The
+decision stands — device-side, after approval, nothing Augments-shaped on
+the wire — but its placement changes: tendcf-agent is Android-only and
+written in Kotlin, and on Linux and macOS the projector runs in
+`tendcf-validate`, a Python command promoted from `bin/projector.py`.
+Point 2's "written once in the agent's language, running wherever the
+agent already runs" no longer holds: there are two languages, the Python
+implementation normative and the one CI calls (so on Linux and macOS CI
+tests the device code itself), and the Kotlin port held to the same
+golden bytes, which is residue R22 of
+`projector-reconciliation-2026-08-16.md`. Point 1 is unaffected.
 
 What keeps this from quietly rebuilding Model A's interpreter — the honest
 cost of the decision, carried as residue R21: **the projector must be
@@ -1027,7 +1046,11 @@ in the same change.
   `project(goal-file.json)` must byte-equal the checked-in
   `host_specific.json` golden; a projection with any top-level key other
   than `vars` is a negative (parser leniency as a backdoor — Grok's
-  fixture, adopted).
+  fixture, adopted). *Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md`
+  D45):* "the agent's own projector" is, on Linux and macOS,
+  `tendcf-validate`, to be promoted from `bin/projector.py`, the code this
+  gate already runs; the Android agent's Kotlin port must pass the same
+  goldens.
 - `EXPECTED_BROKEN` bumps as cases land; the §10 negative list plus the
   byte-class and diff-class negatives (baseline-hash mismatch, hunk
   inconsistency, non-empty migration, ordinary-class approval over a

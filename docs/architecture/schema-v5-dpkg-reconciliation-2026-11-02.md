@@ -1,7 +1,7 @@
 # Schema v5: Debian package claims and the unit namespace (Q9, 2026-11-02)
 
 Status: **spec, rulings taken; reviewed by astra and Fable, both "sound with changes", and every
-finding applied (§8). Operator points R4-R8 are settled (§1); only a later tendcf-agent takeover of the detector stays open.** This document is the contract
+finding applied (§8). Operator points R4-R8 are settled (§1); only a later tendcf-agent takeover of the detector stays open, and [`architecture-DEFINITIVE-v3.md`](architecture-DEFINITIVE-v3.md) D45 (2026-11-02, tendcf-agent is Android-only) re-poses it.** This document is the contract
 the v5 slices implement. It changes no schema, lint or fixture. It supersedes its three
 inputs, which stay frozen as written: [the Opus 5.5 draft](schema-v5-opinion-opus-draft.md),
 the [astra review](schema-v5-opinion-astra.md) ("unsound as specified") and the
@@ -273,7 +273,7 @@ zhm.service
 
 ## 3. Detector contract
 
-No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); whether tendcf-agent later takes it over is open, and the contract does not depend on it.
+No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); whether tendcf-agent later takes it over is open (re-posed by `architecture-DEFINITIVE-v3.md` D45, under which there is no tendcf-agent on Linux), and the contract does not depend on it.
 
 ### 3.1 Gate
 
@@ -517,7 +517,7 @@ Then read-only on pastebin, results recorded. This is the one further read-only 
 10. **A hand-made alias has no clean spelling** (§3.2(6)), and a local copy of a vendor fragment has none under any claim (§3.4). Both surface on a host that has them. On pastebin the second count is zero between `/etc` and `/usr/lib`. The first turns on two links whose targets and `Alias=` lines were not read (§2.4).
 11. **Other scopes.** User managers, and any systemd host without dpkg, which can only ever be `incomplete`. rpm would widen the `unit-package` writer enum in a counted bump. Ubuntu snap units need exact claims, unverified.
 12. **The Site Model has no systemd writer registry** (draft C.5). `launchd-writers` is launchd-only and `services.schema.json` has no writer data, so nix2cf has no source for these claims. A step 6 question under Q8.
-13. **For the operator:** settled by R4-R8 (§1). One point is still open: whether tendcf-agent later takes over the detector (R4).
+13. **For the operator:** settled by R4-R8 (§1). One point is still open: whether tendcf-agent later takes over the detector (R4). Re-posed 2026-11-02: `architecture-DEFINITIVE-v3.md` D45 makes tendcf-agent Android-only (Kotlin), and Linux and macOS run CFEngine plus the `tendcf-validate` command with no daemon, so no tendcf-agent exists on Linux to take the detector over. Whether that closes the point or names another component is for the operator (D45's open points, that document's §12).
     - The canary's `comprehensive` is false today (draft A.2) and stays so until a detector exists. A retreat ceremony on pastebin buys nothing checkable now, so C5 is deferred, not a stopgap (Fable F11).
 14. **Orphan drop-in directories.** A `<x>.service.d/` with no unit loaded is invisible to the manager, hence never judged. On pastebin, all 15 `/etc` drop-in directories name a listed unit.
 
@@ -566,7 +566,7 @@ Then read-only on pastebin, results recorded. This is the one further read-only 
 | Fable case against C4 | Recorded. §2.1(5), §7 item 8 |
 | Fable E1-E7 | R1 (E1); R2 (E2, E5, E6); R3a (E3); R3b (E4); E7: v5 carries Q9 alone, §2 |
 | Fable Q-A | R3c |
-| Fable Q-B | Ruled: R4, the policy bundle. Whether tendcf-agent takes it over later is still open. |
+| Fable Q-B | Ruled: R4, the policy bundle. Whether tendcf-agent takes it over later is still open, re-posed by `architecture-DEFINITIVE-v3.md` D45 (§7 item 13). |
 | Draft C.5 items 1-9 | 1: §7 item 2. 2: §7 item 3. 3: §7 item 4. 4: fixed by F5. 5: §7 item 11. 6: §3.3, §3.5. 7: §7 item 11. 8: §2.2(6). 9: §7 item 12 |
 | Draft F.3 unverified list | pastebin list, pastebin ownership in the unit directories, package-name pattern, regexes and lint: done here. Resolution, generated units, snap: §3.5, §7 item 13, §7 item 11 |
 

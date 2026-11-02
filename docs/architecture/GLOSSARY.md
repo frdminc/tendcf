@@ -99,14 +99,28 @@ Authority: `architecture-DEFINITIVE-v3.md` §9;
 
 The **device-side** re-keying of an approved goal file into CFEngine Augments
 form — `$(sys.workdir)/data/host_specific.json`, containing `{"vars": {…}}`
-and no sibling keys. Runs inside `tendcf-agent` after approval.
+and no sibling keys. Runs after approval and before the cf-agent run that
+reads it: in `tendcf-validate` on Linux and macOS, inside `tendcf-agent` on
+Android (`architecture-DEFINITIVE-v3.md` D45).
 
 **The goal file is not the Augments JSON**, and nothing Augments-shaped is
 ever on the wire. This was the brief's hard part 7 and stayed open through
 E1; closed by the reconciliation. Grounds: unknown top-level keys in
 `host_specific.json` are warn-and-skipped by CFEngine 3.27.1, which is
 ignore-unknown semantics in the consent path and disqualifying under E1 §5.6.
-Authority: `goal-file-schema-reconciliation-2026-08-15.md` §9.
+Authority: `goal-file-schema-reconciliation-2026-08-15.md` §9; placement per
+platform, `architecture-DEFINITIVE-v3.md` D45.
+
+### tendcf-validate / tendcf-agent
+
+**`tendcf-validate`** is the device-side component on Linux and macOS: a
+small Python command, `bin/projector.py` promoted (not built yet), that
+validates the approved goal file and writes its projection, then exits.
+Not a daemon.
+**`tendcf-agent`** exists only on Android and is written in Kotlin; its
+projector is a port held to the same golden bytes in CI. Operator ruling
+2026-11-02. Authority: `architecture-DEFINITIVE-v3.md` D45, with its open
+points in §12.
 
 ### coverage
 

@@ -98,12 +98,14 @@ Two other goals sit alongside that:
 
           ▼
   CFEngine +             each device is its own policy hub.
-  tendcf-agent           Supervisors are adapters: systemd, launchd,
-                         runit, Jobber, … from one service record.
+  tendcf-validate        Supervisors are adapters: systemd, launchd,
+  (Linux, macOS), or     runit, Jobber, … from one service record.
+  tendcf-agent (Android) No daemon beside CFEngine off Android.
 
           ▼
   JSONL log (capture)    append-only; the durable record
-  SQLite (index)         tendcf-agent; rebuildable from JSONL
+  SQLite (index)         rebuildable from JSONL; tendcf-agent on
+                         Android, owner open elsewhere
 ```
 
 Git-repo count is not the composition mechanism. Layers are roles.
@@ -305,11 +307,20 @@ Capture and index are different files.
    is lost, not the history. [CFEngine Enterprise](https://docs.cfengine.com)
    already does this locally (`promise_log.jsonl`) before a hub copies it
    into SQL. Community needs the same glue.
-2. **Index:** SQLite inside **tendcf-agent**, for queries, extra-entry
-   counts, “what release am I on.” Rebuildable from JSONL. If the database
-   is corrupt, history still exists.
+2. **Index:** SQLite, for queries, extra-entry counts, “what release am
+   I on.” Rebuildable from JSONL. If the database is corrupt, history
+   still exists. On Android it lives inside **tendcf-agent**.
 
-CFEngine never opens SQLite. The agent tails (or receives) the log.
+CFEngine never opens SQLite. On Android the agent tails (or receives)
+the log.
+
+**Linux and macOS:** there is no tendcf-agent. It is Android-only
+(Kotlin); a Linux or macOS host runs CFEngine plus `tendcf-validate`, a
+small command, not a daemon, that validates the approved goal file and
+writes its projection (§7) before cf-agent reads it. The JSONL capture
+is the record there too; who owns the SQLite index on those platforms is
+still open. Operator ruling, 2026-11-02 (implementer map D45, whose §12
+lists what it leaves open).
 
 Two operational reasons the *device* is the record of truth:
 
@@ -1237,8 +1248,10 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   a suite where one fixture trips three rules cannot tell you the other two
   work.
 - **A reference projector** (`bin/projector.py`) for §7’s projection step,
-  gated in CI against golden bytes so the agent’s eventual second
-  implementation has something to agree with.
+  gated in CI against golden bytes. It is to be promoted to
+  `tendcf-validate`, the command Linux and macOS hosts run, so that CI
+  tests the device code itself; the Android agent’s Kotlin port must agree
+  with the same goldens (implementer map D45).
 - **A first generic bundle** (`policy/tendcf_services.cf`), launchd only —
   the first thing here that CFEngine actually executes (§16.C).
 - **A patch overlay on libntech and cfengine/core** (`overlay/`,
