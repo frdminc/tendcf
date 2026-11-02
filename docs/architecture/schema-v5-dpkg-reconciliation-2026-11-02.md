@@ -1,7 +1,7 @@
 # Schema v5: Debian package claims and the unit namespace (Q9, 2026-11-02)
 
 Status: **spec, rulings taken; reviewed by astra and Fable, both "sound with changes", and every
-finding applied (§8). Operator points stay open in §7 item 13.** This document is the contract
+finding applied (§8). Operator points R4-R8 are settled (§1); only a later tendcf-agent takeover of the detector stays open.** This document is the contract
 the v5 slices implement. It changes no schema, lint or fixture. It supersedes its three
 inputs, which stay frozen as written: [the Opus 5.5 draft](schema-v5-opinion-opus-draft.md),
 the [astra review](schema-v5-opinion-astra.md) ("unsound as specified") and the
@@ -15,13 +15,18 @@ wrong, §8 says so; the inputs are not corrected in place. Q9 is the open item
 3. **The live v4 lint and a real `cf-agent`,** for the hazard in §2.2(4).
 4. **Not run:** no detector or classifier exists, and nothing in §3 has run on a systemd host. The `systemctl show` and `dpkg-query` behaviour §3 depends on is listed in §3.5 for slice S1 to prove.
 
-## 1. Rulings (djbclark, 2026-11-02)
+## 1. Rulings (djbclark, 2026-11-02; R4-R8 the same day, after the spec reviews)
 
 | # | Ruling |
 |---|---|
 | R1 | Package claims (C4), with both reviews' fixes. (Declaring a dpkg package covers the units it ships; a new unit inside a declared package does not surface; a new package does.) |
 | R2 | As Fable proposes: service, socket, timer and path files count; generated units are judged via their source (SourcePath); transient units are out of scope (residue). A local drop-in or mask on a vendor unit is clean only when an exact non-cfengine name claim covers the unit name, otherwise "two-writers"; a cfengine claim on a name whose vendor fragment exists is always "two-writers" (shadowing is the deferred externally-written-unit feature). |
 | R3 | Accept all four: (a) new writer value `tendcf-install` for tendcf's own installed unit (tendcf-execd.service); (b) threat model is accidents only, as R-S3-4: ownership from the dpkg database, no file-hash verification; (c) one unit namespace per host: detection runs across all domains' claims, a unit is extra only if no claim in any domain covers it; (d) a scan that cannot enumerate completely reports "incomplete", never zero extras. |
+| R4 | The detector lives in the CFEngine policy bundle, as a report-only promise set. It writes report rows in the §2.3(2) shape. Whether tendcf-agent should later take it over is a separate discussion, still open. |
+| R5 | Contradictory service states for one unit identity across domains (present in one, absent in another) are rejected in lint, by a cross-domain check with its own negative case. A detector that still sees one reports `incomplete`. |
+| R6 | After CI and review, S0 merges and is deployed to pastebin with the installer, then the canary is checked. |
+| R7 | Confirmed: an exact name claim on a template key covers its instances' drop-ins (`getty@.service` covers `getty@tty1.service.d/`), as §3.4 row 4 reads R2. |
+| R8 | One further read-only probe of pastebin is allowed before S4, for the points §2.4 lists as unmeasured. |
 
 ## 2. Schema deltas
 
@@ -159,7 +164,7 @@ externally-written units stay deferred ([linux-targets](linux-targets.md) row 4;
    "else": {"properties": {"extra_entries": false, "two_writers": false, "unmet_absence": false}}
    ```
 
-   In its top-level `required`, add `extra_scan` and remove `extra_entries`. The row's description says the two new counters are defined for every supervisor's extra scan and are zero where the detector has no such verdict, because a complete launchd row must carry them too. **An incomplete scan cannot carry a zero, because it cannot carry a count.** `report-row` has no version axis, and nothing writes rows yet. This data shape was not put to the operator; see §7 item 13.
+   In its top-level `required`, add `extra_scan` and remove `extra_entries`. The row's description says the two new counters are defined for every supervisor's extra scan and are zero where the detector has no such verdict, because a complete launchd row must carry them too. **An incomplete scan cannot carry a zero, because it cannot carry a count.** `report-row` has no version axis, and nothing writes rows yet. This row shape is adopted by R4.
 3. **`goal-diff.schema.json`:** no shape change. Its hunks do not enumerate kinds (`:68-87`), so `(supervision, unit-package, <pkg>)` is an ordinary address. Ceremony stays `ordinary` (`derive_ceremony_class`). Rendering: an add reads "Debian package X may supply its own units; they stop being reported as extras", and a remove reads "writer declaration dropped; its units are reported as extras; nothing is stopped".
 4. **The projection is unchanged.** `PROJECTING_KINDS` stays `service` and `interlock`, so existing projections stay byte-identical. Report-only classification does not prevent competing writes, and the spec must not be read as saying it does (astra B6).
 
@@ -268,7 +273,7 @@ zhm.service
 
 ## 3. Detector contract
 
-No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. Where it runs is not ruled (§7 item 13); the contract does not depend on it.
+No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); whether tendcf-agent later takes it over is open, and the contract does not depend on it.
 
 ### 3.1 Gate
 
@@ -445,7 +450,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 |---|---|---|---|
 | S0 | tendcf | The live tombstone hazard at v4, on both tombstone paths: §2.2(4)'s rule, cases 129-131, case 64's cleanup; `isplain` instead of `fileexists` at `policy/tendcf_services.cf:241`, with a `tests/policy/run.sh` check. Details below | spec merged |
 | S1 | tendcf | Read-only classifier prototype of §3 (`linux-targets.md` row 4 calls for a bump from a prototype): §3.5, and the fixtures below | spec merged |
-| S2 | tendcf | §2, §4, §5 in one PR; a bump cannot be split | S0; S1's results read and incorporated; operator approval of §2.3(2)'s row shape and a ruling on contradictory service states (§7 item 13) |
+| S2 | tendcf | §2, §4, §5 in one PR; a bump cannot be split | S0; S1's results read and incorporated; R5's cross-domain lint rule implemented (the row shape and the contradiction ruling are settled by R4 and R5) |
 | S3 | nix2cf | §4(11) | S2 merged |
 | S4 | tendcf | The real pastebin declaration from §2.4, as an ordinary diff, re-read at that time because the list moves with `apt` | S2; S1's reading of the two index-based rows (§7 item 13) |
 | S5 | tendcf | The detector proper | §7 item 13 ruled |
@@ -455,7 +460,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 2. **launchd.** `isplain` is systemd-only by design, because a plist is a plain file whoever wrote it. S0's PR states that launchd relies on the lint rule alone (§2.2(4)).
 3. **Witnesses, all at v4.** 129 and 131 use the canary goal file; 130 uses the launchd happy file. Run against the v4 schema on disk: no schema error, and only the new rule fires. Case 64 without its tombstone fires only the present-service rule.
 4. **Interim counts.** `EXPECTED_BROKEN` goes 83 to 86 in S0, and 86 to 124 in S2. "Eighty-three" becomes "eighty-six" (`bin/schema_lint.py:36`, `examples/broken/README.md:3`). The README's goal-file case list (`:8`) gains 129-131 and says 113-128 are reserved until S2.
-5. **Deployment.** S0 is the one slice that changes live-host behaviour. Its PR stops at CI: shipping the policy to pastebin is a root write to `/opt/tendcf` on a live host, for the operator to rule (§7 item 13).
+5. **Deployment.** S0 is the one slice that changes live-host behaviour. Per R6 it merges after CI and review and is deployed to pastebin with the installer, and the canary is checked afterwards.
 
 **S1 fixtures,** on a ubuntu VM (`TENDCF_TEST_SYSTEMD=1`). Each states its result independently (astra A2, A5). Rows naming a vendor unit assume its package is declared unless they say otherwise:
 
@@ -492,7 +497,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | `dpkg-query` removed from `PATH`; no `/run/systemd/system` | `incomplete`, no counts |
 | `supervision` not comprehensive | `not-run` |
 
-Then read-only on pastebin, results recorded. That is a further action on a live host and needs the operator's go.
+Then read-only on pastebin, results recorded. This is the one further read-only probe R8 allows before S4.
 
 ## 7. Residue, recorded rather than fixed
 
@@ -512,12 +517,7 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 10. **A hand-made alias has no clean spelling** (§3.2(6)), and a local copy of a vendor fragment has none under any claim (§3.4). Both surface on a host that has them. On pastebin the second count is zero between `/etc` and `/usr/lib`. The first turns on two links whose targets and `Alias=` lines were not read (§2.4).
 11. **Other scopes.** User managers, and any systemd host without dpkg, which can only ever be `incomplete`. rpm would widen the `unit-package` writer enum in a counted bump. Ubuntu snap units need exact claims, unverified.
 12. **The Site Model has no systemd writer registry** (draft C.5). `launchd-writers` is launchd-only and `services.schema.json` has no writer data, so nix2cf has no source for these claims. A step 6 question under Q8.
-13. **For the operator:**
-    - Where the detector lives, and whether §2.3(2) is the row shape (Fable Q-B). The rulings do not cover this. §2.3(2) is the lead's proposal, because R3d needs some shape and `extra_entries` cannot express it. That shape includes the two new counters on every supervisor's complete row (Fable's spec review, F10).
-    - Contradictory service states for one unit identity across domains (§3.1). Recommended: reject present/absent conflicts in lint, and keep the defensive `incomplete` if one reaches the detector. S2 depends on this.
-    - Whether S0's policy change is deployed to pastebin on merge, a root write to `/opt/tendcf` on a live host, or waits (§6).
-    - One line of confirmation, not a new ruling: §3.4 row 4 reads R2's "exact non-cfengine name claim" as including a template key for its instances, so `getty@.service` covers `getty@tty1.service.d/`.
-    - A further read-only pastebin read before S4, for what §2.4 lists as not measured: `/etc/init.d` ownership for `exim4` and `zhm`, the two alias links, and the other load-path directories. Not run; a further action on a live host needs the operator's go (§6).
+13. **For the operator:** settled by R4-R8 (§1). One point is still open: whether tendcf-agent later takes over the detector (R4).
     - The canary's `comprehensive` is false today (draft A.2) and stays so until a detector exists. A retreat ceremony on pastebin buys nothing checkable now, so C5 is deferred, not a stopgap (Fable F11).
 14. **Orphan drop-in directories.** A `<x>.service.d/` with no unit loaded is invisible to the manager, hence never judged. On pastebin, all 15 `/etc` drop-in directories name a listed unit.
 
@@ -566,7 +566,7 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 | Fable case against C4 | Recorded. §2.1(5), §7 item 8 |
 | Fable E1-E7 | R1 (E1); R2 (E2, E5, E6); R3a (E3); R3b (E4); E7: v5 carries Q9 alone, §2 |
 | Fable Q-A | R3c |
-| Fable Q-B | **Open.** §7 item 13 |
+| Fable Q-B | Ruled: R4, the policy bundle. Whether tendcf-agent takes it over later is still open. |
 | Draft C.5 items 1-9 | 1: §7 item 2. 2: §7 item 3. 3: §7 item 4. 4: fixed by F5. 5: §7 item 11. 6: §3.3, §3.5. 7: §7 item 11. 8: §2.2(6). 9: §7 item 12 |
 | Draft F.3 unverified list | pastebin list, pastebin ownership in the unit directories, package-name pattern, regexes and lint: done here. Resolution, generated units, snap: §3.5, §7 item 13, §7 item 11 |
 
@@ -578,19 +578,19 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 | SF1 §3.2 cannot locate a mask or alias link | Adopted, merged with SA2 into one probe. §3.2(4), §3.5 item 7. **Added here:** the dash-truncated drop-in directories, because otherwise the cross-check calls a legal drop-in a disagreement and the whole scan incomplete. Pastebin's `user-.slice.d` shows the shape |
 | SF9 effective `[Install]`, not the fragment's | Adopted in §3.2(6). Checked against upstream v257 `install.c`, read, not run; §3.5 item 9 |
 | SA2 hidden vendor fragment through a template | Adopted. §2 terms, §3.2(4), §6 fixtures |
-| SA3 contradictory service states across domains | Adopted as a defensive `incomplete`. §3.1, §3.4 row 1, §6 fixture and S2's dependency. **The ruling itself is open:** §7 item 13 |
+| SA3 contradictory service states across domains | Ruled: R5, rejected in lint with a defensive `incomplete` in the detector. §3.1, §3.4 row 1, §6 fixture and S2's dependency |
 | SA4 report-row patch mixes properties and keywords | Adopted. §2.3(2) in three explicit locations; cases 146-154, all run with a deletion mutant. Case 146's base is a `not-run` row: with counters present, the `else` branch would keep it rejected when `required` is deleted |
 | SA5 cases 126-127 cannot discriminate | Adopted. §2.2(5), §5; run |
 | SA6 two residue statements contradict the classifier | Adopted. §7 item 9, §8 item 9 |
 | SA section D: S0 witness, `isplain` claim, S2's dependency | Adopted. §5 case 130, §6 |
 | SF2 transient units not identified | Adopted. §3.2(1), §3.2(3), §3.5 item 8, §6 fixture |
 | SF3 launchd tombstone path | Adopted, with one correction. §2.2(4), §6. SF3 names case 64 as the launchd witness, but §4(4), which SF's own §1 endorses, deletes that tombstone. **Case 130 is the witness instead:** moved to the launchd file with a retained v4 key, which also meets SA section D. Run at v4 and v5 |
-| SF3 S0 deployment | Open. S0 stops at CI (§6); §7 item 13 |
+| SF3 S0 deployment | Ruled: R6, deploy after merge. §6 |
 | SF4 a name claim never covers an owned artifact | Adopted. §3.4 |
 | SF5 dead disjunct in `overlap` | Adopted by deletion. §2.2(1); truth table re-run, both directions, unchanged |
 | SF6 §8 item 9 contradicts §3.4 | Adopted, merged with SA6. §8 item 9 |
 | SF7 §4(1) omits the prefix-writer restriction | Adopted. §4(1) |
 | SF8 S0 lands cases before 113-128 exist | Interim counts stated, without renumbering. §6. The count is 86, not SF8's 85, because case 130 also lands in S0 |
-| SF10 counters on every complete row | Adopted as the description's wording. §2.3(2); part of the open row shape, §7 item 13 |
+| SF10 counters on every complete row | Adopted as the description's wording. §2.3(2); the row shape is adopted by R4 |
 | SF section 5: orphan drop-in directories; a row with no `extra_scan` | Adopted. §7 item 14; case 146 |
-| SF section 6: template key reading of R2 | Confirmation asked. §7 item 13 |
+| SF section 6: template key reading of R2 | Confirmed: R7 |
