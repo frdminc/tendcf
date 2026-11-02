@@ -20,7 +20,8 @@ without starting an agetty.
 Files are written only under /etc/systemd/system, /run/systemd/system and
 /usr/lib/systemd/system, plus /run/systemd/system-generators (a tmpfs directory
 beside them) for the rows that need a generated unit. The private dpkg database
-lives under /var/tmp.
+lives under /var/tmp, and so do the target of the "symlink to a target outside the tree" row and
+the claims files.
 """
 import json
 import os
@@ -215,7 +216,11 @@ class Ownership(Fixture):
         self.assertIn(["tendcf-s1-arch:%s" % self.db.arch], owners)
 
     def test_vendor_symlink_to_target_outside_the_tree(self):
-        tgt = self.sb.write("%s/tendcf-s1-ext/tendcf-s1-ext.service" % R, SVC)
+        # Observed (S1): a link whose target lies in a subdirectory of a lookup directory is `bad`
+        # (not loaded), so the target goes truly outside the tree, in this test's private /var/tmp dir.
+        tgt = os.path.join(self.tmp, "tendcf-s1-ext.service")
+        with open(tgt, "w") as f:
+            f.write(SVC)
         link = self.sb.symlink(U + "/tendcf-s1-ext.service", tgt)
         self.db.add_package("tendcf-s1-ext", [link])
         self.reload()
