@@ -403,6 +403,11 @@ trust-config file, no second format, and nothing for the projector — or
 anything else — to write. §11 of this document called this "the next open
 question"; §7 had already closed it, under a different heading.**
 
+*Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md` D45):* "the agent
+already stores" holds on Android; on Linux and macOS the keeper of the
+stored baseline is D45 open item 3 (its §12). P-8 is unchanged:
+`device-trust` is read from the approved goal file wherever it is kept.
+
 ### 12.1 What R21's third arrow actually names
 
 §11 of this document read `trust entries → the agent's own config` as naming

@@ -1862,7 +1862,8 @@ claim as new is narrower — applying that rule to a concrete
 configuration-management architecture for a heterogeneous fleet. The rest is
 composition:
 a data spine in layered repos, a pure compiler into CFEngine's own data
-layer, per-device JSONL capture with an agent-owned SQLite index, a signed
+layer, per-device JSONL capture with a rebuildable SQLite index
+(agent-owned on Android, owner open elsewhere), a signed
 plan the executor may not exceed, per-device trust, peer actions, and a
 BYO advisor slot, with four of its load-bearing ideas taken from Bcfg2 and
 credited above. We do not claim

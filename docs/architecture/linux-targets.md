@@ -52,7 +52,7 @@ is a derivation kept in the host flake, not in this repo.
 4. Secrets on a headless host: a secretspec provider must be chosen
    before any `Environment=` is rendered.
 5. **`tendcf-validate`** (`architecture-DEFINITIVE-v3.md` D45, operator
-   2026-11-02): the Linux
+   ruling 2026-11-02; the name is the amending session's): the Linux
    device-side component, a Python command (`bin/projector.py` promoted)
    that validates the approved goal file and writes `host_specific.json`
    before cf-agent reads it; no daemon. It is built after schema v5 lands

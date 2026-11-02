@@ -119,7 +119,9 @@ validates the approved goal file and writes its projection, then exits.
 Not a daemon.
 **`tendcf-agent`** exists only on Android and is written in Kotlin; its
 projector is a port held to the same golden bytes in CI. Operator ruling
-2026-11-02. Authority: `architecture-DEFINITIVE-v3.md` D45, with its open
+2026-11-02; the name `tendcf-validate` was chosen by the amending session
+and may change without reopening the ruling. Authority:
+`architecture-DEFINITIVE-v3.md` D45, with its open
 points in §12.
 
 ### coverage
