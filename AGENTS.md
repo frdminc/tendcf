@@ -185,6 +185,10 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
   host and need root: `TENDCF_TEST_SYSTEMD=1` (check 6, the real-systemd
   lifecycle; the ubuntu VM jobs) and `TENDCF_TEST_NIXOS_SHAPE=1` (check 7,
   `/etc/systemd/system` as a read-only store symlink; the `debian:13` job).
+- An ad-hoc `cf-agent` run needs `tests/policy/run.sh`'s scratch workdir
+  (`CFENGINE_TEST_OVERRIDE_WORKDIR`, `ppkeys` from `cf-key`, `bin/` links to
+  `cf-*`). Without it, an unprivileged agent uses `~/.cfagent`, cannot
+  pre-validate, and runs the built-in failsafe (2026-11-02).
 - `tests/deploy/linux-install.sh` (root, ubuntu VMs) proves the root-owned
   install, root `cf-execd` and the canary end to end;
   `tests/deploy/bare-host-libs.sh` (root, `debian:13`) proves the install on a

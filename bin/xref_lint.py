@@ -138,6 +138,14 @@ FROZEN: tuple[tuple[str, str], ...] = (
         "where each was wrong; correcting them in place would destroy that "
         "evidence.",
     ),
+    (
+        "docs/architecture/schema-v5-opinion-*.md",
+        "frozen inputs to schema-v5-dpkg-reconciliation-2026-11-02.md: the "
+        "Opus draft and the two independent frontier reviews (astra, Fable), "
+        "each one model's unedited final message. The reconciliation's §8 "
+        "records how each finding was resolved and where each input was "
+        "wrong; correcting them in place would destroy that evidence.",
+    ),
 )
 
 # `§5.x` is a literal placeholder ("references of the form E1 §5.x"), not a
