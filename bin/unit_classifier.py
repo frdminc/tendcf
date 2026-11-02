@@ -660,7 +660,7 @@ class Scan:
             dirs.add(template_of(u.id) + ".d")
         wanted = set(alias_names_from_cat(out, dirs))
         for a in links:
-            a.authorized = os.path.basename(a.path) in wanted
+            a.authorized = True  # MUTANT
 
     # ---- driver
     def run(self):
