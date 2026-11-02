@@ -121,6 +121,13 @@ class Fixture(unittest.TestCase):
                 name, ("SourcePath=%s\n" % src) if src else "")
         self.sb.write("%s/tendcf-s1-%s-%s" % (GEN, tag, self.id().rsplit(".", 1)[-1][-24:].replace("_", "-")), body, mode=0o755)
 
+    def generate_dropin(self, unit, fname="bindings.conf", tag="gendrop"):
+        """A drop-in written by a generator of our own, under the generator output
+        directory (the shape of pastebin's systemd-zram-setup@zram0.service.d/bindings.conf)."""
+        body = ("#!/bin/sh\nmkdir -p \"$1/%s.d\"\ncat > \"$1/%s.d/%s\" <<'EOF'\n"
+                "[Service]\nEnvironment=TENDCF_S1_GEN=1\nEOF\n") % (unit, unit, fname)
+        self.sb.write("%s/tendcf-s1-%s-%s" % (GEN, tag, self.id().rsplit(".", 1)[-1][-24:].replace("_", "-")), body, mode=0o755)
+
     # ---- running
     def classify(self, doc, admindir=True, env=None, argv_prefix=()):
         path = os.path.join(self.tmp, "claims.json")
@@ -679,6 +686,30 @@ class Generated(Fixture):
         self.reload()
         res = self.expect(claims_doc(), "tendcf-s1-gen-nosrc.service", "incomplete")
         self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
+
+    def test_generated_unit_with_empty_sourcepath_exact_third_party_is_clean(self):
+        """R9 (K5): no source to attribute, so an exact non-cfengine claim on the unit
+        covers it; the same unit with no claim stays incomplete (the test above)."""
+        self.generate({"tendcf-s1-gen-nosrc.service": None})
+        self.reload()
+        res = self.expect(claims_doc(writers={"tendcf-s1-gen-nosrc.service": "third-party"}),
+                          "tendcf-s1-gen-nosrc.service", "clean")
+        self.assertEqual(res["summary"]["extra_scan"], "complete")
+
+    def test_generator_dropin_on_declared_vendor_unit_no_claim_is_two_writers(self):
+        """R9 (K13): a drop-in a generator wrote under /run/systemd/generator* is local;
+        the generator's package is not consulted. Loud without a claim."""
+        self.vendor("tendcf-s1-genvend.service", "tendcf-s1-genvendpkg")
+        self.generate_dropin("tendcf-s1-genvend.service")
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-genvendpkg"]), "tendcf-s1-genvend.service", "two-writers")
+
+    def test_generator_dropin_on_declared_vendor_unit_exact_third_party_is_clean(self):
+        self.vendor("tendcf-s1-genvend.service", "tendcf-s1-genvendpkg")
+        self.generate_dropin("tendcf-s1-genvend.service")
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-genvendpkg"], writers={"tendcf-s1-genvend.service": "third-party"}),
+                    "tendcf-s1-genvend.service", "clean")
 
 
 class Transient(Fixture):

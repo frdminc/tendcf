@@ -414,6 +414,48 @@ class VerdictTable(unittest.TestCase):
         self.assertEqual(out["summary"]["extra_scan"], "incomplete")
         self.assertEqual(out["units"][0]["verdict"], "incomplete")
 
+    def test_generated_empty_sourcepath_exact_noncfengine_claim_is_clean_else_incomplete(self):
+        """R9 (K5): an empty-SourcePath generated unit is clean under an exact
+        non-cfengine claim on it; incomplete without one, under a cfengine claim,
+        under a prefix, or under a claim on another unit."""
+        def build():
+            s = FakeSystem()
+            s._put("/run/systemd/generator.late/g.service", ("file",))
+            s.unit("g.service", frag="/run/systemd/generator.late/g.service", ufs="generated", source="")
+            return s
+        out = uc.classify(build(), claims(writers={"g.service": "third-party"}))
+        self.assertEqual(out["summary"]["extra_scan"], "complete")
+        self.assertEqual((out["units"][0]["verdict"], out["summary"]["extra_entries"], out["summary"]["two_writers"]),
+                         ("clean", 0, 0))
+        for label, cl in (("no claim", claims()),
+                          ("cfengine claim", claims(writers={"g.service": "cfengine"})),
+                          ("prefix claim", claims(writers={"g-*": "third-party"})),
+                          ("another unit's claim", claims(writers={"other.service": "third-party"}))):
+            out = uc.classify(build(), cl)
+            self.assertEqual(out["summary"]["extra_scan"], "incomplete", label)
+            self.assertEqual(out["units"][0]["verdict"], "incomplete", label)
+
+    def test_generated_empty_sourcepath_instance_under_template_claim_is_clean(self):
+        s = FakeSystem()
+        s._put("/run/systemd/generator.late/g@1.service", ("file",))
+        s.unit("g@1.service", frag="/run/systemd/generator.late/g@1.service", ufs="generated", source="")
+        out = uc.classify(s, claims(writers={"g@.service": "third-party"}))
+        self.assertEqual((out["summary"]["extra_scan"], out["units"][0]["verdict"]), ("complete", "clean"))
+
+    def test_generator_dropin_on_declared_vendor_unit_is_two_writers_without_a_claim_clean_with_one(self):
+        """R9 (K13): a drop-in a generator wrote under /run/systemd/generator* is
+        a local drop-in. The generator's package is not consulted, declared or not."""
+        for gen_dir in ("/run/systemd/generator", "/run/systemd/generator.early", "/run/systemd/generator.late"):
+            s = FakeSystem()
+            s.vendor("zram.service", "vendorpkg")
+            s.dropin("zram.service", d=gen_dir, fname="bindings.conf")
+            for pk in (["vendorpkg"], ["vendorpkg", "generator-pkg"]):
+                self.assertEqual(self.v(s, claims(pkgs=pk), "zram.service"), "two-writers", (gen_dir, pk))
+                self.assertEqual(self.v(s, claims(pkgs=pk, writers={"zram.service": "third-party"}), "zram.service"),
+                                 "clean", (gen_dir, pk))
+            self.assertEqual(self.v(s, claims(pkgs=["vendorpkg"], writers={"zram.service": "cfengine"}), "zram.service"),
+                             "two-writers", gen_dir)
+
     def test_transient_unit_is_not_judged(self):
         s = FakeSystem()
         s._put("/run/systemd/transient/run-1.service", ("file",))

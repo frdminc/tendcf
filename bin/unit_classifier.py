@@ -684,7 +684,14 @@ class Scan:
                                             and GENERATOR_DIR_RE.match(os.path.dirname(a.path)))]
             src = u.props.get("SourcePath", "")
             if not src:
-                u.problems.append("generated unit with empty SourcePath (unverifiable)")
+                # R9 (K5): a generator's unit with no source cannot be attributed
+                # through its generator, and is not attributed through its
+                # package either. An exact non-cfengine name claim on the unit
+                # (its Id or, for an instance, its template) covers it; with no
+                # such claim the scan stays incomplete, because the evidence is
+                # missing, never silently clean.
+                if not exact_noncf(self.claims, u):
+                    u.problems.append("generated unit with empty SourcePath (unverifiable)")
             else:
                 arts.append(Artifact(canon_path(self.env, src), "source"))
         return arts
