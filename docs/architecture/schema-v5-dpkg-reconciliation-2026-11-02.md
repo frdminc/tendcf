@@ -1,7 +1,7 @@
 # Schema v5: Debian package claims and the unit namespace (Q9, 2026-11-02)
 
 Status: **spec, rulings taken; reviewed by astra and Fable, both "sound with changes", and every
-finding applied (§8). Operator points stay open in §7 item 13.** This document is the contract
+finding applied (§8). Operator points R4-R8 are settled (§1); only a later tendcf-agent takeover of the detector stays open.** This document is the contract
 the v5 slices implement. It changes no schema, lint or fixture. It supersedes its three
 inputs, which stay frozen as written: [the Opus 5.5 draft](schema-v5-opinion-opus-draft.md),
 the [astra review](schema-v5-opinion-astra.md) ("unsound as specified") and the
@@ -164,7 +164,7 @@ externally-written units stay deferred ([linux-targets](linux-targets.md) row 4;
    "else": {"properties": {"extra_entries": false, "two_writers": false, "unmet_absence": false}}
    ```
 
-   In its top-level `required`, add `extra_scan` and remove `extra_entries`. The row's description says the two new counters are defined for every supervisor's extra scan and are zero where the detector has no such verdict, because a complete launchd row must carry them too. **An incomplete scan cannot carry a zero, because it cannot carry a count.** `report-row` has no version axis, and nothing writes rows yet. This data shape was not put to the operator; see §7 item 13.
+   In its top-level `required`, add `extra_scan` and remove `extra_entries`. The row's description says the two new counters are defined for every supervisor's extra scan and are zero where the detector has no such verdict, because a complete launchd row must carry them too. **An incomplete scan cannot carry a zero, because it cannot carry a count.** `report-row` has no version axis, and nothing writes rows yet. This row shape is adopted by R4.
 3. **`goal-diff.schema.json`:** no shape change. Its hunks do not enumerate kinds (`:68-87`), so `(supervision, unit-package, <pkg>)` is an ordinary address. Ceremony stays `ordinary` (`derive_ceremony_class`). Rendering: an add reads "Debian package X may supply its own units; they stop being reported as extras", and a remove reads "writer declaration dropped; its units are reported as extras; nothing is stopped".
 4. **The projection is unchanged.** `PROJECTING_KINDS` stays `service` and `interlock`, so existing projections stay byte-identical. Report-only classification does not prevent competing writes, and the spec must not be read as saying it does (astra B6).
 
@@ -273,7 +273,7 @@ zhm.service
 
 ## 3. Detector contract
 
-No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. Where it runs is not ruled (§7 item 13); the contract does not depend on it.
+No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); whether tendcf-agent later takes it over is open, and the contract does not depend on it.
 
 ### 3.1 Gate
 
@@ -450,7 +450,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 |---|---|---|---|
 | S0 | tendcf | The live tombstone hazard at v4, on both tombstone paths: §2.2(4)'s rule, cases 129-131, case 64's cleanup; `isplain` instead of `fileexists` at `policy/tendcf_services.cf:241`, with a `tests/policy/run.sh` check. Details below | spec merged |
 | S1 | tendcf | Read-only classifier prototype of §3 (`linux-targets.md` row 4 calls for a bump from a prototype): §3.5, and the fixtures below | spec merged |
-| S2 | tendcf | §2, §4, §5 in one PR; a bump cannot be split | S0; S1's results read and incorporated; operator approval of §2.3(2)'s row shape and a ruling on contradictory service states (§7 item 13) |
+| S2 | tendcf | §2, §4, §5 in one PR; a bump cannot be split | S0; S1's results read and incorporated; R5's cross-domain lint rule implemented (the row shape and the contradiction ruling are settled by R4 and R5) |
 | S3 | nix2cf | §4(11) | S2 merged |
 | S4 | tendcf | The real pastebin declaration from §2.4, as an ordinary diff, re-read at that time because the list moves with `apt` | S2; S1's reading of the two index-based rows (§7 item 13) |
 | S5 | tendcf | The detector proper | §7 item 13 ruled |
@@ -497,7 +497,7 @@ All slices use worktrees, absolute paths and Sonnet 5.5 `high` or better. Every 
 | `dpkg-query` removed from `PATH`; no `/run/systemd/system` | `incomplete`, no counts |
 | `supervision` not comprehensive | `not-run` |
 
-Then read-only on pastebin, results recorded. That is a further action on a live host and needs the operator's go.
+Then read-only on pastebin, results recorded. This is the one further read-only probe R8 allows before S4.
 
 ## 7. Residue, recorded rather than fixed
 
@@ -591,6 +591,6 @@ Then read-only on pastebin, results recorded. That is a further action on a live
 | SF6 §8 item 9 contradicts §3.4 | Adopted, merged with SA6. §8 item 9 |
 | SF7 §4(1) omits the prefix-writer restriction | Adopted. §4(1) |
 | SF8 S0 lands cases before 113-128 exist | Interim counts stated, without renumbering. §6. The count is 86, not SF8's 85, because case 130 also lands in S0 |
-| SF10 counters on every complete row | Adopted as the description's wording. §2.3(2); part of the open row shape, §7 item 13 |
+| SF10 counters on every complete row | Adopted as the description's wording. §2.3(2); the row shape is adopted by R4 |
 | SF section 5: orphan drop-in directories; a row with no `extra_scan` | Adopted. §7 item 14; case 146 |
 | SF section 6: template key reading of R2 | Confirmed: R7 |
