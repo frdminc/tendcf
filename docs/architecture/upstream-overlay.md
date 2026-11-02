@@ -38,7 +38,8 @@ Not in the overlay, by that rule:
 
 - the `--simulate-json` series (fork branches `simulate-json-*`): a feature
   the consent path will want (guide §7), not something shipped policy
-  depends on. It joins when the agent calls it.
+  depends on. It joins when the consent path calls it (tendcf-agent on
+  Android; on Linux and macOS the caller is an open point of map D45).
 - the other seventeen fork fixes in the register: real, kept on the forks,
   not load-bearing for anything shipped.
 - tests-only commits, unless a load-bearing patch is stacked on them
@@ -127,9 +128,10 @@ That is the recipe the #3 comment executed by hand on 2026-08-19 (full
 whose HEAD is not the pinned base and refuses a dirty tree, so the recipe
 cannot silently build something else.
 
-**Later**, when tendcf-agent has a build pipeline (map §13 Step 10+,
-"builder/cache"): the same manifest feeds the derivation or the build
-script, and the built agent enters a release only as a digest-bound
+**Later**, when device binaries have a build pipeline (map §13 Step 10+,
+"builder/cache"; this was first written for tendcf-agent, which map D45
+makes Android-only): the same manifest feeds the derivation or the build
+script, and the build enters a release only as a digest-bound
 artifact (map §9.8). The overlay never travels to a device; what travels
 is the binary's digest in the goal file. The change-process design
 ([`change-process.md`](change-process.md) §2) pins the overlay *through*
@@ -253,5 +255,5 @@ cut from today's upstream.
 - **Push the local merge `45c816c` to the fork** as `overlay/tendcf-3` so
   the by-hand build convenience survives the next cleanup; harmless, but a
   write to the fork, so the operator's call.
-- **Whether the simulate-json series joins** once the agent calls
+- **Whether the simulate-json series joins** once the consent path calls
   `--simulate-json` (§2). Not before.

@@ -1,7 +1,7 @@
 # Schema v5: Debian package claims and the unit namespace (Q9, 2026-11-02)
 
 Status: **spec, rulings taken; reviewed by astra and Fable, both "sound with changes", and every
-finding applied (§8). Operator points R4-R8 are settled (§1); only a later tendcf-agent takeover of the detector stays open.** This document is the contract
+finding applied (§8). Operator points R4-R8 are settled (§1); ~~only a later tendcf-agent takeover of the detector stays open.~~ Amended 2026-11-02 by D45 ([`architecture-DEFINITIVE-v3.md`](architecture-DEFINITIVE-v3.md)): takeover by tendcf-agent on Linux is closed; possible reassignment to another command remains open (§7 item 13).** This document is the contract
 the v5 slices implement. It changes no schema, lint or fixture. It supersedes its three
 inputs, which stay frozen as written: [the Opus 5.5 draft](schema-v5-opinion-opus-draft.md),
 the [astra review](schema-v5-opinion-astra.md) ("unsound as specified") and the
@@ -22,7 +22,7 @@ wrong, §8 says so; the inputs are not corrected in place. Q9 is the open item
 | R1 | Package claims (C4), with both reviews' fixes. (Declaring a dpkg package covers the units it ships; a new unit inside a declared package does not surface; a new package does.) |
 | R2 | As Fable proposes: service, socket, timer and path files count; generated units are judged via their source (SourcePath); transient units are out of scope (residue). A local drop-in or mask on a vendor unit is clean only when an exact non-cfengine name claim covers the unit name, otherwise "two-writers"; a cfengine claim on a name whose vendor fragment exists is always "two-writers" (shadowing is the deferred externally-written-unit feature). |
 | R3 | Accept all four: (a) new writer value `tendcf-install` for tendcf's own installed unit (tendcf-execd.service); (b) threat model is accidents only, as R-S3-4: ownership from the dpkg database, no file-hash verification; (c) one unit namespace per host: detection runs across all domains' claims, a unit is extra only if no claim in any domain covers it; (d) a scan that cannot enumerate completely reports "incomplete", never zero extras. |
-| R4 | The detector lives in the CFEngine policy bundle, as a report-only promise set. It writes report rows in the §2.3(2) shape. Whether tendcf-agent should later take it over is a separate discussion, still open. |
+| R4 | The detector lives in the CFEngine policy bundle, as a report-only promise set. It writes report rows in the §2.3(2) shape. ~~Whether tendcf-agent should later take it over is a separate discussion, still open.~~ *Amended 2026-11-02 by D45: takeover by tendcf-agent on Linux is closed; possible reassignment to another command remains open (§7 item 13).* |
 | R5 | Contradictory service states for one unit identity across domains (present in one, absent in another) are rejected in lint, by a cross-domain check with its own negative case. A detector that still sees one reports `incomplete`. |
 | R6 | After CI and review, S0 merges and is deployed to pastebin with the installer, then the canary is checked. |
 | R7 | Confirmed: an exact name claim on a template key covers its instances' drop-ins (`getty@.service` covers `getty@tty1.service.d/`), as §3.4 row 4 reads R2. |
@@ -273,7 +273,7 @@ zhm.service
 
 ## 3. Detector contract
 
-No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); whether tendcf-agent later takes it over is open, and the contract does not depend on it.
+No detector exists; this is what one must do. It reads and reports, and it never removes (reconciliation 2026-08-15; the tombstone is the only actuated removal path). It is threat-modelled for accidents only (R3b): database ownership, no hash verification. It runs in the CFEngine policy bundle as a report-only promise set (R4); ~~whether tendcf-agent later takes it over is open~~ (amended 2026-11-02 by D45: takeover by tendcf-agent on Linux is closed; possible reassignment to another command remains open, §7 item 13), and the contract does not depend on it.
 
 ### 3.1 Gate
 
@@ -517,7 +517,7 @@ Then read-only on pastebin, results recorded. This is the one further read-only 
 10. **A hand-made alias has no clean spelling** (§3.2(6)), and a local copy of a vendor fragment has none under any claim (§3.4). Both surface on a host that has them. On pastebin the second count is zero between `/etc` and `/usr/lib`. The first turns on two links whose targets and `Alias=` lines were not read (§2.4).
 11. **Other scopes.** User managers, and any systemd host without dpkg, which can only ever be `incomplete`. rpm would widen the `unit-package` writer enum in a counted bump. Ubuntu snap units need exact claims, unverified.
 12. **The Site Model has no systemd writer registry** (draft C.5). `launchd-writers` is launchd-only and `services.schema.json` has no writer data, so nix2cf has no source for these claims. A step 6 question under Q8.
-13. **For the operator:** settled by R4-R8 (§1). One point is still open: whether tendcf-agent later takes over the detector (R4).
+13. **Detector ownership after the first implementation.** R4 assigns the detector to the CFEngine policy bundle. Amended 2026-11-02 by `architecture-DEFINITIVE-v3.md` D45: a later takeover by tendcf-agent on Linux is closed, because tendcf-agent is Android-only. Open is whether another command ever takes the detector over from the policy bundle (map §12 item 8). Superseded text, kept: ~~**For the operator:** settled by R4-R8 (§1). One point is still open: whether tendcf-agent later takes over the detector (R4).~~
     - The canary's `comprehensive` is false today (draft A.2) and stays so until a detector exists. A retreat ceremony on pastebin buys nothing checkable now, so C5 is deferred, not a stopgap (Fable F11).
 14. **Orphan drop-in directories.** A `<x>.service.d/` with no unit loaded is invisible to the manager, hence never judged. On pastebin, all 15 `/etc` drop-in directories name a listed unit.
 
@@ -566,7 +566,7 @@ Then read-only on pastebin, results recorded. This is the one further read-only 
 | Fable case against C4 | Recorded. §2.1(5), §7 item 8 |
 | Fable E1-E7 | R1 (E1); R2 (E2, E5, E6); R3a (E3); R3b (E4); E7: v5 carries Q9 alone, §2 |
 | Fable Q-A | R3c |
-| Fable Q-B | Ruled: R4, the policy bundle. Whether tendcf-agent takes it over later is still open. |
+| Fable Q-B | Ruled: R4, the policy bundle. ~~Whether tendcf-agent takes it over later is still open.~~ Amended 2026-11-02 by D45: takeover by tendcf-agent on Linux is closed; possible reassignment to another command remains open (§7 item 13). |
 | Draft C.5 items 1-9 | 1: §7 item 2. 2: §7 item 3. 3: §7 item 4. 4: fixed by F5. 5: §7 item 11. 6: §3.3, §3.5. 7: §7 item 11. 8: §2.2(6). 9: §7 item 12 |
 | Draft F.3 unverified list | pastebin list, pastebin ownership in the unit directories, package-name pattern, regexes and lint: done here. Resolution, generated units, snap: §3.5, §7 item 13, §7 item 11 |
 

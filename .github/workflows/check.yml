@@ -29,7 +29,9 @@ jobs:
 
       # Runs the projector too: schema_lint imports bin/projector.py and gates
       # project(goal-file.json) against examples/host_specific.json, which is
-      # reconciliation §13's "CI invokes the agent's own projector".
+      # reconciliation §13's "CI invokes the agent's own projector". Since
+      # map D45 that is the projector Linux and macOS hosts run, promoted
+      # to tendcf-validate; the Android agent's Kotlin port must match it.
       #
       # xref_lint gates the LIVE corpus only; handoffs, reviews, deprecated
       # designs and frozen opinions are out of scope by policy (--why-frozen

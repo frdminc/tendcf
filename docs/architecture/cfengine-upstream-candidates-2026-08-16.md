@@ -110,8 +110,10 @@ failures, and simply behaves as though nothing was ever configured.
 exists to prevent, and P-4 escalated `@{` from a style rule to a hard negative
 precisely because of it. But N-4 guards the *projector*, and the projector is
 one of two implementation sites — R22 records that tendcf-agent will be the
-other. A defect in the second implementation, or a future kind carrying an
-unexpected value, still lands on this behaviour, and (a) is the difference
+other (since 2026-11-02 on Android only, as a Kotlin port;
+`architecture-DEFINITIVE-v3.md` D45). A defect in the second
+implementation, or a future kind carrying an unexpected value, still lands
+on this behaviour, and (a) is the difference
 between a one-line diagnosis and a silent fleet-wide misconfiguration.
 
 ## U-3 — `exec_timeout` does not bound a `commands:` promise
