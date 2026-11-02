@@ -32,7 +32,8 @@ and domains are comprehensive unless they opt out with a reason.
 
 The architecture is a data spine (the Site Model), a pure compiler from that
 spine to CFEngine's native JSON augments layer, append-only JSONL as the
-durable local capture with a rebuildable SQLite index in tendcf-agent, and a
+durable local capture with a rebuildable SQLite index (in tendcf-agent on
+Android, the one platform that agent runs on), and a
 signed release carrying a typed operation plan that the on-device executor
 mechanically refuses to exceed. Bcfg2 supplies four of its load-bearing
 ideas, credited in §6.
@@ -364,9 +365,13 @@ phone home to it; this design has no equivalent to phone home to at all.
 
 Capture and index are different files. The durable capture is append-only
 JSONL, one `write()` per event, filled from CFEngine's local promise-outcome
-log. The queryable index is SQLite inside tendcf-agent, rebuildable from
-JSONL. CFEngine never opens SQLite. If the index is corrupt, history still
-exists. Any central or shared view is optional and eventually consistent.
+log. The queryable index is SQLite, rebuildable from JSONL; on Android it
+lives inside tendcf-agent. tendcf-agent is Android-only (operator ruling,
+2026-11-02): Linux and macOS hosts run CFEngine plus a small
+validate-and-project command, `tendcf-validate`, and no daemon, and who
+owns the index there is open. CFEngine never opens SQLite. If the index is
+corrupt, history still exists. Any central or shared view is optional and
+eventually consistent.
 
 The grounds are narrower than the local-first literature's [25], and one of them
 is an operational fact about this fleet rather than a principle. On CFEngine
@@ -1315,9 +1320,9 @@ recovers enough of that. We are not certain it does.
 
 Bcfg2 uploads client statistics to the server, which is what makes nightly
 network-wide reports possible and, per LISA '05, what actually bought
-administrator trust. Here the device's JSONL capture
-(and the agent's rebuildable SQLite index) is authoritative and any central
-view is an optional, best-effort push.
+administrator trust. Here the device's JSONL capture (and its rebuildable
+SQLite index, the agent's on Android) is authoritative and any central view
+is an optional, best-effort push.
 
 We are aware this is the decision most likely to be wrong. The grounds are in
 §2.4, and the honest summary is that we currently have *no consumer* for a
@@ -1672,8 +1677,9 @@ document corpus resolves.
 
 Beyond the schemas, two pieces of running code: the **reference projector**
 (`bin/projector.py`), which performs §2.5's goal-file-to-augments projection
-and is gated in CI against golden bytes so that the agent's eventual second
-implementation has an oracle to agree with; and the **generic bundle**
+and is gated in CI against golden bytes; it is to be promoted to the
+`tendcf-validate` command Linux and macOS hosts run, and the Android agent's
+Kotlin port must agree with the same goldens; and the **generic bundle**
 (`policy/tendcf_services.cf`, v1, launchd only), which is the first thing in
 this project that CFEngine actually executes.
 
@@ -1856,7 +1862,8 @@ claim as new is narrower — applying that rule to a concrete
 configuration-management architecture for a heterogeneous fleet. The rest is
 composition:
 a data spine in layered repos, a pure compiler into CFEngine's own data
-layer, per-device JSONL capture with an agent-owned SQLite index, a signed
+layer, per-device JSONL capture with a rebuildable SQLite index
+(agent-owned on Android, owner open elsewhere), a signed
 plan the executor may not exceed, per-device trust, peer actions, and a
 BYO advisor slot, with four of its load-bearing ideas taken from Bcfg2 and
 credited above. We do not claim

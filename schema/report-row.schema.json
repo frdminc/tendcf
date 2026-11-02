@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/report-row.schema.json",
   "title": "Local record — report row (D18)",
-  "description": "The shape of a report row. Durable capture is JSONL; tendcf-agent's SQLite is a rebuildable index (guide §6 / map §8, D18). Nothing writes rows yet; the schema is settled now because it is schema — one column now and a migration later.\n\nTwo requirements from the Bcfg2 papers are load-bearing here:\n  1. EVERY row carries the signed release that produced it, and the device records which release it is converged to (LISA '06 revision-stamping).\n  2. Coverage is a COUNTER per domain, not just a list of discrepancies, and `not-yet-migrated` and `deliberately-unmanaged` are counted SEPARATELY. Conflating them is what makes the number stop meaning anything: one is backlog, the other is permanent by design.\n\nThe SQLite DDL is derived from this schema; this file is the contract, the DDL is a rendering of it.",
+  "description": "The shape of a report row. Durable capture is JSONL; SQLite is a rebuildable index, owned by tendcf-agent on Android and with ownership unresolved on Linux and macOS (guide §6 / map §8, D18 as amended by D45 on 2026-11-02). Nothing writes rows yet; the schema is settled now because it is schema — one column now and a migration later.\n\nTwo requirements from the Bcfg2 papers are load-bearing here:\n  1. EVERY row carries the signed release that produced it, and the device records which release it is converged to (LISA '06 revision-stamping).\n  2. Coverage is a COUNTER per domain, not just a list of discrepancies, and `not-yet-migrated` and `deliberately-unmanaged` are counted SEPARATELY. Conflating them is what makes the number stop meaning anything: one is backlog, the other is permanent by design.\n\nThe SQLite DDL is derived from this schema; this file is the contract, the DDL is a rendering of it.",
 
   "oneOf": [
     { "$ref": "#/$defs/promise_outcome" },
@@ -121,7 +121,7 @@
           "minimum": 1
         },
         "validator_version": {
-          "description": "The tendcf-agent binary that produced this row. schema_ceiling is the claim the render rule depends on; this is the courtesy — diagnostics only, never read by the render rule itself.",
+          "description": "The version of this device's validator: tendcf-agent on Android, tendcf-validate on Linux and macOS (map D45, 2026-11-02). This is diagnostic metadata, not the identity of the report-writing process. schema_ceiling is the claim used by the render rule.",
           "$ref": "common.schema.json#/$defs/release_stamp"
         }
       },

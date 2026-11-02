@@ -38,8 +38,8 @@ cannot start its own privileged helper”).
    proposed change in ordinary language, refuse it, and keep a personal
    branch — using **their** AI, not ours.
 4. **Facts live in site data; behavior lives in tendcf.** Every tool
-   (CFEngine, mise, Nix-for-builds, tendcf-agent) is a replaceable
-   consumer.
+   (CFEngine, mise, Nix-for-builds, `tendcf-validate`, tendcf-agent) is a
+   replaceable consumer.
 5. **When unsure, stop.** Items in §14 are not for a cheap model to
    improvise.
 6. **Prefer local knowledge over global knowledge; prefer
@@ -83,12 +83,14 @@ cannot start its own privileged helper”).
 
           ▼
   CFEngine +             each device is its own policy hub.
-  tendcf-agent           Supervisors are adapters: systemd, launchd,
-                         runit, Jobber, … from one service record.
+  tendcf-validate        Supervisors are adapters: systemd, launchd,
+  (Linux, macOS), or     runit, Jobber, … from one service record.
+  tendcf-agent (Android) No daemon beside CFEngine off Android (D45).
 
           ▼
   JSONL log (capture)    append-only; the durable record
-  SQLite (index)         tendcf-agent; rebuildable from JSONL
+  SQLite (index)         rebuildable from JSONL; tendcf-agent on
+                         Android, owner open elsewhere (§12)
 ```
 
 Collision of the same identity from two peer inputs is a **compile
@@ -100,14 +102,15 @@ error**. Only site-private may bind a winner or a short name.
 
 - **R1** Targets: macOS/Apple Silicon, Linux x86_64, Linux aarch64,
   Android (Termux + tendcf-agent + a Shizuku-class helper). Intel Mac
-  mini out of scope.
+  mini out of scope. tendcf-agent is Android-only; Linux and macOS run
+  CFEngine plus the `tendcf-validate` command, with no daemon (D45).
 - **R2** No permanent control node. Feature roles
   `{main, backups[], peers[]}` are data.
 - **R3** Resource efficiency; no fat containers; no VMs as the build
   substrate.
 - **R4** Android keeps Termux (+api, +x11), the built-in Terminal app, a
-  Shizuku-class helper, tendcf-agent, CFEngine. No nix-on-droid. Nix may
-  build zero-on-device-footprint artifacts only.
+  Shizuku-class helper, tendcf-agent (Kotlin, D45), CFEngine. No
+  nix-on-droid. Nix may build zero-on-device-footprint artifacts only.
 - **R5** No bare-metal Nix. A mainstream stock distro is the reference.
   Ubuntu Server is the default answer, not the requirement.
 - **R7 / R10** Push and pull. Pull becomes user sovereignty: the person’s
@@ -314,7 +317,7 @@ model.
 - `provides` / `requires` inference and origin
 - Goal-file render, canonicalization, and the ChangePlan validator (§9)
 - Consent slot + default prompt (the advisor is theirs)
-- JSONL capture + agent SQLite
+- JSONL capture + SQLite index (§8; tendcf-agent's on Android)
 - Generic bundle that picks a supervisor
 - Peer actions as typed cross-machine help
 
@@ -378,13 +381,24 @@ is incomplete in exactly those windows.
    (`promise_log.jsonl`) before a hub copies it into SQL. Community needs
    the same glue. [osquery](https://osquery.readthedocs.io/en/latest/deployment/logging/)
    likewise logs results as JSON lines.
-2. **Index:** SQLite inside **tendcf-agent**, for queries, extra-entry
-   counts, “what release am I on.” Rebuildable from JSONL. If the DB is
-   corrupt, history still exists.
+2. **Index:** SQLite, for queries, extra-entry counts, “what release am
+   I on.” Rebuildable from JSONL. If the DB is corrupt, history still
+   exists. On Android it lives inside **tendcf-agent**; on Linux and
+   macOS its owner is open (below).
 
-CFEngine never opens SQLite. The agent tails (or receives) the log.
-Single writer to JSONL (engine or its wrapper); single writer to SQLite
-(the agent).
+CFEngine never opens SQLite. Single writer to JSONL (engine or its
+wrapper); single writer to SQLite (on Android the agent, which tails or
+receives the log).
+
+**Linux and macOS (D45, 2026-11-02).** No daemon runs beside CFEngine:
+`tendcf-validate` (§12) is a command that runs and exits, not a process
+that tails the log. What holds there is the capture: JSONL, written by
+the engine or its wrapper. It is not built yet on any host — nothing
+writes report rows (`report-row.schema.json`), and the Linux writer is
+open in [`linux-targets.md`](linux-targets.md) §4. D45 gives the SQLite
+index no owner on these platforms; that is an operator question (§12),
+and nothing above depends on it, because the index is rebuildable and
+the JSONL is the record.
 
 **Android UID isolation (looked up, 2026-08-14).** Termux (`com.termux`)
 and tendcf-agent are different UIDs. The APK **cannot** read
@@ -438,9 +452,11 @@ paragraph left open until the schema family landed; closed by
 the CFEngine Augments JSON (`def.json` / `host_specific.json`) are not
 one document. The goal file is the signed wire artifact and the object
 consent binds to; Augments JSON is produced from it by a **device-side
-projection**, run inside tendcf-agent after approval, and never appears
-on the wire. The projector's target is
-`$(sys.workdir)/data/host_specific.json` and nothing else; its output is
+projection**, run after approval and before the cf-agent run that reads
+it — by `tendcf-validate` on Linux and macOS, inside tendcf-agent on
+Android (D45, §12) — and never appears on the wire. The projector's
+target is `$(sys.workdir)/data/host_specific.json` and nothing else; its
+output is
 `{"vars": {…}}` with no sibling keys — no `variables`, no `classes`, no
 `inputs`, no top-level `data`. `def.json` remains MPF glue under the
 policy-tree digest (§9.8) and is never a per-host slot: 3.27.1 drops its
@@ -450,14 +466,17 @@ was considered and rejected — it reopens the approved-equals-applied gap
 Model B exists to close, since no one *reviews* a hash-bound sibling the
 way the goal-file diff is reviewed, and the projector must exist under
 either option, so putting it device-side costs one implementation with
-two call sites (the agent binary, invoked directly and by CI for golden
-tests) rather than a second wire artifact, a per-host TUF sibling target,
-and an approval-record hash extension. The projector **MUST be
+two call sites (`tendcf-validate`, invoked on the device and by CI for
+golden tests; D45) rather than a second wire artifact, a per-host TUF
+sibling target, and an approval-record hash extension. The Android
+agent's Kotlin projector is a port held to the same golden bytes in CI
+(residue R22), not a second normative source. The projector **MUST be
 policy-free** — a structural re-keying only (entries → the generic
 bundle's containers, tombstones → the negative-promise lists, trust
-entries → the agent's own config) — carried as residue R21; any change
-that inspects entry *values* to decide output *structure* is the
-interpreter returning and is a named §14.2 review target. `def.json`'s
+entries → the validator's own config, which is `device-trust` itself,
+`projector-reconciliation-2026-08-16.md` C-3) — carried as residue R21;
+any change that inspects entry *values* to decide output *structure* is
+the interpreter returning and is a named §14.2 review target. `def.json`'s
 own digest binding is unmoved (§9.8); `augments_digest` inside the goal
 file stays rejected as circular.
 
@@ -642,11 +661,14 @@ field.
   highest schema version that host’s **last-reported** validator supports.
   A long-dark device is rendered at its old version until it reports back.
   *Correction to E1 §5.6, which says the report rows already carry this:*
-  they do not. `report-row.schema.json` carries `release` and
-  `converged_release` but has no validator/agent version column, so the
-  reported field is a **schema addition D44 requires**, not an existing
-  property to read.
-- A schema bump ships in **two phases**: first the validator/agent update
+  they did not. `report-row.schema.json` carried `release` and
+  `converged_release` but no validator version column, so the reported
+  field was a **schema addition D44 requires**, not an existing property
+  to read. It has since landed (checked 2026-11-02) as
+  `device_convergence.schema_ceiling`, with an optional
+  `validator_version`.
+- A schema bump ships in **two phases**: first the validator update
+  (`tendcf-validate` on Linux and macOS, tendcf-agent on Android; D45)
   as an ordinary diff under version N−1 — a privileged-region hunk, TC-25
   class — then the migration release under §9.4’s empty-diff rule. There
   is no separate release-lint phase-order check (cut from this section’s
@@ -702,8 +724,9 @@ device.
   carries no privilege flags — those would be forgeable. The validator
   derives privilege from its own local list, whose floor is: trust
   policy, advisor keys, peer allowlist, policy-tree digest,
-  agent/validator binary and version, device resource policy, and
-  `schema_version` itself. The approval record MUST carry a ceremony
+  validator binary and version (the `device-trust` `agent` entry; what it
+  binds on Linux and macOS is open, §12 / D45), device resource policy,
+  and `schema_version` itself. The approval record MUST carry a ceremony
   class adequate to the derived privilege (§9.4). Coverage transitions
   (§9.7) derive their ceremony class the same way — retreat is
   privileged, not forbidden, because forcing a stall or a lie is worse
@@ -913,20 +936,152 @@ agent evaluates.
 via the launchd adapter. Dry-run default. A Mac that already runs
 nix-darwin keeps that configuration verbatim (passthrough, D12); whether
 the primary workstation adopts nix-darwin is Step 7, gated on §14.1.
-Unit-writers lint is the safety rail on a live daily driver.
+Unit-writers lint is the safety rail on a live daily driver. Runtime:
+CFEngine + `tendcf-validate` (D45, below).
 
 **Android (adapter #2).** Same Site Model vocabulary. Runtime: Termux +
-tendcf-agent + Shizuku-class helper + CFEngine. Agent owns logs (§8).
-Peer actions cover devices that need external ADB help.
+tendcf-agent (Kotlin, D45) + Shizuku-class helper + CFEngine. Agent owns
+logs (§8). Peer actions cover devices that need external ADB help.
 
 **Linux (adapter #3, adoptability keystone).** Stock distro; mise
-toolchains + CFEngine everything else. Distro choice open until this
-step.
+toolchains + CFEngine everything else, plus `tendcf-validate` (D45,
+below). Distro choice open until this step.
 
 **NixOS / nix-darwin (passthrough).** The host's existing Nix
 configuration, unchanged; tendcf supplies distribution, consent and
 reporting around it ([`linux-targets.md`](linux-targets.md) §5, Step 8
 there). First host: vps-primary.
+
+**`tendcf-validate`: the device-side component off Android (D45,
+operator ruling 2026-11-02; the name was chosen by the amending
+session).** tendcf-agent exists only on Android. A Linux or
+macOS host runs CFEngine plus `tendcf-validate`, a command and not a
+daemon: it validates the approved goal file, writes the projection to
+`$(sys.workdir)/data/host_specific.json` (§9), and exits. It runs to
+completion before the cf-agent run that is to read that file. It cannot
+run from inside a bundle, because CFEngine loads the file at start-up,
+before any bundle runs (`LoadCMDBData`, called from
+`GenericAgentDiscoverContext` in `libpromises/generic_agent.c`, the
+start-up path cf-agent and cf-execd share). cf-execd reads the same file
+for itself at start and at policy reload (`cf-execd.c`), so a projection
+written inside `exec_command` reaches cf-agent at once and cf-execd one
+reload later; harmless while the projection carries supervision vars
+only (P-1). CFEngine caps the file at 5 MiB (`cmdb.c`
+`HOST_SPECIFIC_DATA_MAX_SIZE`). The current Linux deployment runs
+cf-execd and cf-agent as root and installs the projection as root-owned
+mode 0600 in a root-owned work directory
+(`deploy/linux/tendcf-install.sh`). Updating that destination requires
+suitable privilege. D45 does not decide whether validation and
+publication share one privileged process or where their privilege
+boundary lies on each platform. The install location is also open; the
+working assumption on Linux is the CFEngine tree (`/opt/tendcf`).
+It is Python, `bin/projector.py` promoted, so the code CI's golden gate
+runs is the code the host runs: one implementation on these platforms,
+with nothing to drift. Each host needs `python3`; per the ruling, Debian
+has it, NixOS gets it through the derivation, and macOS from a bundled
+interpreter or the Command Line Tools. On Android the Kotlin agent runs
+the same validation and projection logic as a port, held byte-for-byte
+to the same checked-in goldens in CI (residue R22 of
+`projector-reconciliation-2026-08-16.md`, whose §9 placed the code); the
+Python implementation stays the one normative source. It is
+built after schema v5 lands and before any further host is enforced
+(§13). Nothing device-side runs today: pastebin's canary data is a
+projection made in this repository by `bin/projector.py`, checked by
+`deploy/linux/canary/check.py` and installed by
+`tendcf-install.sh install --data`.
+
+**Open, for the operator (D45 leaves these undecided; nothing in this
+document decides them):**
+
+1. **Trigger.** What starts `tendcf-validate` ahead of cf-agent:
+   cf-execd's `exec_command` (today `$(sys.cf_agent) -f
+   $(sys.inputdir)/promises.cf`, written by `tendcf-install.sh`) running
+   it first, or a step of its own; and whether it runs before every
+   scheduled run or once per newly approved goal file. Neither scheduling
+   choice by itself establishes §9's approved-equals-applied guarantee. A
+   projection retained between runs needs an integrity check before use;
+   running the command before every run also needs a defined handoff that
+   ensures CFEngine consumes the projection that passed validation. Open
+   are failure propagation, atomic publication, concurrent update/run
+   ordering, and recovery if interrupted between approval-state
+   persistence, projection publication and CFEngine launch. Timeout must
+   not authorize the proposed change (§11). Whether an independently
+   verified previous approved state continues to converge is a separate
+   question. The scheduling and handoff design must preserve DC-2 without
+   treating each convergence run as a new acceptance of the same
+   single-use approval. CFEngine supplies no gate here: `LoadCMDBData`
+   (`libpromises/cmdb.c`) checks only that the file is readable JSON, and
+   a load failure is logged and the run continues
+   (`libpromises/generic_agent.c`), so deleting or withholding the
+   projection is not a demonstrated fail-closed launch protocol.
+2. **What "validate" covers in the first build.** The goal file's schema,
+   canonical bytes and version ceiling plus the projection's own checks,
+   or the whole §9 validator (baseline integrity, device-computed diff,
+   approval record and DC-2, ceremony class). Step 6 needs the latter;
+   D45's timing (after schema v5, before any further host is enforced)
+   does not say which the first build is.
+3. **The rest of the device-side gate on Linux and macOS.** §9 and §11
+   put the TUF fetch and high-water mark (§9.11), the local-yes exchange
+   (§11), the stored baseline (§16 question 13) and device-authored state
+   (residue R24) on the device without naming a component for Linux or
+   macOS; D45 assigns none of them. Likewise who calls `--simulate-json`
+   ([`upstream-overlay.md`](upstream-overlay.md) §2) and who checks the
+   policy-tree digest before CFEngine is pointed at the tree
+   ([`change-process.md`](change-process.md) §3), and who writes the
+   `device_convergence` row whose required `schema_ceiling` the §9.6
+   render rule reads; without a writer the two-phase rule has no per-host
+   input on these platforms. "No daemon" does not preclude any of these
+   being steps of `tendcf-validate` or a sibling command run by cf-execd
+   or a timer: the question is assignment, not feasibility.
+4. **The `device-trust` `agent` entry.** `goal-file.schema.json`
+   (`agent_map`) fixes its id to `tendcf-agent` and calls it "the
+   comparator/projector binary". On Linux and macOS: does the id change
+   (a `schema_version` bump), and what does its `sha256` bind: the
+   script, its installed tree, the `python3` it runs on (DC-11, §9.8)?
+   The schema descriptions (`agent_map`, and `report-row.schema.json`'s
+   header and `validator_version`) were amended to D45 on 2026-11-02;
+   the wire identifier, enums and structure are unchanged.
+   The existing TUF-target wording does not yet specify how it applies to
+   the Python runtime. The operator must define which interpreter,
+   standard-library and dependency bytes are covered by the accepted
+   artifact and verified before apply, and which, if any, belong to an
+   explicitly trusted host runtime outside that artifact. Pinning a
+   version alone does not satisfy DC-11. R-S3-4's accidents-only model
+   applies to the passthrough hard checks, not this consent gate. Timing:
+   the schema is at v4 and v5 is in flight; an id change decided before
+   v5 lands rides that bump, afterwards it costs v6 and a baseline
+   ceremony per device.
+5. **The `rfc8785` dependency.** `bin/projector.py` declares the PyPI
+   package `rfc8785` and runs under `uv run --script`; D45 names only
+   `python3`. Vendor it, package it, or implement JCS in the command.
+   Recommended for the implementation review, not settled by D45: invoke
+   a trusted interpreter by absolute path in isolated mode (`-I`), with
+   dependencies supplied from trusted installed locations. Define
+   executable selection, import paths and dependency installation
+   together; the privileged apply path must not resolve or download
+   dependencies through `uv` at runtime. The complete arrangement must
+   satisfy item 4's runtime trust boundary.
+6. **Interpreter and prefix.** On macOS a bundled `python3` or the
+   Command Line Tools' interpreter (D45 names both); the install prefix
+   on every platform (`/opt/tendcf` is assumed on Linux, not ruled).
+   Debian's standard task ships `python3`; a minimal or container image
+   does not (CI's `debian:13` job installs it), so the install must
+   declare the dependency. On the review machine,
+   `/usr/bin/python3 --version` reports 3.9.6 (checked 2026-11-02), below
+   `bin/projector.py`'s declared `requires-python = ">=3.11"`. This does
+   not establish the version supplied by a CLT-only installation. Before
+   choosing that deployment route, verify its interpreter and dependency
+   compatibility; otherwise use a compatible bundled interpreter. Also
+   open: the execution identity and privilege boundary for validation and
+   projection publication on each platform.
+7. **The SQLite index on Linux and macOS (§8, D18).** No owner:
+   `tendcf-validate` is not a daemon and CFEngine never opens SQLite.
+   Deferred, owned by another command, or not built on these platforms.
+8. **The v5 detector.** `schema-v5-dpkg-reconciliation-2026-11-02.md` R4
+   left open whether tendcf-agent later takes over the Linux unit
+   detector. D45 (1) closes that as posed: no tendcf-agent exists on
+   Linux. Open is only whether any other component (`tendcf-validate` or
+   a further command) ever takes it over from the policy bundle.
 
 Future classes (extension points, no build-out): OpenWrt; consented
 iPhone/wearables that consume artifacts; firmware as Nix-built
@@ -953,7 +1108,7 @@ Each step leaves a coherent system. Not a schedule.
 | 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` has `buildfile` only. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
-| 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. |
+| 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. On Linux and macOS the on-device validator is `tendcf-validate`, built after schema v5 lands and before any further host is enforced; how much of this step's validator its first build carries is open (D45, §12). |
 | 7 | Mac substrate on the primary workstation (nix-darwin) if §14.1 says yes. The nix-darwin passthrough adapter itself is [`linux-targets.md`](linux-targets.md) Step 8 and does not wait on §14.1. |
 | 8 | Pull / self-update. |
 | 9 | Consent surface + default prompt + advisor slot. |
@@ -1006,7 +1161,7 @@ Older “superseded by” archaeology lives in
 | D15 | Compile target | CFEngine Augments, not freehand `.cf`. |
 | D16 | Ordering | No Puppet catalog. Inference + fixpoint + authored `depends_on`. Interlocks. Default-on comprehensiveness. |
 | D17 | ncf | Vendor generic methods as a reference corpus; strip Rudder reporting. |
-| D18 | Local record | JSONL is the durable capture; SQLite in tendcf-agent is the index. On Android the agent owns both in app-private storage. |
+| D18 | Local record | ~~JSONL is the durable capture; SQLite in tendcf-agent is the index. On Android the agent owns both in app-private storage.~~ **Amended 2026-11-02 by D45:** JSONL is the durable capture; SQLite is the index, rebuildable from it. On Android tendcf-agent owns both in app-private storage. On Linux and macOS there is no agent, and the index's owner there is open (§8, §12). |
 | D19 | Composition | Private-site lockfile pins inputs (DAG). Signed release is the deploy artifact. No sibling-repo tag lockstep. |
 | D20 | Nix store locality | Single writer per host. |
 | D21 | Schema home | **tendcf** owns schemas/types. nix2cf is the compiler. |
@@ -1032,6 +1187,7 @@ Older “superseded by” archaeology lives in
 | D42 | Emergency | Restrictive metadata without consent; new installs still gated. |
 | D43 | ChangePlan model | ~~Model A: a closed `capability` vocabulary per operation, executor refuses effects outside the declared set.~~ **Superseded 2026-08-15 by Model B** (synthesis finding E1, adjudicated in `e1-adjudication-xhigh-2026-08-15.md`, which is final and supersedes `e1-adjudication-2026-08-15.md`): the wire artifact is the complete canonical per-host **goal file**; the ChangePlan is the **diff** against the device’s approved baseline; the executor is a **validator** over that diff, not an interpreter. Rationale: CFEngine has no runtime capability confinement, so Model A’s executor requires an interpreter plus a vocabulary-to-policy correspondence proof that does not exist and is not in budget; and coverage closes by construction when compiler and validator share one schema. The vocabulary, its versioning, and its skew policy are dropped. See §9. |
 | D44 | Goal-file schema family | The consent artifact is three paired schemas (goal file, goal diff, approval record) with canonical-byte fixtures. Binding sub-decisions, all from E1 §5 and normative in §9: diff computed **device-side**, full file on the wire, compiler diff is preview (§9.1 / E1 §5.1); RFC 8785 canonical JSON, no defaults, no empty collections, refuse-never-normalize, entry-granular structural hunks (§9.2 / E1 §5.2); accept is all-or-nothing, refusal annotated, no dependency groups (§9.3 / E1 §5.3); first adoption and schema migration are bounded **baseline ceremonies**, migration must diff to empty (§9.4 / E1 §5.4); hunk attribution is **excluded from the format** — impossible device-side — and replaced by an `explain-hunk` query (§9.5 / E1 §5.5); `schema_version` fails closed on unknown kinds, strandedness prevented at the compiler, two-phase bumps (§9.6 / E1 §5.6); per-domain coverage travels **in** the goal file (§9.7 / E1 §5.7). §14.2’s pre-build review applies to this family. |
+| D45 | Device-side component per platform | **Operator, 2026-11-02.** (1) tendcf-agent is **Android-only**, written in Kotlin. A Linux or macOS host runs CFEngine plus "a small validate-and-project command" (the ruling's words; the name **`tendcf-validate`** was chosen by the amending session on 2026-11-02 and may change without reopening the ruling), run before cf-agent reads `host_specific.json`; no daemon. (2) `tendcf-validate` is Python, the promotion of `bin/projector.py`: one implementation, so no byte-identity drift on those platforms. It needs `python3` on each host (Debian ships it, NixOS through the derivation, macOS bundled or the Command Line Tools). The Android agent's Kotlin projector is a port held to the same golden bytes in CI (residue R22), not a second normative source. (3) Built after schema v5 lands, before any further host is enforced. **Supersedes** every reading that ran the validator, the projector or the SQLite index inside tendcf-agent on every host: the §1 diagram's "CFEngine + tendcf-agent" per device, §8's index owner and D18 as written, §9's "run inside tendcf-agent" and "the agent binary" as the projector's call site, `goal-file-schema-reconciliation-2026-08-15.md` §0 item 7, §9 and §13 ("CI invokes the agent's own projector"), and `projector-reconciliation-2026-08-16.md` §9 and R22 ("tendcf-agent must reproduce" the reference). Not decided by it, and open for the operator: §12's list. |
 
 Silence = proceed from Step 0. Objections amend this register.
 

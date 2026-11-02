@@ -11,14 +11,18 @@ are the specification and whose §8 golden is the oracle. Nothing here is a
 design decision; where a choice looks arbitrary the reason is in that
 document, cited by clause.
 
-WHY THIS FILE EXISTS AT ALL. The projector runs device-side, inside
-tendcf-agent, after approval — and tendcf-agent does not exist. This repo is
-contract-only, so §13's "CI invokes the agent's own projector" has nothing to
-invoke. This is the normative implementation that gate runs today and that
-tendcf-agent must reproduce byte-for-byte when it is written (R22). That
-makes this a second implementation site, which is a real cost carried
-knowingly: two implementations can drift. `examples/host_specific.json` is
-the shared oracle, and drift is exactly what a byte comparison catches.
+WHY THIS FILE EXISTS AT ALL. The projector runs device-side, after
+approval. tendcf-agent is Android-only and written in Kotlin; on Linux and
+macOS this file is promoted to `tendcf-validate`, the command a host runs
+before cf-agent reads `host_specific.json` (architecture-DEFINITIVE-v3.md
+D45, operator 2026-11-02). Neither exists yet and this repo is
+contract-only, so §13's "CI invokes the agent's own projector" runs this
+file. It is the normative implementation: on Linux and macOS it is the
+device code itself, and the Android agent's Kotlin port must reproduce it
+byte-for-byte (R22). That port is the second implementation site, a real
+cost carried knowingly: two implementations can drift.
+`examples/host_specific.json` is the shared oracle, and drift is exactly
+what a byte comparison catches.
 
 WHAT PROJECTS, AND WHY SO LITTLE. `supervision`'s `service` and `interlock`
 entries, and nothing else — not `device-trust`, not `unit-writer`, not
@@ -213,8 +217,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """`object_pairs_hook` refusing I-JSON's silent last-wins.
 
     Deliberately a copy of `bin/schema_lint.py`'s, not an import of it: this
-    module is the thing tendcf-agent reproduces, and it may not depend on the
-    repo's linter to be correct.
+    module is the thing `tendcf-validate` is promoted from and the Android
+    agent reproduces, and it may not depend on the repo's linter to be
+    correct.
     """
     seen: set[str] = set()
     for key, _ in pairs:

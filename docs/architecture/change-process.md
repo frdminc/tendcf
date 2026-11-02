@@ -109,8 +109,9 @@ Rules for the file, each with the reason it is a rule:
    rule (`alice.caddy`), applied at the lockfile rather than invented at
    compile time.
 5. **A tool fork is never an input of its own.** The CFEngine patch overlay
-   is content inside the tendcf input; a built agent or APK enters a release
-   only as a digest-bound fetched artifact (map §9.8, DC-11). The lockfile
+   is content inside the tendcf input; a built binary or the Android
+   agent's APK enters a release only as a digest-bound fetched artifact
+   (map §9.8, DC-11). The lockfile
    pins sources, not binaries.
 
 **nix2cf has a one-input lock of the same shape** (`tendcf.lock`) pinning
@@ -149,8 +150,10 @@ Three properties follow:
    device syncs on its own. Map D14's "git-synced policy" is the transport
    between operator hosts; what arrives on a device is the tarball whose
    digest the goal file will carry once map §9.8's obligation is discharged.
-   Until then the digest is recorded in `targets.json` and checked by the
-   agent before it points CFEngine at the tree.
+   Until then the digest is recorded in `targets.json` and checked on the
+   device before CFEngine is pointed at the tree: by tendcf-agent on
+   Android; on Linux and macOS the checking component is not yet assigned
+   (map D45 and its open points in §12).
 
 ## 4. How a change lands
 
@@ -232,8 +235,9 @@ the review artifact):
 3. Every goal file passes `bin/schema_lint.py` at the pinned tendcf rev and
    is canonical bytes.
 4. Project every goal file with the pinned projector; the projection passes
-   the projection lint. (This is the compiler's regression test against the
-   agent's eventual projector: both must agree on golden bytes.)
+   the projection lint. (On Linux and macOS this is the device's own code:
+   the projector is promoted to `tendcf-validate`, map D45. The Android
+   agent's Kotlin port must agree with it on the same golden bytes.)
 5. Compute the per-host preview diff against the previous release's goal
    file for that host. Refuse when:
    - a hunk touches a privileged region (map §9.8) and the commit does not

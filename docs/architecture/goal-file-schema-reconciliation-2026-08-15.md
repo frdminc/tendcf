@@ -68,12 +68,19 @@ and the losing positions are in §§2–9.
 7. **The open question.** The goal file is a **tendcf-owned schema, not the
    Augments JSON** — all three opinions converge, and the 3.27.1 parser
    evidence makes it ground rather than taste. The projector runs
-   **device-side, inside tendcf-agent, after approval**: a policy-free
+   **device-side, ~~inside tendcf-agent,~~ after approval**: a policy-free
    re-keying of the approved file into `$(sys.workdir)/data/host_specific.json`
    as `{"vars": {…}}` only. `def.json` is never a per-host slot; nothing
    Augments-shaped ships on the wire; CI calls the *same* projector binary
    for golden tests, so there is one implementation (§9 — Grok's
    compiler-shipped sibling is rejected as a consent hole).
+
+   *Amended 2026-11-02 (operator; `architecture-DEFINITIVE-v3.md` D45):*
+   tendcf-agent is Android-only. On Linux and macOS the projector runs in
+   `tendcf-validate`, a Python command promoted from `bin/projector.py`,
+   which CI also calls; the Android agent's Kotlin projector is a port
+   held to the same golden bytes. Device-side and after approval still
+   hold everywhere.
 
 Plus one decision the brief did not number because none of the three opinions
 fully owned it: **removal is a state, not an event** (`state: "absent"`
@@ -478,7 +485,7 @@ laundering, and the shape conflict with the MPF). The genuine split is where
 the projector runs, and it is the largest single adjudication in this
 document.
 
-**Decision: the projector is device-side, inside tendcf-agent, run after
+**Decision: the projector is device-side, ~~inside tendcf-agent,~~ run after
 approval — Fable's position — with Grok's empirical specifics adopted as the
 projector's contract:** target is `$(sys.workdir)/data/host_specific.json`
 and nothing else; output is `{"vars": {…}}` with no sibling keys — no
@@ -506,12 +513,12 @@ first-class and Grok's cost argument deserves the answer:
    entire actuated surface.
 2. **The cost argument dissolves on inspection.** "A second implementation
    of the same function on macos, Linux, and Termux" miscounts: the
-   projector is one JSON-to-JSON re-keying, written once in the agent's
+   projector is one JSON-to-JSON re-keying, ~~written once in the agent's
    language, running wherever the agent already runs — exactly like the
-   validator. And the projector must exist *somewhere* under either option
+   validator.~~ And the projector must exist *somewhere* under either option
    (Grok's compiler needs one too); the only question is whether its output
-   is inside or outside the gate. Putting it in the agent and having **CI
-   invoke the same agent binary for golden tests** yields one
+   is inside or outside the gate. ~~Putting it in the agent and having **CI
+   invoke the same agent binary for golden tests**~~ yields one
    implementation, two call sites, and *less* machinery than the sibling
    option (no per-host TUF sibling targets, no approval-record hash
    extension, no wire delivery of a second artifact).
@@ -521,6 +528,18 @@ first-class and Grok's cost argument deserves the answer:
    format's semantics under `schema_version` alone (Fable's reason 1 —
    `host_specific.json` acquiring parsing at 3.18 is itself the proof that
    Augments semantics move with the engine).
+
+*Amended 2026-11-02 (operator; `architecture-DEFINITIVE-v3.md` D45).* The
+decision stands — device-side, after approval, nothing Augments-shaped on
+the wire — but its placement changes: tendcf-agent is Android-only and
+written in Kotlin, and on Linux and macOS the projector runs in
+`tendcf-validate`, a Python command promoted from `bin/projector.py`.
+Point 2's "written once in the agent's language, running wherever the
+agent already runs" no longer holds: there are two languages, the Python
+implementation normative and the one CI calls (so on Linux and macOS CI
+tests the device code itself), and the Kotlin port held to the same
+golden bytes, which is residue R22 of
+`projector-reconciliation-2026-08-16.md`. Point 1 is unaffected.
 
 What keeps this from quietly rebuilding Model A's interpreter — the honest
 cost of the decision, carried as residue R21: **the projector must be
@@ -991,8 +1010,10 @@ On `schema/report-row.schema.json#/$defs/device_convergence`:
   "type": "integer", "minimum": 1
 },
 "validator_version": {       // OPTIONAL (diagnostics only)
-  "description": "tendcf-agent binary that produced this row. The ceiling is
-    the claim; this is the courtesy.",
+  "description": "The version of this device's validator: tendcf-agent on
+    Android, tendcf-validate on Linux and macOS (map D45, 2026-11-02). This
+    is diagnostic metadata, not the identity of the report-writing process.
+    schema_ceiling is the claim used by the render rule.",
   "$ref": "common.schema.json#/$defs/release_stamp"
 }
 ```
@@ -1027,7 +1048,11 @@ in the same change.
   `project(goal-file.json)` must byte-equal the checked-in
   `host_specific.json` golden; a projection with any top-level key other
   than `vars` is a negative (parser leniency as a backdoor — Grok's
-  fixture, adopted).
+  fixture, adopted). *Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md`
+  D45):* "the agent's own projector" is, on Linux and macOS,
+  `tendcf-validate`, to be promoted from `bin/projector.py`, the code this
+  gate already runs; the Android agent's Kotlin port must pass the same
+  goldens.
 - `EXPECTED_BROKEN` bumps as cases land; the §10 negative list plus the
   byte-class and diff-class negatives (baseline-hash mismatch, hunk
   inconsistency, non-empty migration, ordinary-class approval over a

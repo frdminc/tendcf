@@ -794,7 +794,9 @@ def load_projector() -> Any | None:
 def check_projector_golden(projector: Any, loaded: dict[str, Any]) -> bool:
     """project(goal-file.json) must be byte-equal to the checked-in golden.
 
-    This is §13's "CI invokes the agent's own projector" made real. The
+    This is §13's "CI invokes the agent's own projector" made real; on Linux
+    and macOS that projector is this one, promoted to `tendcf-validate`
+    (architecture-DEFINITIVE-v3.md D45). The
     comparison is on BYTES, not on parsed equality: the projection is
     hash-bound on the approval record, so a reordering or a respelling that
     parses the same is still a different artifact from the one consented to.
