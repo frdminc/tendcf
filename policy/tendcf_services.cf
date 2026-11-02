@@ -235,14 +235,40 @@ bundle agent tendcf_services
         expression => returnszero("/usr/bin/systemctl is-enabled --quiet $(service_ids)", "noshell"),
         ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_supported";
 
-      # Tombstone on a systemd host: act only when a unit file of that name
-      # is there. launchd labels and runit names fall through untouched.
-      "service_$(service_canon[$(service_ids)])_unit_present"
+      # Tombstone on a systemd host: tear down only a REGULAR file of that
+      # name, which is what this adapter renders. Anything else at the path
+      # is not ours to remove: an alias or enable-created link (pastebin's
+      # /etc/systemd/system/sshd.service is an unowned alias link), a mask
+      # (link to /dev/null), a dangling link, a directory. `fileexists` is
+      # true for every one of those, so it is not the test; `isplain` is
+      # true only for a regular file and does not follow links (run against
+      # a real cf-agent, 3.29.0a: a link to a regular file is not plain
+      # either). Passing this guard does NOT prove cfengine rendered the
+      # file: who wrote a regular file is the lint's job (a tombstone must
+      # fall under a cfengine unit-writer prefix, schema_lint.py), and it
+      # does not stop `systemctl disable` from touching other links of the
+      # unit (schema-v5-dpkg-reconciliation-2026-11-02.md section 6, S0).
+      # launchd labels and runit names fall through untouched.
+      "service_$(service_canon[$(service_ids)])_unit_plain"
+        expression => isplain("/etc/systemd/system/$(service_ids)"),
+        ifvarclass => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present";
+
+      # Something is at the path and it is not a regular file: refused and
+      # reported below, nothing run. `islink` is read as well, so a link is
+      # refused whatever fileexists says about its target.
+      "service_$(service_canon[$(service_ids)])_unit_exists"
         expression => fileexists("/etc/systemd/system/$(service_ids)"),
         ifvarclass => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present";
 
+      "service_$(service_canon[$(service_ids)])_unit_linked"
+        expression => islink("/etc/systemd/system/$(service_ids)"),
+        ifvarclass => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present";
+
       "service_$(service_canon[$(service_ids)])_teardown"
-        expression => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_unit_present";
+        expression => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_unit_plain";
+
+      "service_$(service_canon[$(service_ids)])_teardown_refused"
+        expression => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present.(service_$(service_canon[$(service_ids)])_unit_exists|service_$(service_canon[$(service_ids)])_unit_linked).!service_$(service_canon[$(service_ids)])_unit_plain";
 
   files:
       "/Library/LaunchDaemons/$(service_ids).plist"
@@ -265,7 +291,11 @@ bundle agent tendcf_services
         ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go";
 
       # A tombstone names no flavour; the launchd adapter owns its cleanup
-      # on darwin and nothing can exist to clean elsewhere.
+      # on darwin and nothing can exist to clean elsewhere. This path has no
+      # existence or type gate, by design: a plist is a plain file whoever
+      # wrote it, so `isplain` would not tell ours from another writer's. Its
+      # only guard is the lint (a tombstone must fall under a cfengine
+      # unit-writer prefix; schema_lint.py, cases 129-131).
       "/Library/LaunchDaemons/$(service_ids).plist"
         delete => tendcf_tidy,
         ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
@@ -332,6 +362,9 @@ bundle agent tendcf_services
 
       "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"::
         "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
+
+      "service_$(service_canon[$(service_ids)])_teardown_refused"::
+        "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system/$(service_ids) is not a regular file (an alias, mask, dangling link or directory); this adapter removes only a file it could have rendered";
 }
 
 body contain tendcf_interlock_contain(timeout)

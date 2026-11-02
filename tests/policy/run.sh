@@ -40,7 +40,9 @@
 #      install (unit rendered, enabled, started), a second run that does
 #      nothing, a changed unit (re-rendered, restarted, disabled), and the
 #      tombstone (stopped, disabled, removed, manager reloaded) with its own
-#      second run that does nothing.
+#      second run that does nothing; then a tombstone naming an alias link, a
+#      mask (link to /dev/null) and a dangling link in /etc/systemd/system,
+#      none of which it may touch: reported, no systemctl, links left as found.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -161,6 +163,9 @@ fi
 echo "# 6. systemd adapter"
 unit=tendcf-test-demo.service
 unit_path=/etc/systemd/system/$unit
+alias_path=/etc/systemd/system/tendcf-test-alias.service
+mask_path=/etc/systemd/system/tendcf-test-mask.service
+dangling_path=/etc/systemd/system/tendcf-test-dangling.service
 no_systemctl() { ! grep -Eq "Executing .*systemctl" "$1"; }
 if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
     if [ "${TENDCF_TEST_SYSTEMD:-}" != 1 ]; then
@@ -175,7 +180,7 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
     if declare -F as_root >/dev/null; then
         cleanup_unit() {
             as_root systemctl disable --now "$unit" >/dev/null 2>&1 || true
-            as_root rm -f "$unit_path"
+            as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path"
             as_root systemctl daemon-reload >/dev/null 2>&1 || true
         }
         trap cleanup_unit EXIT
@@ -231,6 +236,31 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
 
         sysd_run systemd-absent.json "$work/sysd5.out"
         check "second tombstone run issues no systemctl command" no_systemctl "$work/sysd5.out"
+
+        # Refusal: a tombstone must never tear down a path this adapter did
+        # not render. `fileexists` is true for a link, a mask and a dangling
+        # link, so a teardown gated on it would `systemctl disable --now` and
+        # delete each of these (schema-v5-dpkg-reconciliation-2026-11-02.md
+        # section 2.2(4); pastebin's sshd.service is such an alias link).
+        # Created after the regular-file lifecycle above; the EXIT trap
+        # removes them whatever fails. Refusal also means no systemctl at all.
+        alias_target="$work/alias-target.service"
+        : >"$alias_target"
+        as_root ln -s "$alias_target" "$alias_path"
+        as_root ln -s /dev/null "$mask_path"
+        as_root ln -s /nonexistent/tendcf-test "$dangling_path"
+        sysd_run systemd-absent-links.json "$work/sysd6.out"
+        for n in alias mask dangling; do
+            check "tombstone on a $n link reported as not actuated" \
+                grep -q "tendcf: service 'tendcf-test-$n.service' tombstone not actuated: /etc/systemd/system/tendcf-test-$n.service is not a regular file" "$work/sysd6.out"
+        done
+        check "no systemctl invocation for the link tombstones" no_systemctl "$work/sysd6.out"
+        check "alias link left in place" \
+            bash -c "[ \"\$(readlink '$alias_path')\" = '$alias_target' ]"
+        check "alias target left in place" bash -c "[ -f '$alias_target' ]"
+        check "mask link left in place" bash -c "[ \"\$(readlink '$mask_path')\" = /dev/null ]"
+        check "dangling link left in place" \
+            bash -c "[ \"\$(readlink '$dangling_path')\" = /nonexistent/tendcf-test ]"
     fi
 elif [ "${TENDCF_TEST_SYSTEMD:-}" = 1 ]; then
     check "TENDCF_TEST_SYSTEMD=1 needs a host booted by systemd" false
@@ -308,7 +338,7 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
 fi
 
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 nixos-shape nixos-tombstone; do
+    for f in refused satisfied flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
