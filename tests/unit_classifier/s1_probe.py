@@ -9,6 +9,7 @@ into the spec's section 3.5 results. Dpkg behaviour is measured on a private
 admindir under /var/tmp with real dpkg, never on the host database.
 """
 import os
+import shutil
 import sys
 import tempfile
 
@@ -121,6 +122,28 @@ def item2_8_masks_alias_transient():
     rec("where the transient fragment lies", "ls -l /run/systemd/transient/ | grep tendcf-s1 || true")
     sh(["systemctl", "stop", "tendcf-s1-trans.service"])
     sh(["systemctl", "reset-failed", "tendcf-s1-trans.service"])
+
+
+def link_outside():
+    out("## A vendor-directory symlink whose target lies elsewhere\n")
+    ext = "/var/tmp/tendcf-s1-extc"
+    with Sandbox(extra_roots=(ext,)) as sb:
+        for tag, tgt in (("a", R + "/tendcf-s1-ext/tendcf-s1-exta.service"), ("b", E + "/tendcf-s1-extb/tendcf-s1-extb.service"),
+                         ("c", ext + "/tendcf-s1-extc.service")):
+            sb.write(tgt, SVC)
+            sb.symlink(U + "/tendcf-s1-ext%s.service" % tag, tgt)
+        daemon_reload()
+        for tag in "abc":
+            show("tendcf-s1-ext%s.service" % tag)
+        rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-ext*"])
+        rec("systemctl link of a file elsewhere (what a hand-made linked unit looks like)",
+            ["systemctl", "link", "--no-reload", ext + "/tendcf-s1-extc.service"])
+        rec("what link created", "ls -l /etc/systemd/system/tendcf-s1-extc.service")
+        sh(["systemctl", "disable", "--no-reload", "tendcf-s1-extc.service"])
+        if os.path.islink(E + "/tendcf-s1-extc.service"):
+            os.unlink(E + "/tendcf-s1-extc.service")
+    daemon_reload()
+    shutil.rmtree(ext, ignore_errors=True)
 
 
 def item3_generated():
@@ -305,6 +328,10 @@ def baseline_scan():
             len(d["units"]),
             json.dumps({v: sum(1 for u in d["units"] if u["verdict"] == v) for v in sorted({u["verdict"] for u in d["units"]})}),
             json.dumps({str(k): sum(1 for u in d["units"] if u["rule"] == k) for k in sorted({u["rule"] for u in d["units"]})})))
+        out("units that are not a plain rule-8 extra (first 40):\n\n```")
+        for u in [u for u in d["units"] if u["rule"] != 8][:40]:
+            out("%s rule %s %s: %s" % (u["id"], u["rule"], u["verdict"], u["why"][:160]))
+        out("```\n")
         out("incomplete reasons (first 40):\n\n```")
         for x in d["incomplete"][:40]:
             out(x)
@@ -318,7 +345,7 @@ def main():
         print("skip: needs root, TENDCF_TEST_SYSTEMD=1 and a host booted by systemd")
         return 0
     out("# Spec section 3.5 observations (tests/unit_classifier/s1_probe.py)\n")
-    for step in (env_info, baseline_scan, item7_paths, item1, item2_8_masks_alias_transient, item3_generated,
+    for step in (env_info, baseline_scan, item7_paths, item1, item2_8_masks_alias_transient, link_outside, item3_generated,
                  item6_7_dropins, item9_alias_in_dropin, dpkg_items):
         try:
             step()

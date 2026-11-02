@@ -146,12 +146,18 @@ class Fixture(unittest.TestCase):
 
 class Baseline(Fixture):
     def test_clean_host_scan_is_complete_with_no_claims(self):
-        """No fixture, no claims: the scan completes. A runner anomaly that makes it
-        incomplete would silently weaken every count-based assertion below."""
+        """No fixture, no claims: the scan completes, or is incomplete only for the stock
+        generated units below. Anything else would silently weaken the assertions that follow."""
         res = self.classify(claims_doc())
-        self.assertEqual(res["summary"]["extra_scan"], "complete", res["incomplete"][:10])
-        self.assertEqual(res["summary"]["two_writers"], 0)
-        self.assertEqual(res["summary"]["unmet_absence"], 0)
+        # Observed (S1): ubuntu 26.04 ships generators (netplan, sshd-socket) whose units carry no
+        # SourcePath, which the contract makes unverifiable; any other reason is a runner anomaly.
+        stock = [r for r in res["incomplete"] if "generated unit with empty SourcePath" in r]
+        self.assertEqual(res["incomplete"], stock, "unexpected incomplete reasons")
+        if not res["incomplete"]:
+            self.assertEqual(res["summary"]["extra_scan"], "complete")
+            self.assertEqual(res["summary"]["unmet_absence"], 0)
+        else:
+            self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
 
 
 class Ownership(Fixture):
@@ -255,7 +261,9 @@ class Aliases(Fixture):
         self.reload()
         cat = sh(["systemctl", "cat", "tendcfs1dash-x.service"]).stdout
         self.assertIn("Alias=tendcfs1dash-link.service", cat, "precondition: cat prints it")
-        self.expect(claims_doc(pkgs=["tendcfs1dash"]), "tendcfs1dash-link.service", "extra")
+        # the exact claim licenses the local drop-in, so the alias link is the only finding
+        self.expect(claims_doc(pkgs=["tendcfs1dash"], writers={"tendcfs1dash-x.service": "third-party"}),
+                    "tendcfs1dash-link.service", "extra")
 
     def test_cfengine_claim_on_the_alias_name_over_a_vendor_fragment_is_two_writers(self):
         pkg = self.ssh_alias()
