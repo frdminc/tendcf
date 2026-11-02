@@ -93,9 +93,9 @@ class Sandbox:
                         f.flush()
                         # Order matters on Linux: a chown clears setuid/setgid, so the owner is
                         # restored first and the mode (special bits included) last.
-                        os.fchmod(f.fileno(), st.st_mode & 0o7777)  # MUTANT
                         if os.geteuid() == 0:
                             os.fchown(f.fileno(), st.st_uid, st.st_gid)
+                        os.fchmod(f.fileno(), st.st_mode & 0o7777)
                     os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
                     os.replace(tmp, p)
                 except BaseException:
