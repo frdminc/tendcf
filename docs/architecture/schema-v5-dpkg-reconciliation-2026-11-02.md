@@ -13,7 +13,7 @@ wrong, §8 says so; the inputs are not corrected in place. Q9 is the open item
 1. **Two read-only reads of pastebin** (§2.4): a probe for the unit list and states, and the lead's ownership query over the unit directories. Package attributions are **read from pastebin's database**, except two rows that stay index-based and say so.
 2. **An assembled v5 schema, in memory, outside the repository.** It applied §2.1 to the real schemas and used the real `schema_evidence` from `bin/schema_lint.py`. The goal-family cross-file rules of §2.2 were prototyped beside it. Every schema regex, class token and overlap row below comes from that run unless marked. The spec-review changes (`overlap`, §2.2(5), cases 126, 127, 129-131 and the report-row cases) were re-run the same way, with cases 129-131 also against the v4 schema on disk. Case 145 was not run.
 3. **The live v4 lint and a real `cf-agent`,** for the hazard in §2.2(4).
-4. **Not run:** no detector or classifier exists, and nothing in §3 has run on a systemd host. The `systemctl show` and `dpkg-query` behaviour §3 depends on is listed in §3.5 for slice S1 to prove.
+4. **Not run when this document was written:** no detector or classifier existed, and nothing in §3 had run on a systemd host. Slice S1 has since run §3.5 and the §6 fixtures on three ubuntu systemd hosts: §3.6 records the results, and every place where the contract changes is marked `[S2 C<n>]`. Nothing has run on Debian 13 or on pastebin.
 
 ## 1. Rulings (djbclark, 2026-11-02; R4-R8 the same day, after the spec reviews)
 
@@ -284,7 +284,11 @@ No detector exists; this is what one must do. It reads and reports, and it never
 | Gate passes but the dpkg database cannot be queried | `incomplete` |
 | Every in-scope unit resolved with evidence | `complete` |
 
+**S2 markers.** Where S1 observed behaviour that differs from this contract, an indented note marked `[S2 C<n>]` sits under the text it changes. §3.6 has the observations and the full list. The text above each note is the contract as written before S1, and S2 rewrites it.
+
 `supervisor: systemd` does not establish that dpkg exists (astra B4). Other domains' `coverage` switches nothing on or off (Fable F6). Their rows say `not-run`, and unit findings appear on the `supervision` row only.
+
+   - `[S2 C7]` S1 observed that `dpkg-query -S` on a missing or empty admindir exits 1 with "no path found", exactly as for a missing path in a healthy database. "Cannot be queried" is therefore tested with a positive control: a path that must be owned (`/usr/bin/dpkg-query`, `/usr/bin/dpkg`, both spellings). No owner for all of them is `incomplete`.
 
 **The registry is the union of every domain's `unit-writer`, `unit-package` and `service` entries** (R3c). A claim in a non-comprehensive domain counts. This reads service entries across domains, where the lint in §2.2 stays same-domain: lint keeps the stricter authoring rule, and the device judges one namespace.
 
@@ -295,8 +299,10 @@ No detector exists; this is what one must do. It reads and reports, and it never
 1. **Names.** `systemctl list-unit-files` and `systemctl list-units --all`, for the four types (R2). Then, per unit: `Id`, `Names`, `LoadState`, `UnitFileState`, `FragmentPath`, `SourcePath`, `DropInPaths`, `Transient`.
 2. **Provenance is recorded before anything is resolved** (astra A2). Keep the lookup name and the link path; a mask resolved to `/dev/null` has lost its identity.
 3. **Not artifacts:** `.wants/` and `.requires/` entries are dependencies, never classified (Fable F2; §7 item 6). A unit with `Transient=yes` is out of scope (R2) and is dropped before classification. The `list-unit-files` state `transient` alone is not the test, because transient units have no unit file.
+   - `[S2 C1]` S1 observed that `list-unit-files` does list a transient unit (state `transient`), so the sentence above is wrong as written. `Transient=yes` from `systemctl show` stays the only test.
 4. **Artifacts of a unit,** each classified on its own:
    - the effective fragment, or for `UnitFileState=generated` its `SourcePath` (R2). An empty `SourcePath` on a generated unit is unverifiable;
+     - `[S2 C5]` S1 found stock generated units with an empty `SourcePath` on ubuntu 26.04 (`netplan-ovs-cleanup.service`, `sshd-unix-local.socket`). The rule stands and makes a stock 26.04 scan `incomplete`; see §3.6 C5 for the open question.
    - every `DropInPaths` entry, which covers template, instance and type-wide scopes;
    - a mask;
    - an alias link: see below;
@@ -305,12 +311,16 @@ No detector exists; this is what one must do. It reads and reports, and it never
    **The probe is the only directory access: a name lookup, never a walk.** `FragmentPath` shows the winner only, is `/dev/null` for a mask, and is the target's for an alias name, so the manager cannot supply these paths. Obtain and record the ordered system-manager load path from `systemd-analyze unit-paths`; do not assume `/etc` and `/usr/lib` exhaust it. In each directory, without following links, look for:
    - each of the unit's names and the lookup name and, for an instance, its applicable template (`getty@tty1.service` also looks for `getty@.service`);
    - `<name>.d/*.conf` for each of those, the dash-truncated directories (`foo-bar.service` also reads `foo-.service.d/`; `systemd.unit(5)`, read at upstream v257) and the type-wide `<type>.d/*.conf`.
+   - `[S2 C3]` S1 observed `FragmentPath` of a mask to be the mask link's own path (`/etc/systemd/system/x.service` or `/run/systemd/system/x.service`), not `/dev/null`, with `UnitFileState` `masked` or `masked-runtime`. The probe-based reading below is unchanged.
+   - `[S2 C2]` S1 observed that `systemctl show` refuses a bare template name (rc 1, and one template in a multi-name call fails the whole call). A template is never `show`n: its artifacts come from the probe alone.
 
    This yields the mask link, the alias link and any shadowed fragment. `FragmentPath` and `DropInPaths` are then cross-checked against it, and a disagreement is unverifiable. For an instance, a package-owned applicable template counts as a vendor fragment even when a local instance file or mask keeps it from being selected. If the candidates or their provenance cannot be established, the scan is `incomplete`.
+   - `[S2 C4]` Only `DropInPaths` not found by the probe is a disagreement. The probe also finds drop-ins `DropInPaths` omits, because a same-named `*.conf` in a higher-precedence directory shadows them; those are judged as artifacts, not disagreements. A drop-in link to `/dev/null` is listed in `DropInPaths` and is an artifact.
 5. **A link's final target is an artifact too,** except `/dev/null`. An owned link to an unowned target does not launder the target (astra A5).
 6. **Aliases: one rule.** An alias keeps its lookup name, link artifact, target identity and claims until classification is complete.
    - An owned alias link follows the package tier (§2.4 item 3).
    - An unowned alias link is **authorized** only when its name appears in the target's effective `[Install] Alias=`, meaning fragment plus drop-ins as `systemctl cat` prints them. An exact name claim does not otherwise authorize it: an unauthorized alias is `extra` even under a claim. This is what stops `evil.service -> ssh.service` collapsing into `ssh.service` (Fable F2).
+   - `[S2 C6]` S1 observed that `systemctl enable` acts on `[Install] Alias=` from the fragment, `<name>.d` and the template's `.d` only, never from a dash-truncated or type-wide drop-in, although `systemctl cat` prints those too. "Effective" therefore means the fragment plus `<name>.d` and `<template>.d`.
    - Authorization covers the link only. The target and every other artifact pass classification on their own.
    - Evaluate claims on the alias name and R2's vendor-fragment rule first. Only then does a clean alias count as its target, once.
 
@@ -350,7 +360,7 @@ A name claim covers local artifacts only; a package claim covers owned ones (§2
 
 ### 3.5 Behaviour S1 must prove before the shape freezes
 
-None of this has been run. The draft's F.3 and the reviews rest on recall here too:
+As written, before S1, none of this had been run; the draft's F.3 and the reviews rested on recall here too. **S1 has now run every item below: the results, with the systemd and dpkg versions, are in §3.6.**
 1. `systemctl show` on a bare template name (the draft recalls a refusal) and on non-loaded units.
 2. `FragmentPath` on a masked unit: the link path or `/dev/null`.
 3. `SourcePath` on a sysv-generated unit. The D-Bus API documents the property; its value on `exim4.service` and `zhm.service` is unread.
@@ -360,6 +370,87 @@ None of this has been run. The draft's F.3 and the reviews rest on recall here t
 7. `systemd-analyze unit-paths` output, and whether `DropInPaths` lists files the probe does not find, or the reverse.
 8. `Transient` and `FragmentPath` on a `systemd-run` unit, and `FragmentPath` and `Names` on an alias name.
 9. `Alias=` set in a drop-in. `systemctl enable` loads drop-ins for its `[Install]` reading (upstream v257 `src/shared/install.c:1596-1633`, `:2825`; read, not run). That search names `<name>.d` and the template's directory only, so S1 must show whether `systemctl cat` can print an `Alias=` that `enable` would not act on.
+
+### 3.6 Results of §3.5 and of the §6 fixtures (S1, 2026-11-02)
+
+Everything here was run, by `bin/unit_classifier.py` and `tests/unit_classifier/` (`s1_probe.py` records raw output; `test_fixtures.py` is the fixtures; `test_logic.py` is the canned-output verdict table). The probe's full raw output is the `s1-probe-<runner>` artifact of each CI run below. Observed on three GitHub runners:
+
+| Runner | systemd | dpkg |
+|---|---|---|
+| ubuntu-24.04 (amd64) | 255 (255.4-1ubuntu8.18) | 1.22.6 |
+| ubuntu-24.04-arm (arm64) | 255 (255.4-1ubuntu8.18) | 1.22.6 |
+| ubuntu-26.04 (amd64) | 259 (259.9-0ubuntu0.1) | 1.23.7 |
+
+All three have `/lib -> usr/lib`, and the host database records `ssh.service` under `/usr/lib` only (a `/lib` query misses it). The arm64 runner differs from amd64 only in the architecture. ubuntu-26.04 differs in these ways, none affecting a verdict: it ships `sshd.service -> ssh.service` as an owned link in `/usr/lib` (24.04 has none, so `systemctl enable` creates it); `systemctl cat` annotates an empty `.conf` and a `/dev/null` drop-in alike "is a mask"; `systemctl enable` quotes its link paths; a multi-owner line orders the owners differently. Debian 13 (pastebin) was **not** measured: there is no systemd manager in the `debian:13` CI container, and R8's probe is the lead's.
+
+**§3.5 items, as observed.**
+
+| # | Observed |
+|---|---|
+| 1 | `systemctl show getty@.service` exits 1: "Failed to get properties: Unit name getty@.service is neither a valid invocation ID nor unit name." One template among several names fails the whole call with no output. A non-existent name exits 0 with `LoadState=not-found` and empty `FragmentPath`, `SourcePath`, `DropInPaths` and `UnitFileState`. An instance (`getty@tty63.service`) shows normally: `FragmentPath` is the template's, `Names` includes the instance's alias names (`autovt@tty63.service`), and `UnitFileState` is the template's. `list-unit-files` lists the template only; an instance appears in `list-units --all` only while loaded. An instance that is only a `.wants` link of a loaded target stays loaded (`loaded inactive dead`). An instance with only a `.d` directory is not listed, and a `show` of it does not keep it loaded. |
+| 2 | A mask's `FragmentPath` is the link's own path: `/etc/systemd/system/x.service` (`UnitFileState=masked`) or `/run/systemd/system/x.service` (`masked-runtime`), never `/dev/null`. `LoadState=masked`; `systemctl cat` prints "# Unit x.service is masked."; `list-unit-files` says `masked` or `masked-runtime`. The vendor fragment under the mask is not reported by the manager. |
+| 3 | A generated unit has `UnitFileState=generated`, `FragmentPath` in `/run/systemd/generator`, `generator.early` or `generator.late`, and `SourcePath` as the generator wrote it. Real `systemd-sysv-generator` (present on both releases): `SourcePath=/etc/init.d/<name>`, `FragmentPath=/run/systemd/generator.late/<name>.service`. A generator of our own (`/run/systemd/system-generators/`) works the same, and its units survive `daemon-reload` (regenerated). **Stock ubuntu 26.04 has two generated units with an empty `SourcePath`:** `netplan-ovs-cleanup.service` and `sshd-unix-local.socket`. 24.04 has none. |
+| 4 | Removed but not purged (`deinstall ok config-files`): `dpkg-query -S` still names the package for its conffile and no longer for its program files; after purge, for neither. `info/<pkg>.list` keeps only the conffile paths. The contract's reading stands: a declared `exim4-base` makes a unit with such a conffile source clean. **Not shown:** that pastebin's `exim4` is in this state (§2.4); that needs R8's read. |
+| 5 | Output: `pkg: /path`; several owners `a, b: /path` in no fixed order; `pkg:arch: /path` for a `Multi-Arch: same` package only (`tendcf-s1-m:amd64: ...`; a plain package has no qualifier); a directory lists every package that has it. No match: exit 1 and stderr `dpkg-query: no path found matching pattern /p`, with the other arguments' lines still printed on stdout. Diversion: `diversion by <pkg> from: <path>` and `diversion by <pkg> to: <path>` (`local diversion from:` and `to:` for a local one) before the owner line; querying the diversion's target prints the diversion lines only, with exit 0. A path with `*?[\` is a pattern unless escaped with a backslash; the escaped literal matches. `dpkg --force-overwrite` moves a file to the later package, so two packages share a path in the database only through a database that already lists both (a hand-written `info/*.list`, `s1lib.TestDb`, prints the same forms as real dpkg). **A missing admindir exits 1 "no path found", not an error.** |
+| 6 | A type-wide `/etc/systemd/system/service.d/x.conf` is in `DropInPaths` of every service (`ssh.service`, `cron.service`, `systemd-journald.service`, a synthetic unit, an instance). Each covered unit is `two-writers`, loud as the contract says (fixture `test_type_wide_dropin_lands_on_every_unit_item_6`). |
+| 7 | `systemd-analyze unit-paths`, with or without `--system`, prints twelve directories in precedence order, existing or not: `/etc/systemd/system.control`, `/run/systemd/system.control`, `/run/systemd/transient`, `/run/systemd/generator.early`, `/etc/systemd/system`, `/etc/systemd/system.attached`, `/run/systemd/system`, `/run/systemd/system.attached`, `/run/systemd/generator`, `/usr/local/lib/systemd/system`, `/usr/lib/systemd/system`, `/run/systemd/generator.late`. `DropInPaths` lists name, dash-truncated, template and type-wide drop-ins, empty `.conf` files, and an `/etc` `*.conf` link to `/dev/null`; it omits a same-named `*.conf` shadowed by a higher-precedence directory (including the one an `/etc` `/dev/null` link masks) and any file not ending `.conf`. In every case tried the probe found everything `DropInPaths` lists, and the probe found more only where shadowing explains it. |
+| 8 | A `systemd-run --remain-after-exit` unit: `Transient=yes`, `UnitFileState=transient`, `FragmentPath=/run/systemd/transient/<unit>.service`; **`list-unit-files` does list it** (state `transient`), against §3.2(3). An alias name (`show sshd.service`): `Id` is the target's, `Names` has both, `FragmentPath` is the target's fragment, and `list-unit-files` has a row for the alias name with state `alias`. A vendor-directory link whose target lies in a subdirectory of a lookup directory loads as `bad` (not found); a target outside the tree (`/var/tmp/...`) loads, with `FragmentPath` the link's own path. `systemctl link` of an outside file creates `/etc/systemd/system/<name> -> <file>`. |
+| 9 | `systemctl enable` creates the alias link for an `Alias=` in `<name>.d/*.conf` (`tendcfs1p9-viadropin.service`) and ignores one in a dash-truncated `tendcfs1p9-.service.d` and one in a type-wide `service.d`, while `systemctl cat` prints all three. |
+
+**Contract changes for S2** (each is also marked inline, `[S2 C<n>]`, and the classifier already follows the observed behaviour):
+
+1. **C1** §3.2(3): transient units do appear in `list-unit-files`. `Transient=yes` is still the only test.
+2. **C2** §3.2(1), §3.2(4): `systemctl show` is never called for a template (it fails the call). A template's artifacts come from the probe alone; an instance is shown normally.
+3. **C3** §3.2(4): a mask's `FragmentPath` is the link's path, not `/dev/null`. The mask is found by the probe.
+4. **C4** §3.2(4): the `FragmentPath`/`DropInPaths` cross-check runs one way. `DropInPaths` entries the probe does not find are unverifiable. Probe-found drop-ins that `DropInPaths` omits are shadowed copies, judged as artifacts. This is the contract's "disagreement" made exact.
+5. **C5** §3.2(4): a generated unit with an empty `SourcePath` stays `incomplete`, but stock ubuntu 26.04 has two, so a stock 26.04 host can never scan `complete`. **Open for the lead/S2:** accept this, or attribute such a unit through its generator (not done: the manager gives no link from a unit to its generator, and no generator header was checked). Debian 13 was not measured. The classifier keeps the contract.
+6. **C6** §3.2(6): "effective `[Install] Alias=`" is the fragment plus `<name>.d` and the template's `.d`. A dash-truncated or type-wide drop-in is excluded, because `enable` ignores it (item 9). The classifier reads `systemctl cat` and keeps only those blocks.
+7. **C7** §3.1, §3.3: "the dpkg database cannot be queried" needs a positive control, because a missing or empty database answers like a miss. The classifier queries `/usr/bin/dpkg-query` and `/usr/bin/dpkg` under both spellings and needs an owner for at least one.
+8. **C8** §3.3: parse rules for `dpkg-query -S` are as item 5. A diversion line naming a queried path (`from` or `to`) makes that path unverifiable even when an owner line follows. Owner order is unspecified: use sets. An unrecognised stdout line, or an exit status other than 0 or 1, fails the whole query and the scan is `incomplete`.
+9. **C9** §3.2(1), §7 item 14: an instance is enumerated only while the manager holds it loaded. A drop-in directory of an unloaded instance is the orphan case of §7 item 14, and is never judged.
+10. **C10** §3.2(5), §3.4 row 3: an owned link to an unowned target is one fragment chain, not two fragments. The owned link is not a vendor fragment on its own, the unowned target is a local artifact, and rule 3 does not fire; with no claim the unit is `extra` (row 10), with an exact `third-party` claim it is `clean`. Reading row 3 literally would call the pair `two-writers` under any claim, which the astra A5 rule ("an owned link does not launder its target") does not ask for.
+11. **C11** §3.4 row 4: "exact non-cfengine claim on the name" is read as the unit's `Id` or, for an instance, its template. A claim on an alias name does not license a drop-in on the unit. (Row 2's cfengine side still counts every name of the unit, an alias name included, as written.)
+12. **C12** §3.2(1): an unreadable or unexpected unit (a probe that raises, a `show` that fails for a non-template) makes that unit `incomplete`; it is never skipped and never a crash.
+
+**Fixture results.** `tests/unit_classifier/test_fixtures.py`, one independent test per row or variant, each with its own files and its own copy of the dpkg database, gated like policy check 6 (Linux booted by systemd, root, `TENDCF_TEST_SYSTEMD=1`). Fixtures write only under `/etc/systemd/system`, `/run/systemd/system` and `/usr/lib/systemd/system`, plus `/run/systemd/system-generators` (the generated-unit rows), and `/var/tmp` (the private dpkg databases, the outside-the-tree link target and the claims files). Ownership is arranged with synthetic packages in a private copy of the host's database; the real `ssh.service`, `kmod.service` and `hwclock.service` are used where the table names them, and a synthetic template `tendcf-s1-getty@.service` stands in for `getty@.service` (the real one has no instance a fixture can hold loaded without starting a getty). Results on all three runners, from [run 41506950654](https://github.com/frdminc/tendcf/actions/runs/41506950654) (branch workflow) and [run 41507052944](https://github.com/frdminc/tendcf/actions/runs/41507052944) (`linux.yml`, job `vm`): 57 tests, all passing on each. Mutation check: [run 41506077208](https://github.com/frdminc/tendcf/actions/runs/41506077208) with every unowned alias link authorized: exactly three fixtures went red on all three runners (`test_hand_made_alias_to_ssh_no_claim_is_extra`, `test_hand_made_alias_to_ssh_exact_third_party_is_still_extra`, `test_alias_named_only_by_a_dash_truncated_dropin_is_not_authorized`) and the other 54 stayed green. The same mutant also fails `test_logic.VerdictTable.test_unauthorized_alias_is_extra_even_under_exact_claim`.
+
+| §6 row | Tests | Verdict asserted |
+|---|---|---|
+| Rogue `/etc` unit, no claim | `Ownership.test_rogue_etc_unit_no_claim_is_extra` | `extra` |
+| Unowned file in the vendor directory | `test_unowned_file_in_vendor_dir_no_claim_is_extra` | `extra` |
+| Undeclared package; undeclared co-owner | `test_unit_of_undeclared_package_is_extra`, `test_undeclared_coowner_is_extra_and_both_declared_is_clean` | `extra`; `extra`, then `clean` when both declared |
+| Declared package, fragment only | `test_declared_package_fragment_only_is_clean`, `test_real_ssh_service_declared_is_clean` | `clean` |
+| Enable-created alias `sshd.service` | `Aliases.test_enable_created_alias_authorized_by_target_alias_clean_counted_once` | `clean`, one unit record |
+| `Alias=` from a drop-in on the target | `test_alias_authorized_by_dropin_on_the_target_is_clean`, and the C6 case `test_alias_named_only_by_a_dash_truncated_dropin_is_not_authorized` | `clean`; `extra` |
+| Cfengine claim on the alias name | `test_cfengine_claim_on_the_alias_name_over_a_vendor_fragment_is_two_writers` | `two-writers` |
+| Shipped alias `kmod.service`, shipped mask `hwclock.service` | `test_shipped_alias_and_shipped_mask_real_kmod_and_hwclock_are_clean`, `..._synthetic_are_clean` | `clean` |
+| `evil.service -> ssh.service`, no claim / exact `third-party` | `test_hand_made_alias_to_ssh_no_claim_is_extra`, `..._exact_third_party_is_still_extra` | `extra` / `extra` |
+| Local drop-in on `ssh.service` | `Layers.test_local_dropin_on_ssh_no_claim_is_two_writers`, `..._exact_third_party_is_clean` | `two-writers` / `clean` |
+| Dash-truncated drop-in | `test_dash_truncated_dropin_no_claim_is_two_writers`, `..._exact_third_party_is_clean` | `two-writers` / `clean` |
+| Drop-in on a generated unit from an owned source | `test_dropin_on_generated_unit_from_owned_source_no_claim_is_two_writers`, `..._exact_third_party_is_clean` | `two-writers` / `clean` |
+| Persistent and runtime mask on `ssh.service` | six tests `test_persistent_mask_*`, `test_runtime_mask_*` (no claim / exact `third-party` / cfengine) | `two-writers` / `clean` / `two-writers`, each |
+| Package-shipped drop-in under `/etc` | `test_package_shipped_dropin_under_etc_declared_is_clean` | `clean` |
+| Instance drop-in, no claim / template `third-party` | `Instances.test_instance_dropin_no_claim_is_two_writers`, `..._exact_template_third_party_is_clean` | `two-writers` / `clean` |
+| Local copy of `ssh.service` in `/etc`, exact `third-party` | `test_local_copy_of_ssh_in_etc_exact_third_party_is_two_writers` | `two-writers` |
+| Local instance fragment under a template `third-party` claim | `test_local_instance_fragment_under_template_third_party_is_two_writers` | `two-writers` |
+| Instance mask, persistent and runtime, three claims each | six tests `test_persistent_instance_mask_*`, `test_runtime_instance_mask_*` | `two-writers` / `clean` / `two-writers`, each |
+| Cfengine claim and present service on `ssh.service`, no local file | `Claims.test_cfengine_claim_and_present_service_on_ssh_no_local_file_is_two_writers` | `two-writers` |
+| Tombstone under a cfengine claim, file surviving | `test_tombstone_with_surviving_regular_file_is_unmet_absence` | `unmet-absence` |
+| Claim only in a `not-yet-migrated` domain | `test_claim_only_in_a_not_yet_migrated_domain_is_clean` | `clean` |
+| Present and tombstone across domains | `test_present_in_supervision_and_tombstone_in_another_domain_is_incomplete_naming_both` | `incomplete`, both addresses named |
+| Generated unit from an owned source | `Generated.test_generated_unit_from_owned_source_declared_is_clean`, `..._undeclared_is_extra` | `clean` / `extra` |
+| Generated unit, empty `SourcePath` | `test_generated_unit_with_empty_sourcepath_is_incomplete` | `incomplete`, no counts |
+| `systemd-run` transient | `Transient.test_systemd_run_transient_unit_is_not_judged` | not judged |
+| Owner under `/lib` only | `Ownership.test_owner_recorded_under_lib_only_is_package_tier` | package tier: `clean` declared, `extra` undeclared |
+| No owner; multiple owners; arch-qualified; vendor symlink outside the tree | `test_successful_lookup_with_no_owner_is_name_tier_not_a_failure`, `test_undeclared_coowner_*`, `test_architecture_qualified_owner_maps_to_the_package`, `test_vendor_symlink_to_target_outside_the_tree` | `clean` with a claim; as above; `clean`; `extra` (target unclaimed) or `clean` (exact claim) |
+| A diversion on the path | `test_a_diversion_on_the_path_is_incomplete` | `incomplete`, no counts |
+| `dpkg-query` removed from `PATH`; no `/run/systemd/system` | `Gates.test_dpkg_query_removed_from_path_is_incomplete_without_counts`, `test_no_run_systemd_system_is_incomplete_without_counts` (a private mount namespace with a tmpfs over `/run/systemd`) | `incomplete`, no counters |
+| `supervision` not comprehensive | `Claims.test_supervision_not_comprehensive_is_not_run` | `not-run` |
+| Added by S1 | `Baseline` (a clean host scans complete, or incomplete only for stock generated units, C5), `Layers.test_type_wide_dropin_lands_on_every_unit_item_6`, `Gates.test_unusable_dpkg_database_is_incomplete_not_zero_owners` (C7), `ReadOnly.test_a_scan_changes_nothing_on_disk_or_in_the_manager` | |
+
+**Read-only.** `Env.run` refuses every argv outside `systemctl show|cat|list-units|list-unit-files`, `systemd-analyze unit-paths` and `dpkg-query -S` (`test_logic.ReadOnly`). A scan's only filesystem calls are `lstat`, `readlink` and listing the drop-in directories of a unit's own names. `systemctl show NAME` makes the manager load NAME; that is inherent in enumerating through the manager, and it never starts, stops, enables or reloads anything.
+
+**Not proven.** The classifier has never run on Debian 13 or on pastebin (R8). The two index-based attributions of §2.4 (`exim4-base` through `/etc/init.d/exim4`, `zephyr-clients` through `/etc/init.d/zhm`) are still unread: S1 showed what the database answers for a removed package's conffile (item 4), not what pastebin's does. Only `.service` units have fixtures; `.socket`, `.timer` and `.path` take the same code path, and the 26.04 baseline judges `sshd-unix-local.socket`, but no fixture asserts a verdict on one. Generator-written drop-ins, `snap` units, user managers, and the full-scan time on a unit-heavy host are unmeasured.
 
 ## 4. Migration (one PR, S2)
 
