@@ -420,7 +420,9 @@ def resolve_ownership(env, artifacts):
 
 def dir_variants(name):
     """Drop-in directory names systemd.unit(5) reads for one unit name."""
-    m = re.match(r"^(.*)\.(" + TYPE_RE + r")$", name)
+    m = re.match(r"^(.*)\.([a-z]+)$", name)
+    if not m:
+        return [name + ".d"]
     base, suffix = m.group(1), m.group(2)
     out = [name + ".d"]
     t = template_of(name)
@@ -579,7 +581,7 @@ class Scan:
             dnames = []
             for n in sorted(look):
                 dnames += dir_variants(n)
-            for suffix in sorted({n.rsplit(".", 1)[1] for n in look}):
+            for suffix in sorted({n.rsplit(".", 1)[1] for n in look if "." in n}):
                 dnames.append(suffix + ".d")
             for dn in dict.fromkeys(dnames):
                 dp = os.path.join(d, dn)
@@ -680,9 +682,13 @@ class Scan:
         # directory beside it is an orphan the manager ignores (section 7 item 14).
         units = [u for u in units if not u.not_found]
         for u in units:
-            found = self.probe(u)
-            if not u.template:
-                self.cross_check(u, found)
+            try:
+                found = self.probe(u)
+                if not u.template:
+                    self.cross_check(u, found)
+            except Exception as e:  # a unit the probe cannot read is unverifiable, never a crash or a zero
+                u.problems.append("probe error %r" % (e,))
+                found = {}
             probes[u.id] = found
             u.artifacts = self.finish_artifacts(u, found)
         every = [a for u in units for a in u.artifacts]
