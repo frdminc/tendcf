@@ -208,6 +208,7 @@ class Artifact:
     owners_raw: list = field(default_factory=list)
     problem: str = None
     name: str = None             # lookup name it was found under
+    via: str = None              # for a link's final target: the link's canonical path
 
     @property
     def unverifiable(self):
@@ -257,13 +258,30 @@ def parse_unit_list(text):
     return out
 
 
-def alias_names_from_cat(text):
-    """Effective [Install] Alias= (fragment plus drop-ins, as `systemctl cat`
-    prints them; an empty assignment resets)."""
-    aliases, section = [], None
+CAT_HEADER_RE = re.compile(r"^# (/\S+)$")
+
+
+def alias_names_from_cat(text, accept_dropin_dirs=None):
+    """[Install] Alias= as `systemctl cat` prints it (fragment plus drop-ins; an
+    empty assignment resets).
+
+    Observed (S1, systemd 255 and 259): `systemctl enable` acts on an Alias= from
+    the unit's own `<name>.d` (and its template's) but NOT from a dash-truncated
+    `foo-.service.d` or a type-wide `service.d`, while `systemctl cat` prints all
+    of them. `accept_dropin_dirs` (a set of directory names) restricts drop-in
+    files to the ones `enable` acts on; None accepts every file.
+    """
+    aliases, section, accept = [], None, True
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line[0] in "#;":
+        h = CAT_HEADER_RE.match(line)
+        if h:
+            d = os.path.basename(os.path.dirname(h.group(1)))
+            accept = (not d.endswith(".d") or accept_dropin_dirs is None
+                      or d in accept_dropin_dirs)
+            section = None
+            continue
+        if not line or line[0] in "#;" or not accept:
             continue
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
@@ -308,13 +326,26 @@ def dpkg_prefix(env):
     return argv
 
 
+# Observed (S1, dpkg 1.22.6 and 1.23.7): `dpkg-query --admindir /nonexistent -S x`
+# exits 1 with "no path found", exactly like a missing path in a healthy
+# database. A "no match" answer therefore proves nothing about the database, and
+# the gate needs a positive control: a path that must be owned.
+CONTROL_PATHS = ("/usr/bin/dpkg-query", "/usr/bin/dpkg")
+
+
 def dpkg_usable(env):
     if env.which("dpkg-query") is None:
         return False, "dpkg-query not found in PATH"
-    rc, out, err = env.run(dpkg_prefix(env) + ["-S", "/nonexistent/tendcf-unit-classifier-probe"])
-    if rc == 1 and "no path found matching pattern" in err:
+    paths = []
+    for c in CONTROL_PATHS:
+        paths += [c, "/bin/" + os.path.basename(c)]
+    try:
+        res = query_dpkg(env, paths)
+    except DpkgUnavailable as e:
+        return False, str(e)
+    if any(r[0] == "owners" and r[1] for r in res.values()):
         return True, ""
-    return False, "dpkg-query probe rc=%s: %s" % (rc, err.strip()[:200])
+    return False, "dpkg database answers no owner for dpkg's own binaries (empty or unreadable database)"
 
 
 NO_MATCH_RE = re.compile(r"^dpkg-query: no path found matching pattern (.+)$")
@@ -437,7 +468,8 @@ class Scan:
 
     # ---- manager
     def systemctl(self, *args):
-        return self.env.run(["systemctl"] + list(args) + ["--no-pager"])
+        # --no-pager before any `--`, where it would be read as a unit name
+        return self.env.run(["systemctl", args[0], "--no-pager"] + list(args[1:]))
 
     def enumerate_names(self):
         types = ",".join(TYPES)
@@ -518,9 +550,10 @@ class Scan:
             return found[c]
 
         look = set(u.names) | set(u.lookups)
-        t = template_of(u.id)
-        if t:
-            look.add(t)
+        for n in list(look):
+            t = template_of(n)
+            if t:
+                look.add(t)
         for d in self.load_path:
             for n in sorted(look):
                 p = os.path.join(d, n)
@@ -540,7 +573,7 @@ class Scan:
                         else:
                             add(Artifact(p, "fragment", link_target=st[1], name=n))
                         if final is not None:
-                            add(Artifact(final, "target", name=n))
+                            add(Artifact(final, "target", name=n, via=canon_path(env, p)))
                 else:
                     u.problems.append("unsupported file type at %s" % p)
             dnames = []
@@ -620,7 +653,10 @@ class Scan:
         if rc != 0:
             u.problems.append("systemctl cat %s rc=%s: %s" % (u.id, rc, err.strip()[:200]))
             return
-        wanted = set(alias_names_from_cat(out))
+        dirs = {u.id + ".d"}
+        if template_of(u.id):
+            dirs.add(template_of(u.id) + ".d")
+        wanted = set(alias_names_from_cat(out, dirs))
         for a in links:
             a.authorized = os.path.basename(a.path) in wanted
 
@@ -689,8 +725,12 @@ def judge(claims, u, conflict_ids):
     cf = [w for n in names for w in claims.covering(n) if w[1] == "cfengine"]
     any_claim = [w for n in names for w in claims.covering(n)]
     owned = [a for a in arts if a.owned]
-    vendor_frag = [a for a in owned if a.kind in ("fragment", "target", "source")]
     local = [a for a in arts if a.local]
+    # An owned link to an unowned target is one fragment chain, and the target is
+    # local: the link does not launder it (astra A5), nor is it a second fragment.
+    linked_local = {a.via for a in local if a.kind == "target" and a.via}
+    vendor_frag = [a for a in owned if a.kind in ("fragment", "target", "source")
+                   and a.path not in linked_local]
     local_frag = [a for a in local if a.kind in ("fragment", "target", "source")]
     local_layer = [a for a in local if a.kind in ("dropin", "mask")]
     svc = [(d, s) for d, i, s in claims.services if i in names]

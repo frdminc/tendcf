@@ -200,7 +200,7 @@ def item9_alias_in_dropin():
         # unlink what enable made, so the sandbox teardown has nothing to trip on
         rec("disable", ["systemctl", "disable", "--no-reload", "tendcfs1p9-x.service"])
         rec("after disable", "find /etc/systemd/system -name 'tendcfs1p9*' -type l -printf '%p -> %l\\n' | sort")
-        for p in sh("find /etc/systemd/system -name 'tendcfs1p9*' -type l").stdout.split():
+        for p in sh(["sh", "-c", "find /etc/systemd/system -name 'tendcfs1p9*' -type l"]).stdout.split():
             os.unlink(p)
 
 
