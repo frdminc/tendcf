@@ -26,14 +26,16 @@ Six layers, cheapest first:
      fall under a declared writer prefix, no writer prefix nests inside
      another; on the goal-file side, every interlock's bundle is used by
      at least one service, comprehensive-domain services fall under a
-     `cfengine`-writer unit-writer prefix, and goal-file.schema.json
+     `cfengine`-writer unit-writer prefix, every `supervision` tombstone
+     falls under one too (the adapters' teardown checks neither),
+     and goal-file.schema.json
      itself never `$ref`s a def whose defaults would reintroduce
      ignore-unknown (reconciliation §13, Grok 8.6). Across the goal-file
      family: the diff's two hashes name the two goal-file fixtures,
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the eighty-three deliberately broken fixtures in examples/broken/
+  6. each of the eighty-six deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -84,7 +86,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 83
+EXPECTED_BROKEN = 86
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 27
 
@@ -1595,6 +1597,38 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                 fail(
                     f"{label}: domains/{domain_name}/entries/service/{service_id} "
                     "falls under a unit-writer prefix whose writer is not cfengine",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+
+    # --- a tombstone in the projecting domain falls under a cfengine writer --
+    # (schema-v5-dpkg-reconciliation-2026-11-02.md §2.2(4), S0.) Any coverage:
+    # `not-yet-migrated` admits entries too, and the adapter does not look at
+    # coverage. `supervision` is the one projecting domain
+    # (bin/projector.py PROJECTING_DOMAIN); the adapter's teardown checks
+    # neither coverage nor writer, so a `state: absent` here is an actuated
+    # removal of whatever the id names. launchd has no existence gate at all:
+    # a plist is a plain file whoever wrote it, so this rule is the only
+    # guard on that path (policy/tendcf_services.cf's `isplain` is systemd
+    # only). A cfengine claim is necessary, not sufficient: see the doc's §7
+    # item 3 (a vendor fragment behind the removed file).
+    supervision = domains.get("supervision")
+    if isinstance(supervision, dict):
+        supervision_entries = supervision.get("entries") or {}
+        supervision_prefixes = [(p, w) for d, p, w in prefixes if d == "supervision"]
+        for service_id, service in (supervision_entries.get("service") or {}).items():
+            if not (isinstance(service, dict) and service.get("state") == "absent"):
+                continue
+            matched = [
+                (p, w)
+                for p, w in supervision_prefixes
+                if service_id.startswith(p.removesuffix("*"))
+            ]
+            if not any(w == "cfengine" for _, w in matched):
+                fail(
+                    f"{label}: domains/supervision/entries/service/{service_id} is a "
+                    "tombstone under no cfengine unit-writer prefix — a tombstone "
+                    "removes what its id names, and only a unit this writer rendered "
+                    "may be removed",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 

@@ -1,12 +1,14 @@
 # Negative fixtures
 
-Eighty-three deliberately broken overlays, plus six byte-class fixtures in
+Eighty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (the goal-file cases of 13-73, 93-106, 108-112) stays as in the happy path.
+family (the goal-file cases of 13-73, 93-106, 108-112, 129-131) stays as in the happy path.
+Cases 113-128 are reserved for schema v5 ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2). 129-131 land earlier, at v4, with
+the tombstone rule of that document's §2.2(4) (slice S0).
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -311,6 +313,9 @@ not apply to schema rules.
 | 110 | `110-supervisor-empty` | `supervisor: {}`, no entry at all | schema (`minProperties`) |
 | 111 | `111-supervisor-entry-no-name` | the `supervisor` entry `host` carries `state` and no `name` | schema (`required`) |
 | 112 | `112-supervisor-entry-extra-key` | the `supervisor` entry `host` carries a key beside `state` and `name` | schema (`additionalProperties`) |
+| 129 | `129-tombstone-no-claim` | `comprehensive` systemd file; tombstone `ssh.service`, no unit-writer claim | goal cross-file |
+| 130 | `130-tombstone-non-cfengine-claim` | launchd happy file; tombstone `org.example.retired` under `org.example.*` with `writer: third-party` (launchd has no policy-side guard: the lint is the only one) | goal cross-file |
+| 131 | `131-tombstone-not-yet-migrated` | `not-yet-migrated` supervision domain; tombstone `ssh.service`, no unit-writer claim | goal cross-file |
 
 Cases 103-107 close the discrimination gaps that deleting each rule on its
 own exposed: 103 and 104 guard the launchd and runit members of the
