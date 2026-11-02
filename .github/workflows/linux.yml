@@ -43,6 +43,28 @@ jobs:
         env:
           TENDCF_TEST_SYSTEMD: "1"
         run: tests/policy/run.sh --bindir /opt/tendcf/bin
+      # Schema v5 S1 (schema-v5-dpkg-reconciliation-2026-11-02.md section 6):
+      # the read-only unit classifier against the real manager and real
+      # dpkg-query. Before step 7 so the host is still as the image shipped it.
+      # openssh-server supplies the real ssh.service the fixture rows name;
+      # kmod.service, hwclock.service and the dpkg database ship with the image.
+      - name: Unit classifier S1, pure-logic tests
+        run: python3 -m unittest discover -s tests/unit_classifier -p 'test_[lps]*.py' -v   # test_logic, test_probe, test_sandbox (no root needed)
+      - name: Unit classifier S1, openssh-server for the ssh.service rows
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends openssh-server
+      - name: Unit classifier S1, section 3.5 probe
+        shell: bash
+        run: sudo -E env TENDCF_TEST_SYSTEMD=1 python3 tests/unit_classifier/s1_probe.py | tee /tmp/s1-probe.md
+      - name: Unit classifier S1, section 6 fixtures
+        run: sudo -E env TENDCF_TEST_SYSTEMD=1 python3 -m unittest discover -s tests/unit_classifier -p test_fixtures.py -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s1-probe-${{ matrix.runner }}
+          path: /tmp/s1-probe.md
+          retention-days: 14
       # linux-targets.md step 7: the canonical root-owned install and a root
       # cf-execd, with the canary service, on a real systemd manager. After
       # the policy tests: it takes over /var/cfengine.
