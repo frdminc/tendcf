@@ -573,15 +573,20 @@ class Scan:
     # ---- probe
     def probe(self, u):
         env = self.env
-        found = {}  # canonical path -> Artifact
+        found = {}  # (canonical path, chain) -> Artifact
 
         def add(art):
+            # One file can be reached through two chains: as a fragment and as a drop-in's
+            # target. Each chain keeps its own record (shared ownership is asked per path), so
+            # the order in which load-path directories are scanned never hides a fragment.
             c = canon_path(env, art.path)
             art.path = c
-            old = found.get(c)
+            chain = "layer" if (art.kind == "dropin" or (art.kind == "target" and art.role == "dropin")) else "fragment"
+            key = (c, chain)
+            old = found.get(key)
             if old is None or (art.kind in ("alias", "mask") and old.kind == "fragment"):
-                found[c] = art
-            return found[c]
+                found[key] = art
+            return found[key]
 
         look = set(u.names) | set(u.lookups)
         for n in list(look):
@@ -649,7 +654,7 @@ class Scan:
         """FragmentPath and DropInPaths against the probe (section 3.2(4))."""
         env = self.env
         paths_known = {}
-        for c, a in found.items():
+        for (c, _chain), a in found.items():
             paths_known[c] = a
             if a.link_target:
                 final, _, _ = link_final(env, c)

@@ -509,6 +509,23 @@ class DropinLinks(Fixture):
         self.expect(claims_doc(pkgs=["tendcf-s1-dl4"]), "tendcf-s1-dl4.service", "extra")
 
 
+    def _override_with_link_to_the_vendor_file(self, name, writers):
+        """Review 4 finding 1: the vendor file is also the target of an /etc drop-in link, which the scan meets
+        before it scans /usr/lib. It must stay a vendor fragment: local override + vendor fragment = rule 3."""
+        vendor = self.vendor(name, name[:-8])
+        self.local(name)
+        self.sb.symlink("%s/%s.d/x.conf" % (E, name), vendor)
+        self.reload()
+        res = self.expect(claims_doc(pkgs=[name[:-8]], writers=writers), name, "two-writers")
+        self.assertEqual(self.unit(res, name)["rule"], 3)
+
+    def test_local_override_with_dropin_link_to_the_vendor_file_is_rule_3_without_a_claim(self):
+        self._override_with_link_to_the_vendor_file("tendcf-s1-sp.service", None)
+
+    def test_local_override_with_dropin_link_to_the_vendor_file_is_rule_3_under_an_exact_claim(self):
+        self._override_with_link_to_the_vendor_file("tendcf-s1-sp2.service", {"tendcf-s1-sp2.service": "third-party"})
+
+
 class UnresolvedLinks(Fixture):
     """Review finding 3: a link chain with no final target makes the unit unverifiable."""
 
@@ -560,9 +577,25 @@ class UnresolvedLinks(Fixture):
                     "tendcf-s1-ul5.service", "clean")
 
 
+@unittest.skipUnless(GATE, SKIP)
 class SandboxRestore(unittest.TestCase):
     """Review finding 1 on the real manager: a regular unit file masked for the duration of a fixture comes back
     as the regular file, and /dev/null is not written or chmodded."""
+
+    def test_setuid_setgid_and_foreign_owner_survive_a_root_restore(self):
+        """Review 4 finding 4: on Linux a chown clears setuid/setgid, so the owner must be restored before the mode."""
+        d = tempfile.mkdtemp(prefix="tendcf-s1-sbxmode-", dir="/var/tmp")
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, mode in (("suid", 0o4755), ("sgid", 0o2755), ("both-sticky-like", 0o6750)):
+            path = os.path.join(d, name)
+            with open(path, "w") as f:
+                f.write("x\n")
+            os.chown(path, 65534, 65533)
+            os.chmod(path, mode)
+            with Sandbox(roots=[d], run=None) as sb:
+                sb.symlink(path, "/dev/null")
+            st = os.lstat(path)
+            self.assertEqual((oct(st.st_mode & 0o7777), st.st_uid, st.st_gid), (oct(mode), 65534, 65533), name)
 
     def test_regular_file_masked_then_restored(self):
         path = E + "/tendcf-s1-sbxrestore.service"

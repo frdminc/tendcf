@@ -564,6 +564,47 @@ class DropinLinkTargets(unittest.TestCase):
         self.assertEqual(one_unit(out, "a.service")["verdict"], "clean")
 
 
+class SharedPathRoles(unittest.TestCase):
+    """Review 4 finding 1: one file reached as a drop-in's target and as a fragment keeps both roles,
+    whichever load-path directory is scanned first."""
+
+    ORDERS = {"etc-first": UNIT_PATHS, "usr-first": [U] + [p for p in UNIT_PATHS if p != U]}
+
+    def system(self, order, link_dir):
+        s = FakeSystem()
+        s.vendor("a.service", "apkg")
+        s._put(E + "/a.service", ("file",))                       # an unowned override of the vendor fragment
+        s.units["a.service"]["FragmentPath"] = E + "/a.service"
+        s.dropin_link("a.service", U + "/a.service", d=link_dir)  # a drop-in link that ends at the vendor file
+        s.unit_paths_out = "\n".join(self.ORDERS[order]) + "\n"
+        return s
+
+    def test_local_override_plus_vendor_file_as_dropin_target_is_rule_3_in_every_order(self):
+        for order in self.ORDERS:
+            for link_dir in (E, U):
+                for cl in (claims(pkgs=["apkg"]), claims(pkgs=["apkg"], writers={"a.service": "third-party"})):
+                    with self.subTest(order=order, link_dir=link_dir, exact=bool(cl.writers)):
+                        out = uc.classify(self.system(order, link_dir), cl)
+                        u = one_unit(out, "a.service")
+                        self.assertEqual((u["verdict"], u["rule"]), ("two-writers", 3), u["why"])
+
+    def test_both_chains_are_recorded_for_the_shared_path(self):
+        for order in self.ORDERS:
+            out = uc.classify(self.system(order, E), claims(pkgs=["apkg"]))
+            roles = sorted((a["kind"], a["role"]) for a in one_unit(out, "a.service")["artifacts"] if a["path"] == U + "/a.service")
+            self.assertEqual(roles, [("fragment", "fragment"), ("target", "dropin")], order)
+
+    def test_dropin_only_cases_are_unchanged_in_both_orders(self):
+        for order in self.ORDERS:
+            s = FakeSystem()
+            s.vendor("a.service", "apkg")
+            s._put("/opt/conf/x.conf", ("file",))
+            s.dropin_link("a.service", "/opt/conf/x.conf")
+            s.unit_paths_out = "\n".join(self.ORDERS[order]) + "\n"
+            out = uc.classify(s, claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+            self.assertEqual(one_unit(out, "a.service")["verdict"], "clean", order)
+
+
 class UnresolvedLinks(unittest.TestCase):
     """Review finding 3: a link chain with no final target makes the unit unverifiable."""
 

@@ -130,6 +130,53 @@ class Failures(unittest.TestCase):
             sb.__exit__(None, None, None)
         self.assertIn("stop x.service", str(cm.exception))
 
+    def _raising(self, verb):
+        def run(argv):
+            if argv[1:2] == [verb]:
+                raise OSError("cannot spawn systemctl")
+            return ok(argv)
+        return run
+
+    def _exception_leaves_nothing_unrestored(self, verb):
+        path = os.path.join(self.d, "unit.service")
+        with open(path, "w") as f:
+            f.write("original\n")
+        calls = []
+        base = self._raising(verb)
+
+        def run(argv):
+            calls.append(argv[1])
+            return base(argv)
+        sb = Sandbox(roots=[self.d], run=run)
+        sb.started.append("x.service")
+        sb.symlink(path, "/dev/null")           # something to restore
+        with self.assertRaises(CleanupError) as cm:
+            sb.__exit__(None, None, None)
+        self.assertIn(verb + " x.service" if verb != "daemon-reload" else verb, str(cm.exception))
+        self.assertFalse(os.path.islink(path), "the undo steps must still run")
+        with open(path) as f:
+            self.assertEqual(f.read(), "original\n")
+        self.assertEqual(calls[-1], "daemon-reload", "the later operations must still run")
+        return calls
+
+    def test_a_stop_that_raises_does_not_skip_restoration(self):
+        calls = self._exception_leaves_nothing_unrestored("stop")
+        self.assertIn("reset-failed", calls)
+
+    def test_a_reset_failed_that_raises_does_not_skip_restoration(self):
+        calls = self._exception_leaves_nothing_unrestored("reset-failed")
+        self.assertIn("stop", calls)
+
+    def test_a_daemon_reload_that_raises_is_a_cleanup_error(self):
+        self._exception_leaves_nothing_unrestored("daemon-reload")
+
+    def test_reset_failed_rc_1_is_not_a_failure(self):
+        def run(argv):
+            return subprocess.CompletedProcess(argv, 1 if argv[1:2] == ["reset-failed"] else 0, "", "not failed")
+        sb = Sandbox(roots=[self.d], run=run)
+        sb.started.append("x.service")
+        sb.__exit__(None, None, None)
+
     def test_a_clean_exit_with_a_working_manager_does_not_raise(self):
         with Sandbox(roots=[self.d], run=ok) as sb:
             sb.write(os.path.join(self.d, "a"), "x")

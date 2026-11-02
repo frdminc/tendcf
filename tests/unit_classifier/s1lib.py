@@ -90,9 +90,12 @@ class Sandbox:
                 try:
                     with os.fdopen(fd, "wb") as f:
                         f.write(data)
-                        os.fchmod(f.fileno(), st.st_mode & 0o7777)
+                        f.flush()
+                        # Order matters on Linux: a chown clears setuid/setgid, so the owner is
+                        # restored first and the mode (special bits included) last.
                         if os.geteuid() == 0:
                             os.fchown(f.fileno(), st.st_uid, st.st_gid)
+                        os.fchmod(f.fileno(), st.st_mode & 0o7777)
                     os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
                     os.replace(tmp, p)
                 except BaseException:
@@ -147,26 +150,29 @@ class Sandbox:
     def __enter__(self):
         return self
 
-    def _step(self, what, fn):
+    def _guard(self, what, fn):
+        """Run one cleanup operation; an exception is a collected failure, never an abort."""
         try:
-            fn()
+            return fn()
         except Exception as e:
             self.failures.append("%s: %r" % (what, e))
+            return None
 
-    def _manager(self, what, argv):
+    def _manager(self, what, argv, ok=(0,)):
         if self.run is None:
             return
-        r = self.run(argv)
-        if r.returncode != 0:
+        r = self._guard(what, lambda: self.run(argv))
+        if r is not None and r.returncode not in ok:
             self.failures.append("%s: rc=%s %s" % (what, r.returncode, r.stderr.strip()[:200]))
 
     def __exit__(self, *exc):
+        # Every stop, reset, restoration and reload is attempted, whatever any of them does.
         for u in reversed(self.started):
             self._manager("stop " + u, ["systemctl", "stop", u])
-            if self.run is not None:
-                self.run(["systemctl", "reset-failed", u])   # rc 1 for a unit that is not failed: not a failure
+            # reset-failed exits 1 for a unit that is not failed: only an exception counts
+            self._manager("reset-failed " + u, ["systemctl", "reset-failed", u], ok=(0, 1))
         for i, fn in reversed(list(enumerate(self.undo))):
-            self._step("restore step %d" % i, fn)
+            self._guard("restore step %d" % i, fn)
         self._manager("daemon-reload", ["systemctl", "daemon-reload"])
         if self.failures:
             raise CleanupError("sandbox could not restore the host: " + "; ".join(self.failures))

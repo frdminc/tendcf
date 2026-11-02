@@ -8,6 +8,7 @@ Prints a markdown record to stdout; run it in CI and paste the observed rows
 into the spec's section 3.5 results. Dpkg behaviour is measured on a private
 admindir under /var/tmp with real dpkg, never on the host database.
 """
+import glob
 import os
 import shutil
 import sys
@@ -39,15 +40,27 @@ def fail(what):
     out("**UNEXPECTED FAILURE: %s**\n" % what)
 
 
-def rec(title, argv, ok=(0,), **kw):
-    """Run and record. `ok` lists the exit statuses that are the observation; any other
-    status is an unexpected failure (a template `show` refusal or a dpkg miss passes ok=OBSERVED_NONZERO)."""
-    r = sh(argv, **kw) if isinstance(argv, list) else sh(["sh", "-c", argv], **kw)
-    shown = argv if isinstance(argv, str) else " ".join(argv)
-    out("**%s**\n\n`$ %s`  (rc=%d)\n\n```" % (title, shown, r.returncode))
+def rec(title, argv, ok=(0,), lines=None, grep=None, sort=False, **kw):
+    """Run ONE command (argv list, no shell) and record it. `ok` lists the exit statuses that are
+    the observation; any other status is an unexpected failure (a template `show` refusal or a
+    dpkg miss passes ok=OBSERVED_NONZERO). Trimming is done here, in Python, never by a pipeline
+    that would hide the producer's status: `lines` keeps the first N lines, `grep` the lines
+    containing a substring, `sort` sorts them."""
+    if not isinstance(argv, list):
+        raise TypeError("rec takes an argv list: one command per observation, status checked individually")
+    r = sh(argv, **kw)
+    out("**%s**\n\n`$ %s`  (rc=%d)\n\n```" % (title, " ".join(argv), r.returncode))
     if r.returncode not in ok:
         FAILURES.append("%s: rc=%d, expected one of %s" % (title, r.returncode, list(ok)))
-    out(r.stdout.rstrip())
+    text = r.stdout.rstrip()
+    ls = text.splitlines() if text else []
+    if grep is not None:
+        ls = [x for x in ls if grep in x]
+    if sort:
+        ls = sorted(ls)
+    if lines is not None:
+        ls = ls[:lines]
+    out("\n".join(ls))
     if r.stderr.strip():
         out("[stderr] " + r.stderr.rstrip())
     out("```\n")
@@ -60,23 +73,32 @@ def show(unit, *extra, ok=(0,)):
 
 def env_info():
     out("## Environment\n")
-    rec("systemd", "systemctl --version | head -2")
-    rec("dpkg", "dpkg --version | head -1")
-    rec("os", "grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release; uname -m; ls -ld /lib /bin /sbin")
-    rec("PID 1", "readlink /proc/1/exe; ls -d /run/systemd/system")
-    rec("sysv generator present", "ls -l /usr/lib/systemd/system-generators/systemd-sysv-generator")
-    rec("real objects the S1 rows name",
-        "for f in ssh.service sshd.service kmod.service hwclock.service getty@.service; do "
-        "printf '%s: ' $f; ls -l --time-style=+ /usr/lib/systemd/system/$f /etc/systemd/system/$f 2>&1 | tr '\\n' ';'; echo; done; "
-        "dpkg-query -S /usr/lib/systemd/system/ssh.service /usr/lib/systemd/system/kmod.service "
-        "/usr/lib/systemd/system/hwclock.service /usr/lib/systemd/system/getty@.service")
+    rec("systemd", ["systemctl", "--version"], lines=2)
+    rec("dpkg", ["dpkg", "--version"], lines=1)
+    rec("os-release", ["grep", "-E", "^(PRETTY_NAME|VERSION_ID)=", "/etc/os-release"])
+    rec("machine", ["uname", "-m"])
+    rec("usr-merge links", ["ls", "-ld", "/lib", "/bin", "/sbin"])
+    rec("PID 1", ["readlink", "/proc/1/exe"])
+    rec("manager runtime directory", ["ls", "-d", "/run/systemd/system"])
+    rec("sysv generator present", ["ls", "-l", "/usr/lib/systemd/system-generators/systemd-sysv-generator"])
+    # `ls` exits 2 for a path that does not exist: that is the observation for the units that are absent
+    for f in ("ssh.service", "sshd.service", "kmod.service", "hwclock.service", "getty@.service"):
+        rec("where %s lies" % f, ["ls", "-l", "--time-style=+", "/usr/lib/systemd/system/" + f, "/etc/systemd/system/" + f], ok=(0, 2))
+    rec("owners of the units the S1 rows name (host database)",
+        ["dpkg-query", "-S", "/usr/lib/systemd/system/ssh.service", "/usr/lib/systemd/system/kmod.service",
+         "/usr/lib/systemd/system/hwclock.service", "/usr/lib/systemd/system/getty@.service"])
 
 
 def item7_paths():
     out("## Item 7: systemd-analyze unit-paths\n")
     rec("default", ["systemd-analyze", "unit-paths"])
     rec("--system", ["systemd-analyze", "--system", "unit-paths"])
-    rec("existing vs listed", "for d in $(systemd-analyze unit-paths); do [ -e $d ] && echo \"exists $d\" || echo \"absent $d\"; done")
+    r = sh(["systemd-analyze", "unit-paths"])
+    if r.returncode != 0:
+        FAILURES.append("existing vs listed: systemd-analyze unit-paths rc=%d" % r.returncode)
+    out("**existing vs listed**\n\n```")
+    out("\n".join(("exists " if os.path.exists(d) else "absent ") + d for d in r.stdout.split()))
+    out("```\n")
 
 
 def item1():
@@ -136,9 +158,9 @@ def item2_8_masks_alias_transient():
     show("tendcf-s1-trans.service")
     rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-trans*"])
     rec("list-units --all", ["systemctl", "list-units", "--all", "--no-pager", "--no-legend", "--plain", "tendcf-s1-trans*"])
-    rec("where the transient fragment lies", "ls -l /run/systemd/transient/ | grep tendcf-s1 || true")
-    sh(["systemctl", "stop", "tendcf-s1-trans.service"])
-    sh(["systemctl", "reset-failed", "tendcf-s1-trans.service"])
+    rec("where the transient fragment lies", ["ls", "-l", "/run/systemd/transient/"], grep="tendcf-s1")
+    rec("stop the transient unit", ["systemctl", "stop", "tendcf-s1-trans.service"])
+    rec("reset-failed (rc 1 when nothing failed)", ["systemctl", "reset-failed", "tendcf-s1-trans.service"], ok=OBSERVED_NONZERO)
 
 
 def link_outside():
@@ -155,8 +177,8 @@ def link_outside():
         rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-ext*"])
         rec("systemctl link of a file elsewhere (what a hand-made linked unit looks like)",
             ["systemctl", "link", "--no-reload", ext + "/tendcf-s1-extc.service"])
-        rec("what link created", "ls -l /etc/systemd/system/tendcf-s1-extc.service")
-        sh(["systemctl", "disable", "--no-reload", "tendcf-s1-extc.service"])
+        rec("what link created", ["ls", "-l", "/etc/systemd/system/tendcf-s1-extc.service"])
+        rec("disable the linked unit", ["systemctl", "disable", "--no-reload", "tendcf-s1-extc.service"])
         if os.path.islink(E + "/tendcf-s1-extc.service"):
             os.unlink(E + "/tendcf-s1-extc.service")
     daemon_reload()
@@ -176,8 +198,10 @@ def item3_generated():
         show("tendcf-s1-gen.service")
         show("tendcf-s1-gen-nosrc.service")
         rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
-        rec("where the generated fragments lie", "ls -l /run/systemd/generator* | grep tendcf-s1 || true")
-        rec("survive a second daemon-reload?", "systemctl daemon-reload; ls /run/systemd/generator* | grep tendcf-s1 || true")
+        gen_dirs = sorted(glob.glob("/run/systemd/generator*"))
+        rec("where the generated fragments lie", ["ls", "-l"] + gen_dirs, grep="tendcf-s1")
+        rec("a second daemon-reload", ["systemctl", "daemon-reload"])
+        rec("do the generated fragments survive it?", ["ls"] + gen_dirs, grep="tendcf-s1")
     daemon_reload()
     if os.path.exists("/usr/lib/systemd/system-generators/systemd-sysv-generator"):
         out("### the real sysv generator (init script plus rc link)\n")
@@ -191,7 +215,7 @@ def item3_generated():
             daemon_reload()
             show("tendcf-s1-sysv.service")
             rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-sysv*"])
-            rec("dpkg owner of an init script (host database)", "dpkg-query -S /etc/init.d/cron /etc/init.d/tendcf-s1-sysv 2>&1", ok=OBSERVED_NONZERO)
+            rec("dpkg owner of an init script (host database)", ["dpkg-query", "-S", "/etc/init.d/cron", "/etc/init.d/tendcf-s1-sysv"], ok=OBSERVED_NONZERO)
     else:
         out("systemd-sysv-generator is absent on this host: no sysv unit can be generated.\n")
     daemon_reload()
@@ -217,7 +241,7 @@ def item6_7_dropins():
         sb.symlink(E + "/multi-user.target.wants/tendcf-s1-tpl@z.service", U + "/tendcf-s1-tpl@.service")
         daemon_reload()
         show("tendcf-s1-p7.service")
-        rec("probe-side listing for tendcf-s1-p7", "ls -l --time-style=+ /etc/systemd/system/tendcf-s1-p7.service.d /usr/lib/systemd/system/tendcf-s1-p7.service.d")
+        rec("probe-side listing for tendcf-s1-p7", ["ls", "-l", "--time-style=+", "/etc/systemd/system/tendcf-s1-p7.service.d", "/usr/lib/systemd/system/tendcf-s1-p7.service.d"])
         show("tendcfs1p7-bar.service")
         show("tendcf-s1-tpl@z.service")
         rec("is the type-wide drop-in in an arbitrary vendor unit's DropInPaths? (item 6)",
@@ -234,13 +258,14 @@ def item9_alias_in_dropin():
         sb.write(E + "/service.d/tendcfs1p9-typewide.conf", "[Install]\nAlias=tendcfs1p9-viatype.service\n")
         daemon_reload()
         rec("systemctl cat", ["systemctl", "cat", "--no-pager", "tendcfs1p9-x.service"])
-        rec("before enable", "find /etc/systemd/system -name 'tendcfs1p9*' | sort")
+        rec("before enable", ["find", "/etc/systemd/system", "-name", "tendcfs1p9*"], sort=True)
         rec("enable", ["systemctl", "enable", "--no-reload", "tendcfs1p9-x.service"])
-        rec("after enable (links created)", "find /etc/systemd/system -name 'tendcfs1p9*' -type l -printf '%p -> %l\\n' | sort")
+        rec("after enable (links created)", ["find", "/etc/systemd/system", "-name", "tendcfs1p9*", "-type", "l", "-printf", "%p -> %l\\n"], sort=True)
         # unlink what enable made, so the sandbox teardown has nothing to trip on
         rec("disable", ["systemctl", "disable", "--no-reload", "tendcfs1p9-x.service"])
-        rec("after disable", "find /etc/systemd/system -name 'tendcfs1p9*' -type l -printf '%p -> %l\\n' | sort")
-        for p in sh(["sh", "-c", "find /etc/systemd/system -name 'tendcfs1p9*' -type l"]).stdout.split():
+        rec("after disable", ["find", "/etc/systemd/system", "-name", "tendcfs1p9*", "-type", "l", "-printf", "%p -> %l\\n"], sort=True)
+        r = rec("leftover links to remove", ["find", "/etc/systemd/system", "-name", "tendcfs1p9*", "-type", "l"])
+        for p in r.stdout.split():
             os.unlink(p)
 
 
@@ -296,7 +321,7 @@ def dpkg_items():
     rec("conffile of the removed package", q("/etc/tendcf-s1/a.conf"))
     rec("program file of the removed package", q("/usr/lib/tendcf-s1/only-a"), ok=OBSERVED_NONZERO)
     rec("shared file, one owner removed", q("/usr/lib/tendcf-s1/shared"))
-    rec("info/*.list of the removed package", "cat %s/info/tendcf-s1-a.list" % admin)
+    rec("info/*.list of the removed package", ["cat", "%s/info/tendcf-s1-a.list" % admin])
     rec("purge a", dp + ["-P", "tendcf-s1-a"])
     rec("conffile after purge", q("/etc/tendcf-s1/a.conf"), ok=OBSERVED_NONZERO)
     out("### Item 5: diversions\n")
@@ -307,25 +332,42 @@ def dpkg_items():
     rec("query a diverted path next to an ordinary one", q("/usr/lib/tendcf-s1/multi", "/usr/lib/tendcf-s1/shared"))
     rec("add a local diversion", dv + ["--no-rename", "--local", "--add", "--divert", "/usr/lib/tendcf-s1/multi.local", "/usr/lib/tendcf-s1/multi"])
     rec("query the locally diverted path", q("/usr/lib/tendcf-s1/multi"))
-    rec("diversions file", "cat %s/diversions" % admin)
+    rec("diversions file", ["cat", "%s/diversions" % admin])
     out("### the hand-written database of s1lib.TestDb, same questions\n")
-    db = TestDb()
+    db = build_handwritten_db()
     try:
-        db.add_package("tendcf-s1-hw-a", ["/usr/lib/tendcf-s1/hw"])
-        db.add_package("tendcf-s1-hw-b", ["/usr/lib/tendcf-s1/hw"])
-        db.add_package("tendcf-s1-hw-m", ["/usr/lib/tendcf-s1/hwm"], multiarch="same")
-        db.add_diversion("/usr/lib/tendcf-s1/hwd", "/usr/lib/tendcf-s1/hwd.distrib")
-        db.add_package("tendcf-s1-hw-d", ["/usr/lib/tendcf-s1/hwd.distrib"])
-        for label, p in (("two owners", "/usr/lib/tendcf-s1/hw"), ("arch-qualified", "/usr/lib/tendcf-s1/hwm"),
-                         ("diverted", "/usr/lib/tendcf-s1/hwd")):
-            r = db.query(p)
-            out("**%s** `%s` rc=%d\n\n```\n%s%s```\n" % (label, p, r.returncode, r.stdout, r.stderr))
-        rec("real database, /lib versus /usr/lib spellings of one unit file",
-            "dpkg-query -S /lib/systemd/system/ssh.service /usr/lib/systemd/system/ssh.service 2>&1; ls -ld /lib")
+        handwritten_db_items(db)
     finally:
         db.close()
-    import shutil
+    real_db_spellings()
     shutil.rmtree(root, ignore_errors=True)
+
+
+HANDWRITTEN_QUERIES = (("two owners", "/usr/lib/tendcf-s1/hw"), ("arch-qualified", "/usr/lib/tendcf-s1/hwm"),
+                       ("diverted", "/usr/lib/tendcf-s1/hwd"))
+
+
+def build_handwritten_db():
+    db = TestDb()
+    db.add_package("tendcf-s1-hw-a", ["/usr/lib/tendcf-s1/hw"])
+    db.add_package("tendcf-s1-hw-b", ["/usr/lib/tendcf-s1/hw"])
+    db.add_package("tendcf-s1-hw-m", ["/usr/lib/tendcf-s1/hwm"], multiarch="same")
+    db.add_diversion("/usr/lib/tendcf-s1/hwd", "/usr/lib/tendcf-s1/hwd.distrib")
+    db.add_package("tendcf-s1-hw-d", ["/usr/lib/tendcf-s1/hwd.distrib"])
+    return db
+
+
+def handwritten_db_items(db):
+    """One checked observation per query: all three are owned or diverted paths, so rc 0 is the observation."""
+    for label, p in HANDWRITTEN_QUERIES:
+        rec("%s (hand-written database)" % label, ["dpkg-query", "--admindir", db.dir, "-S", p])
+
+
+def real_db_spellings():
+    # the /lib spelling misses (rc 1) in the host database: that is the observation
+    rec("real database, /lib spelling of one unit file", ["dpkg-query", "-S", "/lib/systemd/system/ssh.service"], ok=OBSERVED_NONZERO)
+    rec("real database, /usr/lib spelling of the same file", ["dpkg-query", "-S", "/usr/lib/systemd/system/ssh.service"])
+    rec("is /lib a link to usr/lib", ["ls", "-ld", "/lib"])
 
 
 def baseline_scan():
