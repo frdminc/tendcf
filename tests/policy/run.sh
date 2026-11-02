@@ -166,7 +166,10 @@ unit_path=/etc/systemd/system/$unit
 alias_path=/etc/systemd/system/tendcf-test-alias.service
 mask_path=/etc/systemd/system/tendcf-test-mask.service
 dangling_path=/etc/systemd/system/tendcf-test-dangling.service
-no_systemctl() { ! grep -Eq "Executing .*systemctl" "$1"; }
+# A command promise logs "Executing ..." at inform level; a returnszero() probe
+# logs "returnszero ran '<cmd>' ..." only at verbose level, so a check that must
+# also rule out probes reads verbose output (sysd_run_verbose).
+no_systemctl() { ! grep -Eq "Executing .*systemctl|returnszero ran '[^']*systemctl" "$1"; }
 if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
     if [ "${TENDCF_TEST_SYSTEMD:-}" != 1 ]; then
         echo "skip systemd lifecycle: set TENDCF_TEST_SYSTEMD=1 (writes /etc/systemd/system, needs root)"
@@ -190,6 +193,12 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
                 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$2" 2>&1 || true
             # cf-agent run as root takes the workdir over (found in CI,
             # 2026-10-31: the next cp got "Permission denied"); give it back.
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+        }
+        sysd_run_verbose() {  # as sysd_run, with -v so returnszero probes are logged
+            cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -v -f "$work/inputs/entry.cf" >"$2" 2>&1 || true
             as_root chown -R "$(id -u):$(id -g)" "$work"
         }
         unit_active() { as_root systemctl is-active --quiet "$unit"; }
@@ -249,12 +258,12 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         as_root ln -s "$alias_target" "$alias_path"
         as_root ln -s /dev/null "$mask_path"
         as_root ln -s /nonexistent/tendcf-test "$dangling_path"
-        sysd_run systemd-absent-links.json "$work/sysd6.out"
+        sysd_run_verbose systemd-absent-links.json "$work/sysd6.out"
         for n in alias mask dangling; do
             check "tombstone on a $n link reported as not actuated" \
                 grep -q "tendcf: service 'tendcf-test-$n.service' tombstone not actuated: /etc/systemd/system/tendcf-test-$n.service is not a regular file" "$work/sysd6.out"
         done
-        check "no systemctl invocation for the link tombstones" no_systemctl "$work/sysd6.out"
+        check "no systemctl command or probe for the link tombstones" no_systemctl "$work/sysd6.out"
         check "alias link left in place" \
             bash -c "[ \"\$(readlink '$alias_path')\" = '$alias_target' ]"
         check "alias target left in place" bash -c "[ -f '$alias_target' ]"
