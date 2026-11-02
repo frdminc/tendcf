@@ -694,7 +694,10 @@ class Generated(Fixture):
         self.reload()
         res = self.expect(claims_doc(writers={"tendcf-s1-gen-nosrc.service": "third-party"}),
                           "tendcf-s1-gen-nosrc.service", "clean")
-        self.assertEqual(res["summary"]["extra_scan"], "complete")
+        # Not asserted: extra_scan "complete". A stock ubuntu 26.04 host has two other
+        # generated units with an empty SourcePath (K5), which this claims file does
+        # not cover, so its scan is incomplete for their sake; this unit is not why.
+        self.assertFalse([r for r in res["incomplete"] if "tendcf-s1-gen-nosrc" in r], res["incomplete"])
 
     def test_generator_dropin_on_declared_vendor_unit_no_claim_is_two_writers(self):
         """R9 (K13): a drop-in a generator wrote under /run/systemd/generator* is local;
