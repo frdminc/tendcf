@@ -32,7 +32,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from s1lib import CLASSIFIER, Sandbox, TestDb, daemon_reload, sh  # noqa: E402
+from s1lib import CLASSIFIER, CleanupError, Sandbox, TestDb, daemon_reload, sh  # noqa: E402
 
 U = "/usr/lib/systemd/system"
 E = "/etc/systemd/system"
@@ -64,19 +64,29 @@ def claims_doc(pkgs=(), writers=None, services=None, others=None, coverage="comp
 @unittest.skipUnless(GATE, SKIP)
 class Fixture(unittest.TestCase):
     def setUp(self):
+        self.cleanups = []
         self.sb = Sandbox(extra_roots=(GEN,))
         self.sb.__enter__()
         self.db = TestDb()
         self.tmp = tempfile.mkdtemp(prefix="tendcf-s1-run-", dir="/var/tmp")
         self.addCleanup(self._teardown)
-        self.cleanups = []
 
     def _teardown(self):
+        """Every step runs; any failure fails the test (a host that was not put back must not be green)."""
+        errors = []
         for fn in reversed(self.cleanups):
-            fn()
-        self.sb.__exit__(None, None, None)
+            try:
+                fn()
+            except Exception as e:
+                errors.append("cleanup: %r" % (e,))
+        try:
+            self.sb.__exit__(None, None, None)
+        except CleanupError as e:
+            errors.append(str(e))
         self.db.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if errors:
+            raise CleanupError("; ".join(errors))
 
     # ---- arranging
     def reload(self):
@@ -448,6 +458,134 @@ class Instances(Fixture):
         self._imask(R, {"tendcf-s1-*": "cfengine"}, {"tendcf-s1-getty@tty1.service": "present"}, "two-writers")
 
 
+class DropinLinks(Fixture):
+    """Review finding 2: a drop-in that is a link. Its target belongs to the layer, not to the fragment."""
+
+    def target(self, name="x.conf", content="[Service]\nEnvironment=TENDCF_S1=1\n"):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write(content)
+        return p
+
+    def test_local_dropin_link_to_a_local_file_under_exact_claim_is_clean(self):
+        self.vendor("tendcf-s1-dl.service", "tendcf-s1-dl")
+        self.sb.symlink(E + "/tendcf-s1-dl.service.d/x.conf", self.target())
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-dl"], writers={"tendcf-s1-dl.service": "third-party"}),
+                    "tendcf-s1-dl.service", "clean")
+
+    def test_local_dropin_link_to_a_local_file_without_a_claim_is_two_writers(self):
+        self.vendor("tendcf-s1-dl.service", "tendcf-s1-dl")
+        self.sb.symlink(E + "/tendcf-s1-dl.service.d/x.conf", self.target())
+        self.reload()
+        res = self.expect(claims_doc(pkgs=["tendcf-s1-dl"]), "tendcf-s1-dl.service", "two-writers")
+        self.assertEqual(self.unit(res, "tendcf-s1-dl.service")["rule"], 4)
+
+    def test_local_dropin_link_to_a_package_owned_file_is_not_a_second_fragment(self):
+        """The only fragment is local; the drop-in's target is owned. No vendor fragment exists."""
+        tgt = self.target()
+        self.db.add_package("tendcf-s1-dlt", [tgt])
+        self.local("tendcf-s1-dl2.service")
+        self.sb.symlink(E + "/tendcf-s1-dl2.service.d/x.conf", tgt)
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-dlt"], writers={"tendcf-s1-dl2.service": "third-party"}),
+                    "tendcf-s1-dl2.service", "clean")
+
+    def test_shipped_dropin_link_and_shipped_target_declared_is_clean(self):
+        tgt = self.target()
+        link = E + "/tendcf-s1-dl3.service.d/x.conf"
+        self.vendor("tendcf-s1-dl3.service", "tendcf-s1-dl3", files=[link, tgt])
+        self.sb.symlink(link, tgt)
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-dl3"]), "tendcf-s1-dl3.service", "clean")
+
+    def test_shipped_dropin_link_to_a_file_of_an_undeclared_package_is_extra(self):
+        tgt = self.target()
+        link = E + "/tendcf-s1-dl4.service.d/x.conf"
+        self.vendor("tendcf-s1-dl4.service", "tendcf-s1-dl4", files=[link])
+        self.db.add_package("tendcf-s1-dl4-other", [tgt])
+        self.sb.symlink(link, tgt)
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-dl4"]), "tendcf-s1-dl4.service", "extra")
+
+
+class UnresolvedLinks(Fixture):
+    """Review finding 3: a link chain with no final target makes the unit unverifiable."""
+
+    def incomplete(self, name, pkgs, writers):
+        res = self.expect(claims_doc(pkgs=pkgs, writers=writers), name, "incomplete")
+        self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
+        return res
+
+    def test_dangling_dropin_link_is_incomplete_even_under_an_exact_claim(self):
+        self.vendor("tendcf-s1-ul.service", "tendcf-s1-ul")
+        self.sb.symlink(E + "/tendcf-s1-ul.service.d/x.conf", "/nonexistent/tendcf-s1/x.conf")
+        self.reload()
+        res = self.incomplete("tendcf-s1-ul.service", ["tendcf-s1-ul"], {"tendcf-s1-ul.service": "third-party"})
+        self.assertIn("dangling", self.unit(res, "tendcf-s1-ul.service")["why"])
+
+    def test_shadowed_dangling_dropin_link_is_incomplete(self):
+        self.vendor("tendcf-s1-ul2.service", "tendcf-s1-ul2")
+        self.sb.symlink(U + "/tendcf-s1-ul2.service.d/x.conf", "/nonexistent/tendcf-s1/x.conf")
+        self.sb.write(E + "/tendcf-s1-ul2.service.d/x.conf", "[Service]\nEnvironment=A=1\n")
+        self.reload()
+        self.incomplete("tendcf-s1-ul2.service", ["tendcf-s1-ul2"], {"tendcf-s1-ul2.service": "third-party"})
+
+    def test_dropin_link_cycle_is_incomplete(self):
+        self.vendor("tendcf-s1-ul3.service", "tendcf-s1-ul3")
+        a, b = os.path.join(self.tmp, "a.conf"), os.path.join(self.tmp, "b.conf")
+        os.symlink(b, a)
+        os.symlink(a, b)
+        self.sb.symlink(E + "/tendcf-s1-ul3.service.d/x.conf", a)
+        self.reload()
+        res = self.incomplete("tendcf-s1-ul3.service", ["tendcf-s1-ul3"], {"tendcf-s1-ul3.service": "third-party"})
+        self.assertIn("cycle", self.unit(res, "tendcf-s1-ul3.service")["why"])
+
+    def test_dropin_link_chain_over_the_limit_is_incomplete(self):
+        self.vendor("tendcf-s1-ul4.service", "tendcf-s1-ul4")
+        with open(os.path.join(self.tmp, "l12"), "w") as f:
+            f.write("[Service]\nEnvironment=A=1\n")
+        for i in range(12):
+            os.symlink(os.path.join(self.tmp, "l%d" % (i + 1)), os.path.join(self.tmp, "l%d" % i))
+        self.sb.symlink(E + "/tendcf-s1-ul4.service.d/x.conf", os.path.join(self.tmp, "l0"))
+        self.reload()
+        res = self.incomplete("tendcf-s1-ul4.service", ["tendcf-s1-ul4"], {"tendcf-s1-ul4.service": "third-party"})
+        self.assertIn("longer than", self.unit(res, "tendcf-s1-ul4.service")["why"])
+
+    def test_dropin_link_to_dev_null_is_still_exempt(self):
+        self.vendor("tendcf-s1-ul5.service", "tendcf-s1-ul5")
+        self.sb.symlink(E + "/tendcf-s1-ul5.service.d/x.conf", "/dev/null")
+        self.reload()
+        self.expect(claims_doc(pkgs=["tendcf-s1-ul5"], writers={"tendcf-s1-ul5.service": "third-party"}),
+                    "tendcf-s1-ul5.service", "clean")
+
+
+class SandboxRestore(unittest.TestCase):
+    """Review finding 1 on the real manager: a regular unit file masked for the duration of a fixture comes back
+    as the regular file, and /dev/null is not written or chmodded."""
+
+    def test_regular_file_masked_then_restored(self):
+        path = E + "/tendcf-s1-sbxrestore.service"
+        st_null = os.stat("/dev/null")
+        with open(path, "w") as f:
+            f.write(SVC)
+        os.chmod(path, 0o640)
+        self.addCleanup(lambda: os.path.lexists(path) and os.unlink(path))
+        self.addCleanup(daemon_reload)
+        daemon_reload()
+        with Sandbox() as sb:
+            sb.symlink(path, "/dev/null")
+            daemon_reload()
+            self.assertEqual(sh(["systemctl", "show", "-p", "LoadState", "--value", "tendcf-s1-sbxrestore.service"]).stdout.strip(), "masked")
+        self.assertFalse(os.path.islink(path))
+        with open(path) as f:
+            self.assertEqual(f.read(), SVC)
+        self.assertEqual(os.stat(path).st_mode & 0o7777, 0o640)
+        now = os.stat("/dev/null")
+        self.assertEqual((now.st_mode, now.st_rdev, now.st_uid, now.st_gid), (st_null.st_mode, st_null.st_rdev, st_null.st_uid, st_null.st_gid))
+        self.assertEqual(sh(["systemctl", "show", "-p", "LoadState", "--value", "tendcf-s1-sbxrestore.service"]).stdout.strip(), "loaded")
+
+
 class Claims(Fixture):
     def test_cfengine_claim_and_present_service_on_ssh_no_local_file_is_two_writers(self):
         pkg = self.real_owner(U + "/ssh.service")
@@ -512,8 +650,12 @@ class Generated(Fixture):
 
 class Transient(Fixture):
     def test_systemd_run_transient_unit_is_not_judged(self):
-        self.cleanups.append(lambda: (sh(["systemctl", "stop", "tendcf-s1-trans.service"]),
-                                      sh(["systemctl", "reset-failed", "tendcf-s1-trans.service"])))
+        def stop():
+            r = sh(["systemctl", "stop", "tendcf-s1-trans.service"])
+            if r.returncode != 0:
+                raise RuntimeError("stop tendcf-s1-trans.service rc=%s: %s" % (r.returncode, r.stderr.strip()))
+            sh(["systemctl", "reset-failed", "tendcf-s1-trans.service"])   # rc 1 when nothing failed: fine
+        self.cleanups.append(stop)
         r = sh(["systemd-run", "--unit=tendcf-s1-trans", "--remain-after-exit", "--collect", "/bin/true"])
         self.assertEqual(r.returncode, 0, r.stderr)
         show = sh(["systemctl", "show", "-p", "Transient", "--value", "tendcf-s1-trans.service"]).stdout.strip()
@@ -536,6 +678,47 @@ class Gates(Fixture):
         res = self.classify(claims_doc(), admindir=False, env={"PATH": bindir})
         self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
         self.assertTrue(any("dpkg" in r for r in res["incomplete"]), res["incomplete"])
+
+    def _shimmed(self, shims):
+        """A PATH of real dpkg-query plus `shims`: {tool: shell script body}; every other tool is the real one."""
+        bindir = os.path.join(self.tmp, "shim-bin")
+        os.mkdir(bindir)
+        for t in ("systemctl", "systemd-analyze", "dpkg-query"):
+            real = shutil.which(t)
+            if t in shims:
+                with open(os.path.join(bindir, t), "w") as f:
+                    f.write("#!/bin/sh\n" + shims[t].replace("@REAL@", real) + "\n")
+                os.chmod(os.path.join(bindir, t), 0o755)
+            else:
+                os.symlink(real, os.path.join(bindir, t))
+        return bindir
+
+    def _incomplete_with(self, shims):
+        self.local("tendcf-s1-shim.service")
+        self.reload()
+        res = self.classify(claims_doc(), admindir=False, env={"PATH": self._shimmed(shims)})
+        self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
+        return res
+
+    def test_unit_paths_with_no_absolute_path_is_incomplete_not_zero(self):
+        res = self._incomplete_with({"systemd-analyze": "echo 'no paths here'"})
+        self.assertTrue(any("unit-paths" in r for r in res["incomplete"]), res["incomplete"])
+
+    def test_unit_paths_with_no_output_is_incomplete(self):
+        self._incomplete_with({"systemd-analyze": "exit 0"})
+
+    def test_malformed_list_unit_files_record_is_incomplete(self):
+        res = self._incomplete_with({"systemctl": 'case "$1" in list-unit-files) echo "this is not a unit record";; *) exec @REAL@ "$@";; esac'})
+        self.assertTrue(any("malformed record" in r for r in res["incomplete"]), res["incomplete"])
+
+    def test_empty_unit_listings_stay_a_complete_scan_with_zero_units(self):
+        self.local("tendcf-s1-shim.service")
+        self.reload()
+        shim = 'case "$1" in list-unit-files|list-units) exit 0;; *) exec @REAL@ "$@";; esac'
+        res = self.classify(claims_doc(), admindir=False, env={"PATH": self._shimmed({"systemctl": shim})})
+        self.assertEqual(res["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "complete",
+                                          "extra_entries": 0, "two_writers": 0, "unmet_absence": 0})
+        self.assertEqual(res["units"], [])
 
     def test_unusable_dpkg_database_is_incomplete_not_zero_owners(self):
         """Observed: dpkg-query -S on a missing admindir exits 1 'no path found'. Without a

@@ -58,6 +58,10 @@ ALLOWED_COMMANDS = {
 }
 GENERATOR_DIR_RE = re.compile(r"^/run/systemd/generator(?:\.early|\.late)?$")
 DEV_NULL = "/dev/null"
+LINK_LIMIT = 10
+# Per-command bound (seconds). A command that exceeds it is a failed command (rc 124),
+# which every caller already turns into `incomplete`: a hung manager never hangs a scan.
+RUN_TIMEOUT = 120
 
 
 # --------------------------------------------------------------------------
@@ -67,9 +71,10 @@ DEV_NULL = "/dev/null"
 class Env:
     """Real host access. Subclass or replace for canned tests."""
 
-    def __init__(self, dpkg_admindir=None, path=None):
+    def __init__(self, dpkg_admindir=None, path=None, timeout=RUN_TIMEOUT):
         self.dpkg_admindir = dpkg_admindir
         self.path = path if path is not None else os.environ.get("PATH", "")
+        self.timeout = timeout
 
     # -- commands
     def which(self, tool):
@@ -90,8 +95,11 @@ class Env:
             return 127, "", "%s: not found in PATH" % tool
         env = {"LC_ALL": "C", "LANG": "C", "SYSTEMD_COLORS": "0",
                "SYSTEMD_PAGER": "", "PATH": self.path}
-        r = subprocess.run([exe] + list(argv[1:]), capture_output=True, text=True,
-                           errors="replace", env=env)
+        try:
+            r = subprocess.run([exe] + list(argv[1:]), capture_output=True, text=True,
+                               errors="replace", env=env, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            return 124, "", "%s: timed out after %ss" % (tool, self.timeout)
         return r.returncode, r.stdout, r.stderr
 
     # -- filesystem (lstat / readlink / listing only)
@@ -211,6 +219,7 @@ class Artifact:
     problem: str = None
     name: str = None             # lookup name it was found under
     via: str = None              # for a link's final target: the link's canonical path
+    role: str = "fragment"       # for a link's final target: what the chain belongs to (fragment | dropin)
 
     @property
     def unverifiable(self):
@@ -250,14 +259,20 @@ def parse_show(text):
     return props
 
 
-def parse_unit_list(text):
-    """First whitespace token of each non-empty line (list-units / list-unit-files)."""
-    out = []
+def parse_records(text, min_fields):
+    """(names, malformed lines) of a list-units / list-unit-files listing. A record
+    whose first field is not a unit name of the four types, or that has fewer than
+    min_fields fields, is malformed: dropping it silently would under-count."""
+    names, bad = [], []
     for line in text.splitlines():
         t = line.split()
-        if t:
-            out.append((t[0], t[1] if len(t) > 1 else ""))
-    return out
+        if not t:
+            continue
+        if len(t) < min_fields or not UNIT_NAME_RE.match(t[0]):
+            bad.append(line.strip()[:120])
+        else:
+            names.append((t[0], t[1]))
+    return names, bad
 
 
 CAT_HEADER_RE = re.compile(r"^# (/\S+)$")
@@ -439,23 +454,29 @@ def dir_variants(name):
     return out
 
 
-def link_final(env, path, limit=10):
-    """Follow a link chain by hand. Returns (final_path or None, hits_dev_null)."""
-    cur = path
-    for _ in range(limit):
+def link_final(env, path, limit=LINK_LIMIT):
+    """Follow a link chain by hand. Returns (final_path, hits_dev_null, problem).
+    problem is None for a resolved chain (final_path set; /dev/null sets hits_dev_null)
+    and otherwise says why the chain has no final target: dangling, cycle or too long.
+    An unresolved chain is unverifiable (R3d), never a silently dropped target."""
+    cur, seen = path, set()
+    for _ in range(limit + 1):   # `limit` link hops, then the final non-link
+        if cur in seen:
+            return None, False, "link cycle at %s" % cur
+        seen.add(cur)
         st = env.lstat(cur)
         if st is None:
-            return None, False
+            return None, False, "dangling link: %s does not exist" % cur
         if st[0] != "link":
-            return cur, cur == DEV_NULL
+            return cur, cur == DEV_NULL, None
         tgt = st[1]
         if tgt == DEV_NULL:
-            return DEV_NULL, True
+            return DEV_NULL, True, None
         cur = tgt if tgt.startswith("/") else os.path.join(os.path.dirname(cur), tgt)
         cur = os.path.normpath(cur)
         if cur == DEV_NULL:
-            return DEV_NULL, True
-    return None, False
+            return DEV_NULL, True, None
+    return None, False, "link chain from %s is longer than %d hops" % (path, limit)
 
 
 def canon_path(env, path):
@@ -478,35 +499,44 @@ class Scan:
     def enumerate_names(self):
         types = ",".join(TYPES)
         names = {}
-        rc, out, err = self.systemctl("list-unit-files", "--no-legend", "--plain", "--type=" + types)
-        if rc != 0:
-            self.incomplete.append("list-unit-files failed rc=%s: %s" % (rc, err.strip()[:200]))
-        for n, st in parse_unit_list(out):
-            if UNIT_NAME_RE.match(n):
-                names[n] = st
-        rc, out, err = self.systemctl("list-units", "--all", "--no-legend", "--plain", "--type=" + types)
-        if rc != 0:
-            self.incomplete.append("list-units failed rc=%s: %s" % (rc, err.strip()[:200]))
-        for n, _ in parse_unit_list(out):
-            if UNIT_NAME_RE.match(n):
-                names.setdefault(n, "")
+        # An empty listing is legitimate; an unparseable record is not (R3d).
+        for what, args, min_fields in (
+                ("list-unit-files", ("list-unit-files", "--no-legend", "--plain", "--type=" + types), 2),
+                ("list-units", ("list-units", "--all", "--no-legend", "--plain", "--type=" + types), 4)):
+            rc, out, err = self.systemctl(*args)
+            if rc != 0:
+                self.incomplete.append("%s failed rc=%s: %s" % (what, rc, err.strip()[:200]))
+                continue
+            recs, bad = parse_records(out, min_fields)
+            for b in bad:
+                self.incomplete.append("%s: malformed record %r" % (what, b))
+            for n, st in recs:
+                if what == "list-unit-files":
+                    names[n] = st
+                else:
+                    names.setdefault(n, "")
         return names
 
     def read_load_path(self):
         rc, out, err = self.env.run(["systemd-analyze", "unit-paths"])
-        if rc != 0 or not out.strip():
+        if rc != 0:
             self.incomplete.append("systemd-analyze unit-paths failed rc=%s: %s" % (rc, err.strip()[:200]))
             return
         seen = set()
         for line in out.splitlines():
             p = line.strip()
+            if not p:
+                continue
             if not p.startswith("/"):
+                self.incomplete.append("systemd-analyze unit-paths: malformed record %r" % p[:120])
                 continue
             real = self.env.realpath(p)
             if real in seen:
                 continue
             seen.add(real)
             self.load_path.append(p)
+        if not self.load_path:
+            self.incomplete.append("systemd-analyze unit-paths gave no absolute path: the load path is unknown")
 
     def show(self, name):
         rc, out, err = self.systemctl("show", "--property=" + ",".join(SHOW_PROPS), "--", name)
@@ -567,7 +597,9 @@ class Scan:
                 if st[0] == "file":
                     add(Artifact(p, "fragment", name=n))
                 elif st[0] == "link":
-                    final, devnull = link_final(env, p)
+                    final, devnull, why = link_final(env, p)
+                    if why:
+                        u.problems.append("%s: %s" % (p, why))
                     if devnull:
                         add(Artifact(p, "mask", link_target=DEV_NULL, name=n))
                     else:
@@ -603,10 +635,12 @@ class Scan:
                     if fst is None or fst[0] == "dir":
                         continue
                     if fst[0] == "link":
-                        final, devnull = link_final(env, fp)
+                        final, devnull, why = link_final(env, fp)
+                        if why:
+                            u.problems.append("%s: %s" % (fp, why))
                         add(Artifact(fp, "dropin", link_target=fst[1]))
                         if final is not None and not devnull:
-                            add(Artifact(final, "target", name=e))
+                            add(Artifact(final, "target", name=e, role="dropin"))
                     else:
                         add(Artifact(fp, "dropin"))
         return found
@@ -618,7 +652,7 @@ class Scan:
         for c, a in found.items():
             paths_known[c] = a
             if a.link_target:
-                final, _ = link_final(env, c)
+                final, _, _ = link_final(env, c)
                 if final:
                     paths_known[canon_path(env, final)] = a
         fp = u.props.get("FragmentPath", "")
@@ -675,7 +709,7 @@ class Scan:
             self.incomplete.append("dpkg database cannot be queried: " + why)
             return
         self.read_load_path()
-        if not self.load_path:
+        if self.incomplete:
             return
         names = self.enumerate_names()
         units = self.build_units(names)
@@ -736,11 +770,18 @@ def judge(claims, u, conflict_ids):
     local = [a for a in arts if a.local]
     # An owned link to an unowned target is one fragment chain, and the target is
     # local: the link does not launder it (astra A5), nor is it a second fragment.
-    linked_local = {a.via for a in local if a.kind == "target" and a.via}
-    vendor_frag = [a for a in owned if a.kind in ("fragment", "target", "source")
-                   and a.path not in linked_local]
-    local_frag = [a for a in local if a.kind in ("fragment", "target", "source")]
-    local_layer = [a for a in local if a.kind in ("dropin", "mask")]
+    # A link target keeps the role of the chain it ends (a drop-in's target is part of the
+    # layer, never a fragment): only fragment-chain targets feed vendor_frag and local_frag.
+    def frag(a):
+        return a.kind in ("fragment", "source") or (a.kind == "target" and a.role == "fragment")
+
+    def layer(a):
+        return a.kind in ("dropin", "mask") or (a.kind == "target" and a.role == "dropin")
+
+    linked_local = {a.via for a in local if a.kind == "target" and a.role == "fragment" and a.via}
+    vendor_frag = [a for a in owned if frag(a) and a.path not in linked_local]
+    local_frag = [a for a in local if frag(a)]
+    local_layer = [a for a in local if layer(a)]
     svc = [(d, s) for d, i, s in claims.services if i in names]
     tomb = any(s == "absent" for _, s in svc)
 
@@ -797,7 +838,7 @@ def classify(env, claims):
             "rule": u.rule, "why": u.why,
             "state": u.props.get("UnitFileState", ""),
             "artifacts": [{"path": a.path, "kind": a.kind, "owners": a.owners,
-                           "owners_raw": a.owners_raw, "authorized": a.authorized,
+                           "owners_raw": a.owners_raw, "authorized": a.authorized, "role": a.role,
                            "link_target": a.link_target, "problem": a.problem}
                           for a in u.artifacts],
         })

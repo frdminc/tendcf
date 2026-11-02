@@ -39,6 +39,9 @@ class FakeSystem(uc.Env):
         self.path = ""
         self.merged = True
         self.extra_stdout = ""
+        self.unit_paths_out = None   # override of the systemd-analyze unit-paths stdout
+        self.files_out = None        # override of the list-unit-files stdout
+        self.units_out = None        # override of the list-units stdout
 
     # ---- uc.Env surface
     def which(self, tool):
@@ -71,7 +74,7 @@ class FakeSystem(uc.Env):
         tool = os.path.basename(argv[0])
         rest = list(argv[1:])
         if tool == "systemd-analyze":
-            return 0, "\n".join(UNIT_PATHS) + "\n", ""
+            return 0, (self.unit_paths_out if self.unit_paths_out is not None else "\n".join(UNIT_PATHS) + "\n"), ""
         if tool == "systemctl":
             return self._systemctl(rest)
         if tool == "dpkg-query":
@@ -79,6 +82,10 @@ class FakeSystem(uc.Env):
         raise AssertionError(argv)
 
     def _systemctl(self, a):
+        if a[0] == "list-unit-files" and self.files_out is not None:
+            return 0, self.files_out, ""
+        if a[0] == "list-units" and self.units_out is not None:
+            return 0, self.units_out, ""
         if a[0] == "list-unit-files":
             return 0, "".join("%-45s %-10s enabled\n" % (n, s) for n, s in sorted(self.files.items())), ""
         if a[0] == "list-units":
@@ -148,6 +155,14 @@ class FakeSystem(uc.Env):
         if unit in self.units:
             cur = self.units[unit]["DropInPaths"]
             self.units[unit]["DropInPaths"] = (cur + " " + path).strip()
+        return path
+
+    def dropin_link(self, unit, target, fname="x.conf", d=E, final=None, pkg=None):
+        """A drop-in that is a link, with its (optional) final target file and owner of the link."""
+        path = "%s/%s.d/%s" % (d, unit, fname)
+        self._put(path, ("link", target), [pkg] if pkg else None)
+        cur = self.units[unit]["DropInPaths"]
+        self.units[unit]["DropInPaths"] = (cur + " " + path).strip()
         return path
 
     def mask(self, name, d=E):
@@ -475,6 +490,222 @@ class VerdictTable(unittest.TestCase):
         s.vendor("b.service", "pkg")
         s.units["b.service"]["FragmentPath"] = "/somewhere/else/b.service"
         self.assertEqual(uc.classify(s, claims(pkgs=["pkg"]))["units"][0]["verdict"], "incomplete")
+
+
+def one_unit(out, name):
+    hit = [u for u in out["units"] if name in u["names"]]
+    assert len(hit) == 1, hit
+    return hit[0]
+
+
+class DropinLinkTargets(unittest.TestCase):
+    """Review finding 2: a drop-in's link target is part of the layer, never a fragment."""
+
+    def system(self, vendor_pkg="apkg", target_owner=None, link_owner=None):
+        s = FakeSystem()
+        s.vendor("a.service", vendor_pkg)
+        s._put("/opt/conf/x.conf", ("file",), [target_owner] if target_owner else None)
+        s.dropin_link("a.service", "/opt/conf/x.conf", pkg=link_owner)
+        return s
+
+    def judged(self, s, cl):
+        out = uc.classify(s, cl)
+        return one_unit(out, "a.service"), out
+
+    def test_local_target_under_exact_claim_is_clean_not_rule_3(self):
+        u, out = self.judged(self.system(), claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        self.assertEqual((u["verdict"], u["rule"]), ("clean", 11), u["why"])
+        self.assertEqual(out["summary"]["two_writers"], 0)
+
+    def test_local_target_without_a_claim_is_rule_4_two_writers(self):
+        u, _ = self.judged(self.system(), claims(pkgs=["apkg"]))
+        self.assertEqual((u["verdict"], u["rule"]), ("two-writers", 4))
+
+    def test_the_target_artifact_keeps_the_dropin_role(self):
+        u, _ = self.judged(self.system(), claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        roles = {a["path"]: a["role"] for a in u["artifacts"] if a["kind"] == "target"}
+        self.assertEqual(roles, {"/opt/conf/x.conf": "dropin"})
+
+    def test_owned_target_of_a_local_link_is_not_a_vendor_fragment(self):
+        """A unit whose only fragment is local, under an exact claim, with a local drop-in link to a
+        package-owned file: no vendor fragment exists, so rule 3 must not fire."""
+        s = FakeSystem()
+        s.local("b.service")
+        s._put("/opt/conf/x.conf", ("file",), ["cpkg"])
+        s.dropin_link("b.service", "/opt/conf/x.conf")
+        out = uc.classify(s, claims(pkgs=["cpkg"], writers={"b.service": "third-party"}))
+        u = one_unit(out, "b.service")
+        self.assertEqual((u["verdict"], u["rule"]), ("clean", 11), u["why"])
+
+    def test_shipped_link_and_owned_target_both_declared_is_clean(self):
+        s = self.system(target_owner="apkg", link_owner="apkg")
+        u, _ = self.judged(s, claims(pkgs=["apkg"]))
+        self.assertEqual((u["verdict"], u["rule"]), ("clean", 11), u["why"])
+
+    def test_owned_target_of_an_undeclared_package_is_extra(self):
+        s = self.system(target_owner="zpkg", link_owner="apkg")
+        u, _ = self.judged(s, claims(pkgs=["apkg"]))
+        self.assertEqual((u["verdict"], u["rule"]), ("extra", 8))
+
+    def test_k10_fragment_chain_unchanged(self):
+        s = FakeSystem()
+        s._put(U + "/ext.service", ("link", "/opt/x/ext.service"), ["pkg"])
+        s._put("/opt/x/ext.service", ("file",))
+        s.unit("ext.service", frag="/opt/x/ext.service")
+        self.assertEqual(one_unit(uc.classify(s, claims(pkgs=["pkg"])), "ext.service")["rule"], 10)
+
+    def test_dropin_link_to_dev_null_is_still_exempt(self):
+        s = FakeSystem()
+        s.vendor("a.service", "apkg")
+        s._put(E + "/a.service.d/x.conf", ("link", "/dev/null"))
+        s.units["a.service"]["DropInPaths"] = E + "/a.service.d/x.conf"
+        out = uc.classify(s, claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        self.assertEqual(out["summary"]["extra_scan"], "complete")
+        self.assertEqual(one_unit(out, "a.service")["verdict"], "clean")
+
+
+class UnresolvedLinks(unittest.TestCase):
+    """Review finding 3: a link chain with no final target makes the unit unverifiable."""
+
+    def check(self, s):
+        out = uc.classify(s, claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        self.assertEqual(out["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
+        u = one_unit(out, "a.service")
+        self.assertEqual(u["verdict"], "incomplete")
+        return u
+
+    def base(self):
+        s = FakeSystem()
+        s.vendor("a.service", "apkg")
+        return s
+
+    def test_dangling_dropin_link(self):
+        s = self.base()
+        s.dropin_link("a.service", "/nonexistent/x.conf")
+        self.assertIn("dangling", self.check(s)["why"])
+
+    def test_dangling_shadowed_fragment_link(self):
+        s = self.base()
+        s._put(R + "/a.service", ("link", "/nonexistent/a.service"))
+        self.assertIn("dangling", self.check(s)["why"])
+
+    def test_dropin_link_cycle(self):
+        s = self.base()
+        s._put("/opt/c/one", ("link", "/opt/c/two"))
+        s._put("/opt/c/two", ("link", "/opt/c/one"))
+        s.dropin_link("a.service", "/opt/c/one")
+        self.assertIn("cycle", self.check(s)["why"])
+
+    def test_dropin_link_chain_over_the_limit(self):
+        s = self.base()
+        for i in range(12):
+            s._put("/opt/c/l%d" % i, ("link", "/opt/c/l%d" % (i + 1)))
+        s._put("/opt/c/l12", ("file",))
+        s.dropin_link("a.service", "/opt/c/l0")
+        self.assertIn("longer than", self.check(s)["why"])
+
+    def test_chain_at_the_limit_resolves(self):
+        s = self.base()
+        for i in range(9):      # the drop-in link plus nine more: ten hops, the limit
+            s._put("/opt/c/l%d" % i, ("link", "/opt/c/l%d" % (i + 1)))
+        s._put("/opt/c/l9", ("file",))
+        s.dropin_link("a.service", "/opt/c/l0")
+        out = uc.classify(s, claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        self.assertEqual(out["summary"]["extra_scan"], "complete")
+
+    def test_link_final_distinguishes_the_three_failures(self):
+        s = FakeSystem()
+        s._put("/p/dangling", ("link", "/nowhere"))
+        s._put("/p/a", ("link", "/p/b"))
+        s._put("/p/b", ("link", "/p/a"))
+        self.assertEqual(uc.link_final(s, "/p/dangling")[:2], (None, False))
+        self.assertIn("dangling", uc.link_final(s, "/p/dangling")[2])
+        self.assertIn("cycle", uc.link_final(s, "/p/a")[2])
+        s._put("/p/null", ("link", "/dev/null"))
+        self.assertEqual(uc.link_final(s, "/p/null"), ("/dev/null", True, None))
+
+
+class FailClosedRecords(unittest.TestCase):
+    """Review finding 4: malformed manager output never yields complete with zero counts."""
+
+    def incomplete(self, s, **kw):
+        out = uc.classify(s, claims(**kw))
+        self.assertEqual(out["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "incomplete"})
+        return out
+
+    def test_unit_paths_with_no_absolute_path(self):
+        s = FakeSystem()
+        s.local("x.service")
+        s.unit_paths_out = "garbage\nnot a path\n"
+        out = self.incomplete(s)
+        self.assertTrue(any("malformed record" in r for r in out["incomplete"]), out["incomplete"])
+        self.assertTrue(any("load path is unknown" in r for r in out["incomplete"]), out["incomplete"])
+
+    def test_unit_paths_empty_or_blank(self):
+        for blank in ("", "\n  \n"):
+            s = FakeSystem()
+            s.unit_paths_out = blank
+            self.incomplete(s)
+
+    def test_unit_paths_one_malformed_line_among_valid_ones(self):
+        s = FakeSystem()
+        s.local("x.service")
+        s.unit_paths_out = "\n".join(UNIT_PATHS) + "\nrelative/dir\n"
+        out = self.incomplete(s)
+        self.assertEqual(out["units"], [])
+
+    def test_malformed_list_unit_files_record(self):
+        s = FakeSystem()
+        s.local("x.service")
+        s.files_out = "x.service static enabled\nthis is not a unit record\n"
+        out = self.incomplete(s)
+        self.assertTrue(any("list-unit-files: malformed" in r for r in out["incomplete"]))
+
+    def test_short_list_units_record(self):
+        s = FakeSystem()
+        s.local("x.service")
+        s.units_out = "x.service loaded\n"
+        self.incomplete(s)
+
+    def test_a_record_naming_another_unit_type_is_malformed(self):
+        s = FakeSystem()
+        s.files_out = "multi-user.target static -\n"
+        self.incomplete(s)
+
+    def test_empty_unit_lists_stay_legitimate(self):
+        s = FakeSystem()
+        s.files_out = ""
+        s.units_out = ""
+        out = uc.classify(s, claims())
+        self.assertEqual(out["summary"], {"row_type": "domain_coverage", "domain": "supervision", "extra_scan": "complete",
+                                          "extra_entries": 0, "two_writers": 0, "unmet_absence": 0})
+
+
+class Bounded(unittest.TestCase):
+    def test_a_hung_command_times_out_as_a_failed_command(self):
+        import stat
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "systemctl")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\nexec /bin/sleep 30\n")
+            os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR)
+            t = time.time()
+            rc, out, err = uc.Env(path=d, timeout=1).run(["systemctl", "show"])
+            self.assertEqual(rc, 124)
+            self.assertIn("timed out", err)
+            self.assertLess(time.time() - t, 10)
+
+    def test_a_scan_with_a_timing_out_manager_is_incomplete(self):
+        class Hung(FakeSystem):
+            def _systemctl(self, a):
+                return 124, "", "systemctl: timed out after 1s"
+        s = Hung()
+        s.vendor("a.service", "pkg")
+        out = uc.classify(s, claims())
+        self.assertEqual(out["summary"]["extra_scan"], "incomplete")
+        self.assertNotIn("extra_entries", out["summary"])
 
 
 class ReadOnly(unittest.TestCase):

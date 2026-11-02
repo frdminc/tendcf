@@ -27,10 +27,26 @@ def out(s=""):
     print(s, flush=True)
 
 
-def rec(title, argv, **kw):
+# Unexpected failures of this run: a command whose exit status is outside what the
+# observation expects, a step that raised, a classifier or cleanup that failed. main()
+# returns nonzero when any exist, after every step and every cleanup has run.
+FAILURES = []
+OBSERVED_NONZERO = (0, 1)   # for commands whose refusal or miss IS the observation
+
+
+def fail(what):
+    FAILURES.append(what)
+    out("**UNEXPECTED FAILURE: %s**\n" % what)
+
+
+def rec(title, argv, ok=(0,), **kw):
+    """Run and record. `ok` lists the exit statuses that are the observation; any other
+    status is an unexpected failure (a template `show` refusal or a dpkg miss passes ok=OBSERVED_NONZERO)."""
     r = sh(argv, **kw) if isinstance(argv, list) else sh(["sh", "-c", argv], **kw)
     shown = argv if isinstance(argv, str) else " ".join(argv)
     out("**%s**\n\n`$ %s`  (rc=%d)\n\n```" % (title, shown, r.returncode))
+    if r.returncode not in ok:
+        FAILURES.append("%s: rc=%d, expected one of %s" % (title, r.returncode, list(ok)))
     out(r.stdout.rstrip())
     if r.stderr.strip():
         out("[stderr] " + r.stderr.rstrip())
@@ -38,8 +54,8 @@ def rec(title, argv, **kw):
     return r
 
 
-def show(unit, *extra):
-    return rec("show " + unit, ["systemctl", "show", "--no-pager", "-p", PROPS] + list(extra) + [unit])
+def show(unit, *extra, ok=(0,)):
+    return rec("show " + unit, ["systemctl", "show", "--no-pager", "-p", PROPS] + list(extra) + [unit], ok=ok)
 
 
 def env_info():
@@ -65,10 +81,11 @@ def item7_paths():
 
 def item1():
     out("## Item 1: systemctl show on templates and non-loaded units\n")
-    show("getty@.service")
+    show("getty@.service", ok=OBSERVED_NONZERO)
     show("tendcf-s1-nonexistent.service")
     rec("show of two names (order, blank-line separation)",
-        ["systemctl", "show", "--no-pager", "-p", "Id,LoadState", "getty@.service", "tendcf-s1-nonexistent.service", "systemd-journald.service"])
+        ["systemctl", "show", "--no-pager", "-p", "Id,LoadState", "getty@.service", "tendcf-s1-nonexistent.service", "systemd-journald.service"],
+        ok=OBSERVED_NONZERO)
     rec("show instance of a template", ["systemctl", "show", "--no-pager", "-p", PROPS, "getty@tty63.service"])
     rec("list-unit-files for getty", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "getty*"])
     rec("list-units --all for getty", ["systemctl", "list-units", "--all", "--no-pager", "--no-legend", "--plain", "getty*"])
@@ -174,7 +191,7 @@ def item3_generated():
             daemon_reload()
             show("tendcf-s1-sysv.service")
             rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-sysv*"])
-            rec("dpkg owner of an init script (host database)", "dpkg-query -S /etc/init.d/cron /etc/init.d/tendcf-s1-sysv 2>&1")
+            rec("dpkg owner of an init script (host database)", "dpkg-query -S /etc/init.d/cron /etc/init.d/tendcf-s1-sysv 2>&1", ok=OBSERVED_NONZERO)
     else:
         out("systemd-sysv-generator is absent on this host: no sysv unit can be generated.\n")
     daemon_reload()
@@ -267,21 +284,21 @@ def dpkg_items():
     rec("one owner", q("/usr/lib/tendcf-s1/only-a"))
     rec("two owners", q("/usr/lib/tendcf-s1/shared"))
     rec("arch-qualified (Multi-Arch: same)", q("/usr/lib/tendcf-s1/multi"))
-    rec("no match", q("/usr/lib/tendcf-s1/nothing"))
-    rec("mixed batch: match, no match, match", q("/usr/lib/tendcf-s1/only-a", "/usr/lib/tendcf-s1/nothing", "/usr/lib/tendcf-s1/multi"))
+    rec("no match", q("/usr/lib/tendcf-s1/nothing"), ok=OBSERVED_NONZERO)
+    rec("mixed batch: match, no match, match", q("/usr/lib/tendcf-s1/only-a", "/usr/lib/tendcf-s1/nothing", "/usr/lib/tendcf-s1/multi"), ok=OBSERVED_NONZERO)
     rec("a directory", q("/usr/lib/tendcf-s1"))
     rec("glob-escaped literal", q("/usr/lib/tendcf-s1/only\\-a"))
-    rec("unusable admindir", ["dpkg-query", "--admindir", "/nonexistent/tendcf-s1", "-S", "/usr/bin/ls"])
+    rec("unusable admindir", ["dpkg-query", "--admindir", "/nonexistent/tendcf-s1", "-S", "/usr/bin/ls"], ok=OBSERVED_NONZERO)
     out("### Item 4: conffile of a removed (not purged) package, then purged\n")
     rec("status after install", ["dpkg-query", "--admindir", admin, "-W", "-f", "${Package} ${Status}\\n", "tendcf-s1-a"])
     rec("remove a", dp + ["-r", "tendcf-s1-a"])
     rec("status after remove", ["dpkg-query", "--admindir", admin, "-W", "-f", "${Package} ${Status}\\n", "tendcf-s1-a"])
     rec("conffile of the removed package", q("/etc/tendcf-s1/a.conf"))
-    rec("program file of the removed package", q("/usr/lib/tendcf-s1/only-a"))
+    rec("program file of the removed package", q("/usr/lib/tendcf-s1/only-a"), ok=OBSERVED_NONZERO)
     rec("shared file, one owner removed", q("/usr/lib/tendcf-s1/shared"))
     rec("info/*.list of the removed package", "cat %s/info/tendcf-s1-a.list" % admin)
     rec("purge a", dp + ["-P", "tendcf-s1-a"])
-    rec("conffile after purge", q("/etc/tendcf-s1/a.conf"))
+    rec("conffile after purge", q("/etc/tendcf-s1/a.conf"), ok=OBSERVED_NONZERO)
     out("### Item 5: diversions\n")
     dv = ["dpkg-divert", "--admindir", admin, "--instdir", root]
     rec("add a package diversion (no rename)", dv + ["--no-rename", "--package", "tendcf-s1-b", "--add", "--divert", "/usr/lib/tendcf-s1/shared.distrib", "/usr/lib/tendcf-s1/shared"])
@@ -321,6 +338,8 @@ def baseline_scan():
     r = sh([sys.executable, CLASSIFIER, "--claims", f.name])
     os.unlink(f.name)
     out("rc=%d\n" % r.returncode)
+    if r.returncode != 0:
+        FAILURES.append("baseline classifier scan rc=%d" % r.returncode)
     if r.returncode == 0:
         d = json.loads(r.stdout)
         out("summary: `%s`\n" % json.dumps(d["summary"], sort_keys=True))
@@ -340,19 +359,41 @@ def baseline_scan():
         out("```\n%s\n```\n" % r.stderr[-3000:])
 
 
-def main():
-    if os.geteuid() != 0 or os.environ.get("TENDCF_TEST_SYSTEMD") != "1" or not os.path.isdir("/run/systemd/system"):
+STEPS = (env_info, baseline_scan, item7_paths, item1, item2_8_masks_alias_transient, link_outside, item3_generated,
+         item6_7_dropins, item9_alias_in_dropin, dpkg_items)
+
+
+def reload_manager():
+    r = sh(["systemctl", "daemon-reload"])
+    if r.returncode != 0:
+        FAILURES.append("daemon-reload rc=%d: %s" % (r.returncode, r.stderr.strip()[:200]))
+
+
+def main(steps=None, cleanup=None, gate=True):
+    """Run every step, collect what went wrong, and exit nonzero afterwards if anything did.
+    `steps`, `cleanup` and `gate` exist so a test can inject a failing step off a systemd host."""
+    if gate and (os.geteuid() != 0 or os.environ.get("TENDCF_TEST_SYSTEMD") != "1" or not os.path.isdir("/run/systemd/system")):
         print("skip: needs root, TENDCF_TEST_SYSTEMD=1 and a host booted by systemd")
         return 0
+    del FAILURES[:]
+    cleanup = cleanup or reload_manager
     out("# Spec section 3.5 observations (tests/unit_classifier/s1_probe.py)\n")
-    for step in (env_info, baseline_scan, item7_paths, item1, item2_8_masks_alias_transient, link_outside, item3_generated,
-                 item6_7_dropins, item9_alias_in_dropin, dpkg_items):
+    for step in (STEPS if steps is None else steps):
         try:
             step()
-        except Exception as e:  # a failing step must not hide the others
-            out("**STEP %s FAILED: %r**\n" % (step.__name__, e))
+        except Exception as e:  # a failing step must not hide the others, and must not pass
+            fail("step %s raised %r" % (step.__name__, e))
         finally:
-            daemon_reload()
+            try:
+                cleanup()
+            except Exception as e:
+                fail("cleanup after %s raised %r" % (step.__name__, e))
+    if FAILURES:
+        out("## UNEXPECTED FAILURES (%d)\n" % len(FAILURES))
+        for f in FAILURES:
+            out("- " + f)
+        print("s1_probe: %d unexpected failure(s)" % len(FAILURES), file=sys.stderr)
+        return 1
     return 0
 
 

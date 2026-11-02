@@ -29,13 +29,32 @@ def daemon_reload():
     sh(["systemctl", "daemon-reload"], check=True)
 
 
-class Sandbox:
-    """Context manager. Every path it touches is recorded first and put back."""
+class CleanupError(RuntimeError):
+    """A fixture could not put the host back. Never swallowed: a suite that cannot restore
+    its files must not report green (it would poison later fixtures and later CI steps)."""
 
-    def __init__(self, extra_roots=()):
-        self.roots = ALLOWED_ROOTS + tuple(extra_roots)
+
+class Sandbox:
+    """Context manager. Every path it touches is recorded first and put back.
+
+    roots     the directories it may write under (default: the unit directories plus extra_roots)
+    run       how it runs systemctl (default `sh`); None skips the manager, for tests of the
+              sandbox itself on a host with no systemd
+
+    Restoration never opens a pathname through a link: a regular file or a link is rebuilt
+    as a fresh sibling and moved over the path with os.replace, so a replacement symlink
+    (a mask to /dev/null, a link to some other file) is replaced, never written through.
+    Failures of any restoration, stop or reload are collected and raised together as
+    CleanupError after every step has been attempted.
+    """
+
+    def __init__(self, extra_roots=(), roots=None, run=sh):
+        self.roots = tuple(roots) if roots is not None else ALLOWED_ROOTS + tuple(extra_roots)
+        self.run = run
         self.undo = []          # callables, run in reverse
         self.started = []
+        self.failures = []
+        self._tmp_n = 0
 
     def _check(self, path):
         p = os.path.normpath(path)
@@ -43,18 +62,43 @@ class Sandbox:
             raise AssertionError("fixture may not write %s" % path)
         return p
 
+    def _sibling(self, p):
+        self._tmp_n += 1
+        return os.path.join(os.path.dirname(p), ".tendcf-s1-restore-%d-%d" % (os.getpid(), self._tmp_n))
+
     def _snapshot(self, p):
         if os.path.islink(p):
             tgt = os.readlink(p)
-            return lambda: (_rm(p), os.symlink(tgt, p))
-        if os.path.isfile(p):
-            data, mode = open(p, "rb").read(), os.stat(p).st_mode & 0o7777
 
-            def restore():
-                with open(p, "wb") as f:
-                    f.write(data)
-                os.chmod(p, mode)
-            return restore
+            def restore_link():
+                tmp = self._sibling(p)
+                os.symlink(tgt, tmp)
+                try:
+                    os.replace(tmp, p)
+                except BaseException:
+                    _unlink_quiet(tmp)
+                    raise
+            return restore_link
+        if os.path.isfile(p):
+            st = os.stat(p)
+            with open(p, "rb") as f:
+                data = f.read()
+
+            def restore_file():
+                tmp = self._sibling(p)
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                        os.fchmod(f.fileno(), st.st_mode & 0o7777)
+                        if os.geteuid() == 0:
+                            os.fchown(f.fileno(), st.st_uid, st.st_gid)
+                    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+                    os.replace(tmp, p)
+                except BaseException:
+                    _unlink_quiet(tmp)
+                    raise
+            return restore_file
         if os.path.isdir(p):
             raise AssertionError("refusing to replace directory %s" % p)
         return lambda: _rm(p)
@@ -67,7 +111,7 @@ class Sandbox:
             d = os.path.dirname(d)
         for t in reversed(todo):
             os.mkdir(t)
-            self.undo.append(lambda t=t: _rmdir(t))
+            self.undo.append(lambda t=t: os.rmdir(t))
 
     def write(self, path, text, mode=0o644):
         p = self._check(path)
@@ -103,29 +147,42 @@ class Sandbox:
     def __enter__(self):
         return self
 
+    def _step(self, what, fn):
+        try:
+            fn()
+        except Exception as e:
+            self.failures.append("%s: %r" % (what, e))
+
+    def _manager(self, what, argv):
+        if self.run is None:
+            return
+        r = self.run(argv)
+        if r.returncode != 0:
+            self.failures.append("%s: rc=%s %s" % (what, r.returncode, r.stderr.strip()[:200]))
+
     def __exit__(self, *exc):
         for u in reversed(self.started):
-            sh(["systemctl", "stop", u])
-            sh(["systemctl", "reset-failed", u])
-        for fn in reversed(self.undo):
-            try:
-                fn()
-            except OSError:
-                pass
-        sh(["systemctl", "daemon-reload"])
+            self._manager("stop " + u, ["systemctl", "stop", u])
+            if self.run is not None:
+                self.run(["systemctl", "reset-failed", u])   # rc 1 for a unit that is not failed: not a failure
+        for i, fn in reversed(list(enumerate(self.undo))):
+            self._step("restore step %d" % i, fn)
+        self._manager("daemon-reload", ["systemctl", "daemon-reload"])
+        if self.failures:
+            raise CleanupError("sandbox could not restore the host: " + "; ".join(self.failures))
         return False
+
+
+def _unlink_quiet(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
 
 
 def _rm(p):
     if os.path.lexists(p):
         os.unlink(p)
-
-
-def _rmdir(p):
-    try:
-        os.rmdir(p)
-    except OSError:
-        pass
 
 
 class TestDb:
