@@ -967,12 +967,14 @@ for itself at start and at policy reload (`cf-execd.c`), so a projection
 written inside `exec_command` reaches cf-agent at once and cf-execd one
 reload later; harmless while the projection carries supervision vars
 only (P-1). CFEngine caps the file at 5 MiB (`cmdb.c`
-`HOST_SPECIFIC_DATA_MAX_SIZE`). It must run as root: its output is the
-root-owned, mode-0600 CMDB file in a root-owned work directory
-(`tendcf-install.sh`), and the root `cf-execd` schedules the cf-agent
-runs that read it ([`deploy/linux/`](../../deploy/linux/README.md)). Its
-install location is not ruled; the working assumption is the CFEngine
-tree (`/opt/tendcf` on Linux).
+`HOST_SPECIFIC_DATA_MAX_SIZE`). The current Linux deployment runs
+cf-execd and cf-agent as root and installs the projection as root-owned
+mode 0600 in a root-owned work directory
+(`deploy/linux/tendcf-install.sh`). Updating that destination requires
+suitable privilege. D45 does not decide whether validation and
+publication share one privileged process or where their privilege
+boundary lies on each platform. The install location is also open; the
+working assumption on Linux is the CFEngine tree (`/opt/tendcf`).
 It is Python, `bin/projector.py` promoted, so the code CI's golden gate
 runs is the code the host runs: one implementation on these platforms,
 with nothing to drift. Each host needs `python3`; per the ruling, Debian
@@ -995,14 +997,23 @@ document decides them):**
    cf-execd's `exec_command` (today `$(sys.cf_agent) -f
    $(sys.inputdir)/promises.cf`, written by `tendcf-install.sh`) running
    it first, or a step of its own; and whether it runs before every
-   scheduled run or once per newly approved goal file. The two are not
-   equal under §9.1 and DC-11: a projection written once persists between
-   runs as device-authored state that nothing re-verifies before cf-agent
-   starts (CFEngine checks only that the file is readable JSON, `cmdb.c`
-   `LoadCMDBData`); running before every run keeps approved-equals-applied
-   checked on every apply. If it runs inside `exec_command`, a kill by
-   `agent_expireafter` mid-wait must read as deny: write the projection
-   only after the verdict (§11 "Timeout is deny").
+   scheduled run or once per newly approved goal file. Neither scheduling
+   choice by itself establishes §9's approved-equals-applied guarantee. A
+   projection retained between runs needs an integrity check before use;
+   running the command before every run also needs a defined handoff that
+   ensures CFEngine consumes the projection that passed validation. Open
+   are failure propagation, atomic publication, concurrent update/run
+   ordering, and recovery if interrupted between approval-state
+   persistence, projection publication and CFEngine launch. Timeout must
+   not authorize the proposed change (§11). Whether an independently
+   verified previous approved state continues to converge is a separate
+   question. The scheduling and handoff design must preserve DC-2 without
+   treating each convergence run as a new acceptance of the same
+   single-use approval. CFEngine supplies no gate here: `LoadCMDBData`
+   (`libpromises/cmdb.c`) checks only that the file is readable JSON, and
+   a load failure is logged and the run continues
+   (`libpromises/generic_agent.c`), so deleting or withholding the
+   projection is not a demonstrated fail-closed launch protocol.
 2. **What "validate" covers in the first build.** The goal file's schema,
    canonical bytes and version ceiling plus the projection's own checks,
    or the whole §9 validator (baseline integrity, device-computed diff,
@@ -1027,31 +1038,42 @@ document decides them):**
    comparator/projector binary". On Linux and macOS: does the id change
    (a `schema_version` bump), and what does its `sha256` bind: the
    script, its installed tree, the `python3` it runs on (DC-11, §9.8)?
-   `report-row.schema.json` still names tendcf-agent in its description
-   and in `validator_version`; D45 changes no schema text.
-   `agent_map`'s description says the validator's bytes arrive "as a TUF
-   target, not via a package-manager chain"; a distro `python3` is such a
-   chain. Either that sentence is amended (the interpreter joins cf-agent
-   in the host's trust base, outside TUF) or the interpreter is pinned.
-   R-S3-4's accidents-only model is scoped to the passthrough hard checks
-   and does not cover this. Timing: the schema is at v4 and v5 is in
-   flight; an id change decided before v5 lands rides that bump,
-   afterwards it costs v6 and a baseline ceremony per device.
+   The schema descriptions (`agent_map`, and `report-row.schema.json`'s
+   header and `validator_version`) were amended to D45 on 2026-11-02;
+   the wire identifier, enums and structure are unchanged.
+   The existing TUF-target wording does not yet specify how it applies to
+   the Python runtime. The operator must define which interpreter,
+   standard-library and dependency bytes are covered by the accepted
+   artifact and verified before apply, and which, if any, belong to an
+   explicitly trusted host runtime outside that artifact. Pinning a
+   version alone does not satisfy DC-11. R-S3-4's accidents-only model
+   applies to the passthrough hard checks, not this consent gate. Timing:
+   the schema is at v4 and v5 is in flight; an id change decided before
+   v5 lands rides that bump, afterwards it costs v6 and a baseline
+   ceremony per device.
 5. **The `rfc8785` dependency.** `bin/projector.py` declares the PyPI
    package `rfc8785` and runs under `uv run --script`; D45 names only
    `python3`. Vendor it, package it, or implement JCS in the command.
-   Whatever is chosen, the command runs `python3 -I` (isolated mode), so
-   `PYTHONPATH`, user site and the script directory cannot inject code
-   into the root trust path.
+   Recommended for the implementation review, not settled by D45: invoke
+   a trusted interpreter by absolute path in isolated mode (`-I`), with
+   dependencies supplied from trusted installed locations. Define
+   executable selection, import paths and dependency installation
+   together; the privileged apply path must not resolve or download
+   dependencies through `uv` at runtime. The complete arrangement must
+   satisfy item 4's runtime trust boundary.
 6. **Interpreter and prefix.** On macOS a bundled `python3` or the
    Command Line Tools' interpreter (D45 names both); the install prefix
    on every platform (`/opt/tendcf` is assumed on Linux, not ruled).
    Debian's standard task ships `python3`; a minimal or container image
    does not (CI's `debian:13` job installs it), so the install must
-   declare the dependency. The Command Line Tools' `/usr/bin/python3` is
-   3.9.6 (checked 2026-11-02 on macOS 27 with CLT 27.0.0.0), below
-   `bin/projector.py`'s `requires-python = ">=3.11"`: the CLT branch
-   needs either a lowered floor or the bundled interpreter.
+   declare the dependency. On the review machine,
+   `/usr/bin/python3 --version` reports 3.9.6 (checked 2026-11-02), below
+   `bin/projector.py`'s declared `requires-python = ">=3.11"`. This does
+   not establish the version supplied by a CLT-only installation. Before
+   choosing that deployment route, verify its interpreter and dependency
+   compatibility; otherwise use a compatible bundled interpreter. Also
+   open: the execution identity and privilege boundary for validation and
+   projection publication on each platform.
 7. **The SQLite index on Linux and macOS (§8, D18).** No owner:
    `tendcf-validate` is not a daemon and CFEngine never opens SQLite.
    Deferred, owned by another command, or not built on these platforms.

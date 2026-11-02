@@ -68,7 +68,7 @@ and the losing positions are in §§2–9.
 7. **The open question.** The goal file is a **tendcf-owned schema, not the
    Augments JSON** — all three opinions converge, and the 3.27.1 parser
    evidence makes it ground rather than taste. The projector runs
-   **device-side, inside tendcf-agent, after approval**: a policy-free
+   **device-side, ~~inside tendcf-agent,~~ after approval**: a policy-free
    re-keying of the approved file into `$(sys.workdir)/data/host_specific.json`
    as `{"vars": {…}}` only. `def.json` is never a per-host slot; nothing
    Augments-shaped ships on the wire; CI calls the *same* projector binary
@@ -485,7 +485,7 @@ laundering, and the shape conflict with the MPF). The genuine split is where
 the projector runs, and it is the largest single adjudication in this
 document.
 
-**Decision: the projector is device-side, inside tendcf-agent, run after
+**Decision: the projector is device-side, ~~inside tendcf-agent,~~ run after
 approval — Fable's position — with Grok's empirical specifics adopted as the
 projector's contract:** target is `$(sys.workdir)/data/host_specific.json`
 and nothing else; output is `{"vars": {…}}` with no sibling keys — no
@@ -513,12 +513,12 @@ first-class and Grok's cost argument deserves the answer:
    entire actuated surface.
 2. **The cost argument dissolves on inspection.** "A second implementation
    of the same function on macos, Linux, and Termux" miscounts: the
-   projector is one JSON-to-JSON re-keying, written once in the agent's
+   projector is one JSON-to-JSON re-keying, ~~written once in the agent's
    language, running wherever the agent already runs — exactly like the
-   validator. And the projector must exist *somewhere* under either option
+   validator.~~ And the projector must exist *somewhere* under either option
    (Grok's compiler needs one too); the only question is whether its output
-   is inside or outside the gate. Putting it in the agent and having **CI
-   invoke the same agent binary for golden tests** yields one
+   is inside or outside the gate. ~~Putting it in the agent and having **CI
+   invoke the same agent binary for golden tests**~~ yields one
    implementation, two call sites, and *less* machinery than the sibling
    option (no per-host TUF sibling targets, no approval-record hash
    extension, no wire delivery of a second artifact).
@@ -1010,8 +1010,10 @@ On `schema/report-row.schema.json#/$defs/device_convergence`:
   "type": "integer", "minimum": 1
 },
 "validator_version": {       // OPTIONAL (diagnostics only)
-  "description": "tendcf-agent binary that produced this row. The ceiling is
-    the claim; this is the courtesy.",
+  "description": "The version of this device's validator: tendcf-agent on
+    Android, tendcf-validate on Linux and macOS (map D45, 2026-11-02). This
+    is diagnostic metadata, not the identity of the report-writing process.
+    schema_ceiling is the claim used by the render rule.",
   "$ref": "common.schema.json#/$defs/release_stamp"
 }
 ```

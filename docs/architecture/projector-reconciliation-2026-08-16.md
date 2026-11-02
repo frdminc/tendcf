@@ -6,7 +6,7 @@ of §13, which could not be built because the mapping they were to be goldens
 *of* had never been specified.
 
 What was already decided and is **not** reopened here: the projector runs
-device-side, inside tendcf-agent, after approval; its target is
+device-side, ~~inside tendcf-agent,~~ after approval; its target is
 `$(sys.workdir)/data/host_specific.json` and nothing else; its output is
 `{"vars": {…}}` with no sibling keys (§9, and §13's adopted negative). What
 this document adds is the mapping: which entries project, under what names,
@@ -343,8 +343,8 @@ and `expect_exit` are a real boolean and a real integer (P-2/E-4), and no
 `bin/projector.py`, beside the two linters, as the **normative reference
 implementation**. §13 says "CI invokes the agent's own projector", and
 tendcf-agent does not exist; this repo is contract-only. The reference
-implementation is what §13's gate runs today and what tendcf-agent must
-reproduce byte-for-byte when it exists. It puts nothing Augments-shaped on
+implementation is what §13's gate runs today ~~and what tendcf-agent must
+reproduce byte-for-byte when it exists~~. It puts nothing Augments-shaped on
 the wire, so §9's rejection of a compiler-shipped sibling is not reopened.
 
 This is a **second implementation site**, and that is a real cost carried as
@@ -376,7 +376,7 @@ oracle it must reproduce byte-for-byte; the Python stays normative.
 
 | id | Residue |
 |---|---|
-| R22 | The reference projector in `bin/` is a second implementation site to tendcf-agent's. The golden bytes are the anti-drift oracle. *Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md` D45):* on Linux and macOS `bin/projector.py` is promoted to `tendcf-validate` and is the device implementation; the second site is the Android agent's Kotlin port, held to the same golden bytes in CI. |
+| R22 | ~~The reference projector in `bin/` is a second implementation site to tendcf-agent's.~~ The golden bytes are the anti-drift oracle. *Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md` D45):* on Linux and macOS `bin/projector.py` is promoted to `tendcf-validate` and is the device implementation; the second site is the Android agent's Kotlin port, held to the same golden bytes in CI. |
 | R23 | The kind-token `-`→`_` rule is convention with no mechanical force; hyphens are legal in `vars` keys on 3.27.1 (measured). Do not re-derive a mechanical justification for it. |
 | R24 | Device-authored operational state — device nonce, monotonic `approval_seq` high-water, TUF root and high-water mark — has no specified home. It cannot live in the goal file (signed upstream; these are device-authored), it is **not** `device-trust` content, and it must carry no copy of any, or P-8's second-source-of-truth objection applies to it. `architecture-DEFINITIVE-v3.md` open questions 13 and 15, and its §14.4. |
 
