@@ -1,14 +1,14 @@
 # Negative fixtures
 
-Eighty-six deliberately broken overlays, plus six byte-class fixtures in
+One hundred twenty-five deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
-`examples/`. The rest of the Site Model (cases 1-12, 107) or the goal-file
-family (the goal-file cases of 13-73, 93-106, 108-112, 129-131) stays as in the happy path.
-Cases 113-128 are reserved for schema v5 ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2). 129-131 land earlier, at v4, with
-the tombstone rule of that document's §2.2(4) (slice S0).
+`examples/`. The rest of the Site Model (cases 1-12, 107, 123, 143-144, 146-154) or the goal-file
+family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155) stays as in the happy path.
+Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
+the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number.
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -57,7 +57,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 5`, one above the current 4 | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 6`, one above the current 5 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -376,6 +376,59 @@ asserts `ordinary` and the reject mirror asserts `privileged`, the class the
 validator derives. The baseline holds no services, so supervisor `systemd`
 there does not trip the unit-flavour rule that case 101 exists for.
 
+## Schema v5 cases (113-155)
+
+The numbering is the one series across all three fixture directories (`broken/` ended at 112 and `broken-projection/` at 92 when v5 began), and 113-154 are the numbers
+`docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md` §5 assigns. 129-131 are in the v4 table above (slice S0); 145 is `../broken-projection/145-unit-package-under-vars.json`;
+155 is R5's cross-domain case. Unless the row says otherwise the base is the canary goal file `deploy/linux/canary/goal-file.json` (supervisor `systemd`); "launchd happy file" is
+`examples/goal-file.json`; "runit base" is that file with supervisor `runit` and its `service` and `interlock` entries removed (so only the `unit-writer` entry
+remains); "passthrough base" is `deploy/linux/passthrough/goal-file.json` (supervisor `nixos`). Each case adds, replaces or removes exactly the one thing its row names.
+The report-row cases (143, 144, 146-154) and 123 overlay a whole Site Model file, as cases 1-12 do, and each starts from an otherwise valid `domain_coverage` row.
+
+| # | Case | Broken input | Caught by |
+| --- | --- | --- | --- |
+| 113 | `113-unit-writer-bare-star` | key `*`, replacing `tendcf.canary.*` | schema (`pattern`) |
+| 114 | `114-unit-writer-mid-glob` | key `ssh*.service` | schema (`pattern`) |
+| 115 | `115-unit-writer-instance-key` | key `getty@tty1.service` (an instance, not a template) | schema (`pattern`) |
+| 116 | `116-unit-writer-no-separator` | key `ssh*` (a star not directly after `.` or `-`) | schema (`pattern`) |
+| 117 | `117-unit-writer-non-code-suffix` | key `foo.target` (not one of the four unit types) | schema (`pattern`) |
+| 118 | `118-exact-under-prefix` | `tendcf.canary.service` beside `tendcf.canary.*` | goal cross-file |
+| 119 | `119-template-under-prefix` | `foo-w@.service` beside `foo-*` | goal cross-file |
+| 120 | `120-launchd-single-label-key` | launchd happy file; key `ssh.service` | schema (`if/then`) |
+| 121 | `121-runit-single-label-key` | runit base; key `ssh.service` | schema (`if/then`) |
+| 122 | `122-writer-dpkg-on-name` | `ssh.service` with `writer: dpkg` | schema (`enum`) |
+| 123 | `123-launchd-writers-dpkg-writer` | `launchd-writers.yml` with `writer: dpkg` | schema (`enum`) |
+| 124 | `124-third-party-prefix` | prefix `local-*` with `third-party` (a systemd prefix belongs to cfengine alone) | schema (`if/then`) |
+| 125 | `125-tendcf-install-other-unit` | `foo.service` with `writer: tendcf-install` | goal cross-file |
+| 126 | `126-tendcf-install-launchd` | launchd happy file; `org.example.x.*` with `tendcf-install` | schema (`if/then`) |
+| 127 | `127-tendcf-install-runit` | runit base; `org.example.x.*` with `tendcf-install` | schema (`if/then`) |
+| 128 | `128-service-exact-non-cfengine` | a present `foo.service` under an exact `third-party` key | goal cross-file |
+| 132 | `132-nixos-unit-package` | passthrough base; a `packaging` domain carrying `unit-package` | schema (`if/then`) |
+| 133 | `133-launchd-unit-package` | launchd happy file with `unit-package` in `supervision` | schema (`if/then`) |
+| 134 | `134-runit-unit-package` | runit base with `unit-package` in `supervision` | schema (`if/then`) |
+| 135 | `135-unit-package-bad-name` | package id `Open_SSH` | schema (`pattern`) |
+| 136 | `136-unit-package-wrong-writer` | `openssh-server` with `writer: cfengine` | schema (`enum`) |
+| 137 | `137-unit-package-empty` | `unit-package: {}` | schema (`minProperties`) |
+| 138 | `138-unit-package-tombstone` | a package entry with `state: absent` | schema (`const`) |
+| 139 | `139-unit-package-no-writer` | a package entry without `writer` | schema (`required`) |
+| 140 | `140-unit-package-no-state` | a package entry without `state` | schema (`required`) |
+| 141 | `141-unit-package-extra-key` | a package entry with a key beside `state` and `writer` | schema (`additionalProperties`) |
+| 142 | `142-unit-package-twice` | `openssh-server` declared in two domains | goal cross-file |
+| 143 | `143-incomplete-with-count` | `report-rows.yml`: `extra_scan: incomplete` with `extra_entries: 0` | schema (`if/else`) |
+| 144 | `144-complete-without-count` | `report-rows.yml`: `extra_scan: complete` without `extra_entries` | schema (`if/then`) |
+| 146 | `146-row-no-extra-scan` | `report-rows.yml`: a row with no `extra_scan` and no counter | schema (`required`) |
+| 147 | `147-row-bad-extra-scan` | `extra_scan: partial`, no counters | schema (`enum`) |
+| 148 | `148-complete-no-two-writers` | `extra_scan: complete` without `two_writers` | schema (`if/then`) |
+| 149 | `149-complete-no-unmet-absence` | `extra_scan: complete` without `unmet_absence` | schema (`if/then`) |
+| 150 | `150-incomplete-two-writers` | `extra_scan: incomplete` with `two_writers: 0` | schema (`if/else`) |
+| 151 | `151-incomplete-unmet-absence` | `extra_scan: incomplete` with `unmet_absence: 0` | schema (`if/else`) |
+| 152 | `152-not-run-extra-entries` | `extra_scan: not-run` with `extra_entries: 0` | schema (`if/else`) |
+| 153 | `153-not-run-two-writers` | `extra_scan: not-run` with `two_writers: 0` | schema (`if/else`) |
+| 154 | `154-not-run-unmet-absence` | `extra_scan: not-run` with `unmet_absence: 0` | schema (`if/else`) |
+| 155 | `155-service-present-and-tombstone-across-domains` | `tendcf.canary.service` present in `supervision` and a tombstone in domain `apps` (R5) | goal cross-file |
+
+Measured in slice S2, one clause at a time. The goal cross-file rules: disabling the overlap check turns 62, 118 and 119 red; the cross-domain rule, 155 alone; package-id uniqueness, 142 alone; the `tendcf-install` rule, 125 alone; the present-service writer rule, 64 and 128. The schema cases each flip when the one clause they exercise is removed (the key regex for 113-117, each admitting only its own key; the launchd and runit members' `unit-writer` pattern for 120 and 121 and their `tendcf-install` ban for 126 and 127; the systemd prefix rule for 124; the nixos, launchd and runit `unit-package` bans for 132-134; each clause of `unit_package_map` for 135-141; and the row's `required`, `if/then` and `else` properties, one at a time, for 143-154), and the cases of the same group stay red. 126 and 127 are accepted by the whole pipeline (family noise aside) once the supervisor's `tendcf-install` prohibition is deleted. 113 replaces `tendcf.canary.*` with `*` so that no overlap or coverage rule fires beside the pattern, and 98 uses `third-party` (it used `dpkg`, which would also fire `enum`).
+
 ## Every class has a fixture
 
 `check_class_coverage()` asks the declarations' question from the other
@@ -476,6 +529,7 @@ below are that document's negatives.
 | 90 | `90-vars-is-an-array.json` | `vars` is an array | projection |
 | 91 | `91-container-is-an-array.json` | a kind container is an array | projection |
 | 92 | `92-entry-body-is-an-array.json` | an entry body is an array | projection |
+| 145 | `145-unit-package-under-vars.json` | a `unit-package` container under `vars` (schema v5: detector data, never projected; the existing closed-container rule, not a new one) | projection |
 
 Three of the twelve negatives have no row, and deliberately — all three are
 checked by `check_projector_properties()` instead, over bytes it synthesises.

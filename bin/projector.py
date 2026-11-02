@@ -26,7 +26,8 @@ what a byte comparison catches.
 
 WHAT PROJECTS, AND WHY SO LITTLE. `supervision`'s `service` and `interlock`
 entries, and nothing else — not `device-trust`, not `unit-writer`, not
-`coverage`, not `host`, not `schema_version` (P-1). The filter is structural:
+`unit-package` (schema v5: detector data, who may write units, never actuated),
+not `coverage`, not `host`, not `schema_version` (P-1). The filter is structural:
 it keys on domain class and kind, positions whose vocabularies are closed and
 disjoint in `goal-file.schema.json`, never on an entry's values. That
 distinction is R21's tripwire, and N-1 makes it mechanical.
@@ -438,7 +439,7 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                 RULE_PROJECTION,
                 f"vars/{name} names no projecting kind — only "
                 f"{', '.join(sorted(CONTAINERS))} project. device-trust, "
-                "unit-writer, coverage, host and schema_version do not, and a "
+                "unit-writer, unit-package, coverage, host and schema_version do not, and a "
                 "verbatim copy of the goal file under `vars` is the shape that "
                 "passes a naive `vars`-only check (N-5, N-12, P-1)",
             )

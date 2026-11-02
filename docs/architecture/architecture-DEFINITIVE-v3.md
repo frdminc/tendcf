@@ -188,9 +188,17 @@ Facts and intent in data; behavior in generic code; adapters translate.
   `supervisor` (see §6). Rendered to whatever unit that OS uses.
 - **roles** — `role → {main, backups[], peers[]}`. This file dissolves
   “the control node.”
-- **unit-writers** — exactly one writer per unit-name prefix, for every
+- **unit-writers** — one writer per unit name in the goal file's name
+  claims (an exact name, a template key, or a prefix), for every
   supervisor (launchd label, systemd instance, runit service, Jobber
-  job, …). Two writers on one unit is a lint failure.
+  job, …); on Debian a `unit-package` claim covers what a package ships;
+  and a local drop-in or mask on a vendor unit is admitted only under an
+  exact non-cfengine claim on that unit (schema v5, amended 2026-11-02,
+  [schema-v5-dpkg-reconciliation-2026-11-02.md](schema-v5-dpkg-reconciliation-2026-11-02.md)
+  §4(10); ~~exactly one writer per unit-name prefix; two writers on one
+  unit is a lint failure~~). Lint proves uniqueness among name claims
+  and package ids only; the device detects the layered rest
+  (`two_writers`).
 - **trust policy** — per-device, §10. Lives in site-private; compiled
   into that host’s signed release.
 - Schema + lint in tendcf; example fixture paired with every schema

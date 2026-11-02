@@ -60,7 +60,7 @@
 
     "domain_coverage_row": {
       "title": "domain_coverage row",
-      "description": "The managed/unmanaged ratio per domain, recorded as a quantity. This is what turns comprehensiveness from a lint into the build order's progress metric: Bcfg2's first client run reports 0 managed / 2308 unmanaged, and the whole deployment story is grinding that second number down.",
+      "description": "The managed/unmanaged ratio per domain, recorded as a quantity. This is what turns comprehensiveness from a lint into the build order's progress metric: Bcfg2's first client run reports 0 managed / 2308 unmanaged, and the whole deployment story is grinding that second number down. `extra_scan` says whether the extra-entry scan ran and finished: `complete` carries all three counters (extra_entries, two_writers, unmet_absence), defined for every supervisor's scan and zero where the detector has no such verdict, because a complete launchd row must carry them too; `incomplete` (the scan could not enumerate every in-scope unit with evidence) and `not-run` (the gate did not pass, or the domain is not scanned) carry none of them. An incomplete scan cannot carry a zero, because it cannot carry a count: a partial count is never reported as a total (schema v5, R3d).",
       "allOf": [{ "$ref": "#/$defs/base_columns" }],
       "properties": {
         "row_type": { "const": "domain_coverage" },
@@ -84,7 +84,21 @@
           "minimum": 0
         },
         "extra_entries": {
-          "description": "Present on the device, absent from a comprehensive domain's description (D16(d) two-way verification). The multi-writer skew signal.",
+          "description": "Present on the device, absent from a comprehensive domain's description (D16(d) two-way verification). The multi-writer skew signal. Carried only on a `complete` scan (`extra_scan`): an incomplete or not-run scan has no count to give.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "extra_scan": {
+          "description": "Whether the extra-entry scan of this domain ran to completion (schema v5, R3d). `complete`: every in-scope unit was resolved with evidence, and the three counters are present. `incomplete`: the gate passed but the scan could not finish (manager unreachable, dpkg database unusable, an unverifiable artifact, contradictory service declarations); no counter is carried. `not-run`: the gate did not pass (domain not comprehensive, or supervisor not systemd) or no detector exists for the domain; no counter is carried.",
+          "enum": ["complete", "incomplete", "not-run"]
+        },
+        "two_writers": {
+          "description": "Units shaped by a writer the goal file does not name for them: a claim and a vendor fragment on one name, a local fragment hiding a vendor one, or a local drop-in or mask on a vendor unit with no exact non-cfengine claim (schema v5 §3.4). Carried only on a `complete` scan; zero where the detector has no such verdict.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unmet_absence": {
+          "description": "A cfengine-claimed local fragment whose service entry is a tombstone: the removal the goal file asks for has not happened (schema v5 §3.4 row 6). Carried only on a `complete` scan; zero where the detector has no such verdict.",
           "type": "integer",
           "minimum": 0
         }
@@ -95,9 +109,21 @@
         "managed",
         "not_yet_migrated",
         "deliberately_unmanaged",
-        "extra_entries"
+        "extra_scan"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "if": {
+        "properties": { "extra_scan": { "const": "complete" } },
+        "required": ["extra_scan"]
+      },
+      "then": { "required": ["extra_entries", "two_writers", "unmet_absence"] },
+      "else": {
+        "properties": {
+          "extra_entries": false,
+          "two_writers": false,
+          "unmet_absence": false
+        }
+      }
     },
 
     "device_convergence": {

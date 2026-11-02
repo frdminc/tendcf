@@ -26,16 +26,18 @@ Six layers, cheapest first:
      fall under a declared writer prefix, no writer prefix nests inside
      another; on the goal-file side, every interlock's bundle is used by
      at least one service, comprehensive-domain services fall under a
-     `cfengine`-writer unit-writer prefix, every `supervision` tombstone
-     falls under one too (the adapters' teardown checks neither),
-     and goal-file.schema.json
+     `cfengine`-writer unit-writer key (an exact name, a template, or a
+     prefix; no two keys overlap), every `supervision` tombstone falls
+     under one too (the adapters' teardown checks neither), no unit id is
+     present in one domain and a tombstone in another, and
+     goal-file.schema.json
      itself never `$ref`s a def whose defaults would reintroduce
      ignore-unknown (reconciliation §13, Grok 8.6). Across the goal-file
      family: the diff's two hashes name the two goal-file fixtures,
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the eighty-six deliberately broken fixtures in examples/broken/
+  6. each of the one hundred twenty-five deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -86,9 +88,9 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 86
+EXPECTED_BROKEN = 125
 EXPECTED_BYTE_CLASS = 6
-EXPECTED_PROJECTION = 27
+EXPECTED_PROJECTION = 28
 
 # example file -> schema file. report-rows.yml is a sequence of rows, each
 # validated individually against the row schema. The goal-file family is
@@ -420,7 +422,7 @@ def check_family_canonical_bytes() -> None:
 
 BROKEN_README = BROKEN_DIR / "README.md"
 
-# | 13 | `13-schema-version-bump` | `schema_version: 5`, one above the current 4 | schema (`const`) |
+# | 13 | `13-schema-version-bump` | `schema_version: 6`, one above the current 5 | schema (`const`) |
 _README_ROW = re.compile(r"^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|.*\|\s*(.+?)\s*\|\s*$")
 
 
@@ -1511,6 +1513,101 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
             )
 
 
+# A template key (`getty@.service`) names the instances of one template.
+# schema-v5-dpkg-reconciliation-2026-11-02.md §2.2(1).
+UNIT_TEMPLATE = re.compile(r"^(.+@)\.(service|socket|timer|path)$")
+
+
+def unit_key_covers(key: str, name: str) -> bool:
+    """Does the unit-writer `key` cover the unit named `name`?
+
+    A prefix key covers every name that starts with it; an exact key covers
+    that name; a template key also covers the instances of its template
+    (`getty@.service` covers `getty@tty1.service`, never `getty@.service`
+    spelled with an empty instance). Not interchangeable with
+    unit_keys_overlap(): this one matches a service against a claim, that
+    one compares two claims.
+    """
+    if key.endswith("*"):
+        return name.startswith(key[:-1])
+    if name == key:
+        return True
+    template = UNIT_TEMPLATE.match(key)
+    if template:
+        anchor, suffix = template.group(1), "." + template.group(2)
+        return (
+            name.startswith(anchor)
+            and name.endswith(suffix)
+            and len(name) > len(anchor) + len(suffix)
+        )
+    return False
+
+
+def unit_keys_overlap(a: str, b: str) -> bool:
+    """Do two unit-writer claims name a common unit by their literal text?
+
+    Two prefixes overlap when one is a prefix of the other; a prefix and an
+    exact key when the key starts with the prefix; two exact keys only when
+    equal. `foo.service` and `foo.service.*` are disjoint: the star stands
+    for text after the dot, and the exact name ends at `service`. Literal
+    overlap says nothing about aliases, package contents or layered
+    configuration; that is the device's job (§3).
+    """
+    a_star, b_star = a.endswith("*"), b.endswith("*")
+    if a_star and b_star:
+        return a[:-1].startswith(b[:-1]) or b[:-1].startswith(a[:-1])
+    if a_star:
+        return b.startswith(a[:-1])
+    if b_star:
+        return unit_keys_overlap(b, a)
+    return a == b
+
+
+def check_unit_claim_selftest() -> None:
+    """Pin unit_key_covers and unit_keys_overlap against the §2.2(2) table.
+
+    There is no tests/**/*.py harness for the lint, so the truth table of the
+    spec lives here, run before any fixture. Both directions of every pair.
+    """
+    overlap_table = (
+        ("foo.service", "foo.service.*", False),
+        ("foo.*", "foo.bar.*", True),
+        ("foo-*", "foo-bar.service", True),
+        ("foo-*", "foo-w@.service", True),
+        ("fo-*", "foo@.service", False),
+        ("foo.service", "foo.socket", False),
+        ("foo@.service", "foo@.socket", False),
+        ("foo@.service", "foo.service", False),
+        ("tendcf.canary.*", "tendcf-execd.service", False),
+    )
+    for a, b, want in overlap_table:
+        for x, y in ((a, b), (b, a)):
+            if unit_keys_overlap(x, y) != want:
+                fail(
+                    f"unit-claim self-test: unit_keys_overlap({x!r}, {y!r}) "
+                    f"is not {want}",
+                    rule=RULE_HARNESS,
+                )
+    covers_table = (
+        ("tendcf-w@.service", "tendcf-w@1.service", True),
+        ("tendcf-w@.service", "tendcf-w@.service", True),
+        ("tendcf-w@.service", "tendcf-w@.socket", False),
+        ("tendcf-w@.service", "tendcf-w@1.socket", False),
+        ("getty@.service", "getty@tty1.service", True),
+        ("foo.service", "foo.service", True),
+        ("foo.service", "foo.service.x", False),
+        ("foo.*", "foo.service", True),
+        ("foo.service.*", "foo.service", False),
+        ("foo-*", "foo-w@1.service", True),
+    )
+    for key, name, want in covers_table:
+        if unit_key_covers(key, name) != want:
+            fail(
+                f"unit-claim self-test: unit_key_covers({key!r}, {name!r}) is not {want}",
+                rule=RULE_HARNESS,
+            )
+
+
 def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
     """Cross-entry rules goal-file.schema.json cannot express alone.
 
@@ -1525,11 +1622,13 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
     label = name.removesuffix(".json")
     domains: dict[str, Any] = goal_file.get("domains") or {}
 
-    # (domain, prefix, writer) for every unit-writer entry, plus the
-    # present service ids each domain declares.
-    prefixes: list[tuple[str, str, str | None]] = []
-    seen_prefixes: set[str] = set()
+    # (domain, key, writer) for every unit-writer entry, the present and
+    # absent service ids each domain declares, and every unit-package id.
+    keys: list[tuple[str, str, str | None]] = []
+    seen_keys: set[str] = set()
+    seen_packages: dict[str, str] = {}
     service_ids_by_domain: dict[str, list[str]] = {}
+    tombstones_by_domain: dict[str, list[str]] = {}
     bundles_in_use: set[str] = set()
 
     for domain_name, domain in domains.items():
@@ -1537,20 +1636,35 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
             continue
         entries = domain.get("entries") or {}
         for service_id, service in (entries.get("service") or {}).items():
-            if isinstance(service, dict) and service.get("state") == "present":
+            if not isinstance(service, dict):
+                continue
+            if service.get("state") == "present":
                 service_ids_by_domain.setdefault(domain_name, []).append(service_id)
                 bundle = service.get("bundle")
                 if bundle:
                     bundles_in_use.add(bundle)
-        for prefix, writer_entry in (entries.get("unit-writer") or {}).items():
-            if prefix in seen_prefixes:
+            elif service.get("state") == "absent":
+                tombstones_by_domain.setdefault(domain_name, []).append(service_id)
+        for key, writer_entry in (entries.get("unit-writer") or {}).items():
+            if key in seen_keys:
                 fail(
-                    f"{label}: unit-writer prefix {prefix!r} declared twice",
+                    f"{label}: unit-writer key {key!r} declared twice",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
-            seen_prefixes.add(prefix)
+            seen_keys.add(key)
             writer = writer_entry.get("writer") if isinstance(writer_entry, dict) else None
-            prefixes.append((domain_name, prefix, writer))
+            keys.append((domain_name, key, writer))
+        # Package ids are unique across domains (§2.2(3)), on the model of
+        # the unit-writer duplicate rule above. Not covered by that rule: a
+        # package id and a unit name never collide in the key space.
+        for package in entries.get("unit-package") or {}:
+            if package in seen_packages:
+                fail(
+                    f"{label}: unit-package {package!r} declared in both "
+                    f"{seen_packages[package]!r} and {domain_name!r}",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            seen_packages.setdefault(package, domain_name)
 
     # --- every interlock's bundle is used by >= 1 present service ----------
     for domain_name, domain in domains.items():
@@ -1566,39 +1680,39 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 
-    # --- no unit-writer prefix nests inside another (one label namespace) --
-    all_prefixes = [p for _, p, _ in prefixes]
-    for outer in all_prefixes:
-        for inner in all_prefixes:
-            if outer == inner:
-                continue
-            if inner.removesuffix("*").startswith(outer.removesuffix("*")):
+    # --- no two unit-writer keys overlap (one unit-name namespace) ---------
+    # §2.2(1): literal overlap, not startswith. An exact name beside a prefix
+    # that merely shares its stem (`foo.service` / `foo.service.*`) is fine;
+    # an exact name or template under a prefix (`tendcf.canary.service` under
+    # `tendcf.canary.*`, `foo-w@.service` under `foo-*`) is two writers over
+    # one namespace. Equal keys are the duplicate rule's, reported once there.
+    all_keys = [k for _, k, _ in keys]
+    for index, first in enumerate(all_keys):
+        for second in all_keys[index + 1 :]:
+            if first != second and unit_keys_overlap(first, second):
                 fail(
-                    f"{label}: unit-writer prefix {inner!r} nests inside {outer!r} — "
-                    "two writers over one namespace", rule=RULE_GOAL_CROSS_FILE
+                    f"{label}: unit-writer keys {first!r} and {second!r} overlap — "
+                    "two writers over one namespace",
+                    rule=RULE_GOAL_CROSS_FILE,
                 )
 
     # --- comprehensive-domain services fall under a cfengine writer --------
     for domain_name, domain in domains.items():
         if not isinstance(domain, dict) or domain.get("coverage") != "comprehensive":
             continue
-        domain_prefixes = [(p, w) for d, p, w in prefixes if d == domain_name]
+        domain_keys = [(k, w) for d, k, w in keys if d == domain_name]
         for service_id in service_ids_by_domain.get(domain_name, []):
-            matched = [
-                (p, w)
-                for p, w in domain_prefixes
-                if service_id.startswith(p.removesuffix("*"))
-            ]
+            matched = [(k, w) for k, w in domain_keys if unit_key_covers(k, service_id)]
             if not matched:
                 fail(
                     f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                    "falls under no declared unit-writer prefix — the two-writers rail, "
+                    "falls under no declared unit-writer key — the two-writers rail, "
                     "applied to the goal file", rule=RULE_GOAL_CROSS_FILE
                 )
             elif not any(w == "cfengine" for _, w in matched):
                 fail(
                     f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                    "falls under a unit-writer prefix whose writer is not cfengine",
+                    "falls under a unit-writer key whose writer is not cfengine",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 
@@ -1613,24 +1727,52 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
     # guard on that path (policy/tendcf_services.cf's `isplain` is systemd
     # only). A cfengine claim is necessary, not sufficient: see the doc's §7
     # item 3 (a vendor fragment behind the removed file).
-    supervision = domains.get("supervision")
-    if isinstance(supervision, dict):
-        supervision_entries = supervision.get("entries") or {}
-        supervision_prefixes = [(p, w) for d, p, w in prefixes if d == "supervision"]
-        for service_id, service in (supervision_entries.get("service") or {}).items():
-            if not (isinstance(service, dict) and service.get("state") == "absent"):
-                continue
-            matched = [
-                (p, w)
-                for p, w in supervision_prefixes
-                if service_id.startswith(p.removesuffix("*"))
-            ]
-            if not any(w == "cfengine" for _, w in matched):
+    supervision_keys = [(k, w) for d, k, w in keys if d == "supervision"]
+    for service_id in tombstones_by_domain.get("supervision", []):
+        matched = [(k, w) for k, w in supervision_keys if unit_key_covers(k, service_id)]
+        if not any(w == "cfengine" for _, w in matched):
+            fail(
+                f"{label}: domains/supervision/entries/service/{service_id} is a "
+                "tombstone under no cfengine unit-writer key — a tombstone "
+                "removes what its id names, and only a unit this writer rendered "
+                "may be removed",
+                rule=RULE_GOAL_CROSS_FILE,
+            )
+
+    # --- one unit identity is not present in one domain and absent in another --
+    # (§1 R5, §3.1.) The detector judges one unit namespace per host (R3c), so
+    # a present entry in one domain and a tombstone for the same id in
+    # another contradict each other, and neither the same-domain coverage
+    # rules above nor the schema sees across domains. Identity is the id
+    # spelling: no lint can know aliases.
+    for service_id in sorted({i for ids in service_ids_by_domain.values() for i in ids}):
+        present_in = [d for d, ids in service_ids_by_domain.items() if service_id in ids]
+        absent_in = [d for d, ids in tombstones_by_domain.items() if service_id in ids]
+        if present_in and absent_in:
+            fail(
+                f"{label}: service {service_id!r} is present in domain "
+                f"{present_in[0]!r} and a tombstone in domain {absent_in[0]!r} — "
+                "one unit, two contradictory states",
+                rule=RULE_GOAL_CROSS_FILE,
+            )
+
+    # --- `tendcf-install` names tendcf's own unit and nothing else ----------
+    # §2.2(5). Only on a systemd host: the other supervisors reject the
+    # writer in schema (goal-file.schema.json allOf), and this rule does not
+    # duplicate that, so the launchd and runit cases discriminate.
+    supervisor = (
+        ((domains.get("device-trust") or {}).get("entries") or {})
+        .get("supervisor", {})
+        .get("host", {})
+        .get("name")
+    )
+    if supervisor == "systemd":
+        for domain_name, key, writer in keys:
+            if writer == "tendcf-install" and key != "tendcf-execd.service":
                 fail(
-                    f"{label}: domains/supervision/entries/service/{service_id} is a "
-                    "tombstone under no cfengine unit-writer prefix — a tombstone "
-                    "removes what its id names, and only a unit this writer rendered "
-                    "may be removed",
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    "carries writer 'tendcf-install', which names exactly one "
+                    "unit, tendcf-execd.service",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 
@@ -2084,6 +2226,7 @@ def main() -> int:
             check_trust_inexpressible(loaded, schemas, registry)
             declared = read_declared_classes()
             check_claim_selftest()
+            check_unit_claim_selftest()
             caught = check_negative_fixtures(loaded, schemas, registry, declared)
             byte_caught = check_byte_class_fixtures(declared)
             projector = load_projector()
