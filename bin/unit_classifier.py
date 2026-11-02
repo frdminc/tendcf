@@ -25,8 +25,10 @@ unit directory). One caveat is inherent in enumerating through the manager:
 ``systemctl show NAME`` makes the manager load NAME. That is a read for every
 purpose of this contract and never starts, stops, enables or reloads anything.
 
-Run on a Debian host without any root:
+Run on a Debian host (python3 and systemd; no root needed, nothing is written):
     bin/unit_classifier.py --claims CLAIMS.json
+or from a workstation with nothing copied to the host:
+    ssh HOST python3 - --claims-json "'$(tr -d '\\n' < CLAIMS.json)'" < bin/unit_classifier.py
 """
 from __future__ import annotations
 
@@ -816,12 +818,17 @@ def classify(env, claims):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read-only unit-namespace classifier (schema v5, S1)")
-    ap.add_argument("--claims", required=True, help="goal-file-shaped JSON with unit-writer/unit-package/service claims")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--claims", help="goal-file-shaped JSON file with unit-writer/unit-package/service claims")
+    g.add_argument("--claims-json", help="the same JSON inline, so the script can be piped over ssh with nothing written on the host")
     ap.add_argument("--dpkg-admindir", help="dpkg database directory (test databases; default: the host's)")
     ap.add_argument("--quiet", action="store_true", help="print only the summary row")
     a = ap.parse_args(argv)
-    with open(a.claims) as f:
-        claims = load_claims(json.load(f))
+    if a.claims_json is not None:
+        claims = load_claims(json.loads(a.claims_json))
+    else:
+        with open(a.claims) as f:
+            claims = load_claims(json.load(f))
     out = classify(Env(dpkg_admindir=a.dpkg_admindir), claims)
     json.dump(out["summary"] if a.quiet else out, sys.stdout, indent=1, sort_keys=True)
     sys.stdout.write("\n")
