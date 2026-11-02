@@ -144,25 +144,34 @@ class Sandbox:
             os.unlink(p)
 
     def start(self, unit):
-        self.started.append(unit)
-        sh(["systemctl", "start", unit], check=True)
+        if self.run is None:
+            raise RuntimeError("a Sandbox without a manager runner cannot start %s" % unit)
+        self.started.append(unit)      # registered first: __exit__ stops it even if the start half-failed
+        r = self.run(["systemctl", "start", unit])
+        if r is None or r.returncode != 0:
+            raise RuntimeError("systemctl start %s failed: %s" % (unit, r and r.stderr.strip()))
 
     def __enter__(self):
         return self
 
     def _guard(self, what, fn):
-        """Run one cleanup operation; an exception is a collected failure, never an abort."""
+        """Run one cleanup operation; an exception is a collected failure, never an abort.
+        Returns _FAILED (not None) for an exception, so a runner that returns None is not mistaken for it."""
         try:
             return fn()
         except Exception as e:
             self.failures.append("%s: %r" % (what, e))
-            return None
+            return _FAILED
 
     def _manager(self, what, argv, ok=(0,)):
         if self.run is None:
             return
         r = self._guard(what, lambda: self.run(argv))
-        if r is not None and r.returncode not in ok:
+        if r is _FAILED:
+            return
+        if r is None:
+            self.failures.append("%s: the runner returned no result" % what)
+        elif r.returncode not in ok:
             self.failures.append("%s: rc=%s %s" % (what, r.returncode, r.stderr.strip()[:200]))
 
     def __exit__(self, *exc):
@@ -177,6 +186,9 @@ class Sandbox:
         if self.failures:
             raise CleanupError("sandbox could not restore the host: " + "; ".join(self.failures))
         return False
+
+
+_FAILED = object()
 
 
 def _unlink_quiet(p):

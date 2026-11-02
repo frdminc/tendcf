@@ -424,7 +424,8 @@ def main(steps=None, cleanup=None, gate=True):
         try:
             step()
         except Exception as e:  # a failing step must not hide the others, and must not pass
-            fail("step %s raised %r" % (step.__name__, e))
+            # a CleanupError raised inside `with Sandbox()` hides the step's own exception as __context__
+            fail("step %s raised %r%s" % (step.__name__, e, " (while handling %r)" % (e.__context__,) if e.__context__ else ""))
         finally:
             try:
                 cleanup()

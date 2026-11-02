@@ -63,6 +63,17 @@ class ProbeExitStatus(unittest.TestCase):
             s1_probe.rec("crash", ["sh", "-c", "exit 2"], ok=s1_probe.OBSERVED_NONZERO)
         self.assertEqual(run([step])[0], 1)
 
+    def test_a_step_exception_hidden_by_a_cleanup_error_is_still_reported(self):
+        def step():
+            try:
+                raise RuntimeError("the observation itself failed")
+            except RuntimeError:
+                raise OSError("cleanup error that replaced it")     # __context__ is the first exception
+        rc, out, _ = run([step])
+        self.assertEqual(rc, 1)
+        self.assertIn("cleanup error that replaced it", out)
+        self.assertIn("the observation itself failed", out)
+
     def test_a_failing_cleanup_fails_the_run(self):
         def cleanup():
             raise RuntimeError("daemon-reload failed")

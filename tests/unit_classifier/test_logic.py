@@ -605,6 +605,52 @@ class SharedPathRoles(unittest.TestCase):
             self.assertEqual(one_unit(out, "a.service")["verdict"], "clean", order)
 
 
+class FragmentChainLinkInAnyOrder(unittest.TestCase):
+    """Review 5 finding 1: an owned link to an unowned fragment (K10) is one chain in either scan order."""
+
+    ORDERS = SharedPathRoles.ORDERS
+
+    def system(self, order):
+        s = FakeSystem()
+        s._put(U + "/a.service", ("link", E + "/a.service"), ["apkg"])     # the package's link
+        s._put(E + "/a.service", ("file",))                                # ... to an unowned file
+        s.unit("a.service", frag=E + "/a.service")
+        s.unit_paths_out = "\n".join(self.ORDERS[order]) + "\n"
+        return s
+
+    def test_owned_link_to_an_unowned_fragment_is_not_a_second_fragment(self):
+        for order in self.ORDERS:
+            for writers, rule, verdict in ((None, 10, "extra"), ({"a.service": "third-party"}, 11, "clean")):
+                with self.subTest(order=order, exact=bool(writers)):
+                    out = uc.classify(self.system(order), claims(pkgs=["apkg"], writers=writers))
+                    u = one_unit(out, "a.service")
+                    self.assertEqual((u["verdict"], u["rule"]), (verdict, rule), u["why"])
+
+    def test_the_record_for_the_shared_path_carries_the_link_that_leads_to_it(self):
+        for order in self.ORDERS:
+            out = uc.classify(self.system(order), claims(pkgs=["apkg"]))
+            vias = [a["via"] for a in one_unit(out, "a.service")["artifacts"] if a["path"] == E + "/a.service"]
+            self.assertEqual(vias, [U + "/a.service"], order)
+
+
+class RecordShape(unittest.TestCase):
+    """Review 5 finding 4: the JSON records say which chain each belongs to, so a consumer need not guess."""
+
+    def test_dropin_records_say_dropin_and_target_records_say_via(self):
+        s = FakeSystem()
+        s.vendor("a.service", "apkg")
+        s._put("/opt/conf/x.conf", ("file",))
+        s.dropin_link("a.service", "/opt/conf/x.conf")
+        s.dropin("a.service", fname="y.conf")
+        out = uc.classify(s, claims(pkgs=["apkg"], writers={"a.service": "third-party"}))
+        arts = {a["path"]: a for a in one_unit(out, "a.service")["artifacts"]}
+        self.assertEqual(arts[E + "/a.service.d/x.conf"]["role"], "dropin")
+        self.assertEqual(arts[E + "/a.service.d/y.conf"]["role"], "dropin")
+        self.assertEqual(arts["/opt/conf/x.conf"]["role"], "dropin")
+        self.assertEqual(arts["/opt/conf/x.conf"]["via"], E + "/a.service.d/x.conf")
+        self.assertEqual(arts[U + "/a.service"]["role"], "fragment")
+
+
 class UnresolvedLinks(unittest.TestCase):
     """Review finding 3: a link chain with no final target makes the unit unverifiable."""
 

@@ -177,6 +177,40 @@ class Failures(unittest.TestCase):
         sb.started.append("x.service")
         sb.__exit__(None, None, None)
 
+    def test_start_goes_through_the_injected_runner_and_is_stopped_on_exit(self):
+        calls = []
+
+        def run(argv):
+            calls.append(argv[1:])
+            return ok(argv)
+        with Sandbox(roots=[self.d], run=run) as sb:
+            sb.start("x.service")
+        self.assertEqual(calls[0], ["start", "x.service"])
+        self.assertIn(["stop", "x.service"], calls)
+
+    def test_a_sandbox_without_a_manager_cannot_start_a_unit(self):
+        with Sandbox(roots=[self.d], run=None) as sb:
+            with self.assertRaises(RuntimeError):
+                sb.start("x.service")
+
+    def test_a_failed_start_raises_and_the_unit_is_still_stopped(self):
+        calls = []
+
+        def run(argv):
+            calls.append(argv[1])
+            return subprocess.CompletedProcess(argv, 1 if argv[1] == "start" else 0, "", "boom")
+        sb = Sandbox(roots=[self.d], run=run)
+        with self.assertRaises(RuntimeError):
+            sb.start("x.service")
+        sb.__exit__(None, None, None)
+        self.assertIn("stop", calls)
+
+    def test_a_runner_that_returns_none_is_a_cleanup_error_not_silence(self):
+        sb = Sandbox(roots=[self.d], run=lambda argv: None)
+        with self.assertRaises(CleanupError) as cm:
+            sb.__exit__(None, None, None)
+        self.assertIn("no result", str(cm.exception))
+
     def test_a_clean_exit_with_a_working_manager_does_not_raise(self):
         with Sandbox(roots=[self.d], run=ok) as sb:
             sb.write(os.path.join(self.d, "a"), "x")

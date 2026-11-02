@@ -586,6 +586,8 @@ class Scan:
             old = found.get(key)
             if old is None or (art.kind in ("alias", "mask") and old.kind == "fragment"):
                 found[key] = art
+            elif art.kind == "target" and art.via and not old.via:
+                old.via = art.via      # the same file met first as a fragment keeps the link that leads to it (K10)
             return found[key]
 
         look = set(u.names) | set(u.lookups)
@@ -643,11 +645,11 @@ class Scan:
                         final, devnull, why = link_final(env, fp)
                         if why:
                             u.problems.append("%s: %s" % (fp, why))
-                        add(Artifact(fp, "dropin", link_target=fst[1]))
+                        add(Artifact(fp, "dropin", link_target=fst[1], role="dropin"))
                         if final is not None and not devnull:
-                            add(Artifact(final, "target", name=e, role="dropin"))
+                            add(Artifact(final, "target", name=e, role="dropin", via=canon_path(env, fp)))
                     else:
-                        add(Artifact(fp, "dropin"))
+                        add(Artifact(fp, "dropin", role="dropin"))
         return found
 
     def cross_check(self, u, found):
@@ -783,7 +785,7 @@ def judge(claims, u, conflict_ids):
     def layer(a):
         return a.kind in ("dropin", "mask") or (a.kind == "target" and a.role == "dropin")
 
-    linked_local = {a.via for a in local if a.kind == "target" and a.role == "fragment" and a.via}
+    linked_local = {a.via for a in local if frag(a) and a.via}
     vendor_frag = [a for a in owned if frag(a) and a.path not in linked_local]
     local_frag = [a for a in local if frag(a)]
     local_layer = [a for a in local if layer(a)]
@@ -843,7 +845,7 @@ def classify(env, claims):
             "rule": u.rule, "why": u.why,
             "state": u.props.get("UnitFileState", ""),
             "artifacts": [{"path": a.path, "kind": a.kind, "owners": a.owners,
-                           "owners_raw": a.owners_raw, "authorized": a.authorized, "role": a.role,
+                           "owners_raw": a.owners_raw, "authorized": a.authorized, "role": a.role, "via": a.via,
                            "link_target": a.link_target, "problem": a.problem}
                           for a in u.artifacts],
         })
