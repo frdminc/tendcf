@@ -40,7 +40,7 @@ PAIRS = (
     # A FIXTURE too (schema v5 spec 4 item 8, narrowed by S4): the positive
     # witnesses of spec 5 on a Debian host and nothing else. The pastebin-shaped
     # sketch it used to carry is now pastebin's real declaration in goal-file.json
-    # (schema v5 spec 3.6, S4). Witnesses: an exact third-party name,
+    # (schema v5 spec 3.7, S4). Witnesses: an exact third-party name,
     # tendcf-install, a cfengine template key with the instance it covers, a
     # prefix disjoint from an exact name, and unit-package claims in two domains.
     # unit-package and unit-writer are detector data and do not project, so its
