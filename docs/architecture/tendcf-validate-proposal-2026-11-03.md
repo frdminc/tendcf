@@ -42,10 +42,17 @@ Each was read in the pinned fork source or in this repository on
    `tendcf_interlock` container still loads `tendcf_service`. In
    `policy/tendcf_services.cf`, the only source of the
    `interlock_blocked_*` classes is the interlock container (lines
-   107-147). A partially loaded projection therefore runs guarded
-   bundles unguarded. This is fail-open, and only a check made before
-   publication prevents it (the projector's N-series, run by whoever
-   writes the file).
+   107-147). Services are gated *negatively*, on
+   `!interlock_blocked_<bundle>` (lines 217, 280, 313). A skipped or
+   missing `tendcf_interlock` container therefore leaves every service
+   ungated: **fail-open, in the live design**. The skip is a whole
+   top-level `vars` key, and so a whole container: `AddCMDBVariable`
+   installs a container as one value. `ReadCMDBVars` still returns
+   `true` (`cmdb.c:380`), so not even "Failed to load CMDB data" is
+   logged. A check made before publication (the projector's N-series)
+   prevents the causes it knows about. It cannot prove that the loader
+   accepts what the projector accepted. The remedies are in §13, for the
+   operator.
 3. **No data means no actuation, and no removal either.** The generic bundle
    iterates `getindices("data:variables.tendcf_service")`. With no CMDB
    data it promises nothing, so it removes nothing: tombstones live in
@@ -61,17 +68,35 @@ Each was read in the pinned fork source or in this repository on
 5. **The cf-execd timeout kill targets one child of the popen'd process,
    and that child's process group only if the child leads one.** On
    `agent_expireafter` (default 120 minutes, `exec-config.c:138`), the
-   runner selects the child of the process `cf_popen_sh` started and
-   signals it. It signals the child's whole group only when the child's
-   PGID equals its PID (`cf-execd-runner.c:270-310`). Which process is
-   picked depends on the shell. If `sh -c` keeps running, the picked
-   child is the wrapper, and a cf-agent the wrapper forked survives
-   unless the wrapper leads a group that cf-agent is in. If `sh -c`
-   `exec`s the wrapper (common for a single simple command, and not
-   verified for the hosts' `/bin/sh`), the picked child is cf-agent
-   itself. A wrapper that calls `setpgid(0,0)` before forking is
-   killed with its cf-agent in the first case, and loses only cf-agent
-   in the second. Either way no orphaned cf-agent survives.
+   runner lists the children of the process `cf_popen_sh` started
+   (`pid_shell`) and signals the first one. It signals that child's
+   whole group only when the child's PGID equals its PID
+   (`cf-execd-runner.c:284-314`). The signal sequence is SIGINT, then
+   SIGTERM after 1 s, then SIGKILL after 5 s more
+   (`ProcessSignalTerminate`, `libpromises/unix.c`). Which process is
+   picked depends on whether `sh -c` `exec`s a single simple command,
+   which this review did not verify for the hosts' `/bin/sh`.
+
+   - If the shell stays, the picked child is the wrapper.
+   - If the shell `exec`s, `pid_shell` is the wrapper and the picked
+     child is cf-agent.
+
+   This proposal's first text had the wrapper call `setpgid(0,0)`. That
+   is wrong in the second case. cf-agent would inherit the wrapper's
+   group, so it does not lead a group, and only its own PID is signalled.
+   Its children are left alive, and the wrapper wakes up and carries on
+   with its post-run steps (review finding 1).
+
+   Two more facts bear on the protocol in §1:
+
+   - The pinned build is configured with `--enable-debug`
+     (`.github/actions/build-fork/action.yml:54`), so
+     `assert(procs->next == NULL)` (`cf-execd-runner.c:302`) is live:
+     a `pid_shell` with two children aborts the timeout path.
+   - A `commands:` promise with `exec_timeout` runs in its *own*
+     process group (`pipes_unix.c:243-258`). No group kill from above
+     reaches it, so it outlives a SIGKILLed cf-agent. That is CFEngine's
+     behaviour with or without a wrapper.
 6. **cf-execd loads the file too**, at start and at policy reload
    (`cf-execd.c:194`, `:1001`), as map §12 says. It is harmless while
    the projection carries supervision vars only (P-1).
@@ -104,6 +129,18 @@ Each was read in the pinned fork source or in this repository on
 12. **Zero devices hold a device-side baseline.** Nothing device-side
     runs (map §12). pastebin's data was installed by hand, and no
     approved goal file is stored on any host.
+13. **cf-execd starts a run on every schedule without checking whether
+    the last one is still running.** `ScheduleRun` is followed by
+    `LocalExecInFork` (`cf-execd.c:568-581`). Nothing checks for a run
+    still in progress, so a wedged run has a new one started beside it
+    every five minutes. `tendcf-install.sh`'s `exec_command` has no `-K`
+    (line 137); `run-once` has it (line 180).
+14. **With an empty `exec_command`, cf-execd runs its built-in failsafe
+    command** `cf-agent -f failsafe.cf && cf-agent -Dfrom_cfexecd…`
+    (`ConstructFailsafeCommand`, `cf-execd-runner.c:109-120`). That is
+    today's NixOS shape (fact 9) once `execd.enable` is on. A non-interactive
+    cf-agent whose policy fails `cf-promises` also writes and runs the
+    built-in `failsafe.cf` (`generic_agent.c:205-245`).
 
 ## 1. Trigger and launch handoff
 
@@ -115,20 +152,46 @@ projection that passed validation, and only that projection?
 
 1. **Wrapper as `exec_command`, every run, re-projecting from the stored
    baseline.** `tendcf-install.sh` writes
-   `exec_command => "/opt/tendcf/libexec/tendcf-validate run -- $(sys.cf_agent) -f $(sys.inputdir)/promises.cf"`.
-   `run` takes an exclusive `flock` on `<state>/lock`, verifies the
-   stored baseline generation (layout below), and promotes a pending
-   approved proposal if one exists. It then projects the current
-   baseline, publishes the projection atomically, and starts cf-agent.
-   Publication writes `data/.host_specific.json.tmp` (mode 0600,
-   `fsync`), `rename(2)`s it over `data/host_specific.json`, and
-   `fsync`s `data/`. `run` calls `setpgid(0,0)` and forks and waits for
-   cf-agent, so no cf-agent outlives the cf-execd timeout kill (fact 5).
-   It holds the lock until cf-agent exits. `tendcf-install.sh run-once`
-   becomes `tendcf-validate run -- cf-agent -K -I -f …`. The projection is
-   a pure function of the baseline (`project()` is pure,
-   `bin/projector.py:251`), so re-deriving it costs one parse of one
-   file of at most 5 MiB. Nothing retained between runs is trusted
+   `exec_command => "exec /opt/tendcf/libexec/tendcf-validate run -- $(sys.cf_agent) --no-augments -f $(sys.inputdir)/promises.cf"`.
+   The leading `exec` makes the shell replace itself, whatever `/bin/sh`
+   it is, so `pid_shell` is the wrapper (fact 5).
+
+   `run` takes an exclusive `flock` on `<state>/lock`, **non-blocking**.
+   A second `run` that finds the lock held exits at once and prints why.
+   It writes no row and launches nothing, because fact 13 makes overlap
+   a normal event and not a fault. `adopt` and `accept` wait for the lock
+   with a bound, long enough for a normal run. When the bound expires
+   they refuse with a lock-timeout error and change nothing (review
+   finding 6). Once it holds the lock, `run` verifies the stored baseline
+   generation (layout below) and promotes a pending approved proposal if
+   one exists. It projects the current baseline, publishes the
+   projection atomically, and starts cf-agent. Publication writes
+   `data/.host_specific.json.tmp` (mode 0600, `fsync`), `rename(2)`s it
+   over `data/host_specific.json`, and `fsync`s `data/`.
+
+   The process protocol, from fact 5:
+
+   - The wrapper forks cf-agent into a **group of its own**
+     (`setpgid(pid, pid)` in both parent and child), so the child
+     cf-execd picks is a group leader and its group kill reaches
+     cf-agent's children.
+   - The wrapper forwards SIGINT and SIGTERM to that group.
+   - The wrapper enforces its **own deadline**, shorter than
+     `agent_expireafter`. On expiry it terminates the group itself and
+     records `complete: false`. cf-execd's kill path is then a backstop
+     and never the mechanism.
+   - It never has two children at once (fact 5's live assert).
+   - When cf-agent dies by a signal or by the deadline, it skips every
+     post-run step except the row.
+
+   `exec_timeout` commands in their own groups survive any of this. That
+   is CFEngine's residual and is unchanged by the wrapper.
+
+   `run` holds the lock until cf-agent exits. `tendcf-install.sh run-once`
+   becomes `tendcf-validate run -- cf-agent --no-augments -K -I -f …`.
+   The projection is a pure function of the baseline (`project()` is
+   pure, `bin/projector.py:251`), so re-deriving it costs one parse of
+   one file of at most 5 MiB. Nothing retained between runs is trusted
    without re-checking.
 2. **Once per approval, with a check in policy on every run.** `tendcf-validate
    accept` publishes the projection once, together with a sealed digest file
@@ -152,14 +215,40 @@ projection that passed validation, and only that projection?
    still need an integrity check that CFEngine does not make (fact 1).
 
 Common to all options, and recommended whichever is chosen: a launch
-guard class. `run` passes `-D tendcf_validated` to cf-agent, and the
-generic bundle actuates nothing unless that class is defined. A cf-agent
-started any other way (a hand-run `cf-agent`, the failsafe, a future
-`cf-runagent`, book ch. 35) then does nothing instead of acting on a
-stale file. The class guards against accidents and proves nothing:
-anyone who is root can pass `-D`, but root is already inside the trust
-boundary on these hosts. This is a policy change, and so a change to
-the policy-tree digest.
+guard class. `run` passes `-D tendcf_validated` to cf-agent. The guard
+sits in `promises.cf`, the entry file, and not in a bundle:
+
+```
+tendcf_validated:: bundlesequence => { "tendcf_interlocks", "tendcf_services" };
+!tendcf_validated:: bundlesequence => { "tendcf_unvalidated" };
+```
+
+`tendcf_unvalidated` only reports. Guarding the bundles would not do:
+`tendcf_interlocks` runs each interlock's `pre_action` command
+(`policy/tendcf_services.cf:88-98`), so a guard inside `tendcf_services`
+alone would still execute those commands on an unvalidated run (review
+finding 2). Whether `body common control` accepts class-guarded
+`bundlesequence` on the pinned fork is unverified (§12).
+
+A cf-agent started any other way (a hand-run `cf-agent`, a future
+`cf-runagent`, book ch. 35) then runs no tendcf bundle, instead of
+acting on a stale file. **This guards against accidents and is not a
+boundary.** The class can be supplied without the wrapper by:
+
+- `-D` on the command line;
+- a `classes` key in a `host_specific.json` that never passed the gate
+  (`cmdb.c:739`; a validated projection cannot carry one, N-2);
+- `def.json` or `def_preferred.json` in `inputs/`
+  (`generic_agent.c:1036-1049`; the wrapper's `--no-augments` closes
+  this for wrapped runs only);
+- a persistent class in the state database (`generic_agent.c:1109`).
+
+Every one of these needs root, and root is already inside the trust
+boundary on these hosts. Before any bundle runs, an unvalidated
+cf-agent can still do two things: its start-up housekeeping of the work
+directory, and the built-in failsafe when the policy fails `cf-promises`
+(fact 14). The guard reaches neither. The guard is a policy change, and
+so a change to the policy-tree digest.
 
 State layout (options 1-3). The state directory is
 `$(sys.workdir)/state/tendcf/`, root 0700: under the Linux fork build
@@ -212,9 +301,17 @@ write `seq`, `fsync`, swap `current`, publish the projection, launch.
   re-approval. A crash after the swap leaves the new baseline current,
   and the next `run` re-publishes the projection idempotently. A crash
   between publication and launch is harmless: the next run redoes both.
-  Option 2 adds one more crash window, between publishing the projection
-  and writing the sealed digest, which shows up as refusal runs until
-  repaired.
+  A crash during or after cf-agent leaves nothing to undo or re-decide.
+  The approval was consumed at promotion, before launch. The next run
+  converges on the same `current`, which map §12 item 1 requires ("not
+  treating each convergence run as a new acceptance"). Option 2 adds one
+  more crash window, between publishing the projection and writing the
+  sealed digest, which shows up as refusal runs until repaired.
+- *Cross-item dependency.* Item 3 assigns several duties to `run`: the
+  policy-tree check before launch, the convergence row, and starting the
+  item 8 detector. Option 2 has no process that runs on every cycle, so
+  under option 2 none of those has an owner. Options 1 and 3 both have
+  one.
 
 **(d) Recommendation: option 1, plus the launch guard class.** It is
 the only option that keeps CFEngine's scheduler and also makes the
@@ -236,11 +333,15 @@ work directory with a real `cf-agent`/`cf-execd` (the
 3. A refused proposal leaves `current` and the published bytes
    unchanged, and the canary still converges.
 4. A hand-run `cf-agent -K -I` without `-D tendcf_validated` repairs
-   nothing.
-5. An `accept` started during a `run` blocks on the lock until cf-agent
-   exits.
-6. With `agent_expireafter => "1"` and an interlock that sleeps, the
-   timeout kill leaves no cf-agent alive.
+   nothing and runs no interlock `pre_action`.
+5. An `accept` started during a `run` waits on the lock until cf-agent
+   exits. A second `run` started during a `run` exits at once and
+   launches nothing.
+6. With an interlock that sleeps past the wrapper's deadline, the
+   wrapper ends the run. No cf-agent and no child of it outside an
+   `exec_timeout` group is left, and the row says `complete: false`.
+   With the wrapper's deadline disabled and `agent_expireafter => "1"`,
+   cf-execd's group kill gives the same result.
 7. Crash windows: a unit test drives the promotion sequence through an
    injected filesystem layer that raises at each boundary listed under
    recovery, and asserts the state the next `run` sees. No fault
@@ -266,7 +367,8 @@ structural checks or the whole map §9 validator, and what may it claim?
    - baseline integrity as a precondition (map §9.1);
    - the device-computed diff;
    - approval-record verification: every hash recomputed, the signature,
-     `host` equal to this host, the device nonce, `approval_seq` above
+     `host` equal to this host's own key (see the device-identity row in
+     item 3), the device nonce, `approval_seq` above
      the high-water, persisted rejects (DC-2);
    - the ceremony class derived from the baseline's structure and
      checked against the record (map §9.8, including the coverage
@@ -385,8 +487,9 @@ The individual assignments, under options 1 and 2:
 | TUF verification and high-water | `accept` | Step 6 |
 | Local-yes exchange | `propose` (nonce, briefing) and `accept` (record); a timeout means no `accept`, so nothing is promoted (map §11) | Step 9 |
 | `--simulate-json` | `propose` only, as the human-facing confirmation map §9.1 allows; never `run`, never the gate | Step 9 |
-| Policy-tree digest (change-process.md §3) | `run`, immediately before launch: the hash of `inputs/tendcf/` must equal the baseline's `device-trust.policy-tree.tree.sha256` | once R23 is specified |
-| `device_convergence` row | `run`, after cf-agent exits. `schema_ceiling` is the validator's own constant. `complete` needs the policy to say whether an interlock blocked (the row's own definition), so the bundle writes a one-run outcome file that `run` reads | first build |
+| Device identity key | The goal file's `host` and the approval record's `host` are a device public key (`ed25519:` plus hex; "host identity is the key, not the hostname", `goal-file.schema.json`). No host has one: `cf-key` makes CFEngine's own RSA pair (`cf-key-functions.c:322`), which is a different key. Generating it, storing its private half and the enrollment ceremony belong with DC-1 and R24 (review finding 11, amended: the identity is a key, never a hostname) | before the first `adopt` that checks `host`; Step 6 at the latest |
+| Policy-tree digest (change-process.md §3) | `run`, immediately before launch. The digest must cover **every file cf-agent reads from `inputs/`**: `promises.cf` (which `tendcf-install.sh` writes, lines 125-141, and which holds `exec_command`) as well as `tendcf/`. Any other file there refuses the launch, which covers `def.json`, `def_preferred.json` and a failsafe-written `failsafe.cf`. Today's tree tarball (change-process.md §3) holds only the bundles, so either R23's serialization covers the whole `inputs/` tree or the installer renders `promises.cf` from the tree. The wrapper's `--no-augments` is a second line (review finding 4) | once R23 is specified |
+| `device_convergence` row | `run`, after cf-agent exits. `schema_ceiling` is the validator's own constant. `complete` needs the policy to say whether an interlock blocked (the row's own definition), so the bundle writes a one-run outcome file that `run` reads. Two gaps (review findings 7 and 8, amended). First, `release` and `converged_release` are required `release_stamp`s, "the signed release that produced this row", and before Step 6 there is no signed release: the minimal build either writes no rows or names the adopted goal file in a field defined as a signed release (picklist 12). Second, one row per run is about 288 rows a day on cf-execd's 5-minute default; JSONL retention is map §8's, and undecided | first build, subject to picklist 12 |
 
 **(c) Consequences.**
 
@@ -756,8 +859,9 @@ item 3 option 2's first-build duties, item 4 option 1 or 2, item 5 option
    - `tendcf-install.sh` installs the tree, writes the wrapper
      `exec_command`, and routes `run-once` through `run`;
    - `data` becomes `adopt`;
-   - the generic bundle gains the `tendcf_validated` guard and the
-     one-run outcome file for `complete`;
+   - `promises.cf` gains the `tendcf_validated` guard on
+     `bundlesequence`, and the generic bundle gains the one-run outcome
+     file for `complete`;
    - pastebin gets a real goal file (fact 11).
 
 **It does not yet guarantee:**
@@ -776,19 +880,29 @@ item 3 option 2's first-build duties, item 4 option 1 or 2, item 5 option
    checks* (map §9.1, §9.4, §9.8). With no approval record there is
    nothing to check them against.
 6. *Effects* (map §9.10). Unchanged in every option.
+7. *Host binding.* No host has a device identity key yet (item 3), so
+   `adopt` cannot check that the goal file's `host` is this host.
+8. *Interlocks against a loader that drops their container* (fact 2).
+   No option in items 1-8 closes this. §13 does, once djbclark rules on
+   it.
 
 It does guarantee three things:
 
 - cf-agent, when launched through `run`, loads exactly
-  `project(current/goal.json)`;
+  `project(current/goal.json)`. That is the bytes; which of them the
+  loader then installs is fact 2's caveat;
 - `current` passed the structural checks, and passes them again on
   every run;
-- a refusal is visible and never fails open.
+- a refusal by `tendcf-validate` is visible and never fails open. This
+  covers the validator's own refusals, not the loader's silent skips
+  (§13).
 
 ## 10. Operator picklist
 
 1. Trigger: (1) wrapper `exec_command`, every run, re-project from the
-   baseline [recommended], plus the launch guard class [recommended];
+   baseline [recommended], plus the launch guard class on
+   `bundlesequence` in `promises.cf`, an accident guard only
+   [recommended];
    (2) once per approval, with a policy `hashmatch` check; (3) a
    systemd/launchd timer replaces cf-execd; (4) a `commands:` promise
    (rejected).
@@ -815,6 +929,26 @@ It does guarantee three things:
    Python classifier.
 9. pastebin's goal file (fact 11): rule its real `trust-policy` tier
    before any validator other than the projector runs there.
+10. **Interlock fail-open (§13; live design, pastebin included):**
+    (1) projector-synthesized interlock reference (breaks R21 and P-2);
+    (2) author-declared `interlocked` field, schema v6; (3) the policy
+    checks the loaded keys against the file with `readjson` and
+    `isvariable` [recommended]; (4) the wrapper checks
+    `cf-promises --show-vars` before launch; (5) an all-or-nothing CMDB
+    loader in the fork.
+11. How report rows leave a Linux or macOS device (review finding 9;
+    map §8, linux-targets.md §4 item 3): (1) the pusher collects the
+    JSONL over SSH at each push, fitting Step 6's push-only and needing
+    no device credentials [recommended]; (2) the device sends rows to
+    an operator endpoint, which needs credentials on the device; (3)
+    nothing leaves the device before Step 8, and rows are read on demand.
+12. The `release` column before Step 6 (item 3 table): (1) write no
+    `device_convergence` rows until signed releases exist; (2) write
+    rows whose `release` names the adopted goal file, documented as "not
+    a signed release", which strains the column's definition;
+    (3) amend `report-row.schema.json` to allow an explicit unsigned
+    marker (a schema change). No recommendation: (1) loses the
+    first build's only report, and (2) and (3) bend the column.
 
 ## 11. Stale facts corrected
 
@@ -852,6 +986,11 @@ that hold the stale text, per its brief.
 6. **`deploy/linux/tendcf-install.sh` `put_data`** is not atomic against
    a concurrent cf-agent (fact 8). This matters once a scheduler runs,
    which stage B enables.
+7. **This proposal's own first text** (commit `a7b7c31`, fact 5 and item
+   1 option 1) had the wrapper call `setpgid(0,0)` and said no cf-agent
+   could survive the timeout kill. In the shell-`exec`s case that left
+   cf-agent outside any group cf-execd signals. Corrected in fact 5 and
+   item 1 (review finding 1).
 
 ## 12. Not verified
 
@@ -862,7 +1001,194 @@ that hold the stale text, per its brief.
 3. Whether `projector.py` needs Python 3.11, or merely declares it.
 4. What a CLT-only Mac (no Xcode.app) resolves `/usr/bin/python3` to.
    Only this Mac's Xcode-selected layout was measured.
-5. Every option above is unbuilt. No test in §1-§8 has been run; each
-   is a specification of the proof, not a result.
-6. The cf-execd timeout behaviour with a group-leading wrapper (fact 5)
-   was read in the source, not exercised.
+5. Every option above is unbuilt. No test in §1-§8 or §13 has been run;
+   each is a specification of the proof, not a result.
+6. The cf-execd timeout behaviour (fact 5) and the process protocol in
+   item 1 were read in the source, not exercised. So was whether the
+   hosts' `/bin/sh` `exec`s a single simple command. The `exec` prefix
+   makes item 1 independent of that.
+7. Whether `body common control` accepts a class-guarded
+   `bundlesequence` on the pinned fork (item 1's guard, §13 option 3).
+8. Whether `readjson` plus `isvariable("data:variables.<key>")` compose
+   as §13 option 3 needs.
+9. Whether `cf-promises --show-vars` lists CMDB containers in a form
+   §13 option 4 can parse reliably.
+
+## 13. The interlock fail-open: for the operator
+
+**This is a fail-open in the live design, independent of
+`tendcf-validate`, and it applies to pastebin today.** The canary
+projection that `tendcf-install.sh install --data` puts on pastebin
+(deploy/linux/README.md) carries both containers: its `vars` keys are
+`tendcf_interlock` and `tendcf_service`, checked 2026-11-02. Any skip of
+the first leaves the second ungated. No skip is known to happen with the
+current bytes, which pass the N-series. It is flagged for djbclark, not
+decided here.
+
+**(a) Question.** When the CMDB loader installs `tendcf_service` but
+not `tendcf_interlock` (fact 2), how does the policy refuse, instead of
+running every service ungated?
+
+The reviewer's remedy, checked: Argon (review finding 3) proposes that
+the projector add `"interlock_id"` to each `tendcf_service` entry,
+computed from whether that service's `bundle` tag has an interlock, and
+that the policy then gate services *positively*. The projector cannot do
+that without breaking its own contract:
+
+- The join reads entry *values* (the services' and the interlocks'
+  `bundle` strings) to decide output *structure*. R21 and map §9 name
+  that as "the interpreter returning", and `projector.py`'s docstring
+  calls it R21's tripwire.
+- It writes a key into a service body that the goal file does not hold.
+  P-2 and P-6.5 copy the body verbatim, and P-2's container prefix is
+  the only token the projector synthesizes.
+
+So option 1 below is the reviewer's remedy, recorded and not
+recommended. The remedy should depend on nothing about *why* the
+container was dropped. Today's known cause (an unexpanded `$(`) is
+already refused by N-3, but the loader can refuse for reasons the
+projector does not model: `AddCMDBVariable`'s own checks, or a later
+CFEngine.
+
+**(b) Options.**
+
+1. **Projector-synthesized per-service interlock reference** (Argon).
+   This touches `bin/projector.py` (P-1, P-2 and the goldens), the
+   Kotlin port (R22) and `policy/tendcf_services.cf`. It violates R21
+   and P-2 as above. Not recommended.
+2. **Author-declared binding in the goal file (schema v6).** A service
+   entry gains a required boolean, for example `interlocked`, resolved
+   by nix2cf. A lint checks it against the interlock entries'
+   `bundle` tags. It projects verbatim, so the projector does not
+   change. The policy refuses a service with `interlocked: true` unless
+   an interlock class for its bundle was evaluated. The cost is a v6
+   bump, multi-version render in nix2cf, and one fact spelled twice,
+   needing a consistency lint.
+3. **The policy checks the loader against the file.** Projector and
+   schema stay unchanged. A `bundle common` in `tendcf_services.cf`
+   reads the projection itself:
+   `readjson("$(sys.workdir)/data/host_specific.json", 5242880)`. For
+   each key under `vars`, it defines a missing class when
+   `isvariable("data:variables.<key>")` fails. `promises.cf` selects a
+   refusing `bundlesequence` if any missing class is set, or if the file
+   cannot be read. The fork skips per top-level `vars` key, and a
+   container is one key, so the key-set comparison sees every skip
+   whatever its cause. Cost: a second parse of a file of at most 5 MiB,
+   and a policy change, so a change to the policy-tree digest. Untested
+   on the pinned fork (§12).
+4. **The wrapper checks the loader before launch.** Projector, schema
+   and policy stay unchanged. After publication, `run` runs
+   `cf-promises --show-vars` against the same work directory. It refuses
+   the launch unless every `vars` key in the published bytes is
+   reported installed under `data:`. Same binary, same bytes, same
+   loader, so it sees the same skips. Cost: one extra `cf-promises` run
+   per launch, and parsing `--show-vars` output, which is not a stable
+   interface. Wrapped runs only, which the launch guard makes the only
+   runs that act.
+5. **Make the loader all-or-nothing in the fork.** Change `ReadCMDBVars`
+   so that one skipped entry fails the whole `vars` section, with no
+   services installed and the host frozen (fact 3). This is the
+   opposite of overlay patch `8f0076b81` (B-5b in
+   [`upstream-register.md`](upstream-register.md)), which tendcf
+   introduced to narrow the blast radius, and it diverges from what was
+   proposed upstream. Projector and policy stay unchanged.
+
+**(c) Consequences.**
+
+- *Approved equals applied.* Options 2-5 each make "the approved
+  interlocks are in force, or nothing actuates" hold. Option 1 makes it
+  hold too, at the cost of the projector's discipline.
+- *DC-2 and DC-11.* None. Options 1-3 change the policy, so the
+  policy-tree digest changes. Option 4 changes the validator tree, so
+  the agent digest changes (item 4).
+- *Fail closed.* Options 3 and 5 hold for any launch path, wrapped or
+  not. Option 4 holds for wrapped launches. Option 2 holds only for
+  services the author marked, so a missing mark is a silent hole that
+  only the lint can catch.
+- *Recovery.* All of them freeze the host (fact 3) until the cause is
+  fixed. The refusal must be reported, which in option 3 the policy's
+  report does and in option 4 `run`'s output does.
+
+**(d) Recommendation: option 3.** It needs no projector, schema or fork
+change. It covers every launch path. It keys on the loader's actual
+behaviour and not on a model of it. Option 4 is the fallback if
+`readjson` plus `isvariable` turn out not to compose on the pinned fork.
+Rule on this before any further host is enforced with interlocks. It
+also bears on pastebin, which already is (see above).
+
+**(e) Proof.** A policy test with a real `cf-agent` (`tests/policy/run.sh`):
+
+1. A projection whose `tendcf_interlock` container carries a `$(x)`
+   value, written past the projector so that the fork skips the
+   container, actuates no service, and the refusal is reported.
+2. The same projection with the container intact actuates normally.
+3. A projection with no interlocks at all actuates normally.
+
+Run test 1 against the current policy first: it must actuate the
+service. That reproduces the fail-open before the fix.
+
+## 14. Review record
+
+Gemini 4 Argon reviewed commit `a7b7c31` (2026-11-02; verdict "sound
+with changes", 12 findings). Every claim was checked against the fork
+at the pin, the policy and the schemas.
+
+Several findings cite text this proposal does not contain:
+`ledger.json`, `state/outbox/`, a TTL, a `publish` subcommand, a
+"strict single-use" option, report-row fields `os`, `record_type` and
+`host_id`, and a sentence in map §12 item 8 about "which schema carries
+it ... and how the controller fetches it". The map has no such sentence;
+its item 8 is only the detector question. Those findings were checked
+for a real problem underneath. One line per finding:
+
+1. *Amended.* Correct that `setpgid(0,0)` fails in the shell-`exec`s
+   case, and that the `assert` is live under `--enable-debug`. Applied
+   as fact 5 and item 1's process protocol: an `exec` prefix, cf-agent
+   in its own group, signals forwarded, the wrapper's own deadline, one
+   child at a time. Argon's "`(pid_to_kill != getpgid(0))`" condition
+   is not in the source; the real one is `kill(-pid, 0) == 0`. Same
+   effect.
+2. *Applied.* Every forgery path is in the source. `tendcf_interlocks`
+   runs `pre_action` commands unguarded under the first text. The guard
+   moved to `bundlesequence` in `promises.cf`, `--no-augments` was
+   added, and the guard is called an accident guard. Its failsafe
+   detail is amended: the default failsafe command is
+   `cf-agent -f failsafe.cf && cf-agent`, not an `update.cf` run.
+3. *Amended.* The fail-open is real (fact 2). The proposed projector
+   field breaks R21 and P-2, so it is option 1 of the new §13.
+   Projector-unchanged alternatives are options 3-5. Marked for the
+   operator, and picklist item 10.
+4. *Applied.* The digest must cover `promises.cf` and refuse any other
+   file in `inputs/`; see item 3's table. Argon's "cf-execd runs
+   `inputs/update.cf`" is false (fact 14).
+5. *Rejected.* It is about a ledger this design does not have. Here the
+   approval is consumed at promotion, before launch, so a crash after
+   actuation re-decides nothing (item 1, recovery).
+6. *Amended.* The overlap is real (fact 13), though `exec_command`
+   has no `-K`, contrary to the finding. `run` takes the lock
+   non-blocking; `adopt` and `accept` wait with a bound.
+7. *Amended.* There is no outbox. The real counterpart is unbounded
+   JSONL growth, about 288 rows a day, whose retention is map §8's
+   (item 3 table).
+8. *Rejected as stated.* `report-row.schema.json` requires `device`,
+   `recorded_at` and `release`, not `os`, `record_type` or `host_id`,
+   and the proposal adds no approval-record field. A real conflict was
+   found in its place: `release` and `converged_release` are signed
+   release stamps that do not exist before Step 6 (item 3 table,
+   picklist 12).
+9. *Amended.* The quoted map sentence does not exist. The detector's
+   row shape is already ruled: v5 R4 has the detector write report rows
+   in the v5 reconciliation's §2.3(2) shape. How rows leave a Linux or
+   macOS device is genuinely undefined (map §8 and
+   [`linux-targets.md`](linux-targets.md) §4 item 3), and it belongs to
+   the row writer, not to item 8. Added as picklist item 11.
+10. *Amended.* The options it names (a "once per approval at install"
+    option 3, TTL) are not this proposal's. The real dependency is that
+    item 1 option 2 has no per-cycle process for item 3's `run` duties.
+    Added to item 1's consequences.
+11. *Amended.* There is no hostname check here, and host identity is a
+    key by schema. The real gap is that no host has its identity key
+    (`cf-key` makes RSA). Added to item 3's table and §9.
+12. *Applied, amended.* Picklist items 10-12 were added (§13, row
+    transport, pre-Step-6 row stamp). The "schema placement" sub-question
+    is not real; see 9.
