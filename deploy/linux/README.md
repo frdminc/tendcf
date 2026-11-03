@@ -16,7 +16,7 @@ What lands on the host:
 | `/opt/tendcf` | root:root, no group/other write | the CI-built CFEngine fork (`--prefix=/opt/tendcf`), plus `share/tendcf/{policy,deploy,REVISION}` |
 | `/opt/tendcf/var/libntech` | root | the work directory this fork build compiles in (libntech's configure names it; `tendcf-install.sh workdir` prints it): keys (0700), `inputs/`, `data/` (0700), state |
 | `<workdir>/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
-| `<workdir>/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of the canary goal file |
+| `<workdir>/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of pastebin's goal file (the canary, plus pastebin's v5 unit claims, which are detector data and do not project) |
 | `/etc/systemd/system/tendcf.canary.service` | root | rendered by the policy: `sleep infinity` as `nobody`, `Restart=on-failure` |
 | `/etc/systemd/system/tendcf-execd.service` | root | stage B only: runs `cf-execd --no-fork` |
 

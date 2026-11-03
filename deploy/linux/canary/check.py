@@ -37,12 +37,14 @@ PAIRS = (
     # unit-package entry and the projection is empty: cf-agent has nothing to
     # actuate there.
     (HERE.parent / "passthrough" / "goal-file.json", HERE.parent / "passthrough" / "host_specific.json"),
-    # A FIXTURE too (schema v5 spec 4 item 8): a Debian host's unit claims,
-    # pastebin-shaped (spec 2.4) plus the positive witnesses of spec 5: exact
-    # third-party names, tendcf-install, a cfengine template key with the
-    # instance it covers, a prefix disjoint from an exact name, and unit-package
-    # claims in two domains. unit-package and unit-writer are detector data and
-    # do not project, so its projection is the canary's plus the one instance.
+    # A FIXTURE too (schema v5 spec 4 item 8, narrowed by S4): the positive
+    # witnesses of spec 5 on a Debian host and nothing else. The pastebin-shaped
+    # sketch it used to carry is now pastebin's real declaration in goal-file.json
+    # (schema v5 spec 3.6, S4). Witnesses: an exact third-party name,
+    # tendcf-install, a cfengine template key with the instance it covers, a
+    # prefix disjoint from an exact name, and unit-package claims in two domains.
+    # unit-package and unit-writer are detector data and do not project, so its
+    # projection is the canary's plus the one instance.
     (HERE / "goal-file-debian.json", HERE / "host_specific-debian.json"),
 )
 
