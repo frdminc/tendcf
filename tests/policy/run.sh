@@ -26,6 +26,11 @@
 #      (darwin) and systemd (Linux booted by systemd), so the entry must be
 #      refused by name and nothing rendered, on every host (linux-targets.md
 #      step 3: the fail-closed guard, with this as its negative test).
+#   4b. malformed interlock entry, enforce mode: a host_specific.json whose
+#      interlock has an unresolved variable reference, beside a present
+#      service. The fork's CMDB loader is all-or-nothing, so the file installs
+#      nothing: no service is processed and no interlock runs. A loader that
+#      skipped only the bad entry would let the service through unguarded.
 #   5. host guard, enforce mode, non-Darwin only: a satisfied interlock and
 #      two present launchd services. launchd exists only on darwin, so a
 #      Linux host must refuse both, write nothing under /Library and run no
@@ -144,6 +149,30 @@ check "nothing rendered for the runit entry" \
     bash -c "! grep -q 'Created file' '$out'"
 check "no launchctl invocation" \
     bash -c "! grep -q launchctl '$out'"
+
+echo "# 4b. malformed interlock entry: the CMDB loader fails closed"
+# One malformed entry (an unresolved variable reference in the interlock's
+# pre_action) next to a present service. The pre_action would fail if it ran,
+# so a loader that dropped only the bad entry and kept the rest would let the
+# service through unguarded: the service would be processed and reported (the
+# runit flavour is refused by name on every host, check 4). The fork's
+# all-or-nothing CMDB loader installs nothing from the file, so no service and
+# no interlock exists to act on, and the error names the entry.
+cp "$repo/tests/policy/fixtures/interlock-malformed.json" "$work/data/host_specific.json"
+out="$work/malformed.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "malformed entry named in the CMDB error" \
+    grep -q "offending value in entry 'tendcf_interlock'" "$out"
+check "loader reports that it installed none of the file" \
+    grep -q "installing none of its contents" "$out"
+check "no service processed (the sibling service entry was not installed)" \
+    bash -c "! grep -q \"tendcf: service 'demo-runit'\" '$out'"
+check "no interlock command executed" \
+    bash -c "! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
+check "nothing rendered" \
+    bash -c "! grep -q 'Created file' '$out'"
+check "no launchctl or systemctl invocation" \
+    bash -c "! grep -Eq 'launchctl|systemctl' '$out'"
 
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"

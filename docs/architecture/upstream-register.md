@@ -344,6 +344,17 @@ unmerged-libntech submodule dependency, and
 [#1](https://github.com/djbclark/core/issues/1) is the
 investigation trail behind P-1/P-2 and is not itself a defect.
 
+**B-5b reversed on the integration branch, 2026-11-02 (operator ruling R13).**
+`8f0076b81` made the CMDB loader skip one bad entry and install the rest. For
+tendcf that is fail-open: an interlock entry dropped at load leaves the
+services it guards actuated unguarded. `tendcf-integration` now carries
+`cmdb-fail-closed` (`a750b1dfe`, merged `0ea30a48f`): `LoadCMDBData()` validates
+every entry of `vars`/`variables`/`classes` first and installs nothing from
+`host_specific.json` if any one is invalid, logging each by name and returning
+false; the agent then runs with no CMDB variables. Upstream PRs #6315/#6320
+stay closed unmerged; the overlay manifest's B-5b patch still describes
+`8f0076b81`, not this behaviour (see the PR that bumped `overlay/fork.json`).
+
 B-2 through B-7 are described, measured and sourced in
 [`cfengine-upstream-candidates-2026-08-16.md`](cfengine-upstream-candidates-2026-08-16.md);
 B-1's full evidence is in
