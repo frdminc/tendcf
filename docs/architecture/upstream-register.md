@@ -348,7 +348,7 @@ investigation trail behind P-1/P-2 and is not itself a defect.
 `8f0076b81` made the CMDB loader skip one bad entry and install the rest. For
 tendcf that is fail-open: an interlock entry dropped at load leaves the
 services it guards actuated unguarded. `tendcf-integration` now carries
-`cmdb-fail-closed` (`a750b1dfe`, merged `0ea30a48f`): `LoadCMDBData()` validates
+`cmdb-fail-closed` (`a750b1dfe` + `dbf9dede6`, merged `c3afaac26`): `LoadCMDBData()` validates
 every entry of `vars`/`variables`/`classes` first and installs nothing from
 `host_specific.json` if any one is invalid, logging each by name and returning
 false; the agent then runs with no CMDB variables. Upstream PRs #6315/#6320
