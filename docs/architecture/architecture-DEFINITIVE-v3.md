@@ -999,7 +999,9 @@ projection made in this repository by `bin/projector.py`, checked by
 `tendcf-install.sh install --data`.
 
 **Open, for the operator (D45 leaves these undecided; nothing in this
-document decides them):**
+document decides them). Options and a recommendation per item, deciding
+nothing:
+[`tendcf-validate-proposal-2026-11-03.md`](tendcf-validate-proposal-2026-11-03.md).**
 
 1. **Trigger.** What starts `tendcf-validate` ahead of cf-agent:
    cf-execd's `exec_command` (today `$(sys.cf_agent) -f
@@ -1288,5 +1290,8 @@ with full mesh) is **D38**.
   wins on conflict.
 - `schema/`, `examples/`, `bin/schema_lint.py` — Site Model contract.
 - `frdminc/nix2cf` — compiler tool (Step 3). Consumes this contract.
+- `tendcf-validate-proposal-2026-11-03.md` — a proposal, deciding
+  nothing: options and a recommendation for each of §12's open D45
+  items, a minimal first build, and an operator picklist.
 
 Local prior-art clones (not dependencies): `~/src/config-mgmt-prior-art/`.
