@@ -33,9 +33,17 @@ PAIRS = (
     (HERE / "goal-file-absent.json", HERE / "host_specific-absent.json"),
     # A FIXTURE, not get's goal file (reconciliation 2026-10-31 Q10): the NixOS
     # passthrough host (nixos-passthrough-plan.md section 4). Its supervisor is
-    # nixos, so no domain carries a service, interlock or unit-writer entry and
-    # the projection is empty: cf-agent has nothing to actuate there.
+    # nixos, so no domain carries a service, interlock, unit-writer or
+    # unit-package entry and the projection is empty: cf-agent has nothing to
+    # actuate there.
     (HERE.parent / "passthrough" / "goal-file.json", HERE.parent / "passthrough" / "host_specific.json"),
+    # A FIXTURE too (schema v5 spec 4 item 8): a Debian host's unit claims,
+    # pastebin-shaped (spec 2.4) plus the positive witnesses of spec 5: exact
+    # third-party names, tendcf-install, a cfengine template key with the
+    # instance it covers, a prefix disjoint from an exact name, and unit-package
+    # claims in two domains. unit-package and unit-writer are detector data and
+    # do not project, so its projection is the canary's plus the one instance.
+    (HERE / "goal-file-debian.json", HERE / "host_specific-debian.json"),
 )
 
 

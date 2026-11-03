@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/launchd-writers.schema.json",
   "title": "Site Model — launchd unit-writers (macOS adapter)",
-  "description": "The launchd instance of generic unit-writers (guide §3 / map §4.1, D36): exactly one writer per unit-name prefix. Two writers on one prefix is a lint failure. Other supervisors (systemd, runit, Jobber, …) get the same rule; this file is the first adapter, not the model.",
+  "description": "The launchd instance of generic unit-writers (guide §3 / map §4.1, D36): exactly one writer per unit-name prefix. Two writers on one prefix is a lint failure. On systemd the goal file's own unit-writer map takes exact names, template keys and cfengine-only prefixes, and a unit-package map claims a Debian package's units (schema v5); this file is the first adapter, not the model.",
 
   "type": "object",
   "properties": {
     "contract_version": { "$ref": "common.schema.json#/$defs/contract_version" },
 
     "domain": {
-      "description": "The launchd label namespace, as a domain of device state (D16(d)). Comprehensive means: any loaded launchd job whose label matches no declared prefix is reported as an extra entry.",
+      "description": "The launchd label namespace, as a domain of device state (D16(d)). Comprehensive means: any loaded launchd job that is absent from the domain's description is reported as an extra entry (a label under no declared prefix is how a job is absent here).",
       "$ref": "common.schema.json#/$defs/domain_coverage"
     },
 
@@ -33,7 +33,7 @@
         },
         "writer": {
           "description": "The single tool permitted to write labels under this prefix.",
-          "enum": ["cfengine", "mise", "nix-darwin", "dpkg", "homebrew", "apple", "third-party"]
+          "enum": ["cfengine", "mise", "nix-darwin", "homebrew", "apple", "third-party"]
         },
         "repo": {
           "description": "Where that writer's definition lives, when it is ours.",

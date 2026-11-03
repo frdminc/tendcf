@@ -46,7 +46,10 @@
   managed: 3
   not_yet_migrated: 41
   deliberately_unmanaged: 6
+  extra_scan: complete
   extra_entries: 2
+  two_writers: 0
+  unmet_absence: 0
 
 - row_type: device_convergence
   device: mac

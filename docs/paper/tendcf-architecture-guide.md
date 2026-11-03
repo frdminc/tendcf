@@ -165,10 +165,16 @@ rendering of one such record.
 node” is not a machine. It is a row in this file. Any eligible host can
 hold any role.
 
-**Unit writers.** Exactly one writer per unit-name prefix, for every
-supervisor (launchd label, systemd instance, runit service, Jobber job).
-Two tools writing the same unit is a class of outage this file is meant to
-make impossible. launchd is one adapter, not the model.
+**Unit writers.** One writer per unit name in the goal file's name claims
+(an exact name, a template key, or a prefix), for every supervisor
+(launchd label, systemd instance, runit service, Jobber job). On Debian a
+package claim covers the units a package ships, and a local drop-in or
+mask on a vendor unit is admitted only under an exact non-cfengine claim
+(schema v5, amended 2026-11-02; ~~exactly one writer per unit-name prefix~~).
+Lint proves uniqueness among name claims and package ids; the device
+detects the layered rest. Two tools writing the same unit is a class of
+outage this file is meant to make visible, and where it can, impossible.
+launchd is one adapter, not the model.
 
 The Site Model has two equal authoring frontends: YAML, and the Nix module
 system (`mkOption`, `mkIf`, `mkDefault`), each rendered to the same JSON
