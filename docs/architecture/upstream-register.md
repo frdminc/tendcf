@@ -348,10 +348,13 @@ investigation trail behind P-1/P-2 and is not itself a defect.
 `8f0076b81` made the CMDB loader skip one bad entry and install the rest. For
 tendcf that is fail-open: an interlock entry dropped at load leaves the
 services it guards actuated unguarded. `tendcf-integration` now carries
-`cmdb-fail-closed` (`a750b1dfe` + `dbf9dede6`, merged `c3afaac26`): `LoadCMDBData()` validates
-every entry of `vars`/`variables`/`classes` first and installs nothing from
-`host_specific.json` if any one is invalid, logging each by name and returning
-false; the agent then runs with no CMDB variables. Upstream PRs #6315/#6320
+`cmdb-fail-closed` (`a750b1dfe`, `dbf9dede6`, `61065e551`; merged `8e70831f3`):
+`LoadCMDBData()` validates every entry of `vars`/`variables`/`classes` first
+and installs nothing from `host_specific.json` if any one is invalid (also an
+unknown top-level key, a null section, a key with index brackets, a
+frame-dependent special scope, two entries naming one variable), logging each
+by name and returning false; the agent then runs with no CMDB variables.
+Upstream PRs #6315/#6320
 stay closed unmerged; the overlay manifest's B-5b patch still describes
 `8f0076b81`, not this behaviour (see the PR that bumped `overlay/fork.json`).
 

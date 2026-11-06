@@ -26,11 +26,15 @@
 #      (darwin) and systemd (Linux booted by systemd), so the entry must be
 #      refused by name and nothing rendered, on every host (linux-targets.md
 #      step 3: the fail-closed guard, with this as its negative test).
-#   4b. malformed interlock entry, enforce mode: a host_specific.json whose
-#      interlock has an unresolved variable reference, beside a present
-#      service. The fork's CMDB loader is all-or-nothing, so the file installs
-#      nothing: no service is processed and no interlock runs. A loader that
-#      skipped only the bad entry would let the service through unguarded.
+#   4b. malformed CMDB entries, enforce mode: a host_specific.json with one
+#      malformed entry (an unresolved variable reference in the interlock;
+#      then a key 'tendcf_interlock[' that the variable parser reads as the
+#      interlock container) beside a valid interlock and a present service.
+#      The fork's CMDB loader is all-or-nothing, so the file installs nothing:
+#      no service is processed, no interlock runs, and a probe policy finds
+#      neither data:variables.tendcf_interlock nor ...tendcf_service. A
+#      loader that skipped only the bad entry would let the service through
+#      unguarded.
 #   5. host guard, enforce mode, non-Darwin only: a satisfied interlock and
 #      two present launchd services. launchd exists only on darwin, so a
 #      Linux host must refuse both, write nothing under /Library and run no
@@ -229,29 +233,57 @@ check "nothing rendered for the runit entry" \
 check "no launchctl invocation" \
     bash -c "! grep -q launchctl '$out'"
 
-echo "# 4b. malformed interlock entry: the CMDB loader fails closed"
-# One malformed entry (an unresolved variable reference in the interlock's
-# pre_action) next to a present service. The pre_action would fail if it ran,
-# so a loader that dropped only the bad entry and kept the rest would let the
-# service through unguarded: the service would be processed and reported (the
-# runit flavour is refused by name on every host, check 4). The fork's
-# all-or-nothing CMDB loader installs nothing from the file, so no service and
-# no interlock exists to act on, and the error names the entry.
-cp "$repo/tests/policy/fixtures/interlock-malformed.json" "$work/data/host_specific.json"
-out="$work/malformed.out"
-"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-check "malformed entry named in the CMDB error" \
-    grep -q "offending value in entry 'tendcf_interlock'" "$out"
-check "loader reports that it installed none of the file" \
-    grep -q "installing none of its contents" "$out"
-check "no service processed (the sibling service entry was not installed)" \
-    bash -c "! grep -q \"tendcf: service 'demo-runit'\" '$out'"
-check "no interlock command executed" \
-    bash -c "! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
-check "nothing rendered" \
-    bash -c "! grep -q 'Created file' '$out'"
-check "no launchctl or systemctl invocation" \
-    bash -c "! grep -Eq 'launchctl|systemctl' '$out'"
+echo "# 4b. malformed CMDB entries: the loader fails closed"
+# Each fixture is a host_specific.json with one malformed entry next to a
+# valid interlock and a present service. The interlock's pre_action would
+# fail if it ran, so a loader that dropped only the bad entry (or let it take
+# the place of another) would let the service through unguarded: the service
+# would be processed and reported (the runit flavour is refused by name on
+# every host, check 4). The fork's all-or-nothing CMDB loader installs
+# nothing from the file, so no service and no interlock exists to act on.
+# Besides what the agent did, the probe policy asks it directly whether either
+# container exists, which a service-only or interlock-only leftover cannot hide
+# from; its positive control is a file that loads.
+cp "$repo/tests/policy/fixtures/cmdb-probe.cf" "$work/inputs/cmdb-probe.cf"
+probe() {  # probe FIXTURE OUT: run the probe policy over FIXTURE as CMDB data
+    cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$2" 2>&1 || true
+}
+probe interlock-refused.json "$work/probe-control.out"
+check "probe control: a file that loads has tendcf_interlock" \
+    grep -q "cmdb-probe: tendcf_interlock present" "$work/probe-control.out"
+check "probe control: a file that loads has tendcf_service" \
+    grep -q "cmdb-probe: tendcf_service present" "$work/probe-control.out"
+
+malformed_case() {  # malformed_case NAME FIXTURE ERROR-PATTERN
+    local name="$1" fixture="$2" pattern="$3"
+    out="$work/malformed-$name.out"
+    cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: malformed entry named in the CMDB error" grep -q "$pattern" "$out"
+    check "$name: loader reports that it installed none of the file" \
+        grep -q "installing none of its contents" "$out"
+    check "$name: no service processed (the sibling service entry was not installed)" \
+        bash -c "! grep -q \"tendcf: service 'demo-runit'\" '$out'"
+    check "$name: no interlock command executed" \
+        bash -c "! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
+    check "$name: nothing rendered" \
+        bash -c "! grep -q 'Created file' '$out'"
+    check "$name: no launchctl or systemctl invocation" \
+        bash -c "! grep -Eq 'launchctl|systemctl' '$out'"
+    probe "$fixture" "$work/probe-$name.out"
+    check "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-$name.out"
+    check "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$work/probe-$name.out"
+}
+# an unresolved variable reference in the interlock's pre_action
+malformed_case unresolved interlock-malformed.json \
+    "offending value in entry 'tendcf_interlock'"
+# a key the variable parser reads as the interlock container itself
+# ('tendcf_interlock[' is 'tendcf_interlock' to it, with only a log message)
+malformed_case index-key interlock-malformed-key.json \
+    "Invalid variable specification in CMDB data: 'tendcf_interlock\\['"
 
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
