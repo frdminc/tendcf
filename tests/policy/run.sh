@@ -51,6 +51,25 @@
 #      schema alphabet admits plus a sample of letters and digits, and a
 #      metacharacter set); 8d refuses a relative command[0] from a projection
 #      that skipped the schema.
+#   9. CMDB cross-check against the agent's real loader (tendcf_cmdb in
+#      policy/tendcf_services.cf, proposal 2026-11-03 section 13 option 3): a
+#      file the loader cannot install whole is refused and reported and
+#      actuates nothing; the consistent files of checks 2-4 raise no report; no
+#      file at all, and a file with no vars, are the normal empty case. NB: the
+#      fork's loader skips a bad entry and installs the rest, but the Mac dev
+#      build rejects the whole `vars` instead (the same fixture refuses on both,
+#      as "nothing loaded"), so only the fork's CI legs see the per-entry skip.
+#  10. the same cross-check against a loader that skips ONE container, which
+#      the Mac dev build cannot do: tests/policy/sim-loader.cf installs
+#      data:variables.* in the loader's place (cf-agent --no-host-specific-data)
+#      from the very file the policy reads. Each case must report what differs
+#      and run nothing; the control case (everything installed) must run as
+#      before, so the others cannot pass because the stand-in installed nothing.
+#      A skipped interlock container with the services loaded is the 2026-11-02
+#      fail-open; a skipped service container with the interlock loaded shows
+#      the first bundle (tendcf_interlocks, which runs pre_action commands) is
+#      gated too. Under TENDCF_TEST_SYSTEMD=1 the same stand-in is run against
+#      the real manager (6b): no unit rendered, a tombstone leaves the unit alone.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -102,12 +121,31 @@ body common control
       bundlesequence => { "tendcf_interlocks", "tendcf_services" };
 }
 EOF
+# Same two bundles, with the stand-in loader first (see tests/policy/sim-loader.cf).
+cat > "$work/inputs/sim-entry.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/tests/policy/sim-loader.cf", "$repo/policy/tendcf_services.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_services" };
+}
+EOF
 
 fail=0
 check() {  # check NAME COND...
     local name="$1"; shift
     if "$@"; then echo "ok   $name"; else echo "FAIL $name"; fail=1; fi
 }
+
+# The cross-check's report. "refusing to actuate anything" is the summary line
+# tendcf_interlocks prints once; no_actuation is what a refused run must not do:
+# run any command (-I logs every one, pre_action included), render, or process
+# a service or an interlock entry at all (each prints a "tendcf: service|interlock"
+# report when it is processed, and `*_ids` are empty under a refusal).
+refusal_reported() { grep -q "tendcf: CMDB cross-check failed: refusing to actuate anything" "$1"; }
+refusal_once() { [ "$(grep -c "CMDB cross-check failed" "$1")" = 1 ]; }
+no_crosscheck() { ! grep -q "CMDB cross-check" "$1"; }
+no_actuation() { ! grep -Eq "Executing|Created file|launchctl|systemctl|tendcf: (service|interlock) '" "$1"; }
+key_not_loaded() { grep -q "key '$2' is under 'vars' in .* but CFEngine did not load data:variables.$2" "$1"; }
 
 echo "# 1. wiring: cf-promises with examples/host_specific.json"
 cp "$repo/examples/host_specific.json" "$work/data/host_specific.json"
@@ -215,6 +253,22 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         unit_enabled() { as_root systemctl is-enabled --quiet "$unit"; }
         main_pid() { systemctl show -p MainPID --value "$unit"; }
 
+        sysd_run_sim() {  # sysd_run_sim FIXTURE CLASSES OUT: stand-in loader, run as root
+            cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -v --no-host-specific-data -D "$2" -f "$work/inputs/sim-entry.cf" >"$3" 2>&1 || true
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+        }
+
+        # 6b. Refused by the CMDB cross-check (check 10): the interlock container
+        #     was skipped, the service loaded. Nothing may be rendered or started.
+        sysd_run_sim systemd-present.json sim_service "$work/sysd-sim-present.out"
+        check "cross-check refusal on a real systemd host: reported" \
+            refusal_reported "$work/sysd-sim-present.out"
+        check "cross-check refusal: no unit rendered" bash -c "[ ! -e '$unit_path' ]"
+        check "cross-check refusal: no systemctl command or probe" \
+            no_systemctl "$work/sysd-sim-present.out"
+
         sysd_run systemd-present.json "$work/sysd1.out"
         check "no refusal reported on a normal systemd host" \
             bash -c "! grep -q \"'$unit' refused\" '$work/sysd1.out'"
@@ -229,6 +283,16 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "unit active after the first run" unit_active
         check "unit enabled after the first run" unit_enabled
         pid1="$(main_pid)"
+
+        # 6b, tombstone: the unit is live; a refused run must leave it alone.
+        sysd_run_sim systemd-absent.json sim_service "$work/sysd-sim-tomb.out"
+        check "cross-check refusal (tombstone): reported" \
+            refusal_reported "$work/sysd-sim-tomb.out"
+        check "cross-check refusal (tombstone): unit file left in place" \
+            bash -c "[ -f '$unit_path' ]"
+        check "cross-check refusal (tombstone): unit still active" unit_active
+        check "cross-check refusal (tombstone): no systemctl command or probe" \
+            no_systemctl "$work/sysd-sim-tomb.out"
 
         sysd_run systemd-present.json "$work/sysd2.out"
         check "second run issues no systemctl command" no_systemctl "$work/sysd2.out"
@@ -450,8 +514,97 @@ check "relative command[0]: the reason is reported" \
 check "relative command[0]: nothing was run" \
     bash -c "[ ! -e '$work/rel/ran' ]"
 
+echo "# 9. CMDB cross-check, the agent's real loader"
+cp "$repo/tests/policy/fixtures/interlock-malformed.json" "$work/data/host_specific.json"
+out="$work/xc-malformed.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "malformed interlock: refusal reported" refusal_reported "$out"
+check "malformed interlock: the container the loader did not install is named" \
+    key_not_loaded "$out" tendcf_interlock
+check "malformed interlock: refusal reported once" refusal_once "$out"
+check "malformed interlock: nothing actuated, no pre_action run, no service processed" \
+    no_actuation "$out"
+for f in refused satisfied flavour; do
+    check "consistent file of the $f run (checks 2-4): no cross-check report" no_crosscheck "$work/$f.out"
+done
+rm -f "$work/data/host_specific.json"
+out="$work/xc-nofile.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "no host_specific.json at all: no report" no_crosscheck "$out"
+check "no host_specific.json at all: no error logged" bash -c "! grep -q 'error:' '$out'"
+check "no host_specific.json at all: nothing actuated" no_actuation "$out"
+printf '%s\n' '{"vars":{}}' >"$work/data/host_specific.json"
+out="$work/xc-novars.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "empty vars: no report" no_crosscheck "$out"
+check "empty vars: nothing actuated" no_actuation "$out"
+printf '%s\n' '{bad' >"$work/data/host_specific.json"
+out="$work/xc-garbage.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "unparseable file: refusal reported" refusal_reported "$out"
+check "unparseable file: reported as unreadable" \
+    grep -q "host_specific.json exists but cannot be read as JSON" "$out"
+check "unparseable file: refusal reported once" refusal_once "$out"
+check "unparseable file: nothing actuated" no_actuation "$out"
+
+echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
+sim_run() {  # sim_run FIXTURE|none CLASSES OUT
+    if [ "$1" = none ]; then rm -f "$work/data/host_specific.json"
+    else cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"; fi
+    "$cf_agent" -K -I --no-host-specific-data -D "$2" -f "$work/inputs/sim-entry.cf" >"$3" 2>&1 || true
+}
+out="$work/xc-sim-control.out"
+sim_run flavour-refused.json sim_interlock,sim_service "$out"
+check "control (everything installed): no cross-check report" no_crosscheck "$out"
+check "control: the pre_action ran" grep -q "Executing .*'/usr/bin/true'" "$out"
+check "control: the service was processed" \
+    grep -q "tendcf: service 'demo-runit' refused: unit flavour 'runit'" "$out"
+
+# The 2026-11-02 fail-open: the services loaded, their interlock did not.
+out="$work/xc-sim-nointerlock.out"
+sim_run flavour-refused.json sim_service "$out"
+check "interlock container skipped: refusal reported" refusal_reported "$out"
+check "interlock container skipped: tendcf_interlock named" key_not_loaded "$out" tendcf_interlock
+check "interlock container skipped: tendcf_service not blamed" \
+    bash -c "! grep -q \"key 'tendcf_service'\" '$out'"
+check "interlock container skipped: no service processed, nothing actuated" no_actuation "$out"
+
+# The reverse, which also proves the FIRST bundle is gated: the interlock
+# loaded, so tendcf_interlocks would run its pre_action.
+out="$work/xc-sim-noservice.out"
+sim_run flavour-refused.json sim_interlock "$out"
+check "service container skipped: refusal reported" refusal_reported "$out"
+check "service container skipped: tendcf_service named" key_not_loaded "$out" tendcf_service
+check "service container skipped: the pre_action did not run (first bundle gated)" no_actuation "$out"
+
+out="$work/xc-sim-partial.out"
+sim_run runit-pair.json sim_interlock,sim_service_partial "$out"
+check "half-loaded container: refusal reported" refusal_reported "$out"
+check "half-loaded container: the entry the loader lost is named" \
+    grep -q "key 'tendcf_service' loaded differently from .*: in the file only: \[demo-runit-two\]; loaded only: \[\]" "$out"
+check "half-loaded container: the whole key is not reported as missing" \
+    bash -c "! grep -q 'did not load data:variables' '$out'"
+check "half-loaded container: nothing actuated (the loaded entry is not processed either)" \
+    no_actuation "$out"
+
+out="$work/xc-sim-stray.out"
+sim_run runit-pair.json sim_interlock,sim_service,sim_stray "$out"
+check "extra loaded variable: refusal reported" refusal_reported "$out"
+check "extra loaded variable: named" \
+    grep -q "CFEngine loaded data:variables.stray, which is not a key under 'vars'" "$out"
+check "extra loaded variable: nothing actuated" no_actuation "$out"
+
+out="$work/xc-sim-nofile.out"
+sim_run none sim_stray "$out"
+check "data loaded with no file: refusal reported" refusal_reported "$out"
+check "data loaded with no file: reported" \
+    grep -q "host_specific.json does not exist but CFEngine loaded data:variables.stray" "$out"
+check "data loaded with no file: nothing actuated" no_actuation "$out"
+
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
+    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile \
+             sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done

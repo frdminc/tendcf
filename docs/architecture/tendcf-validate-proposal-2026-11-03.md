@@ -1127,6 +1127,43 @@ also bears on pastebin, which already is (see above).
 Run test 1 against the current policy first: it must actuate the
 service. That reproduces the fail-open before the fix.
 
+**Implemented 2026-11-06: option 3, per djbclark's ruling Q10 (2026-11-02).**
+`bundle common tendcf_cmdb` in `policy/tendcf_services.cf` reads
+`$(sys.workdir)/data/host_specific.json` with `readjson` (5 MiB cap) and
+compares it with the data the loader installed. For every `vars` key it
+requires `data:variables.<key>` to exist and the key's entry ids to equal
+the loaded container's indices (a half-loaded container is caught). It also
+refuses a loaded `data:variables.*` that is not a `vars` key of the file, a
+file that exists but cannot be parsed, and loaded data with no file. A missing
+file with nothing loaded is the normal empty case and says nothing. On any
+mismatch it defines the one class `tendcf_cmdb_refused`, and
+`tendcf_interlocks` reports what differs once. Both bundles then see empty
+`interlock_ids` and `service_ids`: no pre_action, no service, no tombstone.
+It is a `bundle common`, so cf-agent evaluates it to completion before the
+first agent bundle whatever `bundlesequence` says, which is what makes the
+class final before any gate is read. `bundlesequence` guard classes in
+`promises.cf` are not needed for this check. The fork-side all-or-nothing
+loader (PR #41) and this check are independent: with the loader failing
+closed, the file's keys are not loaded and the check refuses and reports
+it, which is correct and louder.
+
+Two findings from the implementation, both about the proof above. (1) The
+Mac dev build (`3.29.0a.086d27749`) does not carry the per-entry loader
+(`8f0076b81` is not an ancestor): an unresolved `$(...)` anywhere in `vars`
+makes it install nothing at all, so the fail-open cannot be reproduced there
+with a file. `tests/policy/sim-loader.cf` therefore installs
+`data:variables.*` in the loader's place, from the same file, to emulate the
+per-entry skip; the original policy was run against it first and did
+process the service with its interlock skipped. The Linux CI legs build the
+pinned fork and so also exercise the real per-entry skip with the literal
+fixture (`tests/policy/fixtures/interlock-malformed.json`). (2) The check
+needs `readjson` and `variablesmatching` to compose on the loader's
+installed variables; they do on the dev build (checks 9-10 of
+`tests/policy/run.sh`), so option 4 stays unneeded. The policy-tree digest
+changes with this change (§13(b) option 3, §13(c)).
+
+PR: https://github.com/frdminc/tendcf/pull/42
+
 ## 14. Review record
 
 Gemini 4 Argon reviewed commit `a7b7c31` (2026-11-02; verdict "sound
