@@ -1162,7 +1162,7 @@ installed variables; they do on the dev build (checks 8-9 of
 `tests/policy/run.sh`), so option 4 stays unneeded. The policy-tree digest
 changes with this change (§13(b) option 3, §13(c)).
 
-PR: https://github.com/frdminc/tendcf/pull/PRNUM
+PR: https://github.com/frdminc/tendcf/pull/42
 
 ## 14. Review record
 
