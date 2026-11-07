@@ -1,0 +1,46 @@
+# Test only (tests/policy/run.sh checks 8-9). Stands in for a CMDB loader that
+# skipped, or half installed, a container of host_specific.json, which is the
+# fork's behaviour on a bad `tendcf_interlock` entry (the Mac dev build rejects
+# the whole `vars` instead, so it cannot be made to skip one container). Run
+# cf-agent with --no-host-specific-data so this is the only thing installing
+# data:variables.*, and list this file BEFORE tendcf_services.cf in `inputs`:
+# the data must exist before tendcf_cmdb reads it.
+#
+# Classes (-D, default namespace) pick what to install, each from the file:
+#   sim_interlock         install tendcf_interlock as the file has it
+#   sim_service           install tendcf_service as the file has it
+#   sim_service_partial   install tendcf_service with only `demo-runit`
+#   sim_stray             also install data:variables.stray
+
+body file control
+{
+      namespace => "data";
+}
+
+bundle common sim_source
+{
+  vars:
+      "doc"
+        data => readjson("$(sys.workdir)/data/host_specific.json", 5242880),
+        ifvarclass => fileexists("$(sys.workdir)/data/host_specific.json");
+}
+
+bundle common variables
+{
+  vars:
+      "tendcf_interlock"
+        data => mergedata("data:sim_source.doc[vars][tendcf_interlock]"),
+        ifvarclass => "default:sim_interlock";
+
+      "tendcf_service"
+        data => mergedata("data:sim_source.doc[vars][tendcf_service]"),
+        ifvarclass => "default:sim_service";
+
+      "tendcf_service"
+        data => parsejson('{"demo-runit":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"runit":{"enabled":true}},"working_dir":"/"}}'),
+        ifvarclass => "default:sim_service_partial";
+
+      "stray"
+        string => "x",
+        ifvarclass => "default:sim_stray";
+}
