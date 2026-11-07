@@ -3,7 +3,7 @@
   "core": {
     "repo": "https://github.com/djbclark/core",
     "branch": "tendcf-integration",
-    "commit": "b8abf28408b1b54e285d372a9bc5f2d850c960ad"
+    "commit": "d32cade138cad76ebd9ac8ab7757a29a6afe59e4"
   },
   "libntech": {
     "repo": "https://github.com/djbclark/libntech"

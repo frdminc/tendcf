@@ -1,0 +1,24 @@
+# Reports whether the two goal-file containers the generic bundle reads are
+# installed as CMDB data. Run alone by tests/policy/run.sh, after a load that
+# must have installed everything or nothing; it actuates nothing.
+body common control
+{
+      bundlesequence => { "cmdb_probe" };
+}
+
+bundle agent cmdb_probe
+{
+  classes:
+      "interlock_present" expression => isvariable("data:variables.tendcf_interlock");
+      "service_present" expression => isvariable("data:variables.tendcf_service");
+
+  reports:
+    interlock_present::
+      "cmdb-probe: tendcf_interlock present";
+    !interlock_present::
+      "cmdb-probe: tendcf_interlock absent";
+    service_present::
+      "cmdb-probe: tendcf_service present";
+    !service_present::
+      "cmdb-probe: tendcf_service absent";
+}
