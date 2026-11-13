@@ -114,8 +114,12 @@ Rules for the file, each with the reason it is a rule:
    a `ref` while `tree` still proves the content. Both are plain git
    objects: no Nix is needed to compute or check them, which R5 and D6
    require (Nix is an optional builder, never a dependency of the path).
-3. **`ref` is informational.** The resolver updates `rev`/`tree` from `ref`
-   on request; a build never follows `ref`.
+3. **A build never follows `ref`, but `ref` is verified.** The resolver
+   updates `rev`/`tree` from `ref` on request, and a build never replaces
+   the pinned `rev` with the tip of the moving `ref`. Gate 1 does fetch
+   `ref` from `url` and requires `rev` to be its ancestor, so `ref` is a
+   provenance check and not merely informational; for the tendcf input
+   it also has to be a declared branch (gate 1).
 4. **Foreign inputs carry `namespace`**, which is the map §3 composition
    rule (`alice.caddy`), applied at the lockfile rather than invented at
    compile time.
@@ -126,12 +130,19 @@ Rules for the file, each with the reason it is a rule:
    pins sources, not binaries.
 6. **A changed `url` is a privileged change** (decision D-d, issue #48;
    planned, Step 6). Gate 1 below verifies that `rev` belongs to `ref` at
-   `url` and that `tree` matches, so a pull request that repoints the
-   tendcf pin at a fork would make "the pinned tendcf tree" whatever the
-   fork contains, and gate 2 would run its code. The same holds for a pin
-   that is not a descendant of the previous release's pin, for a new
-   input (its `url` is new), and for a changed compiler plugin set: each
-   needs the gate-5 ceremony marker (§6).
+   `url` and that `tree` matches, so a pull request that repoints a pin
+   at a fork would make "the pinned tree" whatever the fork contains, and
+   gate 2 would run its code. The same holds for a pin that is not a
+   descendant of the previous release's pin, for a new input (its `url`
+   is new), and for a changed compiler plugin set: each needs the gate-5
+   ceremony marker (§6). **The tendcf input is the exception** (operator
+   rulings 16 and 17): its `url` and `ref` are fixed by gate 1 against the
+   site's trust root (`frdminc/tendcf` and `master` or a listed
+   release-branch set by default), and a pull request that points it at
+   anything else is refused, not held for a marker. A site declares its
+   own tendcf repository and branch set only in its trust root, and that
+   declaration is a privileged change; a per-pull-request marker never
+   admits a fork.
 7. **A site-shared or foreign input is not yet an import** (decision D-b,
    issue #48; planned, Step 6). Pinning it here fetches its repository and
    verifies `rev` and `tree`; it does not make its recipes evaluable.
@@ -167,7 +178,7 @@ A release is one immutable, numbered artifact set:
 | --- | --- | --- |
 | `targets/<host-pubkey>.goal.json` | that host's complete canonical goal file (map §9) | targets role |
 | `targets/policy-tree.tar` | the generic bundles and templates at the tendcf rev, whose digest is the privileged region map §9.8 names | targets role |
-| `targets.json` | the digest of every target, plus `custom`: release number, `site.lock` SHA-256, the site-private commit, the tendcf rev (compiler and projector; one rev since map D46) and the compiler plugin set (name, distribution, version, hash; map D46), as derived by the plugin-free job and compared by gate 5 with the previous release's (planned), and the signer backend in use (planned) | targets role |
+| `targets.json` | the digest of every target, plus `custom`: release number, `site.lock` SHA-256, the site-private commit, the tendcf rev (compiler and projector; one rev since map D46) and the compiler plugin set (name, and for a third-party plugin distribution, version and hash; an in-tree plugin is identified by the tendcf rev; map D46), as derived by the plugin-free job and compared by gate 5 with the previous release's (planned), and the signer backend in use (planned) | targets role |
 | `snapshot.json`, `timestamp.json` | TUF metadata binding the set and its freshness | snapshot / timestamp roles |
 
 Three properties follow:
@@ -181,7 +192,7 @@ Three properties follow:
    exists ([#47](https://github.com/frdminc/tendcf/issues/47)), a release
    build loads only in-tree plugins named by site-private, so the tendcf
    pin covers them, and plugins installed on the builder but not named
-   are ignored (map D46). Reproducing the release byte for byte also
+   are not selected (map D46; installing one can still run code, plugin-layout §4). Reproducing the release byte for byte also
    needs a fixed dependency and toolchain closure for the build and
    controlled or recorded external inputs (environment, network); those
    are not specified yet.
@@ -287,11 +298,16 @@ the review artifact; a diff computed in the compile job never is):
 1. `site.lock` is canonical bytes; every input's `rev` is reachable and its
    fetched `tree` matches. "Reachable" means `rev` is an ancestor of the
    pin's `ref` as fetched from the pin's `url`; being fetchable by hash is
-   not enough, and for the tendcf input `ref` has to name a protected
-   branch of `frdminc/tendcf`; any other ref is refused (operator ruling;
-   planned, Step 6). Refuse otherwise: a pin that cannot be verified is
-   not a pin. (A changed `url` is also caught by gate 5's
-   privileged-change rule below.)
+   not enough. For the tendcf input `url` and `ref` have to be the
+   repository and branch the site's trust root declares: by default
+   `frdminc/tendcf` and `master`, or an explicitly listed set of its
+   release branches, each with required review, no force-push, no
+   deletion and no administrator bypass; any other ref is refused
+   (operator rulings 16 and 17; planned, Step 6). Refuse otherwise: a pin
+   that cannot be verified is not a pin. (A changed `url` is also caught
+   by gate 5's privileged-change rule below.) Each job fetches and
+   verifies the pins itself; jobs B′ and B take nothing from job A but
+   goal-file bytes and the digest manifest (plugin-layout §4).
 2. Compile every host, loading only the compiler plugins site-private
    names (in-tree only until #47; map D46; the loader is planned,
    [`plugin-layout.md`](plugin-layout.md) §4). Conflict-as-error (map §3):
@@ -302,9 +318,10 @@ the review artifact; a diff computed in the compile job never is):
    rejecting or mismatched verdict refuses the release, unless the
    ceremony marker overrides a negative result (it is then recorded with
    the pin and shown in every later gate 5 review). A pull request that
-   changes a pin's `url` or the plugin set does not get this gate run
-   until the marker is present (operator ruling; job B′'s checks that need
-   no job A output may run).
+   changes a pin's `url` or the plugin set, adds a `site.lock` input (its
+   `url` is new) or changes the trust-root declaration does not get this
+   gate run until the marker is present (operator ruling; job B′'s checks
+   that need no job A output may run).
 3. Every goal file passes `bin/schema_lint.py` at the pinned tendcf rev and
    is canonical bytes.
 4. Project every goal file with the pinned projector; the projection passes
@@ -323,17 +340,20 @@ the review artifact; a diff computed in the compile job never is):
      (forbidden, not merely privileged: roll forward), or
    - the commit makes a **privileged change** and does not carry the
      ceremony marker (decisions D-d and issue #48, planned, Step 6). The
-     list, every item confirmed by the operator: a changed `url` in any
-     `site.lock` pin; a pin that is not a descendant of the previous
-     release's pin (a backward move, but a backward move across a
-     `schema_version` bump is forbidden outright, §8 item 5); a compiler
-     plugin set that differs from the previous release's; a tendcf bump
-     that changes `tools/` (today `bin/`), `schema/` or the projector; a
-     new `site.lock` input; any file that jobs B′ and B execute or build
-     their environment from; the workflow files and signer configuration
-     that define jobs A, B′ and B; a change of signer backend (enrolling
-     or removing a hardware token included); and a lowering of
-     `external_import.without_ai`. The plugin-set rule exists because a
+     list (the operator's: a changed `url` in any `site.lock` pin; a pin
+     that is not a descendant of the previous release's pin, which includes
+     every backward move, though one across a `schema_version` bump is
+     forbidden outright, §8 item 5; a compiler plugin set that differs
+     from the previous release's. Issue #48's F7 fix: a tendcf bump that
+     changes `tools/` (today `bin/`), `schema/` or the projector. The
+     operator-confirmed additions: a new `site.lock` input; any file that
+     jobs B′ and B execute or build their environment from; the workflow
+     files and signer configuration that define jobs A, B′ and B; a change
+     of signer backend, enrolling or removing a hardware token or the Unix
+     user included; and a lowering of `external_import.without_ai`.
+     Following the rulings on forks and break-glass: a change to the tendcf
+     repository or branch set the trust root declares, and a break-glass
+     signing route with no merged pull request). The plugin-set rule exists because a
      plugin can be named now and change behaviour later, and the tendcf
      rule because one tendcf commit can change both the compiler and the
      gates that check it. The plugin set compared is the one the
@@ -371,16 +391,21 @@ concrete:
    without secrets: it runs gates 3 to 5 for a pull request, so that the
    preview a human approves is computed outside the plugins' reach.
 3. **Signers in the first real release are one of n** (operator
-   ruling): the CI key held as a GitHub environment secret (job B signs
-   with it), or any one of at least two enrolled hardware tokens; each may
-   sign alone. `vps-hub` and the Hyades podman runner are not signers. A
-   separate Unix user stays the interim and a non-default backend. A token
-   signer either signs the digest manifest of a passing job B′ run after
-   verifying that run's identity and digests, or re-runs gates 3 to 5
-   itself in a plugin-free environment built from pinned, hash-locked
-   source; the signature records which. What each keeps and loses, and the
-   rules of the signing environment, are in
-   [`plugin-layout.md`](plugin-layout.md) §4.
+   rulings): the CI key held as a GitHub environment secret (job B signs
+   with it), which alone suffices; hardware tokens, optional, and at
+   least two if any is enrolled; and a separate Unix user, opt-in and
+   non-default, which may be enrolled for real releases (enrolling it
+   lowers every release to its level, since compile and signer share one
+   machine). Each enrolled signer may sign alone. `vps-hub` and the
+   Hyades podman runner are not signers. Both token paths normally sign
+   only the approved pull request's job A digests (merged tree equal to
+   the approved head, binding unchanged): path 1 verifies a passing job B′
+   run and signs its manifest, path 2 re-runs gates 3 to 5 itself in a
+   plugin-free environment built from pinned, hash-locked source; the path
+   is recorded in `targets.json` `custom`. A break-glass route with no
+   merged pull request is a privileged change, recorded in the same
+   place. What each keeps and loses, and the rules of the signing
+   environment, are in [`plugin-layout.md`](plugin-layout.md) §4.
 4. **Signed is what was reviewed.** The pull-request run is job A, then
    job B′. Reviewers approve job B′'s preview (which carries the import scan and
    AI review results). The approval is bound to the
@@ -390,7 +415,9 @@ concrete:
    changed, job B takes the same artifacts by run identity, re-runs gates 3
    to 5, checks the digests and previews equal what was approved, and signs
    exactly those digests; otherwise the gates run again and the result is
-   reviewed again. Site-private gets branch protection (stale approvals
+   reviewed again. The approval record that carries this binding is produced
+   by job B′ and verified by job B (a GitHub approval binds only a
+   commit). Site-private gets branch protection (stale approvals
    dismissed on a new push, approval of the most recent push required, no
    administrator bypass). Until this exists, the pull request's preview
    diff is advisory, not a check.
@@ -523,8 +550,24 @@ moved on since.
   promotion of the pull request's artifacts and branch protection on
   site-private** (§6; decisions D-c and D-d, issue #48) are Step 6 code
   and configuration, none of it built.
-- **The privileged-region ceremony marker** (§6 gate 5) is a site-private
-  commit convention to be chosen with the TUF ceremony (map §14.4).
+- **The ceremony marker** (§6 gate 5) carries the privileged-region
+  hunks, the privileged changes, the override of a negative
+  import result and the job A hold, so its mechanism is not a text
+  convention in the commit (a pull request's author would write it): it
+  is still to be chosen with the TUF ceremony (map §14.4), against these
+  invariants. It is an attestation the pull request's author cannot
+  produce for themselves; it is bound to one head commit and to the named
+  changes it admits; and it is verified by jobs B′ and B, never by job A
+  (plugin-layout §4, item 5).
+- **The definitions that check a change come from outside it** (planned
+  invariant; mechanism open). The hold on job A, the privileged-change
+  detector, gate 1 and jobs B′ and B run from the protected ref's
+  workflow and the previous release's pinned tools, never from the tree
+  under test; a change to them takes effect only after it merges under
+  the old definition, with the marker. The approval record is produced by
+  job B′ and verified by job B. The site's trust root, where it lives and
+  how gate 1 reads a branch's protection settings, are open as well
+  (plugin-layout §4 and §7).
 - **The inventory does not exist yet**, so `site.lock` has nothing to pin
   for a real fleet; the format is fixed now so that the real one (Step 6)
   needs no redesign. (~~so that nix2cf's `tendcf.lock` (Step 3) and the

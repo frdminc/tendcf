@@ -256,7 +256,9 @@ separate environment with no plugin installed, and the compile step is to
 hold no signing key (**planned, Step 6**: nothing enforces this today;
 the interim is a separate Unix user on the builder, the default before the
 first real release is a two-job split whose release may be signed by the CI
-key or by any one of at least two hardware tokens, and frontend recipes from other
+key (which alone suffices), by any one of at least two optional hardware
+tokens, or by an opt-in Unix user (which lowers every release to its level),
+and frontend recipes from other
 sites are imported, pinned and scanned before they run). A release is to
 load only the plugins site-private names (planned: the loader), and only
 in-tree ones until out-of-tree plugins can be pinned. The rules, the
