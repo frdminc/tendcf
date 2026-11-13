@@ -37,21 +37,26 @@ OPEN = [
 ]
 
 VARIANTS = {
+    # The recipe file itself is outside the allowed paths until -I allows
+    # its directory (first CI run: bare `base` refuses the main file).
     "base": BASE,
-    "base+I": BASE + ALLOW_DIR,
-    "base+pure": BASE + PURE,
-    "base+pure+I": BASE + PURE + ALLOW_DIR,
+    "base+I": BASE + ["-I", "{dir}"],
+    "base+pure+I": BASE + PURE + ["-I", "{dir}"],
 }
+DOCUMENTED = "base+I"
 
-# case file -> substring that must appear in stderr when it is refused.
+# case file -> substrings (lowercase) that must all appear in stderr when it
+# is refused. Each case gets `-I <its own directory>`, so the refusal must
+# come from the case itself, not from the main file being outside the
+# allowed paths.
 NEGATIVES = {
-    "read-absolute.nix": "forbidden in restricted mode",
-    "read-relative.nix": "forbidden in restricted mode",
-    "fetchurl.nix": "forbidden in restricted mode",
-    "fetchtarball.nix": "forbidden in restricted mode",
-    "ifd.nix": "import from derivation",
-    "exec.nix": "exec",
-    "nixpath-lookup.nix": "search path",
+    "read-absolute.nix": ["access to absolute path '/etc/passwd' is forbidden in restricted mode"],
+    "read-relative.nix": ["outside/secret.txt' is forbidden in restricted mode"],
+    "fetchurl.nix": ["access to uri 'https://example.com/index.html' is forbidden in restricted mode"],
+    "fetchtarball.nix": ["access to uri 'https://example.com/a.tar.gz' is forbidden in restricted mode"],
+    "ifd.nix": ["allow-import-from-derivation"],
+    "exec.nix": ["attribute 'exec' missing"],
+    "nixpath-lookup.nix": ["was not found in the nix search path"],
 }
 
 
@@ -63,7 +68,11 @@ def run(argv, env, path):
 
 def first_line(text):
     lines = [x for x in text.splitlines() if x.strip()]
-    return lines[0][:200] if lines else ""
+    return " | ".join(x.strip() for x in lines[:3])[:300]
+
+
+def with_dir(argv, d):
+    return [a.replace("{dir}", str(d)) for a in argv]
 
 
 def main():
@@ -78,26 +87,46 @@ def main():
         for name in names:
             argv = VARIANTS[name]
             print(f"== variant {name}: {' '.join(repr(a) for a in argv)}")
-            rc, out, err = run(argv, env, POSITIVE)
+            rc, out, err = run(with_dir(argv, POSITIVE.parent), env, POSITIVE)
             ok = rc == 0 and json.loads(out or "null") == POSITIVE_WANT
             print(f"  positive recipe.nix: rc={rc} {'OK' if ok else 'WRONG'} out={out[:120]!r} err={first_line(err)!r}")
             if not ok:
                 bad.append((name, "positive"))
-            for case, want in NEGATIVES.items():
-                rc, out, err = run(argv, env, FIX / "negative" / case)
-                refused = rc != 0 and want in err.lower()
+            for case, wants in NEGATIVES.items():
+                nd = FIX / "negative"
+                rc, out, err = run(with_dir(argv, nd), env, nd / case)
+                refused = rc != 0 and all(w in err.lower() for w in wants)
                 print(f"  negative {case}: rc={rc} {'REFUSED' if refused else 'NOT-AS-EXPECTED'} err={first_line(err)!r}")
                 if not refused:
                     bad.append((name, case))
-            if "pure" in name:
-                rc, out, err = run(argv, env, FIX / "negative" / "currenttime.nix")
-                print(f"  negative currenttime.nix: rc={rc} err={first_line(err)!r}")
-        print("== permissive controls (restrictions off; shows the refusals are due to the flags)")
-        for case in ["read-absolute.nix", "read-relative.nix", "exec.nix"]:
-            rc, out, err = run(OPEN, env, FIX / "negative" / case)
-            print(f"  control {case}: rc={rc} out={out[:80]!r} err={first_line(err)!r}")
-        rc, out, err = run(OPEN, env, FIX / "negative" / "ifd.nix")
-        print(f"  control ifd.nix (IFD allowed): rc={rc} err={first_line(err)!r}")
+        nd = FIX / "negative"
+        print("== single-flag controls (documented flags, one relaxed; shows each flag is what refuses)")
+        doc = VARIANTS[DOCUMENTED]
+        relax = {
+            "allowed-uris=https://example.com/ lets fetchurl past the URI check": (
+                "fetchurl.nix", "allowed-uris", "https://example.com/", "forbidden in restricted mode"),
+            "allow-import-from-derivation=true lets ifd.nix past the IFD check": (
+                "ifd.nix", "allow-import-from-derivation", "true", "allow-import-from-derivation"),
+            "allow-unsafe-native-code-during-evaluation=true provides builtins.exec": (
+                "exec.nix", "allow-unsafe-native-code-during-evaluation", "true", "attribute 'exec' missing"),
+        }
+        for label, (case, opt, val, absent) in relax.items():
+            av = with_dir(doc, nd)
+            i = av.index(opt)
+            av[i + 1] = val
+            rc, out, err = run(av, env, nd / case)
+            passed = absent not in err.lower()
+            print(f"  control [{label}]: rc={rc} {'OK' if passed else 'STILL-REFUSED'} out={out[:60]!r} err={first_line(err)!r}")
+            if not passed:
+                bad.append(("control", label))
+        av = with_dir(doc, nd)
+        i = av.index("restrict-eval")
+        av[i + 1] = "false"
+        for case in ["read-absolute.nix", "read-relative.nix"]:
+            rc, out, err = run(av, env, nd / case)
+            print(f"  control [restrict-eval=false allows {case}]: rc={rc} {'OK' if rc == 0 else 'STILL-REFUSED'} out={out[:60]!r}")
+            if rc != 0:
+                bad.append(("control", case))
         print("== bad:", bad)
         if mode == "check" and bad:
             sys.exit(1)
