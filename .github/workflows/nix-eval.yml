@@ -1,0 +1,30 @@
+# Proves the restricted Nix evaluation invocation documented in
+# docs/architecture/plugin-layout.md ("Frontend inputs are code", item 3)
+# against fixtures in tests/nix/. It evaluates only; it never builds a package.
+name: nix-eval
+
+on:
+  push:
+    branches: [master, "docs/d46-issue48-decisions"]
+    paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]
+  pull_request:
+    paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Nix version and relevant settings
+        run: |
+          nix --version
+          nix-instantiate --version
+          nix show-config | grep -E '^(restrict-eval|allowed-uris|allow-import-from-derivation|pure-eval|allow-unsafe-native-code-during-evaluation|sandbox|trusted-users) '
+      - name: Matrix of variants (informational)
+        run: python3 tests/nix/run_nix_eval.py matrix
