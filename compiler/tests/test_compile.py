@@ -594,6 +594,70 @@ def test_cli_schema_invalid_input_exits_1(tendcf: Path, tmp_path: Path) -> None:
     assert b"opt_out_reason" in proc.stderr
 
 
+# --- where the CLI finds tendcf: --tendcf, then $TENDCF_DIR, then the enclosing checkout ---
+# `_run` always sets TENDCF_DIR, so these use `_run_env` to leave it out or to
+# set it to something other than the real checkout.
+
+def _run_env(args: list[str], tendcf_dir: str | None) -> subprocess.CompletedProcess[bytes]:
+    env = {k: v for k, v in os.environ.items() if k != "TENDCF_DIR"}
+    env["PYTHONPATH"] = str(REPO)
+    if tendcf_dir is not None:
+        env["TENDCF_DIR"] = tendcf_dir
+    return subprocess.run([sys.executable, "-m", "nix2cf.cli", *args], capture_output=True, env=env, check=False)
+
+
+def _buildfile_args(site: Path, *extra: str) -> list[str]:
+    return ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY,
+            "--device-trust", str(site / "device-trust.json"), "--site", str(site), *extra]
+
+
+def test_cli_defaults_to_the_enclosing_checkout(schemas: Schemas, projector, tmp_path: Path) -> None:
+    # No --tendcf and no TENDCF_DIR: --project works (it needs bin/projector.py) ...
+    proc = _run_env(_buildfile_args(SITE, "--project"), None)
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout == projector.project(compile_host(_model(SITE), _host(SITE), schemas).goal_file)
+    assert b"NOT validated" not in proc.stderr
+    # ... and validation is on: a schema-invalid Site Model is refused, not compiled.
+    site = tmp_path / "site"
+    shutil.copytree(SITE, site)
+    doc = yaml.safe_load((site / "services.yml").read_text())
+    doc["domains"]["macos-user-daemons"].pop("opt_out_reason")
+    (site / "services.yml").write_text(yaml.safe_dump(doc))
+    bad = _run_env(_buildfile_args(site), None)
+    assert bad.returncode == 1 and b"opt_out_reason" in bad.stderr and bad.stdout == b""
+
+
+def test_cli_tendcf_location_precedence(tendcf: Path, tmp_path: Path) -> None:
+    empty = tmp_path / "no-schemas"  # a directory with no *.schema.json: using it fails loudly
+    empty.mkdir()
+    refused = b"no *.schema.json under " + str(empty).encode()
+    # --tendcf beats TENDCF_DIR: the real one in the env does not rescue the bad flag ...
+    flag = _run_env(_buildfile_args(SITE, "--tendcf", str(empty)), str(tendcf))
+    assert flag.returncode == 2 and refused in flag.stderr and flag.stdout == b""
+    # ... and the good flag beats a bad TENDCF_DIR.
+    flag_ok = _run_env(_buildfile_args(SITE, "--tendcf", str(tendcf)), str(empty))
+    assert flag_ok.returncode == 0, flag_ok.stderr.decode()
+    # TENDCF_DIR beats the in-tree default: the enclosing checkout has schemas, the env's dir does not.
+    env = _run_env(_buildfile_args(SITE), str(empty))
+    assert env.returncode == 2 and refused in env.stderr and env.stdout == b""
+
+
+def test_in_tree_tendcf_none_outside_a_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from nix2cf import cli
+
+    # In this repository it is the root (compiler/ sits directly under it).
+    assert cli._in_tree_tendcf() == REPO.parent
+    # A package at <root>/compiler/nix2cf/cli.py with no schema/ beside compiler/: not a checkout.
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "compiler" / "nix2cf" / "cli.py"))
+    assert cli._in_tree_tendcf() is None
+    monkeypatch.delenv("TENDCF_DIR", raising=False)
+    assert cli._tendcf_dir(None) is None  # nothing to find: no validation, as before the default existed
+    # The schema file is what confirms a checkout.
+    (tmp_path / "schema").mkdir()
+    (tmp_path / "schema" / "goal-file.schema.json").write_text("{}")
+    assert cli._in_tree_tendcf() == tmp_path
+
+
 # --- the Nix frontend hook ---------------------------------------------------------
 
 @pytest.mark.skipif(shutil.which("nix-instantiate") is None, reason="no Nix install")

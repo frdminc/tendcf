@@ -60,8 +60,10 @@ jobs:
           bin/overlay.py self-test
 
   # The nix2cf compiler (compiler/), imported from frdminc/nix2cf. It reads
-  # this checkout's schemas and projector in-tree, so no TENDCF_DIR is set:
-  # the tests exercise the compiler's default of the enclosing repository.
+  # this checkout's schemas and projector in-tree, so this job sets no
+  # TENDCF_DIR. The library tests and the "defaults to the enclosing checkout"
+  # CLI test (compiler/tests/test_compile.py) exercise that default; the other
+  # CLI tests pass TENDCF_DIR explicitly via their `_run` helper.
   compiler:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
