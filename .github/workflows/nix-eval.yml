@@ -28,24 +28,3 @@ jobs:
           nix show-config | grep -E '^(restrict-eval|allowed-uris|allow-import-from-derivation|pure-eval|allow-unsafe-native-code-during-evaluation|sandbox|trusted-users) '
       - name: Matrix of variants and controls (informational)
         run: python3 tests/nix/run_nix_eval.py matrix
-      - name: IFD debugging (informational)
-        continue-on-error: true
-        run: |
-          export NIX_PATH=
-          d=tests/nix/fixtures/negative
-          echo "--- default options"
-          nix-instantiate --eval --strict --json $d/ifd.nix 2>&1 | tail -3 || true
-          echo "--- IFD true, sandbox false"
-          nix-instantiate --eval --strict --json --option allow-import-from-derivation true --option sandbox false $d/ifd.nix 2>&1 | tail -3 || true
-          echo "--- IFD false, sandbox false, no restrict-eval"
-          nix-instantiate --eval --strict --json --option allow-import-from-derivation false $d/ifd.nix 2>&1 | tail -3 || true
-          echo "--- instantiate only (does the .drv get written?)"
-          nix-instantiate $d/ifd.nix 2>&1 | tail -3 || true
-          echo "--- readFile style, IFD false"
-          cat > $RUNNER_TEMP/ifd2.nix <<'NIX'
-          let d = derivation { name = "ifd2"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo 1 > $out" ]; };
-          in builtins.readFile d
-          NIX
-          nix-instantiate --eval --strict --json --option allow-import-from-derivation false --option sandbox false $RUNNER_TEMP/ifd2.nix 2>&1 | tail -3 || true
-          echo "--- readFile style, IFD true, sandbox false"
-          nix-instantiate --eval --strict --json --option allow-import-from-derivation true --option sandbox false $RUNNER_TEMP/ifd2.nix 2>&1 | tail -3 || true

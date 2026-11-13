@@ -54,7 +54,9 @@ NEGATIVES = {
     "read-relative.nix": ["outside/secret.txt' is forbidden in restricted mode"],
     "fetchurl.nix": ["access to uri 'https://example.com/index.html' is forbidden in restricted mode"],
     "fetchtarball.nix": ["access to uri 'https://example.com/a.tar.gz' is forbidden in restricted mode"],
-    "ifd.nix": ["allow-import-from-derivation"],
+    # `--eval` is read-only: no .drv is written, so IFD cannot run at all
+    # (first CI runs). The flag itself is proven by the read-write control.
+    "ifd.nix": ["is not valid"],
     "exec.nix": ["attribute 'exec' missing"],
     "nixpath-lookup.nix": ["was not found in the nix search path"],
 }
@@ -104,10 +106,8 @@ def main():
         print("== single-flag controls (documented flags, one relaxed; shows each flag is what refuses)")
         doc = VARIANTS[DOCUMENTED]
         relax = {
-            "allowed-uris=https://example.com/ lets fetchurl past the URI check": (
-                "fetchurl.nix", "allowed-uris", "https://example.com/", "forbidden in restricted mode"),
-            "allow-import-from-derivation=true lets ifd.nix past the IFD check": (
-                "ifd.nix", "allow-import-from-derivation", "true", "allow-import-from-derivation"),
+            "allowed-uris=https://example.com/ lets fetchurl reach the network": (
+                "fetchurl.nix", "allowed-uris", "https://example.com/", "unable to download"),
             "allow-unsafe-native-code-during-evaluation=true provides builtins.exec": (
                 "exec.nix", "allow-unsafe-native-code-during-evaluation", "true", "attribute 'exec' missing"),
         }
@@ -116,10 +116,24 @@ def main():
             i = av.index(opt)
             av[i + 1] = val
             rc, out, err = run(av, env, nd / case)
-            passed = absent not in err.lower()
+            # A relaxed flag passes when the refusal text is gone and, for the
+            # download control, the fetch was actually attempted.
+            passed = absent not in err.lower() if case != "fetchurl.nix" else (rc == 0 or absent in err.lower())
             print(f"  control [{label}]: rc={rc} {'OK' if passed else 'STILL-REFUSED'} out={out[:60]!r} err={first_line(err)!r}")
             if not passed:
                 bad.append(("control", label))
+        print("== IFD flag, proven with --read-write-mode (the documented --eval is read-only and never builds)")
+        for val in ["true", "false"]:
+            av = with_dir(doc, nd)
+            i = av.index("allow-import-from-derivation")
+            av[i + 1] = val
+            av = av + ["--read-write-mode", "--option", "sandbox", "false"]
+            rc, out, err = run(av, env, nd / "ifd.nix")
+            blocked = "allow-import-from-derivation" in err.lower()
+            good = (rc != 0 and blocked) if val == "false" else (rc == 0 and out == "1")
+            print(f"  IFD allow-import-from-derivation={val} (--read-write-mode): rc={rc} {'OK' if good else 'UNEXPECTED'} out={out[:40]!r} err={first_line(err)!r}")
+            if not good:
+                bad.append(("ifd-flag", val))
         av = with_dir(doc, nd)
         i = av.index("restrict-eval")
         av[i + 1] = "false"
