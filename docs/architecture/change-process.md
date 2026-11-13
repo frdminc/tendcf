@@ -69,7 +69,7 @@ device seven releases behind still computes one true diff (guide §7).
 
 | Layer (map §3) | Repository today | What a release takes from it |
 | --- | --- | --- |
-| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import, #45, whose one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
+| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import (#45); its one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
 | site-shared | not yet created | recipes |
 | foreign site-shared | none yet | recipes, namespaced |
 | site-private | `~/ops/site-private` (today: ops repo; the tendcf inventory does not exist yet) | inventory, allocations, secret *names*, trust policy, the lockfile |

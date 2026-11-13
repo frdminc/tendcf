@@ -296,10 +296,10 @@ Merge happens once, in the compiler, before render. CFEngine’s own
 
 Because the render is a pure function of the Site Model — same input, same
 output — “show me exactly what device X would receive, without touching
-device X” is almost free. (That purity is a design goal: with plugins it
+device X” is almost free. (That purity is a design goal: it
 also needs a fixed dependency and toolchain closure and controlled
 external inputs, which are not specified yet;
-[`plugin-layout.md`](../architecture/plugin-layout.md) §7.) That command,
+[`plugin-layout.md`](../architecture/plugin-layout.md) §7.) The command for it,
 `buildfile`, was the first piece of the compiler built: merge, conflict
 check and goal-file render, with service units for launchd only and no
 inference yet (§18). It is how an agent checks its own work, how the

@@ -38,7 +38,8 @@ signed release carrying a typed operation plan that the on-device executor
 mechanically refuses to exceed. Bcfg2 supplies four of its load-bearing
 ideas, credited in §6.
 
-**Nothing described here is deployed.** No device has been provisioned from
+**Nothing described here is deployed**, apart from a canary service on
+one operator host. No device has been provisioned from
 factory reset by this automation; we have no operational numbers of any
 kind, and one of our central negative results (§5.4) rests on reasoning
 about a code path that has never been executed. What we do have is an
@@ -326,7 +327,7 @@ and not a schema redesign.
 Because the render is a pure function of the Site Model — the same purity
 Nix's own build model is named for [27] — "show me exactly what device X
 would receive, without touching device X" is nearly free. (That purity is
-a design goal: with plugins it also needs a fixed dependency and toolchain
+a design goal: it also needs a fixed dependency and toolchain
 closure and controlled external inputs, which are not specified yet;
 [`plugin-layout.md`](../architecture/plugin-layout.md) §7.) We built that
 affordance *first*, before the pipeline is finished — `buildfile` merges,
@@ -1761,7 +1762,7 @@ the rest), plus the open parts of those two. Remaining Step 0 work:
 `peer_actions`, trust-policy shape, generic unit-writers, lookup stub, YAML
 canonicalize, and transcribing existing reality as `not-yet-migrated`.
 
-**Nothing is deployed.** No device has been provisioned from factory reset by
+**Nothing is deployed** beyond that one operator-host canary. No device has been provisioned from factory reset by
 this automation. We have no deployment time, no effort figure, no
 managed/unmanaged ratio, and no failure data. Examples A and B in §2.6 remain
 hand-authored to show the target rendering; only Example C is real.
