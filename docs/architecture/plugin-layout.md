@@ -258,10 +258,11 @@ item 3.
    the command that imports, and whether an operator may ever override a
    negative result are not specified: §7.
 3. **Nix limits, for every Nix evaluation, the site's own recipes
-   included.** Restricted evaluation (`restrict-eval`), and pure
-   evaluation (`pure-eval`) where it works; no import-from-derivation;
-   an empty `allowed-uris`; no network. The names below are checked
-   against the Nix 2.35.6 reference manual on 2026-11-13
+   included.** Restricted evaluation (`restrict-eval`); no
+   import-from-derivation; an empty `allowed-uris`; no network; no unsafe
+   native code. Pure evaluation (`pure-eval`) is not used: it cannot
+   evaluate a file named on the command line (tested, below). The names
+   below were read from the Nix 2.35.6 reference manual on 2026-11-13
    ([`nix.conf`](https://nix.dev/manual/nix/latest/command-ref/conf-file),
    [`nix-instantiate`](https://nix.dev/manual/nix/latest/command-ref/nix-instantiate)):
 
@@ -270,37 +271,91 @@ item 3.
    | `restrict-eval` | `true` | the evaluator "doesn't allow access to any files outside of `builtins.nixPath`, or to URIs outside of `allowed-uris`" | `false` |
    | `allowed-uris` | empty | URI prefixes allowed in restricted evaluation | empty |
    | `allow-import-from-derivation` | `false` | with `false`, Nix "throws an error when evaluating an expression that uses" import-from-derivation | `true` |
-   | `pure-eval` | `true`, where it works | restricts file system and network access to files specified by cryptographic hash and disables impure constants (`builtins.currentSystem`, `currentTime`, `nixPath`, `storePath`) | `false` |
+   | `pure-eval` | not used (`false`, the default of `nix-instantiate`) | restricts file system and network access to files specified by cryptographic hash and disables impure constants (`builtins.currentSystem`, `currentTime`, `nixPath`, `storePath`) | `false` |
    | `allow-unsafe-native-code-during-evaluation` | `false`, passed explicitly and never changed | enables `builtins.importNative` and `builtins.exec` | `false` |
 
-   The manual documents `--option NAME VALUE` on `nix-instantiate`
-   ("Set the Nix configuration option _name_ to _value_. This overrides
-   settings in the Nix configuration file"), so the shape of the call is
-   `nix-instantiate --eval --strict --json --option restrict-eval true
-   --option allow-import-from-derivation false --option allowed-uris ''
-   --option allow-unsafe-native-code-during-evaluation false FILE`, with
-   `NIX_PATH` set to the empty string (the manual: "If `NIX_PATH` is set to
-   an empty string, resolving search paths will always fail"), the
-   configuration files controlled rather than inherited (the manual lists
-   `NIX_CONF_DIR`, `NIX_USER_CONF_FILES` and `NIX_CONFIG` as the
-   variables that load configuration), and never `--impure`.
+   **Tested.** On 2026-11-13 the invocation below ran on a real Nix:
+   Nix 2.35.6, installed by `cachix/install-nix-action@v31` (a multi-user
+   install with `nix-daemon`) on a GitHub `ubuntu-latest` runner. The
+   fixtures and runner are `tests/nix/fixtures/` and
+   `tests/nix/run_nix_eval.py`; the job is
+   `.github/workflows/nix-eval.yml`, and its gating step fails the job
+   unless every result below holds. Passing run, at head `fcb9ee4`:
+   <https://github.com/frdminc/tendcf/actions/runs/43462686825>. The
+   tested invocation, with `NIX_PATH` set to the empty string and
+   `NIX_USER_CONF_FILES` pointing at an empty file, so that only these
+   flags are in play (`NIX_CONF_DIR` and `NIX_CONFIG` are the other
+   variables that load configuration):
 
-   **Documented, not yet executed.** That command line is the shape the
-   manual supports, and it has not been run. On 2026-11-13 the machine
-   that wrote this had no `nix-instantiate` and no `docker`; podman was
-   installed but its virtual machine was stopped and unreachable, and
-   starting it was outside what that session was authorised to do. Not
-   tested, so not claimed: whether the command can evaluate its input
-   file at all under `restrict-eval` with an empty `NIX_PATH` (for
-   example whether the file must also be allowed with `-I`); whether
-   `pure-eval` works for a plain file evaluation; that a hostile recipe is
-   refused for each of network access, a file read outside the recipe,
-   import-from-derivation and `builtins.exec`; and how a `nix-daemon`
-   treats these options from a client. The operator ruled that the exact
-   flags get tested in this documentation change; that test is
-   outstanding, and the section keeps this label until the positive and
-   negative checks have run on a real Nix and their commands and output are
-   recorded here.
+   ```
+   nix-instantiate --eval --strict --json \
+     --option restrict-eval true \
+     --option allow-import-from-derivation false \
+     --option allowed-uris '' \
+     --option allow-unsafe-native-code-during-evaluation false \
+     -I RECIPE_DIR RECIPE.nix
+   ```
+
+   Never `--impure`. The manual documents `--option NAME VALUE`
+   ("Set the Nix configuration option _name_ to _value_. This overrides
+   settings in the Nix configuration file"), and the options took effect
+   as set on the command line, with the daemon running.
+
+   What the run showed:
+
+   1. **The recipe's own directory must be allowed with `-I`.** Without
+      it, `restrict-eval` refuses the file named on the command line
+      (`access to absolute path '.../recipe.nix' is forbidden in
+      restricted mode`) and no recipe evaluates. With `-I RECIPE_DIR` the
+      positive fixture, which reads a sibling file and imports a sibling
+      expression, evaluates to the expected JSON
+      (`{"greeting":"hello\n","helper":{"n":3},"site":"ok"}`). `RECIPE_DIR`
+      must be the directory of the pinned, scanned recipe and nothing
+      wider, because `-I` is what grants the read.
+   2. **A hostile recipe is refused, each for its own reason** (each
+      fixture run with `-I` on its own directory, so the main file is
+      not the thing refused):
+      `builtins.readFile /etc/passwd` and
+      `builtins.readFile ../outside/secret.txt` (`access to absolute path
+      ... is forbidden in restricted mode`);
+      `builtins.fetchurl` and `builtins.fetchTarball` (`access to URI ...
+      is forbidden in restricted mode`);
+      `import <nixpkgs> { }` with the empty `NIX_PATH` (`file 'nixpkgs'
+      was not found in the Nix search path`);
+      `builtins.exec` (`attribute 'exec' missing`).
+   3. **Each flag is what refuses, shown by relaxing it alone.** With
+      `restrict-eval false` both file reads succeed and print the file
+      (the runner's `/etc/passwd` and the outside secret). With
+      `allowed-uris https://example.com/` the fetch gets past the URI
+      check and reaches the network (the server answers 404). With
+      `allow-unsafe-native-code-during-evaluation true` `builtins.exec`
+      exists and runs.
+   4. **Import-from-derivation cannot run under `--eval` at all.** `--eval`
+      is read-only: no `.drv` is written, so the fixture fails with `path
+      '....drv' is not valid` whatever `allow-import-from-derivation` says.
+      The flag is therefore a second layer, and it was proven separately
+      by adding `--read-write-mode` to the same call: with the flag
+      `true` the fixture builds and evaluates (`1`); with `false` it stops
+      with `cannot build '....drv^out' during evaluation because the option
+      'allow-import-from-derivation' is disabled`. The documented
+      invocation does not use `--read-write-mode` and must not.
+   5. **`pure-eval` does not work for a plain file evaluation.** With
+      `--option pure-eval true` the file named on the command line is
+      refused (`access to absolute path ... is forbidden in pure evaluation
+      mode (use '--impure' to override)`), with or without `-I`, so no
+      recipe evaluates. That is why the list above does not use it. (The
+      `pure-eval = true` that `nix show-config` prints on the runner is the
+      new `nix` command's default; `nix-instantiate` does not use it.)
+
+   Not tested, so not claimed: macOS or an architecture other than the
+   runner's; `builtins.importNative` (the manual puts it behind the same
+   setting as `builtins.exec`, and only `exec` was run); reads through
+   other builtins (`readDir`, `path`, `filterSource`) outside the recipe
+   directory; options sent to a daemon by an untrusted user; and Nix
+   versions other than 2.35.6 (the job does not pin the Nix version: the
+   installer action's default moves with its releases, so a new Nix
+   changes what the job runs, and a failure there is the signal to re-read
+   the manual).
 
    Today `compiler/nix2cf/cli.py` (`cmd_eval_nix`) passes only
    `--eval --strict --json`: the limits are a code change, planned with
