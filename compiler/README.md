@@ -1,21 +1,22 @@
 # nix2cf
 
-The **compiler tool** for the [tendcf](https://github.com/frdminc/tendcf)
-architecture: **Site Model → merge → conflict check → (inference, later) →
+The **compiler tool** for the [tendcf](..) architecture, living in `compiler/`
+of the tendcf repository (it was the separate `frdminc/nix2cf` repository
+until 2026-11-13; its history was imported here intact): **Site Model → merge → conflict check → (inference, later) →
 per-host canonical goal file**.
 
 The name is historical. YAML and JSON are the inputs. An optional Nix module
 frontend may author the same JSON later (tendcf D12); `nix2cf eval-nix` is
-the hook it would land behind. This repo does not hold site facts, inventory,
-schemas, or the product engine.
+the hook it would land behind. This directory does not hold site facts,
+inventory, schemas, or the product engine.
 
 **Schemas and types live in tendcf** (D21):
-[`schema/`](https://github.com/frdminc/tendcf/tree/master/schema),
-[`examples/`](https://github.com/frdminc/tendcf/tree/master/examples),
-[`bin/schema_lint.py`](https://github.com/frdminc/tendcf/blob/master/bin/schema_lint.py),
-[`bin/projector.py`](https://github.com/frdminc/tendcf/blob/master/bin/projector.py).
+[`schema/`](../schema/),
+[`examples/`](../examples/),
+[`bin/schema_lint.py`](../bin/schema_lint.py),
+[`bin/projector.py`](../bin/projector.py).
 A schema change is a tendcf interface change. This tool consumes that
-contract from a tendcf checkout; it does not own or copy it.
+contract from the enclosing tendcf checkout; it does not own or copy it.
 
 > Authority: `tendcf/docs/paper/tendcf-architecture-guide.md` (vetted
 > current-state). If this README and that guide disagree, the guide wins.
@@ -29,7 +30,9 @@ The first compiler piece the guide (§4) and the paper (§6.2) say to build:
 touching the host.
 
 ```sh
-export TENDCF_DIR=~/src/tendcf            # schemas + reference projector
+# Run from compiler/. The schemas and reference projector are found in the
+# enclosing tendcf checkout; TENDCF_DIR (or --tendcf) is optional and
+# overrides that.
 uv run nix2cf buildfile \
     --host mac --platform macos --supervisor launchd \
     --host-key ed25519:a1a1…a1 \
@@ -99,11 +102,11 @@ Every choice the paper leaves open is marked `TODO(operator)` in
 ## Tests
 
 ```sh
-TENDCF_DIR=~/src/tendcf uv run pytest
+uv run pytest        # from compiler/; TENDCF_DIR=<dir> overrides the tendcf checkout
 ```
 
 Goldens under `tests/golden/` are the compiler's own regression test; update
 them deliberately with `NIX2CF_UPDATE_GOLDEN=1` and read the diff first.
-CI checks out `frdminc/tendcf` beside this repo and runs the same command.
+CI runs the same command from the `compiler` job of the root `.github/workflows/check.yml`.
 
-License: [GPL-3.0-or-later](LICENSE).
+License: [GPL-3.0-or-later](../LICENSE) (the repository's license).

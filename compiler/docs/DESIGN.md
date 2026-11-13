@@ -71,9 +71,9 @@ reasons:
 ## The contract is consumed, not copied
 
 nix2cf holds no schema. Validation of inputs and of the rendered goal file
-loads `tendcf/schema/*.schema.json` from a tendcf checkout (`--tendcf` or
-`$TENDCF_DIR`); the registry is built exactly as `schema_lint.py` builds its
-own (from each schema's `$id`). Without a tendcf directory the compiler still
+loads `tendcf/schema/*.schema.json` from a tendcf checkout (the enclosing
+repository by default; `--tendcf` or `$TENDCF_DIR` override); the registry is
+built exactly as `schema_lint.py` builds its own (from each schema's `$id`). Without a tendcf directory the compiler still
 renders but says loudly that nothing was schema-validated.
 
 The example site under `examples/site/` is tendcf's own fixtures with one edit
