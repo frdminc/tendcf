@@ -537,9 +537,11 @@ plugin-free. What it means now:
       a tendcf CI check that does not exist today). A tendcf commit that
       changes `tools/`, `schema/` or the projector fails tendcf CI if it
       also changes the compiler's goldens, and also if it changes
-      `policy/`. That gives every change to the gate tools a pin-only,
-      byte-identical rev forwards and backwards, so the rule above can
-      always be followed, and it keeps bundle changes in their own tendcf
+      `policy/`. As far as the goldens cover, that gives every change to
+      the gate tools a pin-only, byte-identical rev forwards and
+      backwards, so the rule above can be followed (a miss at a site is
+      refused by gate 5, which fails closed), and it keeps bundle changes
+      in their own tendcf
       commit (once the goal file carries the policy-tree digest, map §9.8,
       a bundle change alters every goal file). The release sequence it
       permits is in [`change-process.md`](change-process.md) §4, and its
@@ -1040,22 +1042,31 @@ change, because the list moves:
   operator ruling 19 it is one person's act (§4, signers).
 - How a pin-only bump release (§4, signing rule 5) keeps every goal file
   byte-identical when the bump changes `schema_version` (every
-  entry-kind change does, map §9.6): the compiler of the new pin renders
-  only the current version (D46 (6)), so such a bump needs a compiler
-  that can still render the old version for that release, or map §9.6's
-  ceiling design. This brings forward the multi-version render that D46
-  (6) deferred until the first device that is not an operator host
-  enrolls: the first entry-kind change after the first release needs it.
-  The whole schema-bump sequence of [`change-process.md`](change-process.md)
-  §4 (gate tools staged, device validator deployed, migration, data) is
-  the intended order and stays open until that is answered, as do how the
-  device validator update is delivered as a goal diff (D45) and what
-  guards that every host has it before the migration while the compiler
-  renders one version.
+  entry-kind change does, map §9.6). With the authoring rule's commit
+  split the compiler at each pinned rev still renders one version, so
+  this needs `schema/` to carry both versions for the window and
+  tendcf's compiler-equals-schema check relaxed
+  ([`change-process.md`](change-process.md) §4), not the multi-version
+  render, which D46 (6) still defers to the first host whose ceiling
+  differs. The whole schema-bump sequence of change-process §4 (gate
+  tools staged, device validator deployed, migration, data) is the
+  intended order and stays open until that is answered, as does how the
+  device validator update is delivered as a goal diff (D45). The guard
+  that every host has the validator before the migration is gate 5's
+  ceiling check (change-process §6); what is missing beyond it (the
+  check is planned code, and whether an operator host reports a ceiling
+  while the compiler renders one version) is in change-process §4.
 - **The tendcf authoring rule's CI check** (operator rulings 20 and 21,
   §4): how it names the compiler's goldens, the projector and `policy/`,
-  and whether it runs per pull request or per commit that lands. It is a
-  tendcf check, not a site-private one, and it does not exist today.
+  and whether it runs per pull request or per commit that lands; how it
+  is reconciled with the check that exists today, `check_schema_version`
+  (`.github/workflows/check.yml`, `compiler/scripts/check_schema_version.py`),
+  which fails unless the compiler's `GOAL_FILE_SCHEMA_VERSION` equals the
+  schema's one `const` `schema_version`; and whether it also refuses
+  changes to compiler source (`compiler/`, `plugins/`) in such a commit,
+  since unchanged goldens show byte-identity only for the golden inputs.
+  It is a tendcf check, not a site-private one, and it does not exist
+  today.
 - **What network egress job A (the plugin-running job) is allowed. Open,
   with the risk stated** (operator ruling: unrestricted for now): a plugin
   or imported recipe in job A can send everything job A sees to any host,
@@ -1104,7 +1115,7 @@ privileged change that a per-pull-request marker never substitutes for
 Settled by the operator's rulings 20 and 21 of 2026-11-13 and no longer
 open: a tendcf commit that changes `tools/`, `schema/` or the projector
 fails a planned tendcf CI check if it also changes the compiler's goldens
-or `policy/` (§4, signing rule 5; the check itself is open, below).
+or `policy/` (§4, signing rule 5; the check itself is open, in §7 above).
 
 Settled by the operator's rulings 18 and 19 of 2026-11-13 and no longer
 open: the gate tools come from the previous release's tendcf pin, a tools,

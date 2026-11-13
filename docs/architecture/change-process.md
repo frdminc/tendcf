@@ -253,7 +253,7 @@ device notices, the second an ordinary goal diff that devices take.
    and its goldens, which touches none of `tools/`, `schema/` and the
    projector. No device notices.
 2. **Release 1, the gate tools staged: site-private bumps the tendcf pin
-   alone**, to the rev after 1(a) (or 1(b)), as its own release. The
+   alone**, to the rev after 1(a), as its own release. The
    commit changes the pin and no data. The previous release's tools check
    it, and they pass it because every host's goal file is byte-identical
    to the previous release's: every host computes an empty diff, which is
@@ -261,10 +261,11 @@ device notices, the second an ordinary goal diff that devices take.
    tendcf bump that changes `tools/`, `schema/` or the projector is a
    privileged change, §6 gate 5). This holds only while the compiler at
    the new pin still renders every host's goal file at the previous
-   `schema_version`. Map §9.6 makes every entry-kind change, additive
-   included, a `schema_version` bump, and the compiler renders only the
-   current version (D46 (6)), so for this example step 2 waits on the open
-   item below.
+   `schema_version`, which is so at the rev after 1(a) because the
+   compiler has not changed there. Map §9.6 makes every entry-kind
+   change, additive included, a `schema_version` bump, and commit 1(a)
+   cannot land in tendcf as it stands, so for this example step 2 waits
+   on the open item below.
 3. **Release 2, the device validator deployed.** The validator update
    (`tendcf-validate` on Linux and macOS, `tendcf-agent` on Android; map
    D45) is an ordinary privileged-region goal diff under schema N−1 (map
@@ -272,13 +273,27 @@ device notices, the second an ordinary goal diff that devices take.
    goal file, and gate 5 refuses a release that moves the pin across a
    tools change and also changes bytes, so the two cannot be one release.
    Release 1's tools, which accept both versions, check it. Hosts report
-   their `schema_ceiling` (map §9.6), and the compiler renders the new
-   version for a host only once that host's ceiling allows it.
+   their `schema_ceiling` (map §9.6), and gate 5's ceiling check (§6)
+   refuses release 3 for any host whose reported ceiling is below the new
+   version.
+
+   **The bundle commit 1(b) is adopted here or in a release of its own,
+   never in release 1 or release 3.** Release 2 may move the pin to the
+   rev after 1(b): that move crosses a bundle commit and no
+   `tools/`, `schema/` or projector commit, so it may change bytes, and
+   once the goal file carries the policy-tree digest (map §9.8) it will
+   change every goal file. It is an ordinary privileged-region release
+   (the authoring rule below). If the bundle's hunk should be reviewed
+   apart from the validator upgrade, it takes a release of its own between
+   release 2 and release 3. Release 1 must be byte-identical, so it cannot
+   cross 1(b); release 3 must diff to empty apart from the version bump,
+   so it cannot either.
 4. **Release 3, the migration.** The pin moves to the rev after 1(c), so
-   the compiler renders the new version. Map §9.4 governs: the migration
-   must diff to empty apart from the version bump and may not be mixed
-   with a semantic change. The new tools, now the previous release's pin,
-   check it.
+   the compiler renders the new version; the bundle commit 1(b) was
+   adopted before this release, so the version bump is its only change.
+   Map §9.4 governs: the migration must diff to empty apart from the
+   version bump and may not be mixed with a semantic change. The new
+   tools, now the previous release's pin, check it.
 5. **Release 4 or later, the data that uses the new kind**, checked by
    the new tools. This is the first release any device sees that uses the
    new kind.
@@ -288,15 +303,29 @@ device notices, the second an ordinary goal diff that devices take.
 both pins.~~ Map D46 put the compiler in tendcf, so the middle step is
 part of the first.)
 
-**Where the sequence depends on the compiler's old-schema rendering, the
-reconciliation is open and is not asserted here.** Releases 1 and 2 need
-the compiler at the pinned rev to render the old `schema_version`, and
-release 3 the new one; D46 (6) has the compiler render only the current
-version until map §9.6's ceiling design applies. How the device validator
-update is delivered as a goal diff (D45), and what guards that every host
-has it before release 3 while the compiler renders one version, are open
-as well ([`plugin-layout.md`](plugin-layout.md) §7). The order above is
-the intended one, not a tested one.
+**Where the sequence depends on tendcf as it stands, the reconciliation is
+open and is not asserted here.** With the authoring rule's commit split
+the compiler at each pinned rev still renders one version: the old one at
+the rev after 1(a), where the compiler has not changed, and the new one
+after 1(c). Releases 1 to 3 therefore need no multi-version compiler; D46
+(6) still defers that to the first host whose ceiling differs. Commit 1(a)
+is not possible in tendcf as it stands. `schema/goal-file.schema.json`
+states `schema_version` as one `const`, and tendcf CI fails unless the
+compiler's `GOAL_FILE_SCHEMA_VERSION` equals it (`check.yml`,
+`compiler/scripts/check_schema_version.py`; §5), so today a schema bump,
+the compiler bump and every golden land in one commit, which the
+authoring rule refuses. The sequence needs `schema/` to carry both
+versions for the window and that check to become "the compiler renders a
+version the schema accepts". Open. How the device validator update is
+delivered as a goal diff (D45) is open as well. What guards that every
+host has the validator before release 3 is gate 5's ceiling check (§6),
+which refuses a release in which a host's `schema_version` exceeds the
+ceiling that host last reported; what is missing beyond it is that the
+check is planned Step 6 code like the rest of gate 5, and whether an
+operator host reports a ceiling at all while the compiler renders one
+version (D46 (6)) is not specified. Both are in
+[`plugin-layout.md`](plugin-layout.md) §7. The order above is the
+intended one, not a tested one.
 
 A tendcf bump that changes none of `tools/`, `schema/` and the projector
 (a compiler-only fix, say) needs no pin-only release: it may go in one
@@ -308,15 +337,19 @@ changes `tools/`, `schema/` or the projector fails tendcf CI if it also
 changes the compiler's goldens, and also if it changes `policy/`. The
 first half gives every change to the gate tools a pin-only rev whose
 output is byte-identical to the rev before it, forwards and backwards
-(§8), so that ruling 18's rule can always be followed; without it, a
-commit that changed a lint and a rendering together could never be
-adopted by any site, and no gate would say so. It covers any such commit,
-not only `schema_version` bumps. The second half keeps bundle changes in
+(§8), as far as the goldens cover (an unchanged golden set shows
+byte-identity for the golden inputs, not for every site's data), so that
+ruling 18's rule can be followed; without it, a commit that changed a
+lint and a rendering together could never be adopted by any site. Where
+the goldens miss, gate 5 still fails closed at the site: a release whose
+bytes differ across a tools change is refused, not signed. The rule
+covers any such commit, not only `schema_version` bumps. The second half keeps bundle changes in
 their own tendcf commit: once the goal file carries the policy-tree digest
 (map §9.8), a bundle change alters every goal file, so a bump across it is
 an ordinary privileged-region release, never a pin-only one, and it must
 not share a commit with a gate-tools change. How the check names the
-goldens and the paths is open.
+goldens and the paths, and how it relates to today's compiler-equals-
+schema check, is open.
 
 Map §9.6's two phases are the sequence above: the validator update first
 as an ordinary diff under the old schema (release 2, after the gate tools
@@ -324,8 +357,9 @@ are staged in release 1), the migration second (release 3), which must
 diff to empty (map §9.4). The lockfile does not change that rule; it only
 makes each release one commit. For every `schema_version` bump, the
 additive case above included, the pin-only release has to keep every goal
-file at the old version, which the compiler of the new pin does not
-render until map §9.6's ceiling design applies (D46 (6)); that is open
+file at the old version. With the commit split the compiler at that pin
+still renders the old version; what the sequence needs is the two-version
+schema window and the relaxed equality check above, which are open
 ([`plugin-layout.md`](plugin-layout.md) §7).
 
 ## 5. Why the other repositories never block
@@ -337,7 +371,12 @@ Each repository's CI runs against pinned inputs, never against a sibling's
   lint, the overlay self-test and, since the compiler moved in (map D46,
   #45), the compiler's goldens against the same commit's schemas. A schema
   change that breaks the compiler fails tendcf's own CI, in the commit
-  that makes it. That is a statement about the current `schema_version`,
+  that makes it. That statement changes with the authoring rule (§4): a
+  commit that changes `schema/` may no longer also change the compiler's
+  goldens, so the compiler-equals-schema check (`check_schema_version`)
+  has to accept the two-version window, not one version (open,
+  [`plugin-layout.md`](plugin-layout.md) §7). It is a statement about the
+  current `schema_version`,
   the only one the compiler renders until map §9.6's ceiling design
   applies (§2).
 - ~~**nix2cf** pins tendcf (`tendcf.lock`). A schema change in tendcf
@@ -603,8 +642,10 @@ moved on since.
    A long range is crossed one step at a time. A step that crosses a
    `tools/`, `schema/` or projector commit is a pin-only release; a step
    that crosses none may change bytes and go with data in one release. The
-   tendcf authoring rule (§4) is what guarantees that such a pin-only step
-   exists across each such commit, forwards and backwards.
+   tendcf authoring rule (§4) is what makes such a pin-only step exist
+   across each such commit, forwards and backwards, as far as the goldens
+   cover; where they miss, gate 5 refuses the pin-only release, which
+   fails closed.
 3. **A device that never took the bad release** computes the diff from its
    own baseline to M and finds it empty or small. Nothing special happens.
 4. **A bad release that must be stopped before devices apply it** uses the
