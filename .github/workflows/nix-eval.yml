@@ -5,7 +5,7 @@ name: nix-eval
 
 on:
   push:
-    branches: [master, "docs/d46-issue48-decisions"]
+    branches: [master]
     paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]
   pull_request:
     paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]
@@ -26,7 +26,9 @@ jobs:
           nix --version
           nix-instantiate --version
           nix show-config | grep -E '^(restrict-eval|allowed-uris|allow-import-from-derivation|pure-eval|allow-unsafe-native-code-during-evaluation|sandbox|trusted-users) '
-      - name: Documented invocation (gating)
+      - name: Documented invocation (gating, fresh store)
         run: python3 tests/nix/run_nix_eval.py check base+I
-      - name: Matrix of variants and controls (informational; shows why -I is needed and that pure-eval fails)
+      - name: Matrix of variants and controls (informational; shows why -I is needed and that pure-eval fails; its read-write control leaves a .drv in the store)
         run: python3 tests/nix/run_nix_eval.py matrix
+      - name: Documented invocation again (gating, populated store)
+        run: python3 tests/nix/run_nix_eval.py check base+I
