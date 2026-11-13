@@ -188,18 +188,21 @@ attacked.
 Git-repo count is not the composition mechanism. Layers are roles:
 
 - **tendcf** (public) — engine, schemas/types, generic adapters, default
-  advisor prompt, compiler interface.
+  advisor prompt, and the compiler with its plugins (§2.2).
 - **site-shared** (optional, public) — reusable recipes, not live inventory.
 - **foreign site-shared** — other people's recipes, listed as read-only inputs.
 - **site-private** (never an input) — this site's facts: inventory,
   allocations, secret *names*, trust policy, extra advisor prompt. Holds the
   lockfile that pins everything else.
-- **tool forks** (optional) — nix2cf, sudo-secretspec, Shizuku, only if
-  patching them.
+- **tool forks** (optional) — sudo-secretspec, Shizuku, only if patching
+  them.
 
-Site-private holds a lockfile (flake-style inputs) that pins tendcf, nix2cf,
-site-shared, foreign shared sites, and optional tool forks. The signed
-release is the deploy artifact. There is no lockstep of sibling checkouts
+Site-private holds a lockfile (flake-style inputs) that pins tendcf,
+site-shared, foreign shared sites, and optional tool forks. The compiler is
+part of tendcf, so one tendcf pin covers schemas and compiler together
+(decided 2026-11-13; until the move lands the compiler is still the
+separate `frdminc/nix2cf` repository). The signed release is the deploy
+artifact. There is no lockstep of sibling checkouts
 that must share one tag. Collision of the same identity from two peer inputs
 is a **compile error**. Only site-private may bind a winner
 (`caddy: from: alice`) or a short name. Never silent last-wins. Foreign
@@ -230,8 +233,9 @@ unit-name prefix for every supervisor, killing a two-writers hazard at the
 source. launchd is one adapter, not the model.
 
 Schemas and types belong in tendcf (`schema/`, `examples/`,
-`bin/schema_lint.py`). The compiler (`nix2cf`) is a tool; it is not the
-home of the contract. A schema change is a tendcf interface change; a
+`bin/schema_lint.py`). The compiler (`tendcf compile`, §2.2) is a tool;
+its code is not the home of the contract, even though the two are moving
+into one repository. A schema change is a tendcf interface change; a
 hostname change is site data.
 
 The Site Model *may* be authored in the Nix module system — `mkOption`,
@@ -241,23 +245,36 @@ JSON is what is schema-validated, signed, and read downstream, and a person
 adopting the project is never required to know Nix to read or fork their own
 site data. We use the Nix *language* and not the Nix *build system*: a
 service that should be running is typed data, and nothing about it needs to
-become a derivation.
+become a derivation. That frontend, not yet built, will carry the name
+`nix2cf` (§2.2).
 
 ### 2.2 The compiler: a pure function into CFEngine's own data layer
 
-A compiler (working name `nix2cf`) reads the Site Model and renders CFEngine
-augments — `def.json` / `host_specific.json` — CFEngine's native JSON
-data-injection layer. The name `nix2cf` is historical; an optional Nix module
-frontend may author the same JSON later. The compiler is a tool, not the home
-of schemas.
+A compiler, `tendcf compile`, reads the Site Model and renders a per-host
+goal file, which the device projects, after approval, into the
+`host_specific.json` half of CFEngine augments — `def.json` /
+`host_specific.json` — CFEngine's native JSON data-injection layer (§2.5).
+The compiler is a tool, not the home of schemas.
+
+It was built as the separate repository `frdminc/nix2cf`, whose
+`nix2cf buildfile` command is its first piece. On 2026-11-13 it was decided
+to fold that repository into tendcf with its history, under `compiler/`, to
+rename the command `tendcf compile` (keeping `nix2cf buildfile` for a while
+as an alias), and to give the name `nix2cf` to what it describes: the
+optional Nix module frontend of §2.1. Frontends, supervisor renderers and
+one-shot importers from other tools become plugins found through Python
+entry points. They run at compile time only, and everything they produce
+still passes the schema lint and the projector, so no plugin can get around
+consent. The layout is in
+[`plugin-layout.md`](../architecture/plugin-layout.md).
 
 Two details of that layer are load-bearing and neither is obvious from the
 documentation; we state them because we got both wrong first. **The version
 floor is 3.18, not 3.7.** 3.7.0 put augments into the Masterfiles Policy
 Framework and 3.7.3 back-ported `def.json` parsing into the core agent, but
 `$(sys.workdir)/data/host_specific.json` has only been parsed since 3.18.0,
-so a design using both files inherits the later floor. **And despite the
-name, YAML is not a valid augments input** — the agent reads JSON only.
+so a design using both files inherits the later floor. **And YAML is not a
+valid augments input** — the agent reads JSON only.
 YAML remains an authoring format for the Site Model and never reaches a
 device.
 
@@ -295,12 +312,14 @@ and not a schema redesign.
 
 Because the render is a pure function of the Site Model — the same purity
 Nix's own build model is named for [27] — "show me exactly what device X
-would receive, without touching device X" is nearly free. We
-plan to build that affordance *first*, before the pipeline is finished, and
-§6.2 explains why it earns its place three separate times over.
+would receive, without touching device X" is nearly free. We built that
+affordance *first*, before the pipeline is finished — `buildfile` merges,
+conflict-checks and renders one host's goal file, with service units for
+launchd only and no inference yet — and §6.2 explains why it earns its place
+three separate times over.
 
 **Where it runs:** operator machine or CI. Consented devices receive a
-signed artifact. They do not run Nix or nix2cf.
+signed artifact. They do not run Nix, the compiler, or any of its plugins.
 
 **This compile-to-native-format shape is not new.** A typed or module-based
 authoring language compiling to an existing execution engine's native format
@@ -486,21 +505,25 @@ showing the same interlock as running code rather than as intent.
 systemd unit or a runit service on another host. The *outputs* — the
 CFEngine augments and the rendered promise text — are hand-authored by us
 to show the target shape, as is the Nix rendering of the same input shown
-partway through Example A. `nix2cf`'s render stage and its Nix authoring
-frontend do not exist yet (§6.5, §8), so nothing in Example A except the
-YAML was produced mechanically.
+partway through Example A. The compiler's inference stage, which Example A
+needs, and its Nix authoring frontend do not exist yet (§6.5, §8), so
+nothing in Example A except the YAML was produced mechanically.
 
 **One further warning, and it is the kind of thing this paper exists to
 surface.** The augments document shown in Example A is *pedagogically*
 right and *mechanically* wrong: its two top-level keys, `data` and
-`nix2cf_edges`, are both keys the agent silently skips. As written it
+`tendcf_edges`, are both keys the agent silently skips. As written it
 injects nothing. We keep it because it shows the derivation legibly, which
 is what the example is for, and we flag it because an illustration that
 would not run is exactly the sort of claim a reader should be able to
 catch us on. The shape the agent actually consumes is `{"vars": {…}}` and
 nothing else, reached by the device-side projection of §2.5; that shape,
 and a generic bundle that reads it, both exist and are shown at the end of
-this section.
+this section. The illustration's key names, `tendcf_services` and
+`tendcf_edges`, are illustrative as well (renamed from `nix2cf_*` on
+2026-11-13, with no schema change); the projection's real keys are
+`tendcf_service` and `tendcf_interlock`, and the goal file carries no
+edges.
 
 **Example A — an edge nobody wrote.** `caddy` and `litellm-proxy` are two
 records in the same `edge-http` bundle. `litellm-proxy` states only what it
@@ -610,11 +633,11 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
 
 ```jsonc
 // host_specific.json (host: mac) — ILLUSTRATIVE ONLY, hand-authored.
-// Does NOT load as Augments: top-level `data` and `nix2cf_edges` are both
+// Does NOT load as Augments: top-level `data` and `tendcf_edges` are both
 // skipped by the agent. Shown for the derivation, not to be copied.
 {
   "data": {
-    "nix2cf_services": {
+    "tendcf_services": {
       "caddy": {
         "service_policy": "start",
         "launchd_label": "com.djbclark.caddy",
@@ -630,7 +653,7 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
       }
     }
   },
-  "nix2cf_edges": [
+  "tendcf_edges": [
     {
       "from": "litellm-proxy",
       "to": "caddy",
@@ -643,9 +666,10 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
 }
 ```
 
-The generic bundle behind `nix2cf_services` is what materializes the actual
-on-device artifact — for `caddy`, the launchd plist CFEngine keeps present
-and loaded:
+The generic bundle `tendcf_services`, which reads the projected
+`tendcf_service` entries, is what materializes the actual on-device
+artifact — for `caddy`, the launchd plist CFEngine keeps present and
+loaded:
 
 ```xml
 <!-- /Library/LaunchDaemons/com.djbclark.caddy.plist — rendered, not authored -->
@@ -672,7 +696,7 @@ and loaded:
 </plist>
 ```
 
-`nix2cf_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
+`tendcf_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
 this edge was never authored, `rule` names the mechanism that produced it,
 and `source` points at the exact `requires` entry responsible. If this edge
 turns out to be spurious, the question it presents is "does `rule` correctly
@@ -1402,8 +1426,8 @@ been demonstrated rather than argued.
 `bcfg2-info buildfile` renders exactly the artifact a named client would
 receive, server-side, without touching the client; the `buildall` variant
 diffs every client's output across server upgrades. For a pure compiler this
-is nearly free, and we plan it first because three separate justifications
-converge on it:
+is nearly free, and we built it first (`nix2cf buildfile`, §2.2) because
+three separate justifications converge on it:
 
 - It is the **agent self-check loop.** An agent that can ask "what does my
   change actually do to device X" verifies its own work locally instead of
@@ -1706,8 +1730,10 @@ Two of the original twelve fixtures exposed error messages that were useless
 failure §3 rules out for the compiler, which we had not applied to the
 compiler's own tooling.
 
-**Not implemented, and this is still most of it:** the compiler `nix2cf`
-itself — merge, conflict check, inference, render — the signed release path,
+**Not implemented, and this is still most of it:** the rest of the compiler
+— inference, extra-entry reporting, service units for any supervisor but
+launchd, the Nix module frontend and the plugin layout (its first piece,
+`buildfile`, exists, §2.2) — the signed release path,
 the on-device validator, the consent surface, peer-action runtime, and every
 supervisor adapter except launchd. Remaining Step 0 work: `peer_actions`,
 trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize,

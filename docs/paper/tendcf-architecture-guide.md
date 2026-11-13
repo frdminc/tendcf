@@ -912,19 +912,23 @@ host.
 edge from that match:
 
 This illustration is **preview-channel material and does not load as
-Augments.** Both of its top-level keys — `data` and `nix2cf_edges` — are
+Augments.** Both of its top-level keys — `data` and `tendcf_edges` — are
 skipped by CFEngine 3.27.1, so as written this file injects nothing. The
 shape the agent actually consumes is `{"vars": {…}}` and nothing else; the
 projection onto it runs device-side, after approval. The nesting below is
 kept because it shows the *derivation* legibly, which is what this
 walkthrough is for — do not copy it onto a device and expect an effect.
+Its key names `tendcf_services` and `tendcf_edges` are illustrative too
+(renamed from `nix2cf_*` on 2026-11-13; no schema change): the
+projection's real `vars` keys are `tendcf_service` and
+`tendcf_interlock` (§16.C), and the goal file carries no edges.
 
 ```jsonc
 // host_specific.json — ILLUSTRATIVE ONLY. Preview channel; does NOT load
-// as Augments (top-level `data` and `nix2cf_edges` are both skipped).
+// as Augments (top-level `data` and `tendcf_edges` are both skipped).
 {
   "data": {
-    "nix2cf_services": {
+    "tendcf_services": {
       "caddy": {
         "service_policy": "start",
         "launchd_label": "com.djbclark.caddy",
@@ -943,7 +947,7 @@ walkthrough is for — do not copy it onto a device and expect an effect.
       }
     }
   },
-  "nix2cf_edges": [
+  "tendcf_edges": [
     {
       "from": "litellm-proxy",
       "to": "caddy",
@@ -974,8 +978,9 @@ anyone writing that down either.
 question is “does this rule apply to this pair?” — a lookup — not “where
 did this ordering come from?” — a search.
 
-The generic bundle behind `nix2cf_services` is what materializes the
-on-device artifact. For `caddy` on macOS, that is a launchd plist
+The generic bundle `tendcf_services`, which reads the projected
+`tendcf_service` entries, is what materializes the on-device artifact.
+For `caddy` on macOS, that is a launchd plist
 CFEngine keeps present and loaded:
 
 ```xml

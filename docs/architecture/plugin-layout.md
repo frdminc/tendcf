@@ -117,11 +117,10 @@ plugin has no other path to a device.
 
 | # | Change | State |
 | --- | --- | --- |
-| 1 | This documentation: the guide, the map (D46), the change process, the Linux targets plan, the glossary, this file. Moves no files and changes no code. | this change |
+| 1 | This documentation: the guide, the paper, the map (D46), the change process, the Linux targets plan, the glossary, this file; and the rename of the illustrative `nix2cf_*` keys (§6). Moves no files and changes no code or schema. | this change |
 | 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | separate pull request |
 | 3 | `bin/` → `tools/`; split the compiler into `compiler/` and `plugins/` with the three entry-point groups; the command becomes `tendcf compile`, `nix2cf buildfile` kept as a short-lived alias. Waits until open PRs #41 and #42 merge. | planned |
-| 4 | Schema v6: rename the `nix2cf_*` data keys to `tendcf_*` (§6). | planned |
-| 5 | Archive `frdminc/nix2cf`. | planned, once the move is done |
+| 4 | Archive `frdminc/nix2cf`. | planned, once the move is done |
 
 ## 6. Names
 
@@ -131,16 +130,19 @@ plugin has no other path to a device.
    to 2026-11-13 the name meant the whole compiler; older documents and
    handoffs use it that way and are not rewritten.
 3. **`guix`** is the planned Guix frontend, `plugins/frontends/guix/`.
-4. **The `nix2cf_*` data keys.** The decision renames `nix2cf_services`
-   and `nix2cf_edges` to `tendcf_*` in schema v6 (planned; today's goal
-   file is `schema_version` 5). Checked on 2026-11-13: those two names
-   occur only in the illustrative, preview-channel `host_specific.json`
-   of guide §16.A (and its copy in the paper) and in review notes about
-   it; the guide itself says that file does not load as Augments. No
-   schema, fixture, projector or bundle carries them; the
-   projection's `vars` keys are already `tendcf_service` and
-   `tendcf_interlock`. What v6 renames therefore depends on what carries
-   those names by then.
+4. **The illustrative `tendcf_services` / `tendcf_edges` keys.** Until
+   2026-11-13 these were spelled `nix2cf_services` and `nix2cf_edges`.
+   Checked that day: they occurred only in the illustrative,
+   preview-channel `host_specific.json` of guide §16.A, its copy in the
+   paper, and review notes about it; the guide itself says that file does
+   not load as Augments. No schema, fixture, projector or bundle carried
+   them. They were renamed in those two illustrations in the same change
+   as this file, and no schema bump is involved (the goal file stays at
+   `schema_version` 5). They are still not the projection's keys, which
+   are `tendcf_service` and `tendcf_interlock`; `tendcf_services` is also
+   the name of the real generic bundle (`policy/tendcf_services.cf`),
+   which reads `tendcf_service`. Dated review and reconciliation notes
+   keep the old spelling.
 
 ## 7. Not decided here
 
