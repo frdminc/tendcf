@@ -235,8 +235,9 @@ Nix module frontend (§3), one of the compiler's plugins. Frontends,
 supervisor renderers and one-shot importers from other tools are
 plugins. Third-party frontends and importers are found through Python
 entry points, so a third party can ship one as an ordinary package;
-plugins in this repository are found through a static import table, never
-entry points; supervisor renderers are in tree only. Plugins run only at
+plugins in this repository are to be found through a static import table,
+never entry points (planned: no loader exists yet); supervisor renderers
+are in tree only. Plugins run only at
 compile time, never on a device.
 
 A plugin is trusted build-time code that the operator explicitly allows,

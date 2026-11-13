@@ -31,7 +31,8 @@
    groups `tendcf.frontends` and `tendcf.importers` (§3). Every plugin in
    this repository (frontends, supervisor renderers and importers) is
    found through a static import table, never through entry points (§4,
-   activation). Supervisor renderers are in tree only; there is no public
+   activation; planned, restructure step 4: no table exists today).
+   Supervisor renderers are in tree only; there is no public
    `tendcf.supervisors` group (§3).
 4. Plugins run at compile time only, and they are trusted build-time code
    that the operator explicitly allows, not sandboxed code (§4).
@@ -142,8 +143,9 @@ Site Model, not a host type. A Guix System host, whose init is Shepherd
 decided (§7).
 
 Built-in frontends, supervisor renderers and importers are in tree, are
-found through a static import table and never through entry points, and
-their names are reserved against third-party entry points (§4). The
+to be found through a static import table and never through entry points
+(planned, §4: no table exists today), and their names are reserved
+against third-party entry points (§4). The
 Python interface a plugin implements, and the table's format, are not
 specified yet; they are to be settled when the split is done (§5, step 4).
 
@@ -223,17 +225,38 @@ exists, and `nix2cf eval-nix` today runs with none of the limits in
 item 3.
 
 1. **Import, not fetch.** An external recipe (one from site-shared or
-   from a foreign site) is imported, never fetched at compile time. The
-   import:
-   1. pins the recipe by content digest;
+   from a foreign site) is imported, never fetched at compile time. This
+   includes every site-shared or foreign-site input that `site.lock` pins
+   ([`change-process.md`](change-process.md) §2): pinning such an input
+   in the lockfile is not an import and does not make its recipes
+   evaluable. The import:
+   1. pins the recipe by content digest, one digest over every file the
+      recipe evaluates;
    2. runs a static scan for network access, file reads outside the
       recipe, import-from-derivation, and exec-style escapes;
-   3. runs an AI review;
+   3. runs an AI review, which reads the recipe as untrusted input (its
+      comments are data, not instructions);
    4. records the verdict with the pin.
-2. **Compile evaluates only pinned recipes whose recorded verdict matches
-   the recipe's digest.** Any change to a recipe is a new import and a
-   new scan. (Where the pin and the verdict are stored, and the command
-   that imports, are not specified: §7.)
+2. **Compile evaluates only pinned recipes with an accepting verdict
+   bound to their digest, and fails closed otherwise.**
+   1. An accepting verdict means the static scan passed and the AI review
+      accepted (or, with no AI reachable, item 5 was satisfied).
+   2. A failed static scan, a rejecting AI review, a missing verdict, or a
+      verdict whose digest does not cover the complete recipe content the
+      compile would evaluate stops the compile. A matching digest on a
+      recorded rejection is a refusal, not an approval.
+   3. An AI review cannot turn a failed static scan into a pass, and
+      nothing overrides a failed static scan: neither the no-AI
+      acknowledgement nor `warn` of item 5 applies to a negative result;
+      they answer only "no AI was reachable".
+   4. Gates 3 to 5 re-run the deterministic static scan over the pinned
+      recipe bytes in the plugin-free environment, so a verdict written
+      into site-private by hand is not enough (planned).
+   5. Any change to a recipe is a new import and a new scan.
+
+   Where the pin and the verdict are stored, who attests the AI verdict,
+   the command that imports, and whether an operator may ever override a
+   negative result are not specified: §7.
 3. **Nix limits, for every Nix evaluation, the site's own recipes
    included.** Restricted evaluation (`restrict-eval`), and pure
    evaluation (`pure-eval`) where it works; no import-from-derivation;
@@ -248,23 +271,37 @@ item 3.
    | `allowed-uris` | empty | URI prefixes allowed in restricted evaluation | empty |
    | `allow-import-from-derivation` | `false` | with `false`, Nix "throws an error when evaluating an expression that uses" import-from-derivation | `true` |
    | `pure-eval` | `true`, where it works | restricts file system and network access to files specified by cryptographic hash and disables impure constants (`builtins.currentSystem`, `currentTime`, `nixPath`, `storePath`) | `false` |
-   | `allow-unsafe-native-code-during-evaluation` | `false`, never changed | enables `builtins.importNative` and `builtins.exec` | `false` |
+   | `allow-unsafe-native-code-during-evaluation` | `false`, passed explicitly and never changed | enables `builtins.importNative` and `builtins.exec` | `false` |
 
    The manual documents `--option NAME VALUE` on `nix-instantiate`
    ("Set the Nix configuration option _name_ to _value_. This overrides
    settings in the Nix configuration file"), so the shape of the call is
    `nix-instantiate --eval --strict --json --option restrict-eval true
    --option allow-import-from-derivation false --option allowed-uris ''
-   FILE`, with `NIX_PATH` set to the empty string (the manual: "If
-   `NIX_PATH` is set to an empty string, resolving search paths will
-   always fail") and never `--impure`. **That command line is the shape
-   the manual supports; it has not been run.** Nix is not installed on
-   the machine that wrote this, so these were not tested: the exact
-   spelling the PR that moves the Nix frontend needs, whether the
-   evaluated file itself must also be allowed under `restrict-eval`
-   (for example through `-I`), whether `pure-eval` works for a plain file
-   evaluation, and how a `nix-daemon` treats these options from a client.
-   That PR tests them on a real Nix and records the tested command here.
+   --option allow-unsafe-native-code-during-evaluation false FILE`, with
+   `NIX_PATH` set to the empty string (the manual: "If `NIX_PATH` is set to
+   an empty string, resolving search paths will always fail"), the
+   configuration files controlled rather than inherited (the manual lists
+   `NIX_CONF_DIR`, `NIX_USER_CONF_FILES` and `NIX_CONFIG` as the
+   variables that load configuration), and never `--impure`.
+
+   **Documented, not yet executed.** That command line is the shape the
+   manual supports, and it has not been run. On 2026-11-13 the machine
+   that wrote this had no `nix-instantiate` and no `docker`; podman was
+   installed but its virtual machine was stopped and unreachable, and
+   starting it was outside what that session was authorised to do. Not
+   tested, so not claimed: whether the command can evaluate its input
+   file at all under `restrict-eval` with an empty `NIX_PATH` (for
+   example whether the file must also be allowed with `-I`); whether
+   `pure-eval` works for a plain file evaluation; that a hostile recipe is
+   refused for each of network access, a file read outside the recipe,
+   import-from-derivation and `builtins.exec`; and how a `nix-daemon`
+   treats these options from a client. The operator ruled that the exact
+   flags get tested in this documentation change; that test is
+   outstanding, and the section keeps this label until the positive and
+   negative checks have run on a real Nix and their commands and output are
+   recorded here.
+
    Today `compiler/nix2cf/cli.py` (`cmd_eval_nix`) passes only
    `--eval --strict --json`: the limits are a code change, planned with
    the Nix frontend move (§5, step 4).
@@ -277,6 +314,11 @@ item 3.
    | `require-human-ack` (default) | needs an explicit operator acknowledgement, recorded in the pin as "reviewed by hand, no AI"; the next import with AI present scans it again |
    | `warn` | goes ahead without an acknowledgement and with a warning, and the pin records that no AI review took place |
    | `refuse` | is refused |
+
+   "The next import with AI present scans it again" means a trigger: any
+   import run with AI present re-scans, with the AI review, every pin
+   whose verdict lacks one. None of the three values applies to a negative
+   static scan (item 2).
 
    The setting lives in the site-private file that names plugins (§7,
    "how site-private names its plugins"). That file's format is still an
@@ -291,7 +333,10 @@ item 3.
    The operator's instruction: "Do 1, but make a toml config file option
    (or whatever format we are using) to allow different options/override
    and doc that." How the compiler decides that no AI is reachable, and
-   what the AI review consists of, are not specified (§7).
+   what the AI review consists of, are not specified (§7). A change that
+   lowers the setting (from `refuse` to `require-human-ack` or `warn`, or
+   from `require-human-ack` to `warn`) is a privileged change below, as
+   the fail-closed reading.
 
 **Release gates and signing run apart from plugins** (decision D-c; **planned,
 Step 6**: no release pipeline exists, so nothing enforces this today). As
@@ -310,11 +355,27 @@ plugin-free. What it means now:
 2. **The default before the first real release: a two-job split.**
    1. **Job A** runs on a throwaway runner with no secrets. It compiles,
       runs gate 2, and uploads the goal-file bytes plus a digest manifest.
-      That is its only output, and it flows one way.
+      That is its only output, and it flows one way. Job A is the only
+      place plugin code runs, and nothing it computes, a preview diff
+      included, is ever a review artifact or a signing input.
    2. **Job B** runs in a protected signing environment. It builds the
       gate tools from the pinned source with hash-locked dependencies,
       without installing the `tendcf` package. It runs gates 3 to 5 on the
       uploaded bytes and signs exactly the digests it checked.
+   3. **Job B′** is job B's environment without the key: the same pinned
+      tools, the same hash-locked dependencies, no `tendcf` package, no
+      secret and no signing credential. It runs gates 3 to 5 on job A's
+      uploaded bytes for a pull request, so that the preview a human
+      reviews is computed outside the plugins' reach. (Completing D-d:
+      without it, no plugin-free preview exists before approval.)
+   4. **The signing environment's own rules** (planned): deployment to it
+      restricted to the protected branch, with required reviewers; no
+      workflow triggered by `pull_request_target` can reach it; job B
+      restores no cache that a pull-request run or job A can write; jobs
+      A, B′ and B do not share a runner; job B takes job A's artifacts by
+      the run identity that was approved, never "the latest". The workflow
+      files and signer configuration that define jobs A, B′ and B are
+      privileged changes (below).
 3. **Signer backends in the first real release** (the signer holds the
    `targets` key):
    1. the two-job CI with the key held as a GitHub environment secret:
@@ -324,25 +385,39 @@ plugin-free. What it means now:
    2. a separate Unix user: a non-default option;
    3. a hardware token on the operator's Mac: a non-default option, never
       required.
+
+   What each backend keeps and loses (the options stay as decided):
+
+   | Backend | Plugin-free gates 3 to 5 | Promotion of the approved artifacts | Open |
+   | --- | --- | --- | --- |
+   | Two-job CI, environment secret (default) | job B′ and job B | holds | the signing-environment rules above; a malicious dependency release at a locked hash |
+   | Separate Unix user (non-default) | the gate tools run as the signer user, pinned and without `tendcf` | the signer signs only the approved run's digests, but compile and signer share one machine, so persistence and pre-signing tampering stay open | no throwaway-runner isolation |
+   | Hardware token on the operator's Mac (non-default, never required) | where they run is not specified (§7); they must meet job B's invariants | the token signs only digests that were so checked | which machine runs the checks |
+
+   The backend in use is recorded in `targets.json` `custom`, and
+   switching it is a privileged change (below), so a site-private change
+   cannot silently trade the default's protections for a weaker backend.
 4. **Cost shown to the operator when deciding:** the two-job split is
    about 1 to 2 agent-days of work plus about $0.03 per release (Linux
    2-core runner at $0.006 a minute; GitHub's runner-pricing page, read
-   2026-11-13). The Unix user is about half a day and $0, but leaves
-   persistence and pre-signing tampering open. The operator chose: "3, but
-   we want to leave the unix user as a non-default option in the first real
-   release." Item 1 is that Unix-user variant as the interim; item 2 is
-   the default before the first real release.
+   2026-11-13). Job B′ runs for each pull request and adds minutes, not a
+   second pipeline of its own; the figure was not recomputed with it. The
+   Unix user is about half a day and $0, but leaves persistence and
+   pre-signing tampering open. The operator chose: "3, but we want to
+   leave the unix user as a non-default option in the first real release."
+   Item 1 is that Unix-user variant as the interim; item 2 is the default
+   before the first real release.
 
 What this still does not give. The compiler and the gates share the
 dependencies pyyaml, jsonschema and rfc8785 (`compiler/pyproject.toml`,
 `bin/schema_lint.py`, `bin/projector.py`). Job B's locked, hash-checked
 closure means a changed dependency is a reviewed change, not a resolution
 made at run time; it does not protect against a malicious release of a
-dependency at a locked hash. The gates' preview diff is computed apart
-from the plugins, but it diffs their output, so it shows what they
-rendered. A preview diff or an `explain-hunk` attribution produced on the
-compile side (D44, map §9.5) is compiler output and inherits the plugins'
-trust.
+dependency at a locked hash. The throwaway runner of job A has network
+access and sees site-private data, and what egress job A is allowed is
+not decided (§7). A preview diff or an `explain-hunk` attribution
+produced on the compile side (D44, map §9.5) is compiler output and
+inherits the plugins' trust.
 
 **Signed is what was reviewed** (decision D-d; **planned, Step 6**). As
 first written, nothing tied what a merge run signs to what the pull
@@ -351,31 +426,52 @@ a plugin can tell a pull-request run from a merge run, and nothing
 required site-private changes to be reviewed at all. Until this is built,
 the preview diff is **advisory**. The rule:
 
-1. **Promote the pull request's own artifacts.** The pull-request run is
-   job A on a throwaway runner with no secrets. It produces the goal files
-   and the digest manifest, and reviewers approve that preview.
-2. **At merge**, if the merged tree equals the approved pull-request head
-   tree, job B signs exactly those digests. If it does not, the gates run
-   again and the result is reviewed again.
-3. **Branch protection on site-private**: a change reaches the signing
-   branch only through a reviewed pull request.
-4. **Privileged changes need the gate-5 ceremony marker**
-   ([`change-process.md`](change-process.md) §6): a changed `url` in a
-   `site.lock` pin; a pin that is not a descendant of the previous one (so
-   any move backwards, which also rolls back gate fixes); a changed plugin
-   set; and a tendcf bump that changes `tools/` (today `bin/`), `schema/`
-   or the projector. Planned requirement: `CODEOWNERS` for `schema/`,
-   `tools/` and `policy/`. Folding the compiler into tendcf cost the
-   independence of producer and checker: one tendcf commit can change
-   both the compiler and its gates, and rolling the pin back rolls back
-   gate fixes too ([`change-process.md`](change-process.md) §9). Whether a
-   pin may move backwards across a `schema_version` bump is not decided
-   (§7).
-5. **A throwaway runner has no secrets but does see site-private data**
-   (private by default, map D35). That is why item 4's changes also
-   matter for pull-request runs, which compile whatever tree the pinned
-   `url` and `rev` name; whether those runs wait for the marker is open
-   (§7).
+1. **Promote the pull request's own artifacts, previewed outside the
+   plugins.** The pull-request run is job A (throwaway runner, no
+   secrets) followed by job B′. Job A produces the goal files and the
+   digest manifest; job B′ computes gates 3 to 5 and the per-host preview
+   from those bytes. Reviewers approve job B′'s preview, never a preview
+   produced in job A.
+2. **The approval is bound to** the head commit, job A's run identity, the
+   digest manifest, job B′'s preview, and the number of the previous
+   release the preview was diffed against. If any of those differs at
+   merge (a new push, a re-run of job A that produced other bytes, or
+   another release published in between), the approval does not carry and
+   the gates run again and the result is reviewed again.
+3. **At merge**, if the merged tree equals the approved pull-request head
+   tree and nothing in item 2 changed, job B takes those artifacts by that
+   run identity, re-runs gates 3 to 5 on them, checks that the digests and
+   the per-host previews equal what was approved, and only then signs
+   exactly those digests. Otherwise the gates run again and the result is
+   reviewed again.
+4. **Branch protection on site-private**: a change reaches the signing
+   branch only through a reviewed pull request; an approval is dismissed
+   when new commits are pushed; the most recent push needs an approval;
+   administrators do not bypass it.
+5. **Privileged changes need the gate-5 ceremony marker**
+   ([`change-process.md`](change-process.md) §6). The operator's list is
+   a changed `url` in a `site.lock` pin, a pin that is not a descendant of
+   the previous one (so any move backwards, which also rolls back gate
+   fixes), and a changed plugin set. Issue #48's fixes add a tendcf bump
+   that changes `tools/` (today `bin/`), `schema/` or the projector. The
+   fail-closed reading in this amendment adds, pending the operator's
+   confirmation (open, §7): a new `site.lock` input (its `url`
+   is new); any file that job B′ or job B executes or builds its
+   environment from (the gate tools' lock file, the projection lint,
+   `tendcf-validate`'s source once it has a home, `overlay/`); the
+   workflow files and signer configuration that define jobs A, B′ and B
+   (the signing-environment rules above); the signer backend; and a lowering of
+   `external_import.without_ai`. Planned requirement: `CODEOWNERS` for
+   `schema/`, `tools/` and `policy/`. Folding the compiler into tendcf
+   cost the independence of producer and checker: one tendcf commit can
+   change both the compiler and its gates, and rolling the pin back rolls
+   back gate fixes too ([`change-process.md`](change-process.md) §9).
+   Whether a pin may move backwards across a `schema_version` bump is not
+   decided (§7).
+6. **A throwaway runner has no secrets but does see site-private data**
+   (private by default, map D35). Pull-request runs compile whatever tree
+   the pinned `url` and `rev` name, so item 5's changes matter for them
+   too; whether those runs wait for the marker is open (§7).
 
 **Activation: a plugin is selected only if site-private names it** (the
 loader is **planned**, restructure step 4, and Step 6 for the release
@@ -387,21 +483,33 @@ checks; no loader exists today). The steps run in this order:
    frontends, supervisor renderers and importers alike, is found through a
    static import table, never through entry points, so distribution name
    and metadata prove nothing and an installed distribution cannot claim
-   to be in-tree.
+   to be in-tree. The proof has to happen before the module's code runs,
+   and an installed wheel's files live under `site-packages`, not under
+   the verified tree. So a release build (planned): runs the compiler from
+   the verified tree by path, without installing `tendcf`, in isolated
+   mode (`python -I`, plus `-S` so that `.pth` files and `sitecustomize`
+   are not processed) with `sys.path` set to that tree; and the loader
+   resolves each table entry to a file, checks that file's realpath, and
+   only then executes it by file location, the way `load_projector` in
+   `compiler/nix2cf/cli.py` already loads the projector.
 2. **Entry points are read only for third-party plugins**, and only after
    [#47](https://github.com/frdminc/tendcf/issues/47) exists. The loader
    lists every entry point, with no deduplication by distribution name
    (`importlib.metadata.entry_points()` drops a second distribution with
    the same name, so "a duplicate name is a compile error" could never
    fire for a second distribution called `tendcf`); refuses a duplicate
-   name within a group; and refuses any non-tendcf entry point that uses a
-   reserved name. Built-in names are reserved.
+   name within a group; and refuses every entry point that claims a
+   reserved name, whatever its distribution name or metadata says (a
+   distribution called `tendcf` gets no exception: built-in plugins have
+   no entry points, so a reserved name found among entry points is
+   impersonation). Built-in names are reserved.
 3. **Only named plugins are loaded.** Site-private names every plugin a
    compile uses: name → distribution, version and hash. An installed
    plugin that site-private does not name **is not selected**. This does
-   not mean that installing it does nothing: `.pth` files and sdist build
-   backends run code at install time, and a hash checked at load time
-   against the installed `RECORD` file proves nothing. So, planned:
+   not mean that installing it does nothing: `.pth` files run when the
+   interpreter starts, sdist build backends run code at install time, and
+   a hash checked at load time against the installed `RECORD` file proves
+   nothing. So, planned:
    1. third-party plugins are installed from a hash-locked resolution,
       wheels only, and the hash is checked at install time;
    2. each plugin's dependency closure is pinned;
@@ -428,11 +536,15 @@ checks; no loader exists today). The steps run in this order:
    choose which tendcf checkout's projector is executed. A release build
    pins that to the gate-1-verified tree or refuses the override. This is
    a code change, planned.
-8. **The release's `targets.json` `custom` records the plugin set**
-   ([`change-process.md`](change-process.md) §3), and gate 5 compares it
-   with the previous release's: a changed plugin set is a privileged
-   change (above), so a plugin cannot be named now and change behaviour
-   later without the ceremony marker. Planned, Step 6.
+8. **The plugin set is derived by the plugin-free job, not reported by
+   the compiler.** Job B′ and job B derive the set from site-private's
+   naming file and the verified tree's static import table. That derived
+   set is what the release's `targets.json` `custom` records
+   ([`change-process.md`](change-process.md) §3) and what gate 5 compares
+   with the previous release's; what the compile says it loaded is at
+   most a cross-check. A changed plugin set is a privileged change
+   (above), so a plugin cannot be named now and change behaviour later
+   without the ceremony marker. Planned, Step 6.
 
 How an out-of-tree plugin earns trust (an OpenPGP web of trust) and how a
 site manages its plugins (a `tendcf plugin` command) is
@@ -475,7 +587,7 @@ and the multi-version render returns with it.
 | 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | done: [#45](https://github.com/frdminc/tendcf/pull/45), merged 2026-11-13 (`ca4fa90`) |
 | 3 | Archive `frdminc/nix2cf`. | done 2026-11-13, right after #45 merged (README points here) |
 | 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the two public entry-point groups; `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. Waits until open PRs #41 and #42 merge. | planned |
-| 5 | The release pipeline (Step 6, [`change-process.md`](change-process.md) §10) and the §4 properties that depend on it: the plugin loader's activation steps; the two-job split and its signer backends; promotion of the pull request's artifacts and branch protection on site-private; the privileged-change checks of gate 5; the import step for external recipes with the Nix limits; the projection lint's cross-host check. None is built. | planned |
+| 5 (map's Step 6) | The release pipeline (Step 6, [`change-process.md`](change-process.md) §10) and the §4 properties that depend on it: the plugin loader's activation steps; the two-job split and its signer backends; promotion of the pull request's artifacts and branch protection on site-private; the privileged-change checks of gate 5; the import step for external recipes with the Nix limits; the projection lint's cross-host check. None is built. The two numberings differ: this table's step 5 is the map's Step 6. | planned |
 
 Step 4 rewrites every path reference in every file, dated records
 included (handoffs, reviews, reconciliations, opinions, `deprecated/`):
@@ -579,18 +691,25 @@ change, because the list moves:
   site-private commit identifies a release's sources but does not by
   itself reproduce its bytes.
 - The external-import step (§4, frontend inputs): the command, where the
-  pin and the verdict are stored, what the AI review consists of, how the
-  compiler decides that no AI is reachable, and whether a change to
-  `external_import.without_ai` is itself a privileged change (it lowers a
-  control, but it is not a change of the plugin set).
+  pin and the verdict are stored, what the AI review consists of, who
+  attests the AI verdict (so that a verdict cannot be hand-written), how
+  the compiler decides that no AI is reachable, and whether an operator
+  may ever override a negative static scan or review (§4 fails closed:
+  nothing does).
 - Whether a pull request whose pin `url` or plugin set changed may run
   gate 2 before the ceremony marker is present (§4: the throwaway runner
   has no secrets but sees site-private data), and whether the tendcf URL
   is allowlisted (issue #48, F3, optional).
+- Whether the privileged-change list of §4 item 5 grows by the
+  fail-closed additions this amendment made (a new `site.lock` input, the
+  files job B′ and job B run, CI workflow and signer configuration, the
+  signer backend, a lowered `external_import.without_ai`).
 - Whether a pin may move backwards across a `schema_version` bump:
   define the rollback or forbid it (issue #48, F7). A backward move is
   privileged either way (§4).
 - Who can read the release store (§4, confidentiality).
+- What network egress job A (the plugin-running job) is allowed, and
+  where the hardware-token backend runs the plugin-free checks (§4).
 - Which importers, if any, get built.
 - Guix System hosts with Shepherd as their supervisor (§3).
 
