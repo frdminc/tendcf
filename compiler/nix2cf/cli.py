@@ -40,11 +40,23 @@ from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, load_docu
 def _in_tree_tendcf() -> Path | None:
     """The enclosing tendcf checkout: this file is <root>/compiler/nix2cf/cli.py.
 
-    Confirmed by the schema being there; None when the package runs from
-    somewhere that is not inside a tendcf checkout (e.g. a plain install).
+    The root is accepted only if the package really sits in a checkout: the
+    directory two levels up is named `compiler` and holds the compiler's
+    pyproject.toml, and the root beside it has the schema and the projector.
+    Anything else (pip --target, PYTHONPATH, a venv's site-packages, ...) gives
+    None, because the grandparent of such an install is not ours, and a
+    projector found there would be run (--project) and schemas found there
+    would be trusted for validation.
     """
-    root = Path(__file__).resolve().parents[2]
-    return root if (root / "schema" / "goal-file.schema.json").exists() else None
+    here = Path(__file__).resolve()
+    compiler_dir, root = here.parents[1], here.parents[2]
+    ok = (
+        compiler_dir.name == "compiler"
+        and (compiler_dir / "pyproject.toml").is_file()
+        and (root / "schema" / "goal-file.schema.json").is_file()
+        and (root / "bin" / "projector.py").is_file()
+    )
+    return root if ok else None
 
 
 def _tendcf_dir(arg: str | None) -> Path | None:

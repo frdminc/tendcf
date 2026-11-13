@@ -642,20 +642,96 @@ def test_cli_tendcf_location_precedence(tendcf: Path, tmp_path: Path) -> None:
     assert env.returncode == 2 and refused in env.stderr and env.stdout == b""
 
 
-def test_in_tree_tendcf_none_outside_a_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _checkout_shape(root: Path, *, projector: bool = True, pyproject: bool = True, schema: bool = True) -> Path:
+    """Build <root>/compiler/nix2cf/cli.py's surroundings; return the fake cli.py path."""
+    (root / "compiler" / "nix2cf").mkdir(parents=True)
+    if pyproject:
+        (root / "compiler" / "pyproject.toml").write_text("")
+    if schema:
+        (root / "schema").mkdir()
+        (root / "schema" / "goal-file.schema.json").write_text("{}")
+    if projector:
+        (root / "bin").mkdir()
+        (root / "bin" / "projector.py").write_text("")
+    return root / "compiler" / "nix2cf" / "cli.py"
+
+
+def test_in_tree_tendcf_accepts_only_a_real_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from nix2cf import cli
 
     # In this repository it is the root (compiler/ sits directly under it).
     assert cli._in_tree_tendcf() == REPO.parent
-    # A package at <root>/compiler/nix2cf/cli.py with no schema/ beside compiler/: not a checkout.
-    monkeypatch.setattr(cli, "__file__", str(tmp_path / "compiler" / "nix2cf" / "cli.py"))
+    # A full checkout shape is accepted ...
+    good = tmp_path / "good"
+    monkeypatch.setattr(cli, "__file__", str(_checkout_shape(good)))
+    assert cli._in_tree_tendcf() == good
+    # ... and each piece of the rule is needed.
+    for name, kwargs in {
+        "no-projector": {"projector": False},
+        "no-pyproject": {"pyproject": False},
+        "no-schema": {"schema": False},
+    }.items():
+        root = tmp_path / name
+        monkeypatch.setattr(cli, "__file__", str(_checkout_shape(root, **kwargs)))
+        assert cli._in_tree_tendcf() is None, name
+    # The directory must be called compiler/.
+    other = tmp_path / "other"
+    _checkout_shape(other)
+    (other / "compiler").rename(other / "elsewhere")
+    monkeypatch.setattr(cli, "__file__", str(other / "elsewhere" / "nix2cf" / "cli.py"))
     assert cli._in_tree_tendcf() is None
+    # With no checkout and no TENDCF_DIR there is nothing to find (no validation, as before the default existed).
     monkeypatch.delenv("TENDCF_DIR", raising=False)
-    assert cli._tendcf_dir(None) is None  # nothing to find: no validation, as before the default existed
-    # The schema file is what confirms a checkout.
-    (tmp_path / "schema").mkdir()
-    (tmp_path / "schema" / "goal-file.schema.json").write_text("{}")
-    assert cli._in_tree_tendcf() == tmp_path
+    assert cli._tendcf_dir(None) is None
+
+
+def _plant_tendcf(root: Path) -> None:
+    (root / "schema").mkdir(parents=True)
+    (root / "schema" / "goal-file.schema.json").write_text("{}")
+    (root / "bin").mkdir()
+    (root / "bin" / "projector.py").write_text("")
+
+
+def test_in_tree_tendcf_none_for_site_packages_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from nix2cf import cli
+
+    # <tmp>/lib/python3.12/site-packages/nix2cf/cli.py: parents[2] is lib/python3.12, which a
+    # planted schema/ and bin/projector.py must not turn into a tendcf checkout.
+    pyroot = tmp_path / "lib" / "python3.12"
+    _plant_tendcf(pyroot)
+    pkg = pyroot / "site-packages" / "nix2cf"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(cli, "__file__", str(pkg / "cli.py"))
+    assert cli._in_tree_tendcf() is None
+
+
+def test_in_tree_tendcf_none_for_pip_target_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from nix2cf import cli
+
+    # pip install --target <tmp>/pkgs (or PYTHONPATH=<tmp>/pkgs): parents[2] is <tmp>, which
+    # anyone may have written to.
+    _plant_tendcf(tmp_path)
+    pkg = tmp_path / "pkgs" / "nix2cf"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(cli, "__file__", str(pkg / "cli.py"))
+    assert cli._in_tree_tendcf() is None
+
+
+def test_yaml_unhashable_key_refused_cleanly(tmp_path: Path) -> None:
+    from nix2cf.sitemodel import SiteModelError
+
+    bad = tmp_path / "services.yml"
+    bad.write_text("? [a, b]\n: 1\n")
+    with pytest.raises(SiteModelError, match="not a scalar"):
+        load_document(bad)
+
+
+def test_cli_unhashable_key_exits_2_without_traceback(tendcf: Path, tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    shutil.copytree(SITE, site)
+    (site / "services.yml").write_text("? [a, b]\n: 1\n")
+    proc = _run(_buildfile_args(site), tendcf)
+    assert proc.returncode == 2 and b"not a scalar" in proc.stderr and b"Traceback" not in proc.stderr
 
 
 # --- the Nix frontend hook ---------------------------------------------------------

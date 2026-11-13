@@ -47,7 +47,13 @@ class _LineLoader(yaml.SafeLoader):
         seen: set[Any] = set()
         for key_node, _ in node.value:
             key = self.construct_object(key_node, deep=deep)
-            if key in seen:
+            try:
+                duplicate = key in seen
+            except TypeError:  # an unhashable key, e.g. `? [a, b]`
+                raise SiteModelError(
+                    f"mapping key {key!r} at line {key_node.start_mark.line + 1} is not a scalar — refused"
+                ) from None
+            if duplicate:
                 raise SiteModelError(
                     f"duplicate key {key!r} at line {key_node.start_mark.line + 1} "
                     "— refused rather than resolved last-wins"
