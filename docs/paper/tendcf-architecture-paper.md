@@ -258,14 +258,25 @@ The compiler is a tool, not the home of schemas.
 
 It was built as the separate repository `frdminc/nix2cf`, whose
 `nix2cf buildfile` command is its first piece. On 2026-11-13 it was decided
-to fold that repository into tendcf with its history, under `compiler/`, to
-rename the command `tendcf compile` (keeping `nix2cf buildfile` for a while
-as an alias), and to give the name `nix2cf` to what it describes: the
-optional Nix module frontend of §2.1. Frontends, supervisor renderers and
-one-shot importers from other tools become plugins found through Python
-entry points. They run at compile time only, and everything they produce
-still passes the schema lint and the projector, so no plugin can get around
-consent. The layout is in
+to fold that repository into tendcf with its history, under `compiler/`
+(archiving it as soon as the import merges), to replace `nix2cf buildfile`
+with `tendcf compile` outright, with no alias, and to give the name
+`nix2cf` to what it describes: the optional Nix module frontend of §2.1.
+Frontends, supervisor renderers and one-shot importers from other tools
+become plugins; frontends and importers are found through Python entry
+points, supervisor renderers stay in tree. Plugins run at compile time
+only.
+
+A plugin is trusted build-time code that the operator explicitly allows,
+not sandboxed code, and the guarantee is correspondingly narrow. A plugin
+cannot make a device accept anything that device's own diff does not
+show (§2.5), and it cannot emit a shape the schema forbids. It can make
+the goal file say something other than what the Site Model says, and it
+sees the site's private data. The release gates (schema lint, projector,
+preview diff) and signing therefore run in a separate environment with no
+plugin installed, the compile step holds no signing key, and a release
+loads only the plugins site-private names, in-tree ones only until
+out-of-tree plugins can be pinned. The rules and the layout are in
 [`plugin-layout.md`](../architecture/plugin-layout.md).
 
 Two details of that layer are load-bearing and neither is obvious from the
@@ -319,7 +330,9 @@ launchd only and no inference yet — and §6.2 explains why it earns its place
 three separate times over.
 
 **Where it runs:** operator machine or CI. Consented devices receive a
-signed artifact. They do not run Nix, the compiler, or any of its plugins.
+signed artifact. They do not run the compiler or any of its plugins; Nix
+runs on a device only where it already is that host's configuration
+system (NixOS, nix-darwin).
 
 **This compile-to-native-format shape is not new.** A typed or module-based
 authoring language compiling to an existing execution engine's native format
@@ -1705,21 +1718,23 @@ Beyond the schemas, two pieces of running code: the **reference projector**
 and is gated in CI against golden bytes; it is to be promoted to the
 `tendcf-validate` command Linux and macOS hosts run, and the Android agent's
 Kotlin port must agree with the same goldens; and the **generic bundle**
-(`policy/tendcf_services.cf`, v1, launchd only), which is the first thing in
-this project that CFEngine actually executes.
+(`policy/tendcf_services.cf`; a launchd branch and, since 2026-10-31, a
+systemd branch), which is the first thing in this project that CFEngine
+actually executes.
 
 **Validated in the following narrow but no longer trivial sense.** A lint
 that passes on correct input demonstrates nothing about whether it catches
-incorrect input, so the contracts are tested against **ninety-two
-deliberately broken fixtures**, each of which must be caught, and the lint
-fails if any is accepted: fifty-nine schema-level negatives (an opt-out with
+incorrect input, so the contracts are tested against **one hundred and
+fifty-nine deliberately broken fixtures** (counted 2026-11-13), each of
+which must be caught, and the lint fails if any is accepted: a hundred and
+twenty-five schema-level negatives (an opt-out with
 no reason, a rogue launchd label, a nested writer prefix, a literal secret
 where a key name belongs, a typo'd token kind, an enforce-mode row carrying
 an audit-mode outcome, a proposer setting a privileged flag, a migration
 that is not a no-op), six byte-level negatives that exist because
 canonicalization violations are invisible after a parse (a pretty-printed
 twin, duplicate keys, a non-NFC path, `15.0` where `15` belongs), and
-twenty-seven projection negatives (a resolved secret value where a name
+twenty-eight projection negatives (a resolved secret value where a name
 belongs, a canonified interlock id, a goal file smuggled under `vars`, an
 `env` that is not an object). Each rule in the projector's checker has a
 fixture that trips **it alone**, which is a stronger property than
@@ -1735,8 +1750,9 @@ compiler's own tooling.
 — inference, extra-entry reporting, service units for any supervisor but
 launchd, the Nix module frontend and the plugin layout (its first piece,
 `buildfile`, exists, §2.2) — the signed release path,
-the on-device validator, the consent surface, peer-action runtime, and every
-supervisor adapter except launchd. Remaining Step 0 work: `peer_actions`,
+the on-device validator, the consent surface, peer-action runtime, and the
+device-side supervisor adapters other than launchd and systemd (runit and
+the rest), plus the open parts of those two. Remaining Step 0 work: `peer_actions`,
 trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize,
 and transcribing existing reality as `not-yet-migrated`.
 

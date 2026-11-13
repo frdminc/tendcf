@@ -79,9 +79,12 @@ both first-class:
    working configuration is ever required.
 2. **Nix as an authoring language.** The Site Model's types are also Nix
    module options (`mkOption`, `mkIf`, `mkDefault`). A site authored in Nix
-   evaluates (`nix eval --json --store dummy://`) to the same
-   schema-validated goal file as one authored in YAML, and the compiler
-   renders it for a launchd or systemd host with no Nix installed. The Nix
+   evaluates (`nix eval --json --store dummy://` in this plan; the
+   `eval-nix` hook that exists today runs
+   `nix-instantiate --eval --strict --json`) to Site Model JSON that
+   compiles to the same schema-validated goal file as one authored in
+   YAML, and the compiler renders it for a launchd or systemd host with no
+   Nix installed. The Nix
    frontend is the compiler plugin named `nix2cf` (map D12, D46). The
    person's Nix knowledge carries over; Nix the runtime is not needed on
    the target (D6 unchanged).

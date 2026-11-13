@@ -133,9 +133,17 @@ points in §12.
   same JSON as the YAML frontend (map D12). Not built yet.
 - **Before 2026-11-13 — the whole compiler**, and the separate repository
   `frdminc/nix2cf` that held it (`nix2cf buildfile`). That compiler is
-  being folded into tendcf under `compiler/`, its command becomes
-  `tendcf compile`, and the repository is archived once the move is done.
-  Older documents and handoffs use the old sense and are not rewritten.
+  being folded into tendcf under `compiler/`, and the repository is
+  archived as soon as that import merges. Older documents and handoffs use
+  the old sense and are not rewritten.
+- **Which sense holds when.** Until the restructure
+  (`plugin-layout.md` §5, step 4) the only thing that ships under the name
+  is still the old compiler: the package `nix2cf` and its command
+  `nix2cf buildfile`, first in `frdminc/nix2cf`, then under `compiler/`.
+  The restructure replaces that command with `tendcf compile`, with no
+  alias, and renames the package `tendcf`; from then on `nix2cf` means
+  only the Nix frontend. The "Current" sense above is the decided
+  meaning, for a plugin not yet built.
 
 Authority: `architecture-DEFINITIVE-v3.md` D46 (amending D12 and D21);
 layout and order of the move in `plugin-layout.md`.

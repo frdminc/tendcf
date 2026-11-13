@@ -28,7 +28,8 @@ open questions in research form, is
 checked, a first generic policy bundle runs, and the projection step has a
 reference implementation. The compiler has its first piece (`buildfile`,
 §4); the rest of it, the on-device executor, and the screens a person
-would use to accept or refuse a change are still to be built. No device has been set up from factory reset by this automation.
+would use to accept or refuse a change are still to be built. No device
+has been set up from factory reset by this automation.
 
 One thing that *was* built, and was not planned: §19 describes the defects
 found underneath, in CFEngine itself, by leaning on the parts of it this
@@ -144,8 +145,8 @@ moving the facts.
 
 **Schemas and types live in tendcf's `schema/`**, not in the compiler's
 code, although the compiler is moving into the same repository (decided
-2026-11-13, §4). A schema change is an interface change. A hostname change is site data. They do not move
-together. The files are [`schema/`](../../schema/) and
+2026-11-13, §4). A schema change is an interface change. A hostname
+change is site data. They do not move together. The files are [`schema/`](../../schema/) and
 [`examples/`](../../examples/) in this repository.
 
 **Inventory is private by default.** Site-shared may ship device *kinds*,
@@ -223,16 +224,28 @@ not the home of schemas.
 **Name and home (decided 2026-11-13).** The compiler was built as the
 separate repository `frdminc/nix2cf`, whose `nix2cf buildfile` command is
 the first piece described below. It is being folded into tendcf with its
-history, under `compiler/`, and its command becomes `tendcf compile`
-(`nix2cf buildfile` stays for a while as an alias). The name `nix2cf`
-moves to what it describes: the Nix module frontend (§3), one of the
-compiler's plugins. Frontends, supervisor renderers and one-shot
-importers from other tools are plugins found through Python entry points,
-so a third party can ship one as an ordinary package. Plugins run only at
-compile time, never on a device, and everything they produce still passes
-the schema lint and the projector, so no plugin can get around consent.
-The layout and the order of the move are in
-[`plugin-layout.md`](../architecture/plugin-layout.md).
+history, under `compiler/`, and that repository is archived as soon as
+the import merges. The command becomes `tendcf compile`, which replaces
+`nix2cf buildfile` outright, with no alias: it compiles every host, and
+`--host` renders one. The name `nix2cf` moves to what it describes: the
+Nix module frontend (§3), one of the compiler's plugins. Frontends,
+supervisor renderers and one-shot importers from other tools are
+plugins. Frontends and importers are found through Python entry points,
+so a third party can ship one as an ordinary package; supervisor
+renderers are in tree only. Plugins run only at compile time, never on a
+device.
+
+A plugin is trusted build-time code that the operator explicitly allows,
+not sandboxed code, and the claim it supports is narrow. A plugin cannot
+make a device accept anything that device's own diff does not show (§7),
+and it cannot emit a shape the schema forbids. It can make the goal file
+say something other than what the Site Model says, and it sees the
+site's private data. So the release gates (schema lint, projector,
+preview diff) and signing run in a separate environment with no plugin
+installed, and the compile step holds no signing key; a release loads
+only the plugins site-private names, and only in-tree ones until
+out-of-tree plugins can be pinned. The rules, the layout and the order
+of the move are in [`plugin-layout.md`](../architecture/plugin-layout.md).
 
 **The two files are not read by the same code, and they do not land in the
 same place.** `def.json` goes through the augments loader and its keys
@@ -253,9 +266,14 @@ directories exist, this service is loaded” for any entry in the data.
 
 A first version of that bundle exists and runs:
 [`policy/tendcf_services.cf`](../../policy/tendcf_services.cf). It handles
-launchd only — systemd, runit and Jobber are unwritten — so “supervisors
-are adapters” (§5) is still a claim about a design, not about running code.
-§16.C shows it working, including an interlock that genuinely refuses.
+launchd and, since 2026-10-31, systemd
+([`linux-targets.md`](../architecture/linux-targets.md) §3, step 5; a
+systemd canary runs under it on a live Linux host). runit and Jobber are
+unwritten, and the compiler still renders service units for launchd only
+(§18), so “supervisors are adapters” (§5) holds in running code for two
+supervisors on the device side and is still a design claim for the rest.
+§16.C shows the launchd branch working, including an interlock that
+genuinely refuses.
 
 The pipeline has four stages:
 
@@ -275,9 +293,13 @@ Because the render is a pure function of the Site Model — same input, same
 output — “show me exactly what device X would receive, without touching
 device X” is almost free. That command, `buildfile`, was the first piece
 of the compiler built: merge, conflict check and goal-file render, with
-service units for launchd only and no inference yet (§18). It is how an agent checks its own work, how the compiler
-regression-tests itself, and how a human sees a proposed change before it
-lands. The shape is [Bcfg2 `buildfile`](https://docs.bcfg2.org/).
+service units for launchd only and no inference yet (§18). It is how an
+agent checks its own work, how the compiler regression-tests itself, and
+how a human sees a proposed change before it lands. The shape is
+[Bcfg2 `buildfile`](https://docs.bcfg2.org/). That lineage survives in
+prose only: from the restructure on, the command is
+`tendcf compile --host NAME`, and no subcommand keeps the name
+`buildfile`.
 
 Compiling a typed description into an existing engine’s native format is a
 known pattern. [NixOS](https://nixos.org/) does it into systemd units;
@@ -1272,15 +1294,17 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   alone: reference resolution, launchd labels checked against declared
   writer prefixes, no prefix nested inside another. A second lint checks
   that every cross-reference in the documentation resolves.
-- **Ninety-two deliberately broken fixtures**, every one of which the lint
+- **One hundred and fifty-nine deliberately broken fixtures** (counted
+  2026-11-13), every one of which the lint
   must catch, and it fails if any is accepted. A passing lint on correct
-  input is not a check. They come in three kinds: fifty-nine schema-level
+  input is not a check. They come in three kinds: a hundred and
+  twenty-five schema-level
   (an opt-out with no reason, a rogue launchd label, a literal secret where
   a key name belongs, a proposer setting a privileged flag, a migration
   that is not a no-op); six byte-level, which exist because a
   canonicalization fault is invisible once the file has been parsed (a
   pretty-printed twin, duplicate keys, a non-NFC path, `15.0` where `15`
-  belongs); and twenty-seven projection-level (a resolved secret value
+  belongs); and twenty-eight projection-level (a resolved secret value
   where a name belongs, a goal file smuggled in under `vars`). Each rule in
   the projector’s checker has a fixture that trips **that rule alone** —
   a suite where one fixture trips three rules cannot tell you the other two
@@ -1290,8 +1314,10 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   `tendcf-validate`, the command Linux and macOS hosts run, so that CI
   tests the device code itself; the Android agent’s Kotlin port must agree
   with the same goldens (implementer map D45).
-- **A first generic bundle** (`policy/tendcf_services.cf`), launchd only —
-  the first thing here that CFEngine actually executes (§16.C).
+- **A first generic bundle** (`policy/tendcf_services.cf`), with a
+  launchd branch and, since 2026-10-31, a systemd branch — the first
+  thing here that CFEngine actually executes (§16.C;
+  [`linux-targets.md`](../architecture/linux-targets.md) §3).
 - **A patch overlay on libntech and cfengine/core** (`overlay/`,
   `bin/overlay.py`): the six fork commits that bundle depends on (§19),
   pinned to one upstream commit per component, with a lint, a self-test, a
@@ -1311,9 +1337,11 @@ observe themselves crossing is a disclaimer rather than a ceiling.
 
 The rest of the compiler (inference, extra-entry reporting, service
 units for any supervisor but launchd, the Nix module frontend and the
-plugin layout, §4), every supervisor adapter except launchd, the signed
-release path, the on-device validator, the consent surface, and the
-peer-action runtime. No operational numbers of any kind.
+plugin layout, §4); device-side supervisor adapters other than launchd
+and systemd (runit and the rest), and the open parts of those two (Step
+1 below; [`linux-targets.md`](../architecture/linux-targets.md) §3);
+the signed release path, the on-device validator, the consent surface,
+and the peer-action runtime. No operational numbers of any kind.
 
 **Build order from here** (each step is meant to leave the system in a
 coherent, describable state):

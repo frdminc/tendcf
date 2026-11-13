@@ -10,15 +10,20 @@ leaves as "a lockfile (flake-style inputs)" and "the signed release is the
 deploy artifact" with a mechanism concrete enough to build.
 
 **Amended 2026-11-13 (map D46).** The compiler, built as the separate
-repository `frdminc/nix2cf`, is folded into tendcf with its history and
-`frdminc/nix2cf` is archived ([`plugin-layout.md`](plugin-layout.md)).
-The compiler is therefore no longer a separately pinned input: schema and
-compiler change in the same tendcf commit, and the two-repository bump
-order and the compiler's own `tendcf.lock` that this document used to
-specify are gone. Site inputs (site-shared, foreign sites, tool forks)
-keep `site.lock` exactly as below. Until the move lands, the compiler's
-CI still checks out tendcf's default branch beside it (it never had the
-`tendcf.lock` specified here).
+repository `frdminc/nix2cf`, is folded into tendcf with its history
+([#45](https://github.com/frdminc/tendcf/pull/45)), and `frdminc/nix2cf`
+is archived as soon as that import merges
+([`plugin-layout.md`](plugin-layout.md)). The compiler is therefore no
+longer a separately pinned input: schema and compiler change in the same
+tendcf commit, and the two-repository bump order and the compiler's own
+`tendcf.lock` that this document used to specify are gone. `site.lock`
+loses only its `nix2cf` entry: it still pins tendcf, site-shared and
+foreign sites, and tool forks stay as rule 5 has them. One tendcf rev is
+now the unit a site pins (§8 item 5). Compiler plugins are trusted
+build-time code; which ones a release loads, and the rule that the gates
+and signing run apart from them, are in §3 and §6. Until the move lands,
+the compiler's CI still checks out tendcf's default branch beside it (it
+never had the `tendcf.lock` specified here).
 
 > The requirement, verbatim from #2: the Site Model → signed-release →
 > deploy path must be **much faster and much more atomic** than cutting a
@@ -62,7 +67,7 @@ device seven releases behind still computes one true diff (guide §7).
 
 | Layer (map §3) | Repository today | What a release takes from it |
 | --- | --- | --- |
-| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; `compiler/` and `plugins/` once the move of map D46 lands, today still `frdminc/nix2cf` with `buildfile` only) |
+| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; `compiler/` and `plugins/` once the move of map D46 lands, today still `frdminc/nix2cf`, whose one compilation command is `buildfile`) |
 | site-shared | not yet created | recipes |
 | foreign site-shared | none yet | recipes, namespaced |
 | site-private | `~/ops/site-private` (today: ops repo; the tendcf inventory does not exist yet) | inventory, allocations, secret *names*, trust policy, the lockfile |
@@ -121,7 +126,13 @@ Rules for the file, each with the reason it is a rule:
 pinning the tendcf rev its golden tests run against.~~ **Amended
 2026-11-13:** there is no compiler lock. The compiler is in tendcf, so its
 goldens run against the schemas of the same commit, and a schema change
-lands together with the compiler support it needs (§4, §5).
+lands together with the compiler support it needs (§4, §5). This holds
+for the current `schema_version`, the only one the compiler renders (map
+D46): older-version rendering is removed in the restructure. Map §9.6's
+ceiling design, which needs the compiler to render older versions for
+hosts below the ceiling, applies once the first device that is not an
+operator host enrolls; how that older output is validated when schema and
+compiler share a commit is decided then.
 
 A `flake.lock` was considered as *the* format and rejected as the
 requirement (§8.5); a converter from `site.lock` to flake inputs is a
@@ -135,7 +146,7 @@ A release is one immutable, numbered artifact set:
 | --- | --- | --- |
 | `targets/<host-pubkey>.goal.json` | that host's complete canonical goal file (map §9) | targets role |
 | `targets/policy-tree.tar` | the generic bundles and templates at the tendcf rev, whose digest is the privileged region map §9.8 names | targets role |
-| `targets.json` | the digest of every target, plus `custom`: release number, `site.lock` SHA-256, the site-private commit, the compiler and projector versions | targets role |
+| `targets.json` | the digest of every target, plus `custom`: release number, `site.lock` SHA-256, the site-private commit, the tendcf rev (compiler and projector; one rev since map D46) and the compiler plugin set the compile loaded (name, distribution, version, hash; map D46) | targets role |
 | `snapshot.json`, `timestamp.json` | TUF metadata binding the set and its freshness | snapshot / timestamp roles |
 
 Three properties follow:
@@ -144,7 +155,12 @@ Three properties follow:
    `version`; it only goes up (high-water mark on every client, map
    §9.11). The content is reproducible from the site-private commit, and
    the lockfile hash in `targets.json` is how a reader gets from a release
-   back to its inputs without trusting a branch name.
+   back to its inputs without trusting a branch name. That needs every
+   compiler plugin to come from a pinned input: until out-of-tree pinning
+   exists ([#47](https://github.com/frdminc/tendcf/issues/47)), a release
+   build loads only in-tree plugins named by site-private, so the tendcf
+   pin covers them, and plugins installed on the builder but not named
+   are ignored (map D46).
 2. **Per-host targets, one release.** One release carries every host.
    Hosts that did not change get a byte-identical goal file and compute an
    empty diff; nothing is applied. This is why "a release" and "a change"
@@ -210,7 +226,9 @@ Each repository's CI runs against pinned inputs, never against a sibling's
   lint, the overlay self-test and, once the compiler has moved in (map
   D46), the compiler's goldens against the same commit's schemas. A schema
   change that breaks the compiler fails tendcf's own CI, in the commit
-  that makes it.
+  that makes it. That is a statement about the current `schema_version`,
+  the only one the compiler renders until map §9.6's ceiling design
+  applies (§2).
 - ~~**nix2cf** pins tendcf (`tendcf.lock`). A schema change in tendcf
   cannot break nix2cf's CI until nix2cf chooses to bump.~~ Gone with map
   D46.
@@ -229,7 +247,7 @@ one consistent set.
 
 | Repo | Gate | Exists today |
 | --- | --- | --- |
-| tendcf | `bin/schema_lint.py` incl. the 92 broken fixtures and projector goldens | yes |
+| tendcf | `bin/schema_lint.py` incl. the 159 broken fixtures (125 schema-level, 6 byte-class, 28 projection; counted 2026-11-13) and projector goldens | yes |
 | tendcf | `bin/xref_lint.py` | yes |
 | tendcf | `bin/overlay.py self-test` and `lint` (patch overlay applies; drift fails loudly) | yes, this change |
 | tendcf | overlay drift against upstream (`check --against upstream/master`) | scheduled / manual job, this change |
@@ -242,8 +260,10 @@ the review artifact):
 1. `site.lock` is canonical bytes; every input's `rev` is reachable and its
    fetched `tree` matches. Refuse otherwise: a pin that cannot be verified
    is not a pin.
-2. Compile every host. Conflict-as-error (map §3): the same identity from
-   two peer inputs without a private bind refuses the whole release.
+2. Compile every host, loading only the compiler plugins site-private
+   names (in-tree only until #47; map D46). Conflict-as-error (map §3):
+   the same identity from two peer inputs without a private bind refuses
+   the whole release, and so does a duplicate plugin name within a group.
 3. Every goal file passes `bin/schema_lint.py` at the pinned tendcf rev and
    is canonical bytes.
 4. Project every goal file with the pinned projector; the projection passes
@@ -267,6 +287,16 @@ The signing key for `targets` lives on the builder, which is an operator
 host; `root` stays offline (map §9.11, residue §14.4). A pull request can
 run every gate but 6, so review happens over the exact diffs a merge would
 ship.
+
+**Gates 3 to 6 run apart from plugin code** (map D46). Compiler plugins
+are trusted build-time code, not sandboxed, so the schema lint, the
+projector, the preview diff and signing run in a separate environment in
+which no plugin distribution is installed, and the compile step (gate 2)
+holds no signing key. The gates bound the shape of what a plugin renders,
+not its faithfulness to the Site Model: gate 5's preview diff shows what
+the plugins rendered, and a preview diff or `explain-hunk` attribution
+produced on the compile side (map D44) is compiler output that inherits
+the plugins' trust ([`plugin-layout.md`](plugin-layout.md) §4).
 
 ## 7. Latency target (proposed; needs the operator)
 
@@ -296,9 +326,10 @@ moved on since.
    Removals revert as `absent → present` replace hunks, which is why map
    §9.8 insists removals are states, not events: a rollback is just another
    diff.
-2. **Partial rollback is the same mechanism**: revert one input's pin or one
-   host's entries, cut a release. There is no "roll back repo X" because no
-   device ever depended on repo X directly.
+2. **Partial rollback is the same mechanism**: move one input's pin back
+   (the tendcf pin moves schemas, policy tree and compiler together, item
+   5) or revert one host's entries, cut a release. There is no "roll back
+   repo X" because no device ever depended on repo X directly.
 3. **A device that never took the bad release** computes the diff from its
    own baseline to M and finds it empty or small. Nothing special happens.
 4. **A bad release that must be stopped before devices apply it** uses the
@@ -309,6 +340,13 @@ moved on since.
    own schedule, or not at all; the fleet is fixed by the site-private
    pin going back, which is step 1. This is the whole point: the input
    repositories' history is never load-bearing for what devices run.
+   Since map D46 one tendcf rev is the unit a site pins: taking or
+   reverting a compiler fix also takes or reverts every `schema/` and
+   `policy/` commit before it, and on a consented device a policy-tree
+   change is a privileged-region hunk (map §9.8). That coupling is
+   accepted. There is no maintenance-branch machinery for carrying a
+   compiler fix alone; revisit when the first device that is not an
+   operator host enrolls.
 
 ## 9. Rejected alternatives
 
@@ -322,7 +360,9 @@ moved on since.
    other people's repositories. A monorepo also cannot hold the tool forks.
    (Map D46, 2026-11-13, does merge two *public engine* repositories, tendcf
    and the compiler, which share an owner, a licence and reviewers; the
-   layers this item keeps apart stay apart.)
+   layers this item keeps apart stay apart. The cost is rollback
+   granularity: one tendcf rev pins compiler, schemas and policy tree
+   together, accepted in §8 item 5.)
 3. **Git submodules in site-private.** A submodule pointer is a lockfile
    with worse properties: it records only `rev` (no `tree`, so a rewritten
    fork is undetectable until the fetch fails), it is bound to a checkout
