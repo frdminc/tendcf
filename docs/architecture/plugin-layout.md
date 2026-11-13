@@ -241,10 +241,16 @@ and the multi-version render returns with it.
 | 3 | Archive `frdminc/nix2cf`. | as soon as #45 merges |
 | 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the two public entry-point groups; `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. Waits until open PRs #41 and #42 merge. | planned |
 
-Step 4 rewrites every reference in the living files. Found on 2026-11-13
-(`rg 'nix2cf'` and `rg 'bin/(schema_lint|projector|xref_lint|overlay|flag_coverage|unit_classifier)'`
-outside dated records); rerun both before the change, because the list
-moves:
+Step 4 rewrites every path reference in every file, dated records
+included (handoffs, reviews, reconciliations, opinions, `deprecated/`):
+djbclark, 2026-11-13, a one-time exception to their append-only
+convention for this move, so that no path in the repository points at
+a location that no longer exists. Prose that names nix2cf as the old
+repository stays as history; only paths change. The living files found
+on 2026-11-13 are listed below (`rg 'nix2cf'` and
+`rg 'bin/(schema_lint|projector|xref_lint|overlay|flag_coverage|unit_classifier)'`
+outside dated records). Rerun both over the whole tree before the
+change, because the list moves:
 
 1. **The compiler's in-tree check** (from #45):
    `compiler/nix2cf/cli.py` accepts an enclosing tendcf checkout only if
