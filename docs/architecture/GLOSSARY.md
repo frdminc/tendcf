@@ -162,8 +162,10 @@ layout and order of the move in `plugin-layout.md`.
   scans it, has an AI review it and records the verdict with the pin;
   compile evaluates only pinned recipes with an accepting verdict bound to
   the recipe's digest, and refuses on a failed scan, a rejection or a
-  missing verdict (`plugin-layout.md` §4, "Frontend inputs are code").
-  Planned, Step 6; no command exists.
+  missing verdict. The recorded verdict is advisory: the plugin-free job
+  B′ re-runs the scan and the AI review, and only the gate-5 ceremony
+  marker overrides a negative result (`plugin-layout.md` §4, "Frontend
+  inputs are code"). Planned, Step 6; no command exists.
 
 Authority: `architecture-DEFINITIVE-v3.md` D46 (9) (decision D-b, issue #48);
 `plugin-layout.md` §3 and §4.

@@ -137,7 +137,10 @@ Rules for the file, each with the reason it is a rule:
    verifies `rev` and `tree`; it does not make its recipes evaluable.
    Gate 2 evaluates a recipe from such an input only if the external
    import of plugin-layout §4 recorded an accepting verdict bound to that
-   recipe's content digest, and refuses otherwise. Without this rule the
+   recipe's content digest, and refuses otherwise. The recorded verdict is
+   advisory: job B′ re-runs the static scan and the AI review on the
+   pinned digest and fails on a negative result, which only the gate-5
+   ceremony marker overrides (operator rulings, plugin-layout §4). Without this rule the
    lockfile would be a second road to the recipes that D-b closes.
 
 ~~**nix2cf has a one-input lock of the same shape** (`tendcf.lock`)
@@ -186,7 +189,9 @@ Three properties follow:
    Hosts that did not change get a byte-identical goal file and compute an
    empty diff; nothing is applied. This is why "a release" and "a change"
    are not the same size: a release is cheap to cut even when it changes one
-   line on one host.
+   line on one host. Reading the store (operator ruling, planned, Step 6):
+   each host reads only its own goal files, by a per-host path and a
+   per-host credential; the operator and the signing job read all.
 3. **The policy tree rides in the release**, not in a git checkout the
    device syncs on its own. Map D14's "git-synced policy" is the transport
    between operator hosts; what arrives on a device is the tarball whose
@@ -283,10 +288,10 @@ the review artifact; a diff computed in the compile job never is):
    fetched `tree` matches. "Reachable" means `rev` is an ancestor of the
    pin's `ref` as fetched from the pin's `url`; being fetchable by hash is
    not enough, and for the tendcf input `ref` has to name a protected
-   branch (planned, Step 6). Refuse otherwise: a pin that cannot be
-   verified is not a pin. (A changed `url` is caught by gate 5's
-   privileged-change rule below; whether to also allowlist the tendcf
-   `url` is open, plugin-layout §7.)
+   branch of `frdminc/tendcf`; any other ref is refused (operator ruling;
+   planned, Step 6). Refuse otherwise: a pin that cannot be verified is
+   not a pin. (A changed `url` is also caught by gate 5's
+   privileged-change rule below.)
 2. Compile every host, loading only the compiler plugins site-private
    names (in-tree only until #47; map D46; the loader is planned,
    [`plugin-layout.md`](plugin-layout.md) §4). Conflict-as-error (map §3):
@@ -294,7 +299,12 @@ the review artifact; a diff computed in the compile job never is):
    the whole release, and so does a duplicate plugin name within a group.
    A recipe from a site-shared or foreign input needs an accepting
    import verdict bound to its content digest (rule 7 above); a missing,
-   rejecting or mismatched verdict refuses the release.
+   rejecting or mismatched verdict refuses the release, unless the
+   ceremony marker overrides a negative result (it is then recorded with
+   the pin and shown in every later gate 5 review). A pull request that
+   changes a pin's `url` or the plugin set does not get this gate run
+   until the marker is present (operator ruling; job B′'s checks that need
+   no job A output may run).
 3. Every goal file passes `bin/schema_lint.py` at the pinned tendcf rev and
    is canonical bytes.
 4. Project every goal file with the pinned projector; the projection passes
@@ -309,17 +319,20 @@ the review artifact; a diff computed in the compile job never is):
      apart from the version bump (map §9.4), or
    - a host's `schema_version` exceeds the ceiling that host last reported
      (guide §7: nobody gets stranded), or
+   - the tendcf pin moves backwards across a `schema_version` bump
+     (forbidden, not merely privileged: roll forward), or
    - the commit makes a **privileged change** and does not carry the
      ceremony marker (decisions D-d and issue #48, planned, Step 6). The
-     operator's list: a changed `url` in any `site.lock` pin; a pin that is
-     not a descendant of the previous release's pin, which includes every
-     move backwards; a compiler plugin set that differs from the previous
-     release's. Issue #48's fixes add a tendcf bump that changes `tools/`
-     (today `bin/`), `schema/` or the projector. This amendment adds, fail
-     closed and pending the operator's confirmation: a new `site.lock`
-     input; any file that jobs B′ and B execute or build their environment
-     from; the workflow files and signer configuration that define jobs A,
-     B′ and B; the signer backend; and a lowering of
+     list, every item confirmed by the operator: a changed `url` in any
+     `site.lock` pin; a pin that is not a descendant of the previous
+     release's pin (a backward move, but a backward move across a
+     `schema_version` bump is forbidden outright, §8 item 5); a compiler
+     plugin set that differs from the previous release's; a tendcf bump
+     that changes `tools/` (today `bin/`), `schema/` or the projector; a
+     new `site.lock` input; any file that jobs B′ and B execute or build
+     their environment from; the workflow files and signer configuration
+     that define jobs A, B′ and B; a change of signer backend (enrolling
+     or removing a hardware token included); and a lowering of
      `external_import.without_ai`. The plugin-set rule exists because a
      plugin can be named now and change behaviour later, and the tendcf
      rule because one tendcf commit can change both the compiler and the
@@ -357,14 +370,20 @@ concrete:
    exactly the digests it checked. Job B′ is job B without the key and
    without secrets: it runs gates 3 to 5 for a pull request, so that the
    preview a human approves is computed outside the plugins' reach.
-3. **Signer backends in the first real release:** two-job CI with the key
-   as a GitHub environment secret (the default; the lead's assumption,
-   pending the operator's confirmation); a separate Unix user and a
-   hardware token on the operator's Mac, both non-default options, the
-   token never required. What each keeps and loses, and the rules of the
-   signing environment, are in [`plugin-layout.md`](plugin-layout.md) §4.
+3. **Signers in the first real release are one of n** (operator
+   ruling): the CI key held as a GitHub environment secret (job B signs
+   with it), or any one of at least two enrolled hardware tokens; each may
+   sign alone. `vps-hub` and the Hyades podman runner are not signers. A
+   separate Unix user stays the interim and a non-default backend. A token
+   signer either signs the digest manifest of a passing job B′ run after
+   verifying that run's identity and digests, or re-runs gates 3 to 5
+   itself in a plugin-free environment built from pinned, hash-locked
+   source; the signature records which. What each keeps and loses, and the
+   rules of the signing environment, are in
+   [`plugin-layout.md`](plugin-layout.md) §4.
 4. **Signed is what was reviewed.** The pull-request run is job A, then
-   job B′. Reviewers approve job B′'s preview. The approval is bound to the
+   job B′. Reviewers approve job B′'s preview (which carries the import scan and
+   AI review results). The approval is bound to the
    head commit, job A's run identity, the digest manifest, that preview and
    the number of the previous release it was diffed against. At merge, if
    the merged tree equals the approved head tree and none of those
@@ -437,9 +456,10 @@ moved on since.
    operator host enrolls. Moving the pin backwards also rolls back every
    fix to `tools/`, `schema/` and the projector that landed after the
    target rev, so a backward pin move is a privileged change (§6, gate 5; planned, Step 6).
-   What a rollback across a `schema_version` bump means is not defined
-   yet: it has to be defined or forbidden before the first real release
-   (issue #48, F7).
+   A rollback across a `schema_version` bump is forbidden (operator
+   ruling): the pin does not move backwards over a bump, and the fix is to
+   roll forward with a new commit. A backward move within one
+   `schema_version` is a privileged change.
 
 ## 9. Rejected alternatives
 
