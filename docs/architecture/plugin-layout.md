@@ -60,7 +60,7 @@ tendcf/
   plugins/
     frontends/yaml/          the YAML Site Model loader (built in)
     frontends/nix/           the Nix module frontend (map D12); named nix2cf
-    frontends/guix/          later: an authoring frontend, Guile records → Site Model JSON
+    frontends/guix/          later: Guile records → Site Model JSON
     supervisors/launchd/     unit renderers, one per supervisor; in tree only
     supervisors/systemd/
     supervisors/runit/
@@ -249,8 +249,9 @@ moves:
 1. **The compiler's in-tree check** (from #45):
    `compiler/nix2cf/cli.py` accepts an enclosing tendcf checkout only if
    it has `bin/projector.py` (`_in_tree_tendcf`), loads the projector from
-   that path (`load_projector`) and names it in an error message; `compiler/nix2cf/__init__.py` and `compile.py` cite
-   `bin/projector.py` and `bin/schema_lint.py` in their docstrings.
+   that path (`load_projector`) and names it in an error message;
+   `compiler/nix2cf/__init__.py` and `compile.py` cite `bin/projector.py`
+   and `bin/schema_lint.py` in their docstrings.
 2. **Schema description text**: `schema/common.schema.json` (three
    descriptions say nix2cf infers edges or fills in a field; under the new
    names that is the compiler), `schema/services.schema.json` and

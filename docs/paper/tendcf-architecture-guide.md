@@ -146,8 +146,9 @@ moving the facts.
 **Schemas and types live in tendcf's `schema/`**, not in the compiler's
 code, although the compiler is moving into the same repository (decided
 2026-11-13, §4). A schema change is an interface change. A hostname
-change is site data. They do not move together. The files are [`schema/`](../../schema/) and
-[`examples/`](../../examples/) in this repository.
+change is site data. They do not move together. The files are
+[`schema/`](../../schema/) and [`examples/`](../../examples/) in this
+repository.
 
 **Inventory is private by default.** Site-shared may ship device *kinds*,
 example inventories, and **explicit exports** (public endpoints, role

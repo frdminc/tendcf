@@ -1752,9 +1752,9 @@ launchd, the Nix module frontend and the plugin layout (its first piece,
 `buildfile`, exists, §2.2) — the signed release path,
 the on-device validator, the consent surface, peer-action runtime, and the
 device-side supervisor adapters other than launchd and systemd (runit and
-the rest), plus the open parts of those two. Remaining Step 0 work: `peer_actions`,
-trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize,
-and transcribing existing reality as `not-yet-migrated`.
+the rest), plus the open parts of those two. Remaining Step 0 work:
+`peer_actions`, trust-policy shape, generic unit-writers, lookup stub, YAML
+canonicalize, and transcribing existing reality as `not-yet-migrated`.
 
 **Nothing is deployed.** No device has been provisioned from factory reset by
 this automation. We have no deployment time, no effort figure, no
