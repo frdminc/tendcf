@@ -115,7 +115,7 @@ def make_generated(td, env):
     }
     for name, body in cases.items():
         (gen / name).write_text(body)
-    return gen, list(cases)
+    return gen, list(cases), store_path
 
 
 def main():
@@ -129,7 +129,7 @@ def main():
                    NIX_CONF_DIR=str(confdir))
         env.pop("NIX_CONFIG", None)
         env.setdefault("HOME", "/home/runner")
-        gen, gen_cases = make_generated(td, env)
+        gen, gen_cases, store_path = make_generated(td, env)
         names = [sys.argv[2]] if mode == "check" else list(VARIANTS)
         bad = []
         for name in names:
@@ -149,8 +149,16 @@ def main():
                     bad.append((name, case))
             for case in gen_cases:
                 rc, out, err = run(with_dir(argv, gen), env, gen / case)
-                # Generated cases: report; storepath cases may be allowed.
-                print(f"  generated {case}: rc={rc} out={out[:80]!r} err={first_line(err)!r}")
+                # Generated cases (paths made at run time, outside the allowed
+                # directory): two refused, and builtins.storePath of an existing
+                # store path is allowed (it names the path; reading it is refused).
+                if case == "storepath.nix":
+                    good = rc == 0 and json.loads(out or "null") == store_path
+                else:
+                    good = refused(rc, err, [("is forbidden in restricted mode",)])
+                print(f"  generated {case}: rc={rc} {'OK' if good else 'UNEXPECTED'} out={out[:80]!r} err={first_line(err)!r}")
+                if not good:
+                    bad.append((name, case))
             ad = FIX / "allowed"
             for case, want in ALLOWED.items():
                 rc, out, err = run(with_dir(argv, ad), env, ad / case)
