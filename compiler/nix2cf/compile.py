@@ -706,8 +706,8 @@ def compile_host(
             )
     else:
         diagnostics.append(
-            "no tendcf schema directory given: the rendered goal file was NOT "
-            "validated against goal-file.schema.json (pass --tendcf or set TENDCF_DIR)"
+            "no tendcf schema directory found (not inside a tendcf checkout): the rendered "
+            "goal file was NOT validated against goal-file.schema.json (pass --tendcf or set TENDCF_DIR)"
         )
 
     raw = canonical_bytes(doc)

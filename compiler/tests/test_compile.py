@@ -1,5 +1,6 @@
 """nix2cf's tests. Every test needs a tendcf checkout for the contract
-(schemas, projector, fixtures): set TENDCF_DIR, or have ~/src/tendcf.
+(schemas, projector, fixtures): by default the enclosing repository (this
+directory is <root>/compiler/tests); set TENDCF_DIR to use another.
 
 The goldens under tests/golden/ are the compiler's own regression test
 (paper §6.2): a compiler change that alters output for a host nobody touched
@@ -34,11 +35,11 @@ HOST_KEY = "ed25519:" + "a1" * 32
 def _tendcf() -> Path:
     raw = os.environ.get("TENDCF_DIR")
     candidates = [Path(raw).expanduser()] if raw else []
-    candidates.append(Path("~/src/tendcf").expanduser())
+    candidates.append(REPO.parent)  # compiler/ sits directly under the tendcf root
     for c in candidates:
         if (c / "schema" / "goal-file.schema.json").exists():
             return c
-    pytest.skip("no tendcf checkout: set TENDCF_DIR")
+    pytest.skip("no tendcf checkout: not inside one; set TENDCF_DIR")
 
 
 @pytest.fixture(scope="session")

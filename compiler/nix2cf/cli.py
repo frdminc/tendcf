@@ -1,7 +1,7 @@
 """`nix2cf` command line.
 
     nix2cf buildfile --host mac --platform macos --supervisor launchd \
-        --host-key ed25519:… --device-trust trust.json --site examples/site [--tendcf ~/src/tendcf] [--project] [-o OUT]
+        --host-key ed25519:… --device-trust trust.json --site examples/site [--tendcf DIR] [--project] [-o OUT]
 
 Renders exactly what one host would receive — the Bcfg2 `buildfile` shape the
 guide (§4) and the paper (§6.2) say to build first — without touching the
@@ -37,9 +37,20 @@ from .compile import SUPERVISORS, CompileError, HostSpec, compile_host
 from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, load_document, load_site_model, validate_site_model
 
 
+def _in_tree_tendcf() -> Path | None:
+    """The enclosing tendcf checkout: this file is <root>/compiler/nix2cf/cli.py.
+
+    Confirmed by the schema being there; None when the package runs from
+    somewhere that is not inside a tendcf checkout (e.g. a plain install).
+    """
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / "schema" / "goal-file.schema.json").exists() else None
+
+
 def _tendcf_dir(arg: str | None) -> Path | None:
+    """--tendcf, else $TENDCF_DIR, else the enclosing tendcf checkout."""
     raw = arg or os.environ.get("TENDCF_DIR")
-    return Path(raw).expanduser() if raw else None
+    return Path(raw).expanduser() if raw else _in_tree_tendcf()
 
 
 def load_projector(tendcf: Path) -> Any:
@@ -108,7 +119,7 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
     out = result.canonical
     if args.project:
         if tendcf is None:
-            print("nix2cf: ERROR: --project needs --tendcf (or TENDCF_DIR) to find bin/projector.py", file=sys.stderr)
+            print("nix2cf: ERROR: --project needs a tendcf checkout to find bin/projector.py (not inside one: pass --tendcf or set TENDCF_DIR)", file=sys.stderr)
             return 2
         projector = load_projector(tendcf)
         try:
@@ -172,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--services")
     b.add_argument("--roles")
     b.add_argument("--launchd-writers", dest="launchd_writers")
-    b.add_argument("--tendcf", help="tendcf checkout (schemas + projector); default $TENDCF_DIR")
+    b.add_argument("--tendcf", help="tendcf checkout (schemas + projector); default $TENDCF_DIR, else the enclosing tendcf checkout")
     b.add_argument("--project", action="store_true", help="print the projector's host_specific.json instead of the goal file")
     b.add_argument("-o", "--output")
     b.set_defaults(func=cmd_buildfile)
