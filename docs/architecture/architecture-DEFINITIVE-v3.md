@@ -54,7 +54,8 @@ cannot start its own privileged helper”).
 
 ```
   tendcf                 engine: schemas/types, generic adapters,
-  (public)               default advisor prompt, compiler interface
+  (public)               default advisor prompt, and the compiler
+                         with its plugins (one repository, D46)
 
   site-shared            reusable recipes (a Caddy role, an apt pattern).
   (optional, public)     Not live inventory.
@@ -66,14 +67,15 @@ cannot start its own privileged helper”).
   (never an input)       secret names, trust policy, extra advisor prompt.
                          Holds the lockfile that pins everything else.
 
-  tool forks (optional)  nix2cf, sudo-secretspec, Shizuku, … only if
+  tool forks (optional)  sudo-secretspec, Shizuku, … only if
                          patching them.
 
           │  Site Model instances (private) + recipes (shared)
           ▼
-  nix2cf                 compiler: merge → conflict check → infer
-  (tool)                 ordering → CFEngine Augments JSON.
-                         Not the home of schemas or facts.
+  tendcf compile         compiler, in tendcf: frontend (YAML, or Nix
+  (tool)                 via the nix2cf plugin) → merge → conflict
+                         check → infer ordering → per-host goal file.
+                         Schemas stay in `schema/`; holds no facts.
 
           ▼
   Signed release         manifest + per-host canonical goal file
@@ -128,23 +130,33 @@ error**. Only site-private may bind a winner or a short name.
 
 Git-repo count is not the composition mechanism. Layers are **roles**.
 Site-private holds a **lockfile** (flake-style inputs) that pins tendcf,
-nix2cf, site-shared, foreign shared sites, and optional tool forks. The
-signed release is the deploy artifact. There is no lockstep of sibling
+site-shared, foreign shared sites, and optional tool forks. **Amended
+2026-11-13 (D46):** the compiler is part of tendcf, so one tendcf pin
+covers schemas and compiler together (~~pins tendcf, nix2cf,
+site-shared, …~~); the compiler is under `compiler/` since #45
+(2026-11-13), and the separate `frdminc/nix2cf` repository is archived.
+The repository's plugin-type layout is
+[`plugin-layout.md`](plugin-layout.md). The signed release is the
+deploy artifact. There is no lockstep of sibling
 checkouts that must share one tag.
 
 | Layer | Holds | Visibility |
 | --- | --- | --- |
-| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt | Public product |
-| **nix2cf** | Compiler tool only (Site Model → CFEngine JSON) | Public tool; fork only to patch |
+| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt, the compiler (`compiler/`) and its plugins (`plugins/`, D46) | Public product |
+| ~~**nix2cf**~~ | ~~Compiler tool only (Site Model → CFEngine JSON)~~ Folded into tendcf (D46). `nix2cf` now names the Nix frontend plugin | Repository archived 2026-11-13, right after the import ([#45](https://github.com/frdminc/tendcf/pull/45)) merged |
 | **site-shared** | Reusable recipes | Public or shared |
 | **site-private** | Inventory, allocations, secret *names*, trust policy, extra prompt, lockfile | Private |
 | **foreign shared** | Other sites' recipes | Read-only inputs |
 | **tool forks** | sudo-secretspec, Shizuku, … | Optional |
 
-**Schemas live in tendcf**, not in nix2cf. A schema change is a tendcf
-interface change. An instance change is site data. The JSON Schema files,
-fixtures, and lint are `schema/`, `examples/`, and `bin/schema_lint.py`
-in this repository.
+**Schemas live in tendcf**, in `schema/`, not in the compiler's code
+(~~not in nix2cf~~; amended 2026-11-13, D46: the compiler moved into
+this repository, `compiler/`, so schema and compiler change in the same
+commit). A
+schema change is a tendcf interface change. An instance change is site
+data. The JSON Schema files, fixtures, and lint are `schema/`,
+`examples/`, and `bin/schema_lint.py` in this repository (`bin/` becomes
+`tools/` in a later change, [`plugin-layout.md`](plugin-layout.md) §5).
 
 **Inventory is private by default (D35).** Site-shared ships:
 
@@ -258,11 +270,32 @@ graph,” not “don’t require names.”
 
 ---
 
-## 5. The compiler (`nix2cf`)
+## 5. The compiler (`tendcf compile`)
 
 A **tool**: Site Model (YAML/JSON, or Nix frontend → JSON) → merge →
-conflict check → inference → [CFEngine Augments](https://docs.cfengine.com/docs/3.21/reference-language-concepts-augments.html)
-(`def.json` / `host_specific.json`).
+conflict check → inference → render of the per-host goal file (§9),
+which the device projects to [CFEngine Augments](https://docs.cfengine.com/docs/3.21/reference-language-concepts-augments.html)
+(`host_specific.json`) after approval. (~~… → inference → CFEngine
+Augments (`def.json` / `host_specific.json`)~~: superseded by §9's
+render-stage decision; corrected here on 2026-11-13.)
+
+**Amended 2026-11-13 (D46).** The compiler was built as the separate
+repository `frdminc/nix2cf` (`nix2cf buildfile`, Step 3). It moved into
+tendcf with its history under `compiler/` (#45, 2026-11-13; the old
+repository is archived), and in the restructure its command becomes
+`tendcf compile`, which replaces `nix2cf buildfile` with no
+alias. The name `nix2cf` moves to the Nix module frontend (D12).
+Frontends, supervisor renderers and importers are plugins, all compile
+time only; frontends and importers are found through the public Python
+entry-point groups `tendcf.frontends` and `tendcf.importers`, supervisor
+renderers are in tree only. Plugins are trusted build-time code the
+operator explicitly allows, not sandboxed: a plugin cannot make a device
+accept anything that device's own diff does not show, and cannot emit a
+shape the schema forbids, but it can make the goal file say something
+other than what the Site Model says. Release gates and signing therefore
+run apart from plugin code. Layout, plugin kinds, the trust and
+activation rules and the order of the move:
+[`plugin-layout.md`](plugin-layout.md).
 
 CFEngine’s [Masterfiles Policy Framework](https://github.com/cfengine/masterfiles)
 already consumes that data layer. Common case: emit data, not `.cf`
@@ -284,7 +317,9 @@ here is Site Model → CFEngine, because of
 multi-owner operation — not because the compiler mechanism is new.
 
 **Where it runs:** operator machine or CI. Consented devices receive a
-signed artifact. They do not run Nix or nix2cf.
+signed artifact. They do not run the compiler, any of its plugins, or
+Nix (except where Nix already is the host's configuration system: D12,
+passthrough).
 
 ---
 
@@ -689,6 +724,14 @@ field.
 Cost, accepted: the compiler carries multi-version render ability for a
 window and tracks per-host versions. The price is paid in one place
 rather than as device-side leniency on every device.
+
+**Amended 2026-11-13 (D46).** There is no device outside the operator's
+own hosts to strand yet, so the
+compiler renders only the current `schema_version`, and its older-version
+rendering is removed when the compiler is restructured
+([`plugin-layout.md`](plugin-layout.md) §4, §5). This section's design
+stands and applies once the first device that is not an operator host
+enrolls; the multi-version render returns with it.
 
 ### 9.7 Coverage travels in the goal file (E1 §5.7)
 
@@ -1115,7 +1158,7 @@ Each step leaves a coherent system. Not a schedule.
 | 0 | Schemas in **tendcf** (`schema/`, `examples/`, `bin/schema_lint.py` — provides/requires, interlocks, comprehensive, report-row). Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
 | 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). 2026-10-29: the satisfied-interlock path had never opened (verdict class fixed in pass 1 before the check ran); the check moved to `tendcf_interlocks`, sequenced before `tendcf_services`, and `tests/policy/run.sh` proves both paths on Linux CI and the Mac. The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)); Linux CI builds the full fork ([`linux-targets.md`](linux-targets.md)). |
 | 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Deferred** (operator, 2026-10-29): Linux comes first, see [`linux-targets.md`](linux-targets.md). Not started as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
-| 3 | nix2cf: `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` has `buildfile` only. Its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2. |
+| 3 | Compiler (`tendcf compile`; ~~nix2cf~~): `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` had one compilation command, `buildfile`, plus the `eval-nix` evaluation hook. **Amended 2026-11-13 (D46):** the compiler moved into tendcf under `compiler/` (#45; `frdminc/nix2cf` archived) and the restructure splits it into plugins ([`plugin-layout.md`](plugin-layout.md)); ~~its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2~~ with schema and compiler in one repository there is no `tendcf.lock` (it was specified, never built). |
 | 4 | Linux reference path on a stock distro. |
 | 5 | First real Linux host; prove roles are data. |
 | 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. On Linux and macOS the on-device validator is `tendcf-validate`, built after schema v5 lands and before any further host is enforced; how much of this step's validator its first build carries is open (D45, §12). |
@@ -1165,16 +1208,16 @@ Older “superseded by” archaeology lives in
 | D6 | Nix on bare metal | No. Builds / dev shells / authoring language / passthrough where a host already runs NixOS or nix-darwin. Never the OS a stranger must install. |
 | D8 | Trust layer | Build it, gated. Sovereignty is the point. |
 | D10 | Task runner | `just` for humans; mise for toolchains. |
-| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. |
+| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. **Amended 2026-11-13 (D46):** the Nix frontend is the compiler plugin `plugins/frontends/nix/` and carries the name `nix2cf`; the YAML frontend is `plugins/frontends/yaml/` (built in); a Guix frontend may follow. Not built yet ([`plugin-layout.md`](plugin-layout.md)). |
 | D13 | Service owner | CFEngine promises everywhere; mise toolchains only. |
 | D14 | Deployment shape | Git-synced policy; `cf-serverd` on every host; push and pull are one mechanism. |
-| D15 | Compile target | CFEngine Augments, not freehand `.cf`. |
+| D15 | Compile target | CFEngine Augments, not freehand `.cf`. (By way of the per-host goal file, which the device projects to Augments after approval: D43, D44, §5, §9.) |
 | D16 | Ordering | No Puppet catalog. Inference + fixpoint + authored `depends_on`. Interlocks. Default-on comprehensiveness. |
 | D17 | ncf | Vendor generic methods as a reference corpus; strip Rudder reporting. |
 | D18 | Local record | ~~JSONL is the durable capture; SQLite in tendcf-agent is the index. On Android the agent owns both in app-private storage.~~ **Amended 2026-11-02 by D45:** JSONL is the durable capture; SQLite is the index, rebuildable from it. On Android tendcf-agent owns both in app-private storage. On Linux and macOS there is no agent, and the index's owner there is open (§8, §12). |
 | D19 | Composition | Private-site lockfile pins inputs (DAG). Signed release is the deploy artifact. No sibling-repo tag lockstep. |
 | D20 | Nix store locality | Single writer per host. |
-| D21 | Schema home | **tendcf** owns schemas/types. nix2cf is the compiler. |
+| D21 | Schema home | **tendcf** owns schemas/types. ~~nix2cf is the compiler.~~ **Amended 2026-11-13 (D46):** the compiler also lives in tendcf (`compiler/`, command `tendcf compile`); schemas stay in `schema/`, outside the compiler's code, and the two change in the same commit. `nix2cf` names the Nix frontend plugin. |
 | D22 | Platform sequence | macOS, Linux. Android deferred by the operator on 2026-10-29 ([`linux-targets.md`](linux-targets.md)). |
 | D23 | YAML canonicalize | Parse, re-serialize, diff on the YAML path. |
 | D24 / D40 | Lookup + auto-provide | Registry/token CLI; default `service:<name>`; compile errors teach names. |
@@ -1198,6 +1241,7 @@ Older “superseded by” archaeology lives in
 | D43 | ChangePlan model | ~~Model A: a closed `capability` vocabulary per operation, executor refuses effects outside the declared set.~~ **Superseded 2026-08-15 by Model B** (synthesis finding E1, adjudicated in `e1-adjudication-xhigh-2026-08-15.md`, which is final and supersedes `e1-adjudication-2026-08-15.md`): the wire artifact is the complete canonical per-host **goal file**; the ChangePlan is the **diff** against the device’s approved baseline; the executor is a **validator** over that diff, not an interpreter. Rationale: CFEngine has no runtime capability confinement, so Model A’s executor requires an interpreter plus a vocabulary-to-policy correspondence proof that does not exist and is not in budget; and coverage closes by construction when compiler and validator share one schema. The vocabulary, its versioning, and its skew policy are dropped. See §9. |
 | D44 | Goal-file schema family | The consent artifact is three paired schemas (goal file, goal diff, approval record) with canonical-byte fixtures. Binding sub-decisions, all from E1 §5 and normative in §9: diff computed **device-side**, full file on the wire, compiler diff is preview (§9.1 / E1 §5.1); RFC 8785 canonical JSON, no defaults, no empty collections, refuse-never-normalize, entry-granular structural hunks (§9.2 / E1 §5.2); accept is all-or-nothing, refusal annotated, no dependency groups (§9.3 / E1 §5.3); first adoption and schema migration are bounded **baseline ceremonies**, migration must diff to empty (§9.4 / E1 §5.4); hunk attribution is **excluded from the format** — impossible device-side — and replaced by an `explain-hunk` query (§9.5 / E1 §5.5); `schema_version` fails closed on unknown kinds, strandedness prevented at the compiler, two-phase bumps (§9.6 / E1 §5.6); per-domain coverage travels **in** the goal file (§9.7 / E1 §5.7). §14.2’s pre-build review applies to this family. |
 | D45 | Device-side component per platform | **Operator, 2026-11-02.** (1) tendcf-agent is **Android-only**, written in Kotlin. A Linux or macOS host runs CFEngine plus "a small validate-and-project command" (the ruling's words; the name **`tendcf-validate`** was chosen by the amending session on 2026-11-02 and may change without reopening the ruling), run before cf-agent reads `host_specific.json`; no daemon. (2) `tendcf-validate` is Python, the promotion of `bin/projector.py`: one implementation, so no byte-identity drift on those platforms. It needs `python3` on each host (Debian ships it, NixOS through the derivation, macOS bundled or the Command Line Tools). The Android agent's Kotlin projector is a port held to the same golden bytes in CI (residue R22), not a second normative source. (3) Built after schema v5 lands, before any further host is enforced. **Supersedes** every reading that ran the validator, the projector or the SQLite index inside tendcf-agent on every host: the §1 diagram's "CFEngine + tendcf-agent" per device, §8's index owner and D18 as written, §9's "run inside tendcf-agent" and "the agent binary" as the projector's call site, `goal-file-schema-reconciliation-2026-08-15.md` §0 item 7, §9 and §13 ("CI invokes the agent's own projector"), and `projector-reconciliation-2026-08-16.md` §9 and R22 ("tendcf-agent must reproduce" the reference). Not decided by it, and open for the operator: §12's list. |
+| D46 | Repository layout and compiler plugins | **Operator, 2026-11-13.** (1) `frdminc/nix2cf` folds into tendcf with full history, first under `compiler/` ([#45](https://github.com/frdminc/tendcf/pull/45)), and is archived as soon as that import merges. Both done 2026-11-13 (merge commit `ca4fa90`; the repository archived the same day). (2) The repository takes the plugin-type layout of [`plugin-layout.md`](plugin-layout.md): `schema/`, `examples/`, `policy/`, `overlay/`, `deploy/` unchanged; `tools/` (was `bin/`); `compiler/` (merge, conflict check, render); `plugins/frontends/` (`yaml`, `nix`, later `guix`, an authoring frontend), `plugins/supervisors/` (`launchd`, `systemd`, `runit`), `plugins/importers/` (`ansible`, `salt`); `contrib/` for in-tree third-party frontends and importers. It becomes one Python package, import name `tendcf`. (3) Frontends and importers are found through the public entry-point groups `tendcf.frontends` and `tendcf.importers`, so a third-party one can also live out of tree as a pip package. Supervisor renderers are in tree only; there is no public `tendcf.supervisors` group, because the goal file's `unit` is a closed `oneOf` and an out-of-tree renderer could only shadow a built-in. (4) Plugins are compile-time only: none runs on a device. The device artifact (`tendcf-validate`, D45) is built from the validator's own source alone, never imports `compiler/`, `plugins/` or `contrib/` and never calls entry-point discovery; the schema lint and the projector never import the compiler; a CI import check is to enforce both (planned). Plugins are trusted build-time code that the operator explicitly allows, not sandboxed: a plugin cannot make a device accept anything that device's own diff does not show, and cannot emit a shape the schema forbids, but it can make the goal file say something other than what the Site Model says, and it sees the site's private data. Release gates (schema lint, projector, preview diff) and signing run in a separate environment with no plugin installed; the compile step holds no signing key. A compile-side preview diff or `explain-hunk` (D44) is compiler output and inherits the plugins' trust. `contrib/`'s lower bar waives support and maintenance promises, never the standing review rule. Out-of-tree trust establishment and plugin management: [#47](https://github.com/frdminc/tendcf/issues/47). (5) Activation: a plugin loads only if site-private names it (name → distribution, version, hash); an installed but unnamed plugin is ignored; a duplicate name in a group is a compile error; built-in names are reserved; until out-of-tree pinning exists (#47) a release build loads in-tree plugins only; the release's `targets.json` `custom` records the plugin set. (6) No users and no backward compatibility yet, so no shims: the compiler's command becomes `tendcf compile`, which replaces `nix2cf buildfile` with no alias (it compiles every host; `--host` renders one); `eval-nix` moves to the Nix frontend; `bin/` → `tools/` leaves no symlink or wrapper and rewrites every path reference in every file, dated records included (djbclark, 2026-11-13, a one-time exception to their append-only convention; only paths change, and prose naming nix2cf as the old repository stays as history); `nix2cf` names the Nix frontend (D12). The compiler renders only the current `schema_version`; older-version rendering is removed in the restructure, and §9.6's ceiling design applies once the first device that is not an operator host enrolls. (7) The keys `nix2cf_services` and `nix2cf_edges` were only ever illustrative: they occurred in guide §16.A's preview-channel example and its copy in the paper, and no schema, fixture, projector or bundle carried them (the projection's keys are `tendcf_service` and `tendcf_interlock`). In the same change that recorded this decision they were renamed `preview_services` and `preview_edges` (illustrative only, chosen so they cannot be mistaken for the `tendcf_services` bundle or the real projected keys `tendcf_service`/`tendcf_interlock`). No schema change is involved ([`plugin-layout.md`](plugin-layout.md) §6). (8) Consequence for [`change-process.md`](change-process.md): the compiler is no longer a separately pinned input, the two-repository bump order and the compiler's `tendcf.lock` go away; `site.lock` loses only its `nix2cf` entry. One tendcf rev is the unit a site pins, so a compiler fix brings the `schema/` and `policy/` commits before it; accepted, with no maintenance-branch machinery, revisited when the first device that is not an operator host enrolls. Moving `bin/` to `tools/` and the plugin split wait until open PRs #41 and #42 merge. Amends D12, D15 (a pointer), D21, §1, §3, §5, §9.6 (when it applies) and Step 3. |
 
 Silence = proceed from Step 0. Objections amend this register.
 
@@ -1289,7 +1333,12 @@ with full mesh) is **D38**.
 - `docs/paper/tendcf-architecture-paper.md` — technical paper; the guide
   wins on conflict.
 - `schema/`, `examples/`, `bin/schema_lint.py` — Site Model contract.
-- `frdminc/nix2cf` — compiler tool (Step 3). Consumes this contract.
+- `frdminc/nix2cf` — compiler tool (Step 3) until 2026-11-13, when it
+  was folded into this repository as `compiler/` (D46, #45) and archived.
+- `compiler/` — the compiler; consumes this contract.
+- `plugin-layout.md` — the repository's plugin-type layout, the plugin
+  kinds and their two public entry-point groups, the plugin trust and
+  activation rules, and the order of the move (D46).
 - `tendcf-validate-proposal-2026-11-03.md` — a proposal, deciding
   nothing: options and a recommendation for each of §12's open D45
   items, a minimal first build, and an operator picklist.

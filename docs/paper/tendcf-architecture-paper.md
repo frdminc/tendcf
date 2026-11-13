@@ -38,7 +38,8 @@ signed release carrying a typed operation plan that the on-device executor
 mechanically refuses to exceed. Bcfg2 supplies four of its load-bearing
 ideas, credited in §6.
 
-**Nothing described here is deployed.** No device has been provisioned from
+**Nothing described here is deployed**, apart from a canary service on
+one operator host. No device has been provisioned from
 factory reset by this automation; we have no operational numbers of any
 kind, and one of our central negative results (§5.4) rests on reasoning
 about a code path that has never been executed. What we do have is an
@@ -188,18 +189,22 @@ attacked.
 Git-repo count is not the composition mechanism. Layers are roles:
 
 - **tendcf** (public) — engine, schemas/types, generic adapters, default
-  advisor prompt, compiler interface.
+  advisor prompt, and the compiler with its plugins (§2.2).
 - **site-shared** (optional, public) — reusable recipes, not live inventory.
 - **foreign site-shared** — other people's recipes, listed as read-only inputs.
 - **site-private** (never an input) — this site's facts: inventory,
   allocations, secret *names*, trust policy, extra advisor prompt. Holds the
   lockfile that pins everything else.
-- **tool forks** (optional) — nix2cf, sudo-secretspec, Shizuku, only if
-  patching them.
+- **tool forks** (optional) — sudo-secretspec, Shizuku, only if patching
+  them.
 
-Site-private holds a lockfile (flake-style inputs) that pins tendcf, nix2cf,
-site-shared, foreign shared sites, and optional tool forks. The signed
-release is the deploy artifact. There is no lockstep of sibling checkouts
+Site-private holds a lockfile (flake-style inputs) that pins tendcf,
+site-shared, foreign shared sites, and optional tool forks. The compiler is
+part of tendcf, so one tendcf pin covers schemas and compiler together
+(decided and done 2026-11-13: the compiler is under `compiler/`, and the
+separate `frdminc/nix2cf` repository is archived). The signed release is
+the deploy
+artifact. There is no lockstep of sibling checkouts
 that must share one tag. Collision of the same identity from two peer inputs
 is a **compile error**. Only site-private may bind a winner
 (`caddy: from: alice`) or a short name. Never silent last-wins. Foreign
@@ -230,8 +235,9 @@ unit-name prefix for every supervisor, killing a two-writers hazard at the
 source. launchd is one adapter, not the model.
 
 Schemas and types belong in tendcf (`schema/`, `examples/`,
-`bin/schema_lint.py`). The compiler (`nix2cf`) is a tool; it is not the
-home of the contract. A schema change is a tendcf interface change; a
+`bin/schema_lint.py`). The compiler (`tendcf compile`, §2.2) is a tool;
+its code is not the home of the contract, even though the two are moving
+into one repository. A schema change is a tendcf interface change; a
 hostname change is site data.
 
 The Site Model *may* be authored in the Nix module system — `mkOption`,
@@ -241,23 +247,48 @@ JSON is what is schema-validated, signed, and read downstream, and a person
 adopting the project is never required to know Nix to read or fork their own
 site data. We use the Nix *language* and not the Nix *build system*: a
 service that should be running is typed data, and nothing about it needs to
-become a derivation.
+become a derivation. That frontend, not yet built, will carry the name
+`nix2cf` (§2.2).
 
 ### 2.2 The compiler: a pure function into CFEngine's own data layer
 
-A compiler (working name `nix2cf`) reads the Site Model and renders CFEngine
-augments — `def.json` / `host_specific.json` — CFEngine's native JSON
-data-injection layer. The name `nix2cf` is historical; an optional Nix module
-frontend may author the same JSON later. The compiler is a tool, not the home
-of schemas.
+A compiler, `tendcf compile`, reads the Site Model and renders a per-host
+goal file, which the device projects, after approval, into the
+`host_specific.json` half of CFEngine augments — `def.json` /
+`host_specific.json` — CFEngine's native JSON data-injection layer (§2.5).
+The compiler is a tool, not the home of schemas.
+
+It was built as the separate repository `frdminc/nix2cf`, whose
+`nix2cf buildfile` command is its first piece. On 2026-11-13 it was decided
+to fold that repository into tendcf with its history, under `compiler/`
+(done the same day, and the old repository archived), to replace
+`nix2cf buildfile` with `tendcf compile` outright in a later
+restructure, with no alias, and to give the name
+`nix2cf` to what it describes: the optional Nix module frontend of §2.1.
+Frontends, supervisor renderers and one-shot importers from other tools
+become plugins; frontends and importers are found through Python entry
+points, supervisor renderers stay in tree. Plugins run at compile time
+only.
+
+A plugin is trusted build-time code that the operator explicitly allows,
+not sandboxed code, and the guarantee is correspondingly narrow. A plugin
+cannot make a device accept anything that device's own diff does not
+show (§2.5), and it cannot emit a shape the schema forbids. It can make
+the goal file say something other than what the Site Model says, and it
+sees the site's private data. The release gates (schema lint, projector,
+preview diff) and signing therefore run in a separate environment with no
+plugin installed, the compile step holds no signing key, and a release
+loads only the plugins site-private names, in-tree ones only until
+out-of-tree plugins can be pinned. The rules and the layout are in
+[`plugin-layout.md`](../architecture/plugin-layout.md).
 
 Two details of that layer are load-bearing and neither is obvious from the
 documentation; we state them because we got both wrong first. **The version
 floor is 3.18, not 3.7.** 3.7.0 put augments into the Masterfiles Policy
 Framework and 3.7.3 back-ported `def.json` parsing into the core agent, but
 `$(sys.workdir)/data/host_specific.json` has only been parsed since 3.18.0,
-so a design using both files inherits the later floor. **And despite the
-name, YAML is not a valid augments input** — the agent reads JSON only.
+so a design using both files inherits the later floor. **And YAML is not a
+valid augments input** — the agent reads JSON only.
 YAML remains an authoring format for the Site Model and never reaches a
 device.
 
@@ -295,12 +326,19 @@ and not a schema redesign.
 
 Because the render is a pure function of the Site Model — the same purity
 Nix's own build model is named for [27] — "show me exactly what device X
-would receive, without touching device X" is nearly free. We
-plan to build that affordance *first*, before the pipeline is finished, and
-§6.2 explains why it earns its place three separate times over.
+would receive, without touching device X" is nearly free. (That purity is
+a design goal: it also needs a fixed dependency and toolchain
+closure and controlled external inputs, which are not specified yet;
+[`plugin-layout.md`](../architecture/plugin-layout.md) §7.) We built that
+affordance *first*, before the pipeline is finished — `buildfile` merges,
+conflict-checks and renders one host's goal file, with service units for
+launchd only and no inference yet — and §6.2 explains why it earns its place
+three separate times over.
 
 **Where it runs:** operator machine or CI. Consented devices receive a
-signed artifact. They do not run Nix or nix2cf.
+signed artifact. They do not run the compiler or any of its plugins; Nix
+runs on a device only where it already is that host's configuration
+system (NixOS, nix-darwin).
 
 **This compile-to-native-format shape is not new.** A typed or module-based
 authoring language compiling to an existing execution engine's native format
@@ -486,21 +524,26 @@ showing the same interlock as running code rather than as intent.
 systemd unit or a runit service on another host. The *outputs* — the
 CFEngine augments and the rendered promise text — are hand-authored by us
 to show the target shape, as is the Nix rendering of the same input shown
-partway through Example A. `nix2cf`'s render stage and its Nix authoring
-frontend do not exist yet (§6.5, §8), so nothing in Example A except the
-YAML was produced mechanically.
+partway through Example A. The compiler's inference stage, which Example A
+needs, and its Nix authoring frontend do not exist yet (§6.5, §8), so
+nothing in Example A except the YAML was produced mechanically.
 
 **One further warning, and it is the kind of thing this paper exists to
 surface.** The augments document shown in Example A is *pedagogically*
 right and *mechanically* wrong: its two top-level keys, `data` and
-`nix2cf_edges`, are both keys the agent silently skips. As written it
+`preview_edges`, are both keys the agent silently skips. As written it
 injects nothing. We keep it because it shows the derivation legibly, which
 is what the example is for, and we flag it because an illustration that
 would not run is exactly the sort of claim a reader should be able to
 catch us on. The shape the agent actually consumes is `{"vars": {…}}` and
 nothing else, reached by the device-side projection of §2.5; that shape,
 and a generic bundle that reads it, both exist and are shown at the end of
-this section.
+this section. The illustration's keys were `nix2cf_*` until 2026-11-13,
+when they were renamed `preview_services` and `preview_edges`:
+illustrative only, chosen so they cannot be mistaken for the
+`tendcf_services` bundle or the projection's real keys `tendcf_service`
+and `tendcf_interlock`. No schema change was involved, and the goal file
+carries no edges.
 
 **Example A — an edge nobody wrote.** `caddy` and `litellm-proxy` are two
 records in the same `edge-http` bundle. `litellm-proxy` states only what it
@@ -610,11 +653,11 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
 
 ```jsonc
 // host_specific.json (host: mac) — ILLUSTRATIVE ONLY, hand-authored.
-// Does NOT load as Augments: top-level `data` and `nix2cf_edges` are both
+// Does NOT load as Augments: top-level `data` and `preview_edges` are both
 // skipped by the agent. Shown for the derivation, not to be copied.
 {
   "data": {
-    "nix2cf_services": {
+    "preview_services": {
       "caddy": {
         "service_policy": "start",
         "launchd_label": "com.djbclark.caddy",
@@ -630,7 +673,7 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
       }
     }
   },
-  "nix2cf_edges": [
+  "preview_edges": [
     {
       "from": "litellm-proxy",
       "to": "caddy",
@@ -643,9 +686,10 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
 }
 ```
 
-The generic bundle behind `nix2cf_services` is what materializes the actual
-on-device artifact — for `caddy`, the launchd plist CFEngine keeps present
-and loaded:
+The generic bundle `tendcf_services`, which reads the projected
+`tendcf_service` entries, is what materializes the actual on-device
+artifact — for `caddy`, the launchd plist CFEngine keeps present and
+loaded:
 
 ```xml
 <!-- /Library/LaunchDaemons/com.djbclark.caddy.plist — rendered, not authored -->
@@ -672,7 +716,7 @@ and loaded:
 </plist>
 ```
 
-`nix2cf_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
+`preview_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
 this edge was never authored, `rule` names the mechanism that produced it,
 and `source` points at the exact `requires` entry responsible. If this edge
 turns out to be spurious, the question it presents is "does `rule` correctly
@@ -1402,8 +1446,8 @@ been demonstrated rather than argued.
 `bcfg2-info buildfile` renders exactly the artifact a named client would
 receive, server-side, without touching the client; the `buildall` variant
 diffs every client's output across server upgrades. For a pure compiler this
-is nearly free, and we plan it first because three separate justifications
-converge on it:
+is nearly free, and we built it first (`nix2cf buildfile`, §2.2) because
+three separate justifications converge on it:
 
 - It is the **agent self-check loop.** An agent that can ask "what does my
   change actually do to device X" verifies its own work locally instead of
@@ -1680,21 +1724,23 @@ Beyond the schemas, two pieces of running code: the **reference projector**
 and is gated in CI against golden bytes; it is to be promoted to the
 `tendcf-validate` command Linux and macOS hosts run, and the Android agent's
 Kotlin port must agree with the same goldens; and the **generic bundle**
-(`policy/tendcf_services.cf`, v1, launchd only), which is the first thing in
-this project that CFEngine actually executes.
+(`policy/tendcf_services.cf`; a launchd branch and, since 2026-10-31, a
+systemd branch), which is the first thing in this project that CFEngine
+actually executes.
 
 **Validated in the following narrow but no longer trivial sense.** A lint
 that passes on correct input demonstrates nothing about whether it catches
-incorrect input, so the contracts are tested against **ninety-two
-deliberately broken fixtures**, each of which must be caught, and the lint
-fails if any is accepted: fifty-nine schema-level negatives (an opt-out with
+incorrect input, so the contracts are tested against **one hundred and
+fifty-nine deliberately broken fixtures** (counted 2026-11-13), each of
+which must be caught, and the lint fails if any is accepted: a hundred and
+twenty-five schema-level negatives (an opt-out with
 no reason, a rogue launchd label, a nested writer prefix, a literal secret
 where a key name belongs, a typo'd token kind, an enforce-mode row carrying
 an audit-mode outcome, a proposer setting a privileged flag, a migration
 that is not a no-op), six byte-level negatives that exist because
 canonicalization violations are invisible after a parse (a pretty-printed
 twin, duplicate keys, a non-NFC path, `15.0` where `15` belongs), and
-twenty-seven projection negatives (a resolved secret value where a name
+twenty-eight projection negatives (a resolved secret value where a name
 belongs, a canonified interlock id, a goal file smuggled under `vars`, an
 `env` that is not an object). Each rule in the projector's checker has a
 fixture that trips **it alone**, which is a stronger property than
@@ -1706,14 +1752,17 @@ Two of the original twelve fixtures exposed error messages that were useless
 failure §3 rules out for the compiler, which we had not applied to the
 compiler's own tooling.
 
-**Not implemented, and this is still most of it:** the compiler `nix2cf`
-itself — merge, conflict check, inference, render — the signed release path,
-the on-device validator, the consent surface, peer-action runtime, and every
-supervisor adapter except launchd. Remaining Step 0 work: `peer_actions`,
-trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize,
-and transcribing existing reality as `not-yet-migrated`.
+**Not implemented, and this is still most of it:** the rest of the compiler
+— inference, extra-entry reporting, service units for any supervisor but
+launchd, the Nix module frontend and the plugin layout (its first piece,
+`buildfile`, exists, §2.2) — the signed release path,
+the on-device validator, the consent surface, peer-action runtime, and the
+device-side supervisor adapters other than launchd and systemd (runit and
+the rest), plus the open parts of those two. Remaining Step 0 work:
+`peer_actions`, trust-policy shape, generic unit-writers, lookup stub, YAML
+canonicalize, and transcribing existing reality as `not-yet-migrated`.
 
-**Nothing is deployed.** No device has been provisioned from factory reset by
+**Nothing is deployed** beyond that one operator-host canary. No device has been provisioned from factory reset by
 this automation. We have no deployment time, no effort figure, no
 managed/unmanaged ratio, and no failure data. Examples A and B in §2.6 remain
 hand-authored to show the target rendering; only Example C is real.
