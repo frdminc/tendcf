@@ -325,7 +325,10 @@ and not a schema redesign.
 
 Because the render is a pure function of the Site Model — the same purity
 Nix's own build model is named for [27] — "show me exactly what device X
-would receive, without touching device X" is nearly free. We built that
+would receive, without touching device X" is nearly free. (That purity is
+a design goal: with plugins it also needs a fixed dependency and toolchain
+closure and controlled external inputs, which are not specified yet;
+[`plugin-layout.md`](../architecture/plugin-layout.md) §7.) We built that
 affordance *first*, before the pipeline is finished — `buildfile` merges,
 conflict-checks and renders one host's goal file, with service units for
 launchd only and no inference yet — and §6.2 explains why it earns its place
