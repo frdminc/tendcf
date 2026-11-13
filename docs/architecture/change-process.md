@@ -21,7 +21,8 @@ loses only its `nix2cf` entry: it still pins tendcf, site-shared and
 foreign sites, and tool forks stay as rule 5 has them. One tendcf rev is
 now the unit a site pins (§8 item 5). Compiler plugins are trusted
 build-time code; which ones a release loads, and the rule that the gates
-and signing run apart from them, are in §3 and §6. Since #45 the
+and signing run apart from them (planned, Step 6; nothing enforces it
+today), are in §3 and §6. Since #45 the
 compiler's tests run in tendcf's own CI against the same commit (the
 `compiler` job of `.github/workflows/check.yml`); before that, nix2cf's
 CI checked out tendcf's default branch beside it and never had the
