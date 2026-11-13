@@ -59,6 +59,30 @@ jobs:
           bin/overlay.py lint
           bin/overlay.py self-test
 
+  # The nix2cf compiler (compiler/), imported from frdminc/nix2cf. It reads
+  # this checkout's schemas and projector in-tree, so this job sets no
+  # TENDCF_DIR. The library tests and the "defaults to the enclosing checkout"
+  # CLI test (compiler/tests/test_compile.py) exercise that default; the other
+  # CLI tests pass TENDCF_DIR explicitly via their `_run` helper.
+  compiler:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    defaults:
+      run:
+        working-directory: compiler
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # A schema_version bump that the compiler has not followed fails here
+      # with one clear line, not as a wall of "was expected" test failures.
+      - name: GOAL_FILE_SCHEMA_VERSION equals the schema const
+        run: uv run --locked python scripts/check_schema_version.py "$GITHUB_WORKSPACE"
+
+      - name: Tests
+        run: uv run --locked pytest
+
   # Drift against upstream is NOT hermetic, so it runs on a schedule and on
   # demand rather than on every push: shallow-clone each upstream and prove
   # the pinned series still applies to its master (and to the newest 3.27.x

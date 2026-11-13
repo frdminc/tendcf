@@ -22,11 +22,12 @@ living document disagrees on the current design, **the guide wins**.
 | [`examples/broken/`](examples/broken/), [`examples/broken-bytes/`](examples/broken-bytes/), [`examples/broken-projection/`](examples/broken-projection/) | One hundred and fifty-nine deliberately broken fixtures (125 + 6 + 28) the lint must catch |
 | [`docs/architecture/change-process.md`](docs/architecture/change-process.md) | How a change lands: lockfile, release, rollback, CI gates (issue #2) |
 | [`overlay/`](overlay/), [`bin/overlay.py`](bin/overlay.py), [`docs/architecture/upstream-overlay.md`](docs/architecture/upstream-overlay.md) | Patch overlay on libntech / cfengine/core that the generic bundle depends on (issue #3) |
-| [frdminc/nix2cf](https://github.com/frdminc/nix2cf) | Compiler (Site Model → CFEngine Augments). Not this repo. |
+| [`compiler/`](compiler/) | The nix2cf compiler (Site Model → per-host goal file; was the separate `frdminc/nix2cf` repository, history preserved). See [`compiler/README.md`](compiler/README.md). |
 
 Nothing described here is deployed. Some data formats exist and are
-checked. The compiler, the on-device executor, and the consent surface
-are still to be built.
+checked. The compiler exists only as its first piece (`buildfile`, in
+[`compiler/`](compiler/)); the rest of it, the on-device executor, and the
+consent surface are still to be built.
 
 ```bash
 bin/schema_lint.py
