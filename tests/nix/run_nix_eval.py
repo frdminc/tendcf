@@ -68,7 +68,8 @@ def run(argv, env, path):
 
 def first_line(text):
     lines = [x for x in text.splitlines() if x.strip()]
-    return " | ".join(x.strip() for x in lines[:3])[:300]
+    # Nix prints the trace first and the message last: keep the tail.
+    return " | ".join(x.strip() for x in lines[-3:])[:400]
 
 
 def with_dir(argv, d):
