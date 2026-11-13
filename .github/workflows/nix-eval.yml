@@ -5,7 +5,7 @@ name: nix-eval
 
 on:
   push:
-    branches: [master, docs/d46-issue48-decisions]  # TEMP: removed after the test run
+    branches: [master]
     paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]
   pull_request:
     paths: ["tests/nix/**", ".github/workflows/nix-eval.yml"]

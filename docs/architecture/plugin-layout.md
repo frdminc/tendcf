@@ -308,8 +308,8 @@ item 3.
    run on a fresh Nix store and again after the informational matrix step
    has populated the store) fail the job unless results 2 to 4 below hold;
    results 1 and 5 come from the informational matrix step, which prints
-   them and is not a gate. Passing run, at head `ced18e9`:
-   <https://github.com/frdminc/tendcf/actions/runs/43469616588>. The tested invocation, with `NIX_PATH` set to the empty
+   them and is not a gate. Passing run, at head `b607872`:
+   <https://github.com/frdminc/tendcf/actions/runs/43483740436>. The tested invocation, with `NIX_PATH` set to the empty
    string and `NIX_CONF_DIR` and `NIX_USER_CONF_FILES` pointing at empty
    locations, so that only these flags and Nix's built-in defaults are in
    play (`NIX_CONFIG` is the remaining variable that loads configuration,
