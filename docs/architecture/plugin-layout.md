@@ -130,19 +130,18 @@ plugin has no other path to a device.
    to 2026-11-13 the name meant the whole compiler; older documents and
    handoffs use it that way and are not rewritten.
 3. **`guix`** is the planned Guix frontend, `plugins/frontends/guix/`.
-4. **The illustrative `tendcf_services` / `tendcf_edges` keys.** Until
-   2026-11-13 these were spelled `nix2cf_services` and `nix2cf_edges`.
-   Checked that day: they occurred only in the illustrative,
-   preview-channel `host_specific.json` of guide §16.A, its copy in the
-   paper, and review notes about it; the guide itself says that file does
-   not load as Augments. No schema, fixture, projector or bundle carried
-   them. They were renamed in those two illustrations in the same change
-   as this file, and no schema bump is involved (the goal file stays at
-   `schema_version` 5). They are still not the projection's keys, which
-   are `tendcf_service` and `tendcf_interlock`; `tendcf_services` is also
-   the name of the real generic bundle (`policy/tendcf_services.cf`),
-   which reads `tendcf_service`. Dated review and reconciliation notes
-   keep the old spelling.
+4. **The illustrative `preview_services` / `preview_edges` keys.** The
+   example's keys were `nix2cf_services` and `nix2cf_edges`. Checked on
+   2026-11-13: they occurred only in the illustrative, preview-channel
+   `host_specific.json` of guide §16.A, its copy in the paper, and review
+   notes about it; the guide itself says that file does not load as
+   Augments. No schema, fixture, projector or bundle carried them. On
+   2026-11-13 they were renamed `preview_services` and `preview_edges`, in
+   the same change as this file: illustrative only, chosen so they cannot
+   be mistaken for the `tendcf_services` bundle or the real projected
+   keys `tendcf_service` and `tendcf_interlock`. No schema change is
+   involved (the goal file stays at `schema_version` 5). Dated review and
+   reconciliation notes keep the old spelling.
 
 ## 7. Not decided here
 

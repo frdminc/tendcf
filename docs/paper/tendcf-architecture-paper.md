@@ -512,18 +512,19 @@ nothing in Example A except the YAML was produced mechanically.
 **One further warning, and it is the kind of thing this paper exists to
 surface.** The augments document shown in Example A is *pedagogically*
 right and *mechanically* wrong: its two top-level keys, `data` and
-`tendcf_edges`, are both keys the agent silently skips. As written it
+`preview_edges`, are both keys the agent silently skips. As written it
 injects nothing. We keep it because it shows the derivation legibly, which
 is what the example is for, and we flag it because an illustration that
 would not run is exactly the sort of claim a reader should be able to
 catch us on. The shape the agent actually consumes is `{"vars": {…}}` and
 nothing else, reached by the device-side projection of §2.5; that shape,
 and a generic bundle that reads it, both exist and are shown at the end of
-this section. The illustration's key names, `tendcf_services` and
-`tendcf_edges`, are illustrative as well (renamed from `nix2cf_*` on
-2026-11-13, with no schema change); the projection's real keys are
-`tendcf_service` and `tendcf_interlock`, and the goal file carries no
-edges.
+this section. The illustration's keys were `nix2cf_*` until 2026-11-13,
+when they were renamed `preview_services` and `preview_edges`:
+illustrative only, chosen so they cannot be mistaken for the
+`tendcf_services` bundle or the projection's real keys `tendcf_service`
+and `tendcf_interlock`. No schema change was involved, and the goal file
+carries no edges.
 
 **Example A — an edge nobody wrote.** `caddy` and `litellm-proxy` are two
 records in the same `edge-http` bundle. `litellm-proxy` states only what it
@@ -633,11 +634,11 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
 
 ```jsonc
 // host_specific.json (host: mac) — ILLUSTRATIVE ONLY, hand-authored.
-// Does NOT load as Augments: top-level `data` and `tendcf_edges` are both
+// Does NOT load as Augments: top-level `data` and `preview_edges` are both
 // skipped by the agent. Shown for the derivation, not to be copied.
 {
   "data": {
-    "tendcf_services": {
+    "preview_services": {
       "caddy": {
         "service_policy": "start",
         "launchd_label": "com.djbclark.caddy",
@@ -653,7 +654,7 @@ edge to carry its own provenance rather than appear as a bare ordering fact:
       }
     }
   },
-  "tendcf_edges": [
+  "preview_edges": [
     {
       "from": "litellm-proxy",
       "to": "caddy",
@@ -696,7 +697,7 @@ loaded:
 </plist>
 ```
 
-`tendcf_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
+`preview_edges[0]` is what §4.1 means by mandatory attribution: `origin` says
 this edge was never authored, `rule` names the mechanism that produced it,
 and `source` points at the exact `requires` entry responsible. If this edge
 turns out to be spurious, the question it presents is "does `rule` correctly

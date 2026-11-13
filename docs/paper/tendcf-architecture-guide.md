@@ -912,23 +912,24 @@ host.
 edge from that match:
 
 This illustration is **preview-channel material and does not load as
-Augments.** Both of its top-level keys — `data` and `tendcf_edges` — are
+Augments.** Both of its top-level keys — `data` and `preview_edges` — are
 skipped by CFEngine 3.27.1, so as written this file injects nothing. The
 shape the agent actually consumes is `{"vars": {…}}` and nothing else; the
 projection onto it runs device-side, after approval. The nesting below is
 kept because it shows the *derivation* legibly, which is what this
 walkthrough is for — do not copy it onto a device and expect an effect.
-Its key names `tendcf_services` and `tendcf_edges` are illustrative too
-(renamed from `nix2cf_*` on 2026-11-13; no schema change): the
-projection's real `vars` keys are `tendcf_service` and
-`tendcf_interlock` (§16.C), and the goal file carries no edges.
+Its keys were `nix2cf_*` until 2026-11-13, when they were renamed
+`preview_services` and `preview_edges`: illustrative only, chosen so they
+cannot be mistaken for the `tendcf_services` bundle or the projection's
+real `vars` keys `tendcf_service` and `tendcf_interlock` (§16.C). No
+schema change was involved, and the goal file carries no edges.
 
 ```jsonc
 // host_specific.json — ILLUSTRATIVE ONLY. Preview channel; does NOT load
-// as Augments (top-level `data` and `tendcf_edges` are both skipped).
+// as Augments (top-level `data` and `preview_edges` are both skipped).
 {
   "data": {
-    "tendcf_services": {
+    "preview_services": {
       "caddy": {
         "service_policy": "start",
         "launchd_label": "com.djbclark.caddy",
@@ -947,7 +948,7 @@ projection's real `vars` keys are `tendcf_service` and
       }
     }
   },
-  "tendcf_edges": [
+  "preview_edges": [
     {
       "from": "litellm-proxy",
       "to": "caddy",
