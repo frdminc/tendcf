@@ -24,7 +24,8 @@ and must agree with this guide. The technical paper, with citations and
 open questions in research form, is
 [`tendcf-architecture-paper.md`](tendcf-architecture-paper.md).
 
-**Nothing described here is deployed.** The data formats exist and are
+**Nothing described here is deployed**, apart from a canary service on
+one operator host (§4). The data formats exist and are
 checked, a first generic policy bundle runs, and the projection step has a
 reference implementation. The compiler has its first piece (`buildfile`,
 §4); the rest of it, the on-device executor, and the screens a person
@@ -115,9 +116,9 @@ Git-repo count is not the composition mechanism. Layers are roles.
 Site-private holds a lockfile (flake-style inputs) that pins tendcf,
 site-shared, foreign shared sites, and optional tool forks. The compiler
 is part of tendcf, so one tendcf pin covers schemas and compiler together
-(decided 2026-11-13; until the move lands the compiler is still the
-separate `frdminc/nix2cf` repository, see
-[`plugin-layout.md`](../architecture/plugin-layout.md)). The
+(decided 2026-11-13 and done the same day: the compiler is under
+`compiler/`, and the separate `frdminc/nix2cf` repository is archived;
+see [`plugin-layout.md`](../architecture/plugin-layout.md)). The
 signed release is the deploy artifact. There is no lockstep of sibling
 checkouts that must share one tag.
 
@@ -144,8 +145,8 @@ Nix-for-builds are *consumers*. Any one of them can be replaced without
 moving the facts.
 
 **Schemas and types live in tendcf's `schema/`**, not in the compiler's
-code, although the compiler is moving into the same repository (decided
-2026-11-13, §4). A schema change is an interface change. A hostname
+code, although the compiler now lives in the same repository (`compiler/`,
+since 2026-11-13, §4). A schema change is an interface change. A hostname
 change is site data. They do not move together. The files are
 [`schema/`](../../schema/) and [`examples/`](../../examples/) in this
 repository.
@@ -224,9 +225,10 @@ not the home of schemas.
 
 **Name and home (decided 2026-11-13).** The compiler was built as the
 separate repository `frdminc/nix2cf`, whose `nix2cf buildfile` command is
-the first piece described below. It is being folded into tendcf with its
-history, under `compiler/`, and that repository is archived as soon as
-the import merges. The command becomes `tendcf compile`, which replaces
+the first piece described below. It was folded into tendcf with its
+history, under `compiler/`, on 2026-11-13, and that repository is
+archived. In the restructure still to come the command becomes
+`tendcf compile`, which replaces
 `nix2cf buildfile` outright, with no alias: it compiles every host, and
 `--host` renders one. The name `nix2cf` moves to what it describes: the
 Nix module frontend (§3), one of the compiler's plugins. Frontends,
@@ -239,7 +241,9 @@ device.
 A plugin is trusted build-time code that the operator explicitly allows,
 not sandboxed code, and the claim it supports is narrow. A plugin cannot
 make a device accept anything that device's own diff does not show (§7),
-and it cannot emit a shape the schema forbids. It can make the goal file
+and it cannot emit a shape the schema forbids. (An operator host applies
+without a local yes, so there the pull request's preview diff is the only
+human check.) It can make the goal file
 say something other than what the Site Model says, and it sees the
 site's private data. So the release gates (schema lint, projector,
 preview diff) and signing run in a separate environment with no plugin
@@ -292,11 +296,15 @@ Merge happens once, in the compiler, before render. CFEngine’s own
 
 Because the render is a pure function of the Site Model — same input, same
 output — “show me exactly what device X would receive, without touching
-device X” is almost free. That command, `buildfile`, was the first piece
-of the compiler built: merge, conflict check and goal-file render, with
-service units for launchd only and no inference yet (§18). It is how an
-agent checks its own work, how the compiler regression-tests itself, and
-how a human sees a proposed change before it lands. The shape is
+device X” is almost free. (That purity is a design goal: with plugins it
+also needs a fixed dependency and toolchain closure and controlled
+external inputs, which are not specified yet;
+[`plugin-layout.md`](../architecture/plugin-layout.md) §7.) That command,
+`buildfile`, was the first piece of the compiler built: merge, conflict
+check and goal-file render, with service units for launchd only and no
+inference yet (§18). It is how an agent checks its own work, how the
+compiler regression-tests itself, and how a human sees a proposed change
+before it lands. The shape is
 [Bcfg2 `buildfile`](https://docs.bcfg2.org/). That lineage survives in
 prose only: from the restructure on, the command is
 `tendcf compile --host NAME`, and no subcommand keeps the name
@@ -486,7 +494,10 @@ reviewed diff. Devices are not stranded by that rule, because goal files are
 per-host: the compiler renders each host at the highest schema version that
 host last reported it can read (§6 is where that report comes from), and a
 schema change ships as two releases — the validator update first, as an
-ordinary diff, and the migration behind it.
+ordinary diff, and the migration behind it. Decided 2026-11-13: until the
+first device that is not an operator host enrolls, the compiler renders
+only the current schema version; the per-host render described here
+returns then (map §9.6).
 
 **Accept is all or nothing.** A refusal may name the entries that caused it;
 it never applies the remainder. The proposer withdraws the corresponding
@@ -1330,9 +1341,10 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   resolver and the release pipeline are Step 6 code.
 - **The compiler's first piece**, `nix2cf buildfile` (§4): merge,
   conflict check and render of one host's goal file, with service units
-  for launchd only. Its tests run in CI against tendcf's schemas and
-  reference projector. It lives in the separate `frdminc/nix2cf`
-  repository until the move into tendcf decided on 2026-11-13 lands.
+  for launchd only, in [`compiler/`](../../compiler/) (imported from the
+  now archived `frdminc/nix2cf` on 2026-11-13). Its tests run in
+  tendcf's own CI against the same commit's schemas and reference
+  projector.
 
 **Not built — this is still most of it**
 
@@ -1352,7 +1364,7 @@ coherent, describable state):
 | 0 | Schemas in tendcf | Existing contract is `schema/` + `examples/` + `bin/schema_lint.py`. Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
 | 1 | macOS services adapter | **Started.** `policy/tendcf_services.cf` renders and loads launchd services from projected data, with interlocks enforced (§16.C; the interlock verdict was split into its own bundle on 2026-10-29 after the pass path was found never to open). Still open in this step: package and file promises, environment rendering, the unit-writer detector. Dry-run default. Not in this step: nix-darwin. |
 | 2 | Android under the Site Model | Same vocabulary. Agent owns JSONL+SQLite in app-private storage. |
-| 3 | Compiler (`tendcf compile`, was `nix2cf`) | “What would device X receive?” first, then conflict check, extra-entry reporting, then inference. Inference waits until types exist on two platforms. **Started:** `buildfile` (merge, conflict check, render) exists in `frdminc/nix2cf`; it moves into tendcf under `compiler/` and is split into plugins ([`plugin-layout.md`](../architecture/plugin-layout.md)). |
+| 3 | Compiler (`tendcf compile`, was `nix2cf`) | “What would device X receive?” first, then conflict check, extra-entry reporting, then inference. Inference waits until types exist on two platforms. **Started:** `buildfile` (merge, conflict check, render) exists in `compiler/` (imported from `frdminc/nix2cf` on 2026-11-13); the restructure splits it into plugins ([`plugin-layout.md`](../architecture/plugin-layout.md)). |
 | 4 | Linux reference path | A stock distro, not NixOS. Distro choice is open until this step; Ubuntu Server is the working default. |
 | 5 | First real Linux host | A second node that can hold backup roles. Proves that roles are data. |
 | 6 | Signed releases, push-only | TUF-subset ceremony; goal-file render and diff; the on-device validator. Operator hosts only. |

@@ -200,8 +200,9 @@ Git-repo count is not the composition mechanism. Layers are roles:
 Site-private holds a lockfile (flake-style inputs) that pins tendcf,
 site-shared, foreign shared sites, and optional tool forks. The compiler is
 part of tendcf, so one tendcf pin covers schemas and compiler together
-(decided 2026-11-13; until the move lands the compiler is still the
-separate `frdminc/nix2cf` repository). The signed release is the deploy
+(decided and done 2026-11-13: the compiler is under `compiler/`, and the
+separate `frdminc/nix2cf` repository is archived). The signed release is
+the deploy
 artifact. There is no lockstep of sibling checkouts
 that must share one tag. Collision of the same identity from two peer inputs
 is a **compile error**. Only site-private may bind a winner
@@ -259,8 +260,9 @@ The compiler is a tool, not the home of schemas.
 It was built as the separate repository `frdminc/nix2cf`, whose
 `nix2cf buildfile` command is its first piece. On 2026-11-13 it was decided
 to fold that repository into tendcf with its history, under `compiler/`
-(archiving it as soon as the import merges), to replace `nix2cf buildfile`
-with `tendcf compile` outright, with no alias, and to give the name
+(done the same day, and the old repository archived), to replace
+`nix2cf buildfile` with `tendcf compile` outright in a later
+restructure, with no alias, and to give the name
 `nix2cf` to what it describes: the optional Nix module frontend of §2.1.
 Frontends, supervisor renderers and one-shot importers from other tools
 become plugins; frontends and importers are found through Python entry

@@ -11,8 +11,8 @@ deploy artifact" with a mechanism concrete enough to build.
 
 **Amended 2026-11-13 (map D46).** The compiler, built as the separate
 repository `frdminc/nix2cf`, is folded into tendcf with its history
-([#45](https://github.com/frdminc/tendcf/pull/45)), and `frdminc/nix2cf`
-is archived as soon as that import merges
+under `compiler/` ([#45](https://github.com/frdminc/tendcf/pull/45),
+merged 2026-11-13), and `frdminc/nix2cf` was archived the same day
 ([`plugin-layout.md`](plugin-layout.md)). The compiler is therefore no
 longer a separately pinned input: schema and compiler change in the same
 tendcf commit, and the two-repository bump order and the compiler's own
@@ -21,9 +21,11 @@ loses only its `nix2cf` entry: it still pins tendcf, site-shared and
 foreign sites, and tool forks stay as rule 5 has them. One tendcf rev is
 now the unit a site pins (§8 item 5). Compiler plugins are trusted
 build-time code; which ones a release loads, and the rule that the gates
-and signing run apart from them, are in §3 and §6. Until the move lands,
-the compiler's CI still checks out tendcf's default branch beside it (it
-never had the `tendcf.lock` specified here).
+and signing run apart from them, are in §3 and §6. Since #45 the
+compiler's tests run in tendcf's own CI against the same commit (the
+`compiler` job of `.github/workflows/check.yml`); before that, nix2cf's
+CI checked out tendcf's default branch beside it and never had the
+`tendcf.lock` specified here.
 
 > The requirement, verbatim from #2: the Site Model → signed-release →
 > deploy path must be **much faster and much more atomic** than cutting a
@@ -67,7 +69,7 @@ device seven releases behind still computes one true diff (guide §7).
 
 | Layer (map §3) | Repository today | What a release takes from it |
 | --- | --- | --- |
-| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; `compiler/` and `plugins/` once the move of map D46 lands, today still `frdminc/nix2cf`, whose one compilation command is `buildfile`) |
+| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import, #45, whose one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
 | site-shared | not yet created | recipes |
 | foreign site-shared | none yet | recipes, namespaced |
 | site-private | `~/ops/site-private` (today: ops repo; the tendcf inventory does not exist yet) | inventory, allocations, secret *names*, trust policy, the lockfile |
@@ -153,14 +155,17 @@ Three properties follow:
 
 1. **Immutable and content-addressed.** The release number is the TUF
    `version`; it only goes up (high-water mark on every client, map
-   §9.11). The content is reproducible from the site-private commit, and
+   §9.11). The site-private commit identifies the release's sources, and
    the lockfile hash in `targets.json` is how a reader gets from a release
    back to its inputs without trusting a branch name. That needs every
    compiler plugin to come from a pinned input: until out-of-tree pinning
    exists ([#47](https://github.com/frdminc/tendcf/issues/47)), a release
    build loads only in-tree plugins named by site-private, so the tendcf
    pin covers them, and plugins installed on the builder but not named
-   are ignored (map D46).
+   are ignored (map D46). Reproducing the release byte for byte also
+   needs a fixed dependency and toolchain closure for the build and
+   controlled or recorded external inputs (environment, network); those
+   are not specified yet.
 2. **Per-host targets, one release.** One release carries every host.
    Hosts that did not change get a byte-identical goal file and compute an
    empty diff; nothing is applied. This is why "a release" and "a change"
@@ -223,8 +228,8 @@ Each repository's CI runs against pinned inputs, never against a sibling's
 `master`:
 
 - **tendcf** has no inputs. Its CI is the schema lint, the cross-reference
-  lint, the overlay self-test and, once the compiler has moved in (map
-  D46), the compiler's goldens against the same commit's schemas. A schema
+  lint, the overlay self-test and, since the compiler moved in (map D46,
+  #45), the compiler's goldens against the same commit's schemas. A schema
   change that breaks the compiler fails tendcf's own CI, in the commit
   that makes it. That is a statement about the current `schema_version`,
   the only one the compiler renders until map §9.6's ceiling design
@@ -251,7 +256,7 @@ one consistent set.
 | tendcf | `bin/xref_lint.py` | yes |
 | tendcf | `bin/overlay.py self-test` and `lint` (patch overlay applies; drift fails loudly) | yes, this change |
 | tendcf | overlay drift against upstream (`check --against upstream/master`) | scheduled / manual job, this change |
-| tendcf (compiler) | compile the tendcf fixtures at the same commit; goldens byte-identical | in `frdminc/nix2cf` CI today, against tendcf's default branch; moves into tendcf CI with the compiler (map D46) |
+| tendcf (compiler) | compile the tendcf fixtures at the same commit; goldens byte-identical | yes: the `compiler` job of `.github/workflows/check.yml`, since #45 (map D46); before that in `frdminc/nix2cf` CI, against tendcf's default branch |
 
 **Release gates** (site-private, every commit; a pull request gets the same
 run with signing and publishing skipped, and the per-host diffs attached as

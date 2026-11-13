@@ -10,8 +10,9 @@
 
 1. `frdminc/nix2cf`, the compiler, folds into `frdminc/tendcf` with its
    full git history, first under `compiler/`. A separate pull request
-   ([#45](https://github.com/frdminc/tendcf/pull/45)) does the import;
-   this document moves no files.
+   ([#45](https://github.com/frdminc/tendcf/pull/45)) did the import; it
+   merged on 2026-11-13 (merge commit `ca4fa90`). This document moves no
+   files.
 2. The repository takes the plugin-type layout of §2. It becomes one
    Python package, import name `tendcf` (today's `nix2cf` package is
    renamed; how the directories map onto it is open, §7).
@@ -28,6 +29,8 @@
    the Nix frontend.
 7. The compiler renders only the current `schema_version` (§4).
 8. `frdminc/nix2cf` is archived as soon as the import (#45) merges (§5).
+   Done 2026-11-13: archived the same day #45 merged, its README pointing
+   here.
 
 The consequence for the change process: the compiler is no longer a
 separately pinned input. Schema and compiler change in the same commit,
@@ -75,7 +78,7 @@ tendcf/
 | `schema/`, `examples/` | exist in tendcf | unchanged |
 | `policy/`, `overlay/`, `deploy/` | exist in tendcf | unchanged |
 | `tools/` | is `bin/`: standalone `uv run --script` files; tendcf has no `pyproject.toml` | `bin/` renamed `tools/` after #41 and #42 merge, with no symlink or wrapper left behind and every reference rewritten (§5, step 4) |
-| `compiler/` | `frdminc/nix2cf` (#45 imports it as `compiler/`): `nix2cf/cli.py`, `compile.py`, `sitemodel.py`. Two subcommands: `buildfile`, the implemented compilation command, which renders one host; and `eval-nix`, a plain-expression evaluation hook, not the D12 module frontend | the compiler of the `tendcf` package; command `tendcf compile` (§6) |
+| `compiler/` | exists since #45 (2026-11-13), imported from the now archived `frdminc/nix2cf`: package `nix2cf` (`nix2cf/cli.py`, `compile.py`, `sitemodel.py`), its tests run by the `compiler` job of `.github/workflows/check.yml`. Two subcommands: `buildfile`, the implemented compilation command, which renders one host; and `eval-nix`, a plain-expression evaluation hook, not the D12 module frontend | the compiler of the `tendcf` package; command `tendcf compile` (§6) |
 | `plugins/frontends/yaml/` | `nix2cf/sitemodel.py` (YAML loading with duplicate-key refusal and line numbers) | split out of the compiler, still built in |
 | `plugins/frontends/nix/` | only the hook: `nix2cf eval-nix FILE` evaluates a plain Nix expression with `nix-instantiate --eval --strict --json`; no module frontend | the D12 Nix module frontend, named `nix2cf`; `eval-nix` moves here |
 | `plugins/frontends/guix/` | nothing | later |
@@ -195,8 +198,11 @@ inherits the plugins' trust.
 4. Until out-of-tree pinning exists
    ([#47](https://github.com/frdminc/tendcf/issues/47)), a release build
    loads in-tree plugins only (`plugins/` and `contrib/`, at the pinned
-   tendcf rev). That way the tendcf pin covers the plugin set, and a
-   release stays reproducible from its site-private commit.
+   tendcf rev). That way the tendcf pin identifies the source of the
+   compiler and of every plugin a release loads. Reproducing a release
+   byte for byte also needs a fixed dependency and toolchain closure and
+   controlled or recorded external inputs (environment, network); those
+   controls are not specified yet (§7).
 5. The release's `targets.json` `custom` records the plugin set
    ([`change-process.md`](change-process.md) §3).
 
@@ -237,8 +243,8 @@ and the multi-version render returns with it.
 | # | Change | State |
 | --- | --- | --- |
 | 1 | This documentation: the guide, the paper, the map (D46), the change process, the Linux targets plan, the glossary, this file; and the rename of the illustrative `nix2cf_*` keys (§6). Moves no files and changes no code or schema. | this change |
-| 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | [#45](https://github.com/frdminc/tendcf/pull/45) |
-| 3 | Archive `frdminc/nix2cf`. | as soon as #45 merges |
+| 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | done: [#45](https://github.com/frdminc/tendcf/pull/45), merged 2026-11-13 (`ca4fa90`) |
+| 3 | Archive `frdminc/nix2cf`. | done 2026-11-13, right after #45 merged (README points here) |
 | 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the two public entry-point groups; `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. Waits until open PRs #41 and #42 merge. | planned |
 
 Step 4 rewrites every path reference in every file, dated records
@@ -252,12 +258,19 @@ on 2026-11-13 are listed below (`rg 'nix2cf'` and
 outside dated records). Rerun both over the whole tree before the
 change, because the list moves:
 
-1. **The compiler's in-tree check** (from #45):
-   `compiler/nix2cf/cli.py` accepts an enclosing tendcf checkout only if
-   it has `bin/projector.py` (`_in_tree_tendcf`), loads the projector from
-   that path (`load_projector`) and names it in an error message;
-   `compiler/nix2cf/__init__.py` and `compile.py` cite `bin/projector.py`
-   and `bin/schema_lint.py` in their docstrings.
+1. **The compiler's in-tree check, and the rest of `compiler/`** (from
+   #45): `compiler/nix2cf/cli.py` accepts an enclosing tendcf checkout
+   only if it has `bin/projector.py` (`_in_tree_tendcf`), loads the
+   projector from that path (`load_projector`) and names it in an error
+   message; `compiler/nix2cf/__init__.py`, `compile.py` and
+   `sitemodel.py` cite `bin/projector.py` or `bin/schema_lint.py` in
+   docstrings and comments; so do `compiler/README.md` (links to
+   `../bin/…`), `compiler/docs/DESIGN.md`, `compiler/pyproject.toml`,
+   `compiler/examples/site/launchd-writers.yml` and
+   `compiler/tests/test_compile.py`. The package name `nix2cf` itself
+   (`compiler/pyproject.toml`, `compiler/AGENTS.md`,
+   `compiler/scripts/check_schema_version.py`, the tests and examples)
+   changes with the rename to `tendcf`.
 2. **Schema description text**: `schema/common.schema.json` (three
    descriptions say nix2cf infers edges or fills in a field; under the new
    names that is the compiler), `schema/services.schema.json` and
@@ -269,15 +282,18 @@ change, because the list moves:
    `examples/broken/README.md`.
 4. **Repository files**: `AGENTS.md` (the standing rule names nix2cf as a
    repository, and its description of `check.yml` names the `bin/`
-   tools),
+   tools; its rule that `docs/handoffs/` is append-only and never
+   rewritten yields to the one-time path exception above, for paths
+   only),
    `README.md`, `overlay/overlay.json`, `overlay/README.md`,
    `.github/workflows/check.yml`, `.githooks/pre-commit`,
    `deploy/linux/canary/check.py`, `tests/unit_classifier/test_logic.py`,
    and the tools' own cross-references inside `bin/`.
 5. **Documents**: map D45 (`bin/projector.py` as the source of
-   `tendcf-validate`), and every living document `bin/xref_lint.py` lints.
-   Dated records (handoffs, reviews, reconciliations, opinions) keep the
-   old paths as history and are not rewritten.
+   `tendcf-validate`), every living document `bin/xref_lint.py` lints,
+   and, under the exception above, every dated record (handoffs, reviews,
+   reconciliations, opinions, `deprecated/`): their paths are rewritten,
+   their prose is not.
 
 ## 6. Names
 
@@ -288,10 +304,10 @@ change, because the list moves:
    (guide §4) is kept in prose only; no subcommand keeps the name.
 2. **`nix2cf`** is the Nix module frontend, `plugins/frontends/nix/`. Up
    to 2026-11-13 the name meant the whole compiler; older documents and
-   handoffs use it that way and are not rewritten. Until the restructure
-   the only thing that ships under the name is still the old compiler
-   (`frdminc/nix2cf`, then `compiler/` after #45, command
-   `nix2cf buildfile`).
+   handoffs use it that way, and that prose is not rewritten (only their
+   paths change, §5). Until the restructure the only thing that ships
+   under the name is still the old compiler (`frdminc/nix2cf`, since #45
+   `compiler/`, command `nix2cf buildfile`).
 3. **`guix`** is the planned Guix authoring frontend,
    `plugins/frontends/guix/`.
 4. **The illustrative `preview_services` / `preview_edges` keys.** The
@@ -322,9 +338,12 @@ change, because the list moves:
 - Out-of-tree pinning and trust establishment, after which a release
   build may load an out-of-tree plugin
   ([#47](https://github.com/frdminc/tendcf/issues/47)).
-- Whether the compile step has network access. The guide calls the render
-  a pure function of the Site Model (guide §4); with plugins that holds
-  only for what the release environment controls.
+- Whether the compile step has network access, the dependency and
+  toolchain closure a release build runs in, and how external inputs are
+  controlled or recorded. The guide calls the render a pure function of
+  the Site Model (guide §4); until these are specified, a pinned
+  site-private commit identifies a release's sources but does not by
+  itself reproduce its bytes.
 - Which importers, if any, get built.
 - Guix System hosts with Shepherd as their supervisor (§3).
 - Whether the PyPI names `tendcf` and `nix2cf` are free; unchecked.
