@@ -207,7 +207,8 @@ marked † are from my prior knowledge, not fetched today.
    `/etc/nixos/configuration.nix` for macOS", applied with `sudo darwin-rebuild
    switch` (<https://github.com/nix-darwin/nix-darwin>, fetched 2026-11-13).
    system-manager: "currently supported on NixOS, Ubuntu, and Debian", needs
-   Nix ≥ 2.32, builds on NixOS modules
+   is tested against Nix 2.32 and above (the README says "tested", not
+   required), builds on NixOS modules
    (<https://github.com/numtide/system-manager>, fetched). nix-on-droid: "does
    not require root ... relies on `proot`", "prototype-grade quality",
    aarch64 only, MIT (<https://github.com/nix-community/nix-on-droid>,

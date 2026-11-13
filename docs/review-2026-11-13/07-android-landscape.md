@@ -51,7 +51,7 @@ As the independent check found them on 2026-11-13:
 | Island ([repo](https://github.com/oasisfeng/island)) | oasisfeng | Apache-2.0 | No public commits since 2021-09-02 |
 | Insular ([F-Droid](https://f-droid.org/packages/com.oasisfeng.island.fdroid/); source gitlab.com/secure-system/Insular, GitHub is a mirror) | proletarius101, single maintainer | Apache-2.0 | Last release 6.4.2 on 2025-08-07; commits resumed 2026-09-11 after a gap from 2025-07-30 |
 
-Not checked by either agent: the licence question raised by ShizukuPlus listing Dhizuku as Apache 2.0 while the Dhizuku repo is GPL-3.
+Checked 2026-11-13: ShizukuPlus's OPEN_SOURCE_LICENSES.md lists Dhizuku as "Apache License 2.0", but Dhizuku's own LICENSE is GNU GPL version 3. The attribution is wrong; treat Dhizuku as GPL-3.0. Whether ShizukuPlus copies Dhizuku code, which would affect its own Apache-2.0 label, was not checked.
 
 ---
 
@@ -88,7 +88,7 @@ Privilege tiers used below:
 | Canta | Debloat through Shizuku | shell | Imperative | — | F-Droid URL 404; not checked further |
 | Obtainium | App updates from source URLs; config export | app | Declarative-ish list, not enforced | GPL-3 | Not fetched; stayturgid dropped it (PR #143) |
 | Tasker / Automate | Event-driven automation; ADB-WiFi or Shizuku for secure settings | app/shell | Imperative | Proprietary | Not fetched |
-| UAD-NG | Debloat lists over ADB from a PC; selection export/import | shell from a PC | Declarative list, one-shot | GPL-3 | v1.2.0; Flatpak PR 2026-10-29 (snippet only, https://github.com/flatpark/flatpark/pull/871) |
+| UAD-NG | Debloat lists over ADB from a PC; selection export/import | shell from a PC | Declarative list, one-shot | GPL-3 | latest release v1.3.1 (2026-11-02); Flatpark PR #871 opened 2026-10-26, merged 2026-10-28, packages 1.2.0 (https://github.com/flatpark/flatpark/pull/871, read) |
 | GrapheneOS tooling | Per-profile isolation, Private Space | OS | — | — | Not checked |
 
 Independently checked 2026-11-13: the ShizukuPlus, thedjchi, Dhizuku and Headwind rows confirmed; the Island row weakened, corrected; the Insular row's licence refuted (it is Apache-2.0, not GPL), corrected in place.
@@ -163,8 +163,8 @@ The nearest competitors and their gaps:
    - ADB:
      - "Apps installed using ADB won't require verification."
      - "Unregistered apps can only be installed or updated when the advanced flow is enabled or by using ADB."
-   - Limited distribution: up to 20 devices per Google's FAQ (the limited-distribution guide, https://developer.android.com/developer-verification/guides/limited-distribution, updated 2026-10-28, says 50; confirm before relying on either), with no ID and no fee.
-   - Termux maintainer: `adb install` "internally is same as the `/system/bin/pm install` command", so Shizuku/rish installs are likely exempt. **Inference; Google has not confirmed it** ([gist](https://gist.github.com/agnostic-apollo/b8d8daa24cbdd216687a6bef53d417a6)). Independently checked 2026-11-13: confirmed that the ADB exemption is as quoted and that Google's pages do not address shell installs.
+   - Limited distribution: up to 20 devices per Google's overview page and FAQ; the dedicated guide, https://developer.android.com/developer-verification/guides/limited-distribution, updated 2026-10-28, says 50; plan for 20 until Google reconciles them; free, no ID. Unregistered apps can be installed or updated only while the advanced flow is on or by ADB; turning the advanced flow on takes a one-time one-day wait, then biometric or PIN confirmation, and can be allowed for 7 days or indefinitely. ADB installs are not subject to the wait.
+   - Termux maintainer: `adb install` "internally is same as the `/system/bin/pm install` command", so Shizuku/rish installs are likely exempt. **Inference; Google has not confirmed it** ([gist](https://gist.github.com/agnostic-apollo/b8d8daa24cbdd216687a6bef53d417a6)). Independently checked 2026-11-13: confirmed that the ADB exemption is as quoted and that Google's pages do not address shell installs. The gist was read in full on 2026-11-13: confirmed, and it remains an inference about Shizuku.
    - The same gist warns that F-Droid-signed Termux may be unable to register.
 6. **Distribution.**
    - Play forbids the privilege model these tools need. Termux's Play build is not the main line; not re-checked this session.
@@ -332,15 +332,15 @@ The nearest competitors and their gaps:
 - tendcf-agent and the helper are sideloaded, unregistered apps.
 - From 2026-09-30, verification applies to installs on certified devices in Brazil, Indonesia, Singapore and Thailand through participating stores (Play, Galaxy Store, HONOR, OPPO and others); it extends to all apps on certified devices in 2027.
 - ADB installs are exempt. The Termux maintainer argues shell `pm install` is the same path, but Google has not confirmed that.
-- G8.3, a stranger installing from the public docs, needs a stated install path: register under limited distribution (up to 20 devices per Google's FAQ; the limited-distribution guide, updated 2026-10-28, says 50; confirm before relying on either) or the full program, or rely on ADB/shell installs and the advanced flow.
+- G8.3, a stranger installing from the public docs, needs a stated install path: register under limited distribution (Google's overview page and FAQ say up to 20 devices; the dedicated guide, updated 2026-10-28, says 50; plan for 20 until Google reconciles them; free, no ID) or the full program, or rely on ADB/shell installs and the advanced flow. Unregistered apps can be installed or updated only while the advanced flow is on or by ADB; turning the advanced flow on takes a one-time one-day wait, then biometric or PIN confirmation, and can be allowed for 7 days or indefinitely. ADB installs are not subject to the wait.
 
-**Evidence:** https://developer.android.com/developer-verification ; https://developer.android.com/developer-verification/guides/faq ; https://developer.android.com/developer-verification/guides/limited-distribution (2026-10-28) ; https://gist.github.com/agnostic-apollo/b8d8daa24cbdd216687a6bef53d417a6 ; https://foresightmobile.com/blog/android-developer-verification-2026 (2026-09-28).
+**Evidence:** https://developer.android.com/developer-verification ; https://developer.android.com/developer-verification/guides/faq ; https://developer.android.com/developer-verification/guides/limited-distribution (2026-10-28) ; https://gist.github.com/agnostic-apollo/b8d8daa24cbdd216687a6bef53d417a6 ; https://foresightmobile.com/blog/android-developer-verification-2026 (2026-09-28). All five pages, and the Termux maintainer's gist, were read in full on 2026-11-13 (`checks/v7-refetch.md`, R12).
 **Proposed text:**
 
 > Distribution: tendcf-agent and the helper are registered under Android developer verification before 2027; until then, and for updates, the helper installs with shell `pm install` (the ADB path, exempt from verification). A device whose installer is not exempt reports the update `not_kept`, not silently stale.
 
 **Merge:** needs the operator's ruling first (whether to register, and under which account type)
-**Checked:** verified (fetched); the shell-install exemption is an inference; independently checked 2026-11-13: weakened, corrected
+**Checked:** verified (fetched); the shell-install exemption is an inference; independently checked 2026-11-13: weakened, corrected; sources re-fetched 2026-11-13: corrected
 
 ### X-android-08: G8.1 needs a reboot-survival gate for the helper
 
@@ -524,7 +524,7 @@ The nearest competitors and their gaps:
 6. **Risk: there is no device-owner path without a factory reset.** For G8.3 strangers, design for PO-plus-shell and treat DO as optional.
 7. **Idea: per-app network block resets on reboot.** It is a natural first convergent promise: re-asserted every run, visibly drifting otherwise.
 8. **Risk: Samsung Secure Folder and Private Space.** These are profiles that neither shell nor Island controls. Model them as `not_managed`, never silently skipped.
-9. **Idea: limited distribution (up to 20 devices per Google's FAQ; the limited-distribution guide, updated 2026-10-28, says 50; confirm before relying on either) fits G8.1–G8.2.** It covers the owner's fleet without an identity filing. Decide before 2027.
+9. **Idea: limited distribution (up to 20 devices per Google's overview page and FAQ; the dedicated guide, updated 2026-10-28, says 50; plan for 20 until Google reconciles them) fits G8.1–G8.2.** It covers the owner's fleet without an identity filing. Decide before 2027.
 10. **Risk: the map was written for "Android deferred".** Linux-shaped assumptions (cf-serverd listener, cf-execd, `processes:`) need an Android audit before step 2 starts.
 
 ## Withdrawn after checking

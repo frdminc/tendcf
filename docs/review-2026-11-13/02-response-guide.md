@@ -593,7 +593,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 **Goal:** G5, G8
 **Weight:** improves
 **Finding:** The guide's own example is the Android client's helper. Under G5 and G8 state 1 that example stops being an illustration and becomes a requirement: the Mac is the healthy peer, and ShizukuPlus is the helper. Non-root Shizuku-family helpers have to be started over ADB or wireless debugging after a reboot. The fork adds headless start/stop/status broadcasts and boot retry, which narrows the cases a peer must cover. The peer-action runtime is "nothing" in code today, so it belongs in the state-1 build order, not in "10+".
-**Evidence:** guide:809-821; inventory §C (ShizukuTendCF features), §H ("Peer actions | nothing"); Shizuku's need for ADB after reboot is inferred from https://github.com/thejaustin/ShizukuPlus ("a privileged process started with adb or root"), not fetched in full.
+**Evidence:** guide:809-821; inventory §C (ShizukuTendCF features), §H ("Peer actions | nothing"); Shizuku's need for ADB after reboot comes from its own setup guide (https://shizuku.rikka.app/guide/setup/): for the wireless-debugging start, "the startup steps need to be performed again after each reboot"; a rooted start is different (read 2026-11-13).
 **Proposed text:**
 
 > This is the first peer action tendcf will run. On an Android device
@@ -604,7 +604,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > device waits, and it reports why.
 
 **Merge:** insert after the first paragraph of §13
-**Checked:** inferred (Shizuku start mechanics not verified against its docs); independently checked 2026-11-13: confirmed
+**Checked:** verified (Shizuku start mechanics read in its setup guide 2026-11-13); independently checked 2026-11-13: confirmed; sources re-fetched 2026-11-13: confirmed
 
 ---
 
