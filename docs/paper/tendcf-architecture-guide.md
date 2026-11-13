@@ -257,7 +257,10 @@ hold no signing key (**planned, Step 6**: nothing enforces this today;
 the interim is a separate Unix user on the builder, the default before the
 first real release is a two-job split whose release may be signed by the CI
 key (which alone suffices), by any one of at least two optional hardware
-tokens, or by an opt-in Unix user (which lowers every release to its level),
+tokens, or by an opt-in Unix user (which lowers every release to its level;
+a break-glass release is one person's act, bounded only by the trust in
+that signer, and the gates run from the previous release's tendcf pin, so
+a tools bump ships alone first),
 and frontend recipes from other
 sites are imported, pinned and scanned before they run). A release is to
 load only the plugins site-private names (planned: the loader), and only

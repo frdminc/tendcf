@@ -170,6 +170,22 @@ layout and order of the move in `plugin-layout.md`.
 Authority: `architecture-DEFINITIVE-v3.md` D46 (9) (decision D-b, issue #48);
 `plugin-layout.md` §3 and §4.
 
+### trust root
+
+**Three live senses.**
+
+- **The device-local trust root** — what the release path cannot write on
+  a device (advisor key, consent policy and the like; DC-1).
+- **The TUF `root` role** — the offline signing keys (map §9.11).
+- **The site's trust root** — a planned site-private declaration of which
+  tendcf repository and branches the site accepts; the tendcf pin's `url`
+  and `ref` must match it. It holds no keys. Gate 1 reads it from the
+  protected base, never from the pull request under test (`plugin-layout.md`
+  §4, "Signed is what was reviewed", item 5). Location and format open.
+
+Authority: `architecture-DEFINITIVE-v3.md` DC-1 and §9.11; `plugin-layout.md`
+§4 and §7 (operator rulings 16 and 17, issue #48 decisions).
+
 ### coverage
 
 **One enum, three values**: `comprehensive`, `not-yet-migrated`,

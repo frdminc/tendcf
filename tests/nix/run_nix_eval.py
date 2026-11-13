@@ -211,7 +211,9 @@ def main():
         avg[avg.index("restrict-eval") + 1] = "false"
         for case in gen_cases:
             rc, out, err = run(avg, env, gen / case)
-            print(f"  control [restrict-eval=false, generated {case}]: rc={rc} out={out[:60]!r} err={first_line(err)!r}")
+            print(f"  control [restrict-eval=false allows generated {case}]: rc={rc} {'OK' if rc == 0 else 'STILL-REFUSED'} out={out[:60]!r} err={first_line(err)!r}")
+            if rc != 0:
+                bad.append(("control", case))
         ad = FIX / "allowed"
         ave = with_dir(doc, ad)
         ave[ave.index("restrict-eval") + 1] = "false"

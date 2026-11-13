@@ -474,11 +474,14 @@ plugin-free. What it means now:
       B has checked them independently and the approval binding below
       holds.
    2. **Job B** runs in a protected signing environment. It builds the
-      gate tools from the pinned source with hash-locked dependencies,
-      without installing the `tendcf` package. It runs gates 3 to 5 on the
+      gate tools (the schema lint, the projector and the projection lint)
+      from the **previous release's tendcf pin**, never the pin under
+      test, with hash-locked dependencies and without installing the
+      `tendcf` package (rule 5 below). It runs gates 3 to 5 on the
       uploaded bytes and signs exactly the digests it checked.
-   3. **Job B′** is job B's environment without the key: the same pinned
-      tools, the same hash-locked dependencies, no `tendcf` package, no
+   3. **Job B′** is job B's environment without the key: the same gate
+      tools from the same pin, the same hash-locked dependencies, no
+      `tendcf` package, no
       secret and no signing credential. It runs gates 3 to 5 on job A's
       uploaded bytes for a pull request, so that the preview a human
       reviews is computed outside the plugins' reach. (Completing D-d:
@@ -498,12 +501,30 @@ plugin-free. What it means now:
       that edits them would be checked by the version it wrote. Therefore
       the hold on job A, the privileged-change detector, gate 1 and jobs
       B′ and B run from definitions the pull request cannot change: the
-      protected ref's workflow and the previous release's pinned tools,
-      never the tree under test. A change to those definitions is never
-      executed or signed by the definition it introduces; it takes effect
-      only after it merges under the old definition, with the ceremony
-      marker. The mechanism (a separate protected repository, required
-      workflows from a protected source) is open, §7.
+      protected base's workflow, **the site's trust-root declaration**
+      (item 5 of "Signed is what was reviewed") and the previous release's
+      gate tools, never the tree under test. A change to those definitions
+      is never executed or signed by the definition it introduces; it takes
+      effect only after it merges under the old definition, with the
+      ceremony marker. The mechanism (a separate protected repository,
+      required workflows from a protected source) is open, §7.
+
+      **Which tools check a release** (operator ruling 18; planned). The
+      gate tools come from the previous release's tendcf pin (the baseline
+      release the preview is diffed against), so a tendcf bump is never
+      judged by the tools it brings. A bump that changes `tools/`,
+      `schema/` or the projector therefore ships as **its own release with
+      unchanged data**: every host's goal file is byte-identical to the
+      previous release's, the old tools pass it, and, being privileged, it
+      carries the ceremony marker. Only a later release may use what the
+      bump added (a new entry kind, a new `schema_version`), and that
+      release is checked by the new tools, which are by then the previous
+      release's pin. Gate 5 refuses a release that moves the pin across
+      such a change and also changes any goal-file bytes. The **first
+      release** has no previous release: its gate tools are built from the
+      tip of the protected branch that the trust root declares, and that
+      rev is recorded in `targets.json` `custom`. Job B′, job B and a
+      token's local re-run all take their tools this way.
    6. **Where gate 1 and the recipe scan run.** Job B′ and job B fetch and
       verify the pins themselves (gate 1) and take nothing from job A
       except the goal-file bytes and the digest manifest. Job B′'s static
@@ -539,9 +560,9 @@ plugin-free. What it means now:
       run, after verifying that run's identity and every digest against
       the approved ones.
    2. *Re-run locally.* Re-run gates 3 to 5 on the approved artifacts in a
-      plugin-free environment built from the pinned source with
-      hash-locked dependencies (no `tendcf` package, no plugin), then sign
-      what that run checked.
+      plugin-free environment built from the gate tools of the previous
+      release's tendcf pin (rule 5 above) with hash-locked dependencies
+      (no `tendcf` package, no plugin), then sign what that run checked.
 
    The path used is recorded in `targets.json` `custom`, which is signed:
    a TUF signature itself carries only a key id and the signature (from
@@ -552,16 +573,23 @@ plugin-free. What it means now:
    **Break-glass.** A route with no merged pull request is allowed
    (operator ruling). It is a privileged change (the ceremony marker; item
    5.11 of "Signed is what was reviewed") and is recorded in
-   `targets.json` `custom`. What a break-glass release may sign, and what
-   replaces the pull request's reviewed preview, are not specified (§7).
+   `targets.json` `custom`. **It is one person's act** (operator ruling
+   19): there is no pull request and no author other than the signer, so
+   the signer chooses what to sign and can also produce the marker the
+   route needs. It is bounded only by the threshold-one trust in that
+   signer, which is the trust every enrolled signer already carries (one
+   signature is enough, so any enrolled signer can sign anything). What a
+   break-glass release may sign, what replaces the pull request's
+   reviewed preview and who verifies its marker (jobs B′ and B have no
+   pull request to check) are not specified (§7).
 
    What each backend keeps and loses:
 
    | Backend | Plugin-free gates 3 to 5 | Promotion of the approved artifacts | Open |
    | --- | --- | --- | --- |
    | Two-job CI, environment secret (suffices alone) | job B′ and job B | holds | the signing-environment rules above; a malicious dependency release at a locked hash |
-   | Hardware token, optional, at least two if any | path 1: job B′'s run; path 2: the token holder's own plugin-free re-run | the token signs only the approved artifacts' digests, so checked | the path is in `custom`; the machine of path 2 is the operator's own and is trusted as such; break-glass has no merged pull request |
-   | Separate Unix user (opt-in, non-default) | the gate tools run as the signer user, pinned and without `tendcf` | the signer signs only the approved run's digests, but compile and signer share one machine, so persistence and pre-signing tampering stay open and lower every release to this level | no throwaway-runner isolation |
+   | Hardware token, optional, at least two if any | path 1: job B′'s run; path 2: the token holder's own plugin-free re-run | the token signs only the approved artifacts' digests, so checked | the path is in `custom`; the machine of path 2 is the operator's own and is trusted as such; break-glass has no merged pull request and is one person's act |
+   | Separate Unix user (opt-in, non-default) | the gate tools (previous release's pin) run as the signer user, without `tendcf` | the signer signs only the approved run's digests, but compile and signer share one machine, so persistence and pre-signing tampering stay open and lower every release to this level | no throwaway-runner isolation |
 
    The backend in use, the signer and the path are recorded in
    `targets.json` `custom` (the field names are not specified), and
@@ -605,8 +633,10 @@ required site-private changes to be reviewed at all. Until this is built,
 the preview diff is **advisory**. The rule:
 
 1. **Promote the pull request's own artifacts, previewed outside the
-   plugins.** The pull-request run is job A (throwaway runner, no
-   secrets) followed by job B′. Job A produces the goal files and the
+   plugins.** The pull-request run is job B′'s checks that need no job A
+   output (gate 1, privileged-change detection, the recipe scan; signing
+   rule 6), then job A (throwaway runner, no secrets), then the rest of
+   job B′. Job A produces the goal files and the
    digest manifest; job B′ computes gates 3 to 5 and the per-host preview
    from those bytes. Reviewers approve job B′'s preview, never a preview
    produced in job A.
@@ -644,7 +674,8 @@ the preview diff is **advisory**. The rule:
       further);
    3. a changed plugin set;
    4. a tendcf bump that changes `tools/` (today `bin/`), `schema/` or the
-      projector;
+      projector, which ships as its own release with unchanged data (the
+      tools rule in signing rule 5);
    5. a new `site.lock` input (its `url` is new);
    6. any file that job B′ or job B executes or builds its environment
       from: the gate tools' lock file, the projection lint,
@@ -655,7 +686,8 @@ the preview diff is **advisory**. The rule:
       hardware token or the Unix user;
    9. a lowering of `external_import.without_ai`;
    10. a change to the tendcf repository or branch set that the site's
-       trust root declares (below);
+       trust root declares (below), which takes effect only for pull
+       requests opened after it merges;
    11. a break-glass signing route with no merged pull request (§4,
        signers).
 
@@ -664,17 +696,24 @@ the preview diff is **advisory**. The rule:
    1. An attestation the pull request's author cannot produce for
       themselves: for example a signature by a ceremony key or an enrolled
       signer, or the approval of a designated person other than the
-      author.
+      author. A break-glass release has no pull request and no other
+      author: its marker is the signer's own act (§4, signers; operator
+      ruling 19).
    2. Bound to one head commit and to the named privileged changes it
       admits (the changed pins, the plugin-set digest, the override
       targets), so a marker for a `url` change does not also admit a scan
       override, and an earlier marker cannot be replayed on a later commit.
-   3. Verified by job B′ and job B, from definitions outside the pull
-      request (the signing-environment rules, item 5), and never by job A.
+   3. For a pull request, verified by job B′ and job B, from definitions
+      outside the pull request (the signing-environment rules, item 5),
+      and never by job A. Who verifies a break-glass marker is open (§7).
 
    **The tendcf pin** (operator rulings). The pin's `url` and `ref` have to
    name the tendcf repository and branch the site's **trust root**
-   declares. The default is `frdminc/tendcf` and `master`, or an
+   declares. (The trust root is a site declaration of which tendcf
+   repository and branches the site accepts. It is neither the TUF `root`
+   role of map §9.11, which holds offline signing keys, nor the
+   device-local trust root of DC-1; its location and format are open, §7.)
+   The default is `frdminc/tendcf` and `master`, or an
    explicitly listed set of release branches of it. Each declared branch
    must have required review, no force-push, no deletion and no
    administrator bypass; a protected branch that lacks any of these does
@@ -684,7 +723,17 @@ the preview diff is **advisory**. The rule:
    root, and that declaration is a privileged change (item 10). A
    per-pull-request marker never admits a fork or another ref: the marker
    covers the changes listed above, and the tendcf `url` and `ref` are
-   fixed by gate 1 and the trust root, not by a marker. For the tendcf
+   fixed by gate 1 and the trust root, not by a marker. **Gate 1 reads
+   the trust-root declaration from the protected base, never from the
+   pull request under test, so a declaration change takes effect only
+   after it merges and a pin that relies on it comes in a later pull
+   request.** Jobs B′ and B read it from the same place, the protected
+   base or the previous release. So a pull request that changes the
+   declaration may not also move the tendcf pin, and a declaration change
+   reaches only pull requests opened after it merges. (This is signing
+   rule 5 of "Release gates and signing run apart from plugins" applied to the declaration, which
+   is data rather than a definition; without it one marker could admit a
+   fork inside a single pull request.) For the tendcf
    input that also answers issue #48's F3 (an allowlist of the tendcf
    `url`). Where the trust root lives, and how gate 1 reads a branch's
    protection settings, are open (§7).
@@ -948,18 +997,28 @@ change, because the list moves:
   it.
 - **The mechanisms behind four planned invariants of §4**, all open:
   1. how the definitions of the job A hold, the privileged-change
-     detector, gate 1 and jobs B′ and B come from outside the pull request
+     detector, gate 1 and jobs B′ and B, the trust-root declaration and
+     the previous release's gate tools come from outside the pull request
      (a separate protected repository, or required workflows from a
      protected source);
   2. what the ceremony marker is: who applies it, how B′ and B verify it,
      and how it is bound to one head and the named changes (the invariants
      are in §4, item 5);
   3. where the approval record is stored and how job B verifies it;
-  4. where the site's trust root lives and its format, and how gate 1
+  4. where the site's trust root lives and its format (a declaration of
+     the accepted tendcf repository and branches, not TUF root metadata
+     and not DC-1's device-local trust root), and how gate 1
      reads a branch's protection settings (required review, no
      force-push, no deletion, no administrator bypass).
-- What a break-glass release (no merged pull request) may sign, and what
-  replaces the pull request's reviewed preview (§4, signers).
+- What a break-glass release (no merged pull request) may sign, what
+  replaces the pull request's reviewed preview, and who verifies its
+  marker: jobs B′ and B have no pull request to check, and under
+  operator ruling 19 it is one person's act (§4, signers).
+- How a pin-only bump release (§4, signing rule 5) keeps every goal file
+  byte-identical when the bump changes `schema_version`: the compiler of
+  the new pin renders only the current version (D46 (6)), so such a bump
+  needs a compiler that can still render the old version for that
+  release, or map §9.6's ceiling design.
 - **What network egress job A (the plugin-running job) is allowed. Open,
   with the risk stated** (operator ruling: unrestricted for now): a plugin
   or imported recipe in job A can send everything job A sees to any host,
@@ -1004,3 +1063,14 @@ review, no force-push, no deletion and no administrator bypass; and a site
 may declare its own tendcf repository and branch set in its trust root, a
 privileged change that a per-pull-request marker never substitutes for
 (§4, item 5).
+
+Settled by the operator's rulings 18 and 19 of 2026-11-13 and no longer
+open: the gate tools come from the previous release's tendcf pin, a tools,
+schema or projector bump ships as its own release with unchanged data
+before any release uses it, and the first release builds its tools from
+the tip of the branch the trust root declares (§4, signing rule 5;
+[`change-process.md`](change-process.md) §4 and §6); and a break-glass
+release is one person's act, bounded only by the threshold-one trust in
+that signer (§4, signers). The trust-root declaration is read from the
+protected base, so one pull request cannot both change it and move the
+tendcf pin (§4, item 5; this follows ruling 17 and is not a new ruling).
