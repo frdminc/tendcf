@@ -23,6 +23,9 @@ gates — issue #2) and [`upstream-overlay.md`](upstream-overlay.md) (the
 patch overlay on libntech / cfengine/core in [`../../overlay/`](../../overlay/)
 — issue #3). [`upstream-register.md`](upstream-register.md) is the living
 record of every CFEngine/libntech defect and contribution.
+[`plugin-layout.md`](plugin-layout.md) is the repository layout and the
+compiler's plugin kinds, decided 2026-11-13 together with moving the
+compiler into tendcf (map D46).
 
 Site Model contract (JSON Schema, fixtures, lint):
 [`../../schema/`](../../schema/), [`../../examples/`](../../examples/),

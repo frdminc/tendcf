@@ -124,6 +124,22 @@ and may change without reopening the ruling. Authority:
 `architecture-DEFINITIVE-v3.md` D45, with its open
 points in §12.
 
+### nix2cf
+
+**A referent that moved.**
+
+- **Current — the Nix module frontend.** The compiler plugin
+  `plugins/frontends/nix/` that renders a Nix-authored Site Model to the
+  same JSON as the YAML frontend (map D12). Not built yet.
+- **Before 2026-11-13 — the whole compiler**, and the separate repository
+  `frdminc/nix2cf` that held it (`nix2cf buildfile`). That compiler is
+  being folded into tendcf under `compiler/`, its command becomes
+  `tendcf compile`, and the repository is archived once the move is done.
+  Older documents and handoffs use the old sense and are not rewritten.
+
+Authority: `architecture-DEFINITIVE-v3.md` D46 (amending D12 and D21);
+layout and order of the move in `plugin-layout.md`.
+
 ### coverage
 
 **One enum, three values**: `comprehensive`, `not-yet-migrated`,
