@@ -47,7 +47,9 @@
    here.
 
 The consequence for the change process: the compiler is no longer a
-separately pinned input. Schema and compiler change in the same commit,
+separately pinned input. Schema and compiler live in one repository
+under one pin (in separate commits whenever a change touches `tools/`,
+`schema/` or the projector, [`change-process.md`](change-process.md) §4),
 so the two-repository bump order and the compiler's `tendcf.lock` go
 away. `site.lock` loses only its `nix2cf` entry: it still pins tendcf,
 site-shared and foreign sites, and tool forks stay as its rule 5 has
@@ -517,14 +519,31 @@ plugin-free. What it means now:
       unchanged data**: every host's goal file is byte-identical to the
       previous release's, the old tools pass it, and, being privileged, it
       carries the ceremony marker. Only a later release may use what the
-      bump added (a new entry kind, a new `schema_version`), and that
-      release is checked by the new tools, which are by then the previous
-      release's pin. Gate 5 refuses a release that moves the pin across
-      such a change and also changes any goal-file bytes. The **first
-      release** has no previous release: its gate tools are built from the
-      tip of the protected branch that the trust root declares, and that
-      rev is recorded in `targets.json` `custom`. Job B′, job B and a
+      bump added (a new entry kind, which is itself a `schema_version`
+      bump, map §9.6), and that release is checked by the new tools, which
+      are by then the previous release's pin. Gate 5 refuses a release
+      that moves the pin, in either direction, across such a change and
+      also changes any goal-file bytes. The **first release** has no
+      previous release: its gate tools are built from the tip of the
+      protected branch that the trust root declares, **resolved once, by
+      job B′**, and that rev is part of the approval binding ("Signed is
+      what was reviewed", item 2) and, once signed, is recorded in
+      `targets.json` `custom`. Job B and a token's local re-run build from
+      the recorded rev, not from the tip as it is by then, and a different
+      rev means the approval does not carry. Otherwise job B′, job B and a
       token's local re-run all take their tools this way.
+
+      **The tendcf authoring rule** (operator rulings 20 and 21; planned,
+      a tendcf CI check that does not exist today). A tendcf commit that
+      changes `tools/`, `schema/` or the projector fails tendcf CI if it
+      also changes the compiler's goldens, and also if it changes
+      `policy/`. That gives every change to the gate tools a pin-only,
+      byte-identical rev forwards and backwards, so the rule above can
+      always be followed, and it keeps bundle changes in their own tendcf
+      commit (once the goal file carries the policy-tree digest, map §9.8,
+      a bundle change alters every goal file). The release sequence it
+      permits is in [`change-process.md`](change-process.md) §4, and its
+      use in a rollback in §8.
    6. **Where gate 1 and the recipe scan run.** Job B′ and job B fetch and
       verify the pins themselves (gate 1) and take nothing from job A
       except the goal-file bytes and the digest manifest. Job B′'s static
@@ -643,7 +662,9 @@ the preview diff is **advisory**. The rule:
 2. **The approval is bound to** the head commit, job A's run identity, the
    digest manifest, job B′'s preview (which carries the static scan and AI
    review results, and any ceremony override, for each pinned recipe),
-   and the number of the previous release the preview was diffed against.
+   and the number of the previous release the preview was diffed against
+   (for the first release, which has none, the tendcf rev that job B′
+   resolved as its bootstrap tools, signing rule 5).
    **The approval record is produced by job B′ and verified by job B**
    (planned invariant): a GitHub approval binds only a commit, so the
    record that carries the rest is written by the plugin-free job, never
@@ -686,8 +707,8 @@ the preview diff is **advisory**. The rule:
       hardware token or the Unix user;
    9. a lowering of `external_import.without_ai`;
    10. a change to the tendcf repository or branch set that the site's
-       trust root declares (below), which takes effect only for pull
-       requests opened after it merges;
+       trust root declares (below), which takes effect when it merges
+       (the gates read the declaration from the protected base);
    11. a break-glass signing route with no merged pull request (§4,
        signers).
 
@@ -728,9 +749,10 @@ the preview diff is **advisory**. The rule:
    pull request under test, so a declaration change takes effect only
    after it merges and a pin that relies on it comes in a later pull
    request.** Jobs B′ and B read it from the same place, the protected
-   base or the previous release. So a pull request that changes the
-   declaration may not also move the tendcf pin, and a declaration change
-   reaches only pull requests opened after it merges. (This is signing
+   base, and nowhere else. So a pull request that changes the declaration
+   may not also move the tendcf pin, and a declaration change takes effect
+   when it merges: any pull request judged after that, an older one
+   re-run included, is judged by the new declaration. (This is signing
    rule 5 of "Release gates and signing run apart from plugins" applied to the declaration, which
    is data rather than a definition; without it one marker could admit a
    fork inside a single pull request.) For the tendcf
@@ -741,7 +763,9 @@ the preview diff is **advisory**. The rule:
    **Rollback** (operator ruling): moving the tendcf pin backwards across
    a `schema_version` bump is forbidden, so the fix is to roll forward
    with a new commit. Within one `schema_version` a backward move is a
-   privileged change (item 2). Planned requirement: `CODEOWNERS` for
+   privileged change (item 2), and across a change to `tools/`, `schema/`
+   or the projector it is a pin-only release, in the order
+   [`change-process.md`](change-process.md) §8 item 2 gives. Planned requirement: `CODEOWNERS` for
    `schema/`, `tools/` and `policy/`. Folding the compiler into tendcf
    cost the independence of producer and checker: one tendcf commit can
    change both the compiler and its gates, and rolling the pin back rolls
@@ -1015,10 +1039,23 @@ change, because the list moves:
   marker: jobs B′ and B have no pull request to check, and under
   operator ruling 19 it is one person's act (§4, signers).
 - How a pin-only bump release (§4, signing rule 5) keeps every goal file
-  byte-identical when the bump changes `schema_version`: the compiler of
-  the new pin renders only the current version (D46 (6)), so such a bump
-  needs a compiler that can still render the old version for that
-  release, or map §9.6's ceiling design.
+  byte-identical when the bump changes `schema_version` (every
+  entry-kind change does, map §9.6): the compiler of the new pin renders
+  only the current version (D46 (6)), so such a bump needs a compiler
+  that can still render the old version for that release, or map §9.6's
+  ceiling design. This brings forward the multi-version render that D46
+  (6) deferred until the first device that is not an operator host
+  enrolls: the first entry-kind change after the first release needs it.
+  The whole schema-bump sequence of [`change-process.md`](change-process.md)
+  §4 (gate tools staged, device validator deployed, migration, data) is
+  the intended order and stays open until that is answered, as do how the
+  device validator update is delivered as a goal diff (D45) and what
+  guards that every host has it before the migration while the compiler
+  renders one version.
+- **The tendcf authoring rule's CI check** (operator rulings 20 and 21,
+  §4): how it names the compiler's goldens, the projector and `policy/`,
+  and whether it runs per pull request or per commit that lands. It is a
+  tendcf check, not a site-private one, and it does not exist today.
 - **What network egress job A (the plugin-running job) is allowed. Open,
   with the risk stated** (operator ruling: unrestricted for now): a plugin
   or imported recipe in job A can send everything job A sees to any host,
@@ -1063,6 +1100,11 @@ review, no force-push, no deletion and no administrator bypass; and a site
 may declare its own tendcf repository and branch set in its trust root, a
 privileged change that a per-pull-request marker never substitutes for
 (§4, item 5).
+
+Settled by the operator's rulings 20 and 21 of 2026-11-13 and no longer
+open: a tendcf commit that changes `tools/`, `schema/` or the projector
+fails a planned tendcf CI check if it also changes the compiler's goldens
+or `policy/` (§4, signing rule 5; the check itself is open, below).
 
 Settled by the operator's rulings 18 and 19 of 2026-11-13 and no longer
 open: the gate tools come from the previous release's tendcf pin, a tools,

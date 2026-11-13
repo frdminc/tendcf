@@ -164,7 +164,8 @@ Rules for the file, each with the reason it is a rule:
 pinning the tendcf rev its golden tests run against.~~ **Amended
 2026-11-13:** there is no compiler lock. The compiler is in tendcf, so its
 goldens run against the schemas of the same commit, and a schema change
-lands together with the compiler support it needs (§4, §5). This holds
+is paired with the compiler support it needs, in separate tendcf commits
+(§4, §5). This holds
 for the current `schema_version`, the only one the compiler renders (map
 D46): older-version rendering is removed in the restructure. Map §9.6's
 ceiling design, which needs the compiler to render older versions for
@@ -233,46 +234,98 @@ The ordinary case, one site-private commit:
 
 The cross-repo case — say a new entry kind, which needs a schema,
 projector support, a generic bundle promise and compiler support (all
-tendcf), and site data (site-private). **The gate tools ship first**
-(operator ruling 18; planned, Step 6): the gates that check a release run
-from the previous release's tendcf pin (§6), so the new kind is two
-site-private releases after one tendcf commit:
+tendcf), and site data (site-private). Two operator rulings shape it.
+**The gate tools ship first** (ruling 18; planned, Step 6): the gates that
+check a release run from the previous release's tendcf pin (§6). And
+**tendcf commits stay separable** (rulings 20 and 21, the authoring rule
+below). Because map §9.6 makes every entry-kind change, additive
+included, a `schema_version` bump, this example is the schema-bump
+sequence, and **staging the gate tools in CI is a different act from
+deploying the device validator**: the first is a pin-only release that no
+device notices, the second an ordinary goal diff that devices take.
 
-1. **tendcf lands first**, as one commit: schema, fixture, projector,
-   bundle, compiler support, and the broken fixtures that prove the lint
-   catches the new kind's failure modes. tendcf CI, compiler goldens
-   included, is green on its own. No device notices.
-2. **site-private bumps the tendcf pin alone, as its own release.** The
+1. **tendcf lands first**, as separate commits, each green on tendcf CI:
+   (a) the schema, the projector and any `tools/` change, with the
+   validator source that accepts the old and the new version, the
+   fixture and the broken fixtures that prove the lint catches the new
+   kind's failure modes; it changes no compiler golden and nothing in
+   `policy/`; (b) the bundle (`policy/`), alone; (c) the compiler support
+   and its goldens, which touches none of `tools/`, `schema/` and the
+   projector. No device notices.
+2. **Release 1, the gate tools staged: site-private bumps the tendcf pin
+   alone**, to the rev after 1(a) (or 1(b)), as its own release. The
    commit changes the pin and no data. The previous release's tools check
    it, and they pass it because every host's goal file is byte-identical
    to the previous release's: every host computes an empty diff, which is
    also the test that the bump was pure. It needs the ceremony marker (a
    tendcf bump that changes `tools/`, `schema/` or the projector is a
-   privileged change, §6 gate 5).
-3. **site-private adds the data in a later release.** The new tools, now
-   the previous release's pin, check it. That release is the first thing
-   any device sees that uses the new kind.
+   privileged change, §6 gate 5). This holds only while the compiler at
+   the new pin still renders every host's goal file at the previous
+   `schema_version`. Map §9.6 makes every entry-kind change, additive
+   included, a `schema_version` bump, and the compiler renders only the
+   current version (D46 (6)), so for this example step 2 waits on the open
+   item below.
+3. **Release 2, the device validator deployed.** The validator update
+   (`tendcf-validate` on Linux and macOS, `tendcf-agent` on Android; map
+   D45) is an ordinary privileged-region goal diff under schema N−1 (map
+   §9.6, TC-25 class). It is a release of its own: release 1 may change no
+   goal file, and gate 5 refuses a release that moves the pin across a
+   tools change and also changes bytes, so the two cannot be one release.
+   Release 1's tools, which accept both versions, check it. Hosts report
+   their `schema_ceiling` (map §9.6), and the compiler renders the new
+   version for a host only once that host's ceiling allows it.
+4. **Release 3, the migration.** The pin moves to the rev after 1(c), so
+   the compiler renders the new version. Map §9.4 governs: the migration
+   must diff to empty apart from the version bump and may not be mixed
+   with a semantic change. The new tools, now the previous release's pin,
+   check it.
+5. **Release 4 or later, the data that uses the new kind**, checked by
+   the new tools. This is the first release any device sees that uses the
+   new kind.
 
 (~~Before 2026-11-13 this was three steps: tendcf, then nix2cf bumping its
 `tendcf.lock` and landing compiler support, then site-private bumping
 both pins.~~ Map D46 put the compiler in tendcf, so the middle step is
 part of the first.)
 
+**Where the sequence depends on the compiler's old-schema rendering, the
+reconciliation is open and is not asserted here.** Releases 1 and 2 need
+the compiler at the pinned rev to render the old `schema_version`, and
+release 3 the new one; D46 (6) has the compiler render only the current
+version until map §9.6's ceiling design applies. How the device validator
+update is delivered as a goal diff (D45), and what guards that every host
+has it before release 3 while the compiler renders one version, are open
+as well ([`plugin-layout.md`](plugin-layout.md) §7). The order above is
+the intended one, not a tested one.
+
 A tendcf bump that changes none of `tools/`, `schema/` and the projector
 (a compiler-only fix, say) needs no pin-only release: it may go in one
 commit with data changes, checked by the previous release's tools.
 
-If the schema change is **not** backward compatible, map §9.6 governs: it
-ships as two releases, the validator update first as an ordinary diff, the
-migration second, and the migration must diff to empty (map §9.4). That is
-the rule above applied to a `schema_version` bump: the validator update is
-the pin-only release of step 2, which the old tools check as an ordinary
-diff under the old schema, and the migration release is checked by the new
-validator, by then the previous release's pin. The lockfile does not
-change that rule; it only makes each of the two releases one commit. For a
-`schema_version` bump the pin-only release has to keep every goal file at
-the old version, which the compiler of the new pin does not render until
-map §9.6's ceiling design applies (D46 (6)); that is open
+**The tendcf authoring rule** (operator rulings 20 and 21; planned: a
+tendcf CI check, which does not exist today). A tendcf commit that
+changes `tools/`, `schema/` or the projector fails tendcf CI if it also
+changes the compiler's goldens, and also if it changes `policy/`. The
+first half gives every change to the gate tools a pin-only rev whose
+output is byte-identical to the rev before it, forwards and backwards
+(§8), so that ruling 18's rule can always be followed; without it, a
+commit that changed a lint and a rendering together could never be
+adopted by any site, and no gate would say so. It covers any such commit,
+not only `schema_version` bumps. The second half keeps bundle changes in
+their own tendcf commit: once the goal file carries the policy-tree digest
+(map §9.8), a bundle change alters every goal file, so a bump across it is
+an ordinary privileged-region release, never a pin-only one, and it must
+not share a commit with a gate-tools change. How the check names the
+goldens and the paths is open.
+
+Map §9.6's two phases are the sequence above: the validator update first
+as an ordinary diff under the old schema (release 2, after the gate tools
+are staged in release 1), the migration second (release 3), which must
+diff to empty (map §9.4). The lockfile does not change that rule; it only
+makes each release one commit. For every `schema_version` bump, the
+additive case above included, the pin-only release has to keep every goal
+file at the old version, which the compiler of the new pin does not
+render until map §9.6's ceiling design applies (D46 (6)); that is open
 ([`plugin-layout.md`](plugin-layout.md) §7).
 
 ## 5. Why the other repositories never block
@@ -310,6 +363,7 @@ one consistent set.
 | tendcf | `bin/overlay.py self-test` and `lint` (patch overlay applies; drift fails loudly) | yes, this change |
 | tendcf | overlay drift against upstream (`check --against upstream/master`) | scheduled / manual job, this change |
 | tendcf (compiler) | compile the tendcf fixtures at the same commit; goldens byte-identical | yes: the `compiler` job of `.github/workflows/check.yml`, since #45 (map D46); before that in `frdminc/nix2cf` CI, against tendcf's default branch |
+| tendcf (authoring rule) | a commit that changes `tools/`, `schema/` or the projector fails if it also changes the compiler goldens or `policy/` (operator rulings 20 and 21, §4) | no, planned |
 
 **Release gates** (site-private, every commit; a pull request gets the same
 run with signing and publishing skipped, and gates 3 to 5 run in a
@@ -366,10 +420,11 @@ the review artifact; a diff computed in the compile job never is):
      (guide §7: nobody gets stranded), or
    - the tendcf pin moves backwards across a `schema_version` bump
      (forbidden, not merely privileged: roll forward), or
-   - the tendcf pin moves across a change to `tools/`, `schema/` or the
-     projector and any host's goal file differs from the previous
-     release's (a tools bump ships alone, with unchanged data; see "Which
-     tendcf rev the gate tools come from" below), or
+   - the tendcf pin moves, in either direction, across a change to
+     `tools/`, `schema/` or the projector and any host's goal file differs
+     from the previous release's (a tools bump or a backward move ships
+     alone, with unchanged data; see "Which tendcf rev the gate tools come
+     from" below and §8 item 2), or
    - the commit makes a **privileged change** and does not carry the
      ceremony marker (decisions D-d and issue #48, planned, Step 6). The
      list (the operator's: a changed `url` in any `site.lock` pin; a pin
@@ -407,11 +462,15 @@ byte-identical to the previous release's (an empty diff for every host),
 the old tools pass it, and it carries the ceremony marker (gate 5,
 privileged change). Only a later release may use what the bump added, and
 that release is checked by the new tools, which are by then the previous
-release's pin (§4). The first release has no previous release: its gate
-tools are built from the tip of the protected branch that the site's trust
-root declares, and that rev is recorded in `targets.json` `custom`. Jobs
-B′ and B and a token's local re-run use the same tools (plugin-layout §4,
-signing rule 5).
+release's pin (§4). A backward move across such a change is a pin-only
+release too (§8 item 2). The first release has no previous release: its
+gate tools are built from the tip of the protected branch that the site's
+trust root declares, **resolved once, by job B′**; that rev is part of the
+approval binding below and, once signed, is recorded in `targets.json`
+`custom`. Job B and a token's local re-run build from that recorded rev,
+not from the tip as it is by then, and a different rev means the approval
+does not carry. Otherwise jobs B′ and B and a token's local re-run use the
+same tools (plugin-layout §4, signing rule 5).
 
 The signing key for `targets` lives on the signer, not in the compile
 step; `root` stays offline (map §9.11, residue §14.4). Which machine the
@@ -462,7 +521,9 @@ concrete:
    that need no job A output, then job A, then the rest of job B′. Reviewers approve job B′'s preview (which carries the import scan and
    AI review results). The approval is bound to the
    head commit, job A's run identity, the digest manifest, that preview and
-   the number of the previous release it was diffed against. At merge, if
+   the number of the previous release it was diffed against (for the first
+   release, which has none, the bootstrap tools' rev that job B′
+   resolved). At merge, if
    the merged tree equals the approved head tree and none of those
    changed, job B takes the same artifacts by run identity, re-runs gates 3
    to 5, checks the digests and previews equal what was approved, and signs
@@ -511,11 +572,39 @@ moved on since.
    ordinary way. A consented device consents again; an operator host applies.
    Removals revert as `absent → present` replace hunks, which is why map
    §9.8 insists removals are states, not events: a rollback is just another
-   diff.
+   diff. **When release N's tendcf pin lies across a change to `tools/`,
+   `schema/` or the projector from the current pin, one commit cannot do
+   it:** gate 5 refuses a release that moves the pin across such a change
+   and also changes goal-file bytes (§6), and a revert changes both. The
+   revert is then two releases, each one commit, in the order item 2
+   gives. A revert across a `schema_version` bump is not offered (item 5).
 2. **Partial rollback is the same mechanism**: move one input's pin back
    (the tendcf pin moves schemas, policy tree and compiler together, item
    5) or revert one host's entries, cut a release. There is no "roll back
-   repo X" because no device ever depended on repo X directly.
+   repo X" because no device ever depended on repo X directly. **A move
+   of the pin across a change to `tools/`, `schema/` or the projector is a
+   pin-only release, and combined with a data revert it is two releases,
+   in an order that depends on which tools would refuse what:**
+   1. *Data first, then the pin*, when the older tendcf tools would refuse
+      the current data (it uses something they lack, a newer entry kind or
+      field, say). Release one reverts the data under the current pin,
+      checked by the current tools. Release two moves the pin back alone,
+      byte-identical, with the ceremony marker.
+   2. *Pin first, then the data*, when the current tools would refuse the
+      older data (a lint tightened since). Release one moves the pin back
+      alone, with unchanged goal files, checked by the current tools and
+      carrying the marker. Release two reverts the data, checked by the
+      older tools, which are by then the previous release's pin.
+   3. *Neither order passes* when each side's tools refuse the other's
+      data. That case cannot be split. The fix is to roll forward with a
+      new tendcf commit or, as a last resort, break-glass (one person's
+      act, §6, operator ruling 19).
+
+   A long range is crossed one step at a time. A step that crosses a
+   `tools/`, `schema/` or projector commit is a pin-only release; a step
+   that crosses none may change bytes and go with data in one release. The
+   tendcf authoring rule (§4) is what guarantees that such a pin-only step
+   exists across each such commit, forwards and backwards.
 3. **A device that never took the bad release** computes the diff from its
    own baseline to M and finds it empty or small. Nothing special happens.
 4. **A bad release that must be stopped before devices apply it** uses the
@@ -524,7 +613,8 @@ moved on since.
 5. **A bad tendcf commit** (schema, projector, bundle or compiler; ~~a bad
    tendcf or nix2cf commit~~ before map D46) is reverted in tendcf on its
    own schedule, or not at all; the fleet is fixed by the site-private
-   pin going back, which is step 1. This is the whole point: the input
+   pin going back, which is item 1 (two releases where item 2 says so).
+   This is the whole point: the input
    repositories' history is never load-bearing for what devices run.
    Since map D46 one tendcf rev is the unit a site pins: taking or
    reverting a compiler fix also takes or reverts every `schema/` and
@@ -538,7 +628,8 @@ moved on since.
    A rollback across a `schema_version` bump is forbidden (operator
    ruling): the pin does not move backwards over a bump, and the fix is to
    roll forward with a new commit. A backward move within one
-   `schema_version` is a privileged change.
+   `schema_version` is a privileged change, and across a change to
+   `tools/`, `schema/` or the projector it is a pin-only release (item 2).
 
 ## 9. Rejected alternatives
 
@@ -557,10 +648,12 @@ moved on since.
    together, accepted in §8 item 5.) The cost the merge also took: the
    compiler and the gates that check its output (`tools/`, `schema/`, the
    projector) now change in one commit, so the producer/checker
-   independence two repositories gave is gone. One commit can change both,
-   and rolling the pin back rolls back gate fixes. The mitigations are
-   privileged-change rules in gate 5 (§6) and `CODEOWNERS` for `schema/`,
-   `tools/` and `policy/`, all planned.
+   independence two repositories gave is gone. One commit could change
+   both, and rolling the pin back rolls back gate fixes. The mitigations
+   are privileged-change rules in gate 5 (§6), the planned tendcf CI check
+   that fails one commit changing the gates together with the compiler's
+   goldens (§4, operator rulings 20 and 21) and `CODEOWNERS` for
+   `schema/`, `tools/` and `policy/`, all planned.
 3. **Git submodules in site-private.** A submodule pointer is a lockfile
    with worse properties: it records only `rev` (no `tree`, so a rewritten
    fork is undetectable until the fetch fails), it is bound to a checkout
