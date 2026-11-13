@@ -26,5 +26,7 @@ jobs:
           nix --version
           nix-instantiate --version
           nix show-config | grep -E '^(restrict-eval|allowed-uris|allow-import-from-derivation|pure-eval|allow-unsafe-native-code-during-evaluation|sandbox|trusted-users) '
-      - name: Matrix of variants and controls (informational)
+      - name: Documented invocation (gating)
+        run: python3 tests/nix/run_nix_eval.py check base+I
+      - name: Matrix of variants and controls (informational; shows why -I is needed and that pure-eval fails)
         run: python3 tests/nix/run_nix_eval.py matrix
