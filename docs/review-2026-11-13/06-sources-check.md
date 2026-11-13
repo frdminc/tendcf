@@ -6,8 +6,10 @@
 **How this was produced:** one reviewing agent (Claude Opus), then an
 independent checking agent that tried to refute each finding; nothing was
 executed unless an item says so.
-**Item counts by Weight, after corrections:** 27 items: misleads 12,
-improves 10, nit 5. None was withdrawn.
+**Item counts by Weight, after corrections:** 29 items: misleads 14,
+improves 10, nit 5. None was withdrawn. (Two items, P-§3.1-s28 and
+P-§3.2-s29, were added on 2026-11-13 from the source re-fetch,
+`checks/v7-refetch.md`.)
 
 This is a read-only review; no repository file was changed.
 
@@ -22,6 +24,14 @@ of [5], [6], [7], [8], [14] and [28], of which only the abstract or first
 pages were read. Section D has the list. Every Bcfg2 claim was checked
 against a primary source.
 
+Update 2026-11-13 (`checks/v7-refetch.md`): once the web and library tools
+were repaired, [9] (in the author's JACM-layout copy; the official ACM copy
+stayed unreachable), the [24] blog post, the [29] ticket (through the public
+REST endpoint), the Promise Theory book [6] and Burgess 2005, and the full
+text of [28] were read. What remains unread of those: the official ACM copy
+of [9]. The sentences below that name these as unread describe the state
+before that pass.
+
 Local primary copies used, extracted read-only to text. `B03` is CLUSTER03
 [1], `B05` is LISA '05 [2], `B06` is LISA '06 [3], `B08` is the 2008 booklet
 [4]. Line anchors `Bnn:LLL` point into a
@@ -33,7 +43,10 @@ unverifiable. (Round 1 was 40 claims: 22, 9, 7, 2. Round 2 changed no
 earlier verdict. It re-sourced T3-T9, T15, T18, T23 and T28 to the Bcfg2 and
 CFEngine documentation and added T41-T59: 13 accurate, 3 overstated, 1
 wrong, 2 unverifiable.) After the independent check, T16 moved from wrong
-to overstated: 35 accurate, 13 overstated, 7 wrong, 4 unverifiable.
+to overstated: 35 accurate, 13 overstated, 7 wrong, 4 unverifiable. The
+2026-11-13 re-fetch resolved all four unverifiable rows: T27 refuted, T40
+and T44 weakened, T59 confirmed; T54 stays overstated, with its blog post
+now read.
 
 Bcfg2 docs used (version 1.3.6, all fetched over http): `BI` =
 http://docs.bcfg2.org/server/bcfg2-info.html, `BA` =
@@ -76,7 +89,7 @@ http://docs.bcfg2.org/getting_started/index.html.
 | T24 | G §12 hyperlink "Bcfg2 Actions" pointing to the LISA '06 PDF | LISA '06 URL | G §12 | **wrong link**. LISA '06 does not describe Actions; the source is [4] §A.2.1. |
 | T25 | internal count | P:38, P:1917, P:1941, G:129-134, G:1638 | Abstract "four of its load-bearing ideas"; G "Six ideas" (six if Actions and bundle scope count separately); Acknowledgements "four Bcfg2 papers" | **wrong** (inconsistent). Desai's AUUG 2005 "Pay As You Go" is a fifth paper, listed in the Bcfg2 papers appendix, and is not cited. |
 | T26 | [1]-[3] bibliographic data | papers.txt URL; LISA PDFs | author lists, venues, pages | accurate |
-| T27 | [6] Burgess and Bergstra, Promise Theory | https://markburgess.org/promises.html (landing page only; the book was not read) | P §2.3, G L316-348: Promise Theory "was formalized … specifically to rule out client-server protocols that push data to a controller" | unverifiable. The page describes "autonomous agencies" and "voluntary cooperation"; the "specifically to rule out" purpose is not stated there. |
+| T27 | [6] Burgess and Bergstra, Promise Theory | https://markburgess.org/promises.html (landing page); the book, markburgess.org/BookOfPromises.pdf, ch. 1 and 17, read in full 2026-11-13 | P §2.3, G L316-348: Promise Theory "was formalized … specifically to rule out client-server protocols that push data to a controller" | refuted. The book (ch. 17.2) says Promise Theory was "originally invented to discuss the issues surrounding this autonomous operation, and voluntary cooperation" and "is not about protocol modeling"; Burgess 2005 builds client-server interactions out of promises (book and paper read 2026-11-13; see P-§2.3-s21 and 01 P-§2.3-02). |
 | T28 | [23] CFEngine | https://docs.cfengine.com/docs/lts/overview/client-server-communication/; https://docs.cfengine.com/docs/lts/getting-started/01-installing-cfengine/general-installation/installation-community/; also *Learning CFEngine* ch. 3 | P §2.3: hub-and-spoke is the textbook setup, and a host can bootstrap to itself | accurate ("You should bootstrap the policy server first to itself"; "The host that other hosts are bootstrapped to automatically assumes the role of policy server"; "The Policy Server must be bootstrapped to itself") |
 | T29 | [21] cdktf | https://github.com/hashicorp/terraform-cdk | P refs: "deprecated December 10, 2025" | accurate ("archived by the owner on Dec 10, 2025") |
 | T30 | [26] TUF spec | https://theupdateframework.github.io/specification/latest/ | P L473 ("unremarkable TUF [26]"), G L554: the trusted root ships out of band; later rotation needs a threshold of old and new keys | accurate ("MUST ship with trusted root keys"; version N and N+1 thresholds) |
@@ -89,11 +102,11 @@ http://docs.bcfg2.org/getting_started/index.html.
 | T37 | [16] Tam et al. | https://arxiv.org/html/2408.02442 (full text) | P §3 item 8: no format wins consistently | accurate ("JSON is more consistent however it does not always outperform other format"). The single YAML-over-JSON case was not located. |
 | T38 | [17] Gloaguen et al. | https://arxiv.org/html/2602.11988 (full text, v3) | P §3: no success gain; cost up "more than a fifth" | accurate (20% and 23%, p < 0.001%) |
 | T39 | [17] | same, §4.2 and Table 3 | P §3.2 item 9: "model-generated files specifically performed worse than supplying no context file at all" | overstated. The drops were 0.5 and 2 points, p = 0.87 and 0.37, which the authors read as "no significant effect on performance". The one significant result is that LLM-generated files did worse than developer-written ones on one of the two benchmarks (CTXbench, p = 0.038). |
-| T40 | [28] Srivatsa et al. | https://arxiv.org/abs/2404.00227 (abstract only) | P §3: LLM-for-IaC verification is "evaluated by textual similarity … rather than semantic or idempotence correctness" | unverifiable from the abstract. Nit: the venue is ICON 2023, while the reference gives 2024. |
+| T40 | [28] Srivatsa et al. | https://arxiv.org/abs/2404.00227 (abstract only) | P §3: LLM-for-IaC verification is "evaluated by textual similarity … rather than semantic or idempotence correctness" | weakened (full text read 2026-11-13: it reports Exact Match, BLEU, "Ansible Aware" and "Schema Correct" metrics, and for Terraform compares the plan with a reference; there is no mention of idempotence; see P-§3.2-s29). Nit: the venue is ICON 2023, while the reference gives 2024. |
 | T41 | [5] Burgess 1995 | https://www.usenix.org/legacy/publications/compsystems/1995/sum_burgess.pdf (first pages) | P refs only (uncited) | accurate (bibliographic: "Computing Systems, Vol. 8, No. 3, Summer 1995") |
 | T42 | [7] Couch and Sun | https://link.springer.com/chapter/10.1007/978-3-540-39671-0_4 (abstract, references) | P refs only (uncited) | accurate (DSOM 2003, LNCS 2867, pp. 28-40; "propose a stronger definition [of convergence] with improved algebraic properties") |
 | T43 | [8] µPuppet | https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ECOOP.2017.12 (abstract) | P refs only (uncited) | accurate (ECOOP 2017, LIPIcs 74, 12:1-12:27; four authors as given) |
-| T44 | [9] Banerjee, Naumann, Rosenberg | https://api.semanticscholar.org/graph/v1/paper/DOI:10.1145/2485982 (metadata; abstract "elided by the publisher"); ACM DL page failed | P §3.1 L991, P L1907: region logic "derives global heap invariants from purely local reasoning about mutation and separation" | unverifiable (not read: paywalled). Bibliographic data accurate (J. ACM 60, 18:1-18:56, 2013); the title fits the claim. |
+| T44 | [9] Banerjee, Naumann, Rosenberg | https://api.semanticscholar.org/graph/v1/paper/DOI:10.1145/2485982 (metadata; abstract "elided by the publisher"); ACM DL page failed | P §3.1 L991, P L1907: region logic "derives global heap invariants from purely local reasoning about mutation and separation" | weakened (read 2026-11-13 in the author's JACM-layout copy, software.imdea.org/~ab/Publications/lrgi1.pdf: it supports "heap-local reasoning about mutation and separation" and the factoring of global invariants "as they are relevant", not "derives global heap invariants from purely local reasoning"; the official ACM page was not reachable, see P-§3.1-s28). Bibliographic data accurate (J. ACM 60, 18:1-18:56, 2013); the title fits the claim. |
 | T45 | [10] Tratt | https://tratt.net/laurie/blog/2026/local_reasoning_for_global_properties.html | P §3.1 L996-997: AI code generation "is reliably good at local … reasoning and unreliable at global reasoning" | overstated. Tratt: AI "often generates high-quality local … chunks of code, but often struggles" with global understanding, "at least as it stands right now". |
 | T46 | [10] | same | P §3.1 L998-999: "his example is Rust's ownership system enforcing data-race freedom through local signatures" | accurate ("this property is enforced at the level of function signatures") |
 | T47 | [10] | same | P refs: "tratt.net blog, July 2026" | **wrong** (nit). The post is dated 2026-06-30. |
@@ -103,12 +116,12 @@ http://docs.bcfg2.org/getting_started/index.html.
 | T51 | [19] nix-darwin | https://github.com/nix-darwin/nix-darwin; https://github.com/nix-darwin/nix-darwin/tree/master/modules/system | P §2.3 L346-347: Nix modules to launchd agents and macOS defaults | accurate (`launchd.nix`, `defaults-write.nix`, `defaults/`; module bodies not read) |
 | T52 | [20] cdk8s | https://github.com/cdk8s-team/cdk8s | P §2.3 L347-348: typed code to Kubernetes YAML | accurate ("cdk8s apps synthesize into standard Kubernetes manifests") |
 | T53 | [22] Flux / GitOps | https://github.com/fluxcd/flux2; https://www.cncf.io/projects/flux/; https://web.archive.org/web/20180107011605/https://www.weave.works/blog/gitops-operations-by-pull-request | P §2.3 L392-394: GitOps "coined by Weaveworks and carried forward by Flux under the CNCF since 2019" | accurate ("'GitOps' is our name for how we use developer tooling to drive operations"; Flux "accepted to CNCF on July 15, 2019", graduated November 30, 2022). The 2017 post names Chef, Puppet and Ansible "diff alerts" as its prior art. |
-| T54 | [24] balena | cited URL failed twice (blog.balena.io and www.balena.io/blog); read https://docs.balena.io/learn/deploy/offline-updates, which links to that post | P §2.3 L396-398: balenaCloud solves "offline-tolerant updates, connectivity-degradation tracking" | overstated. The documented offline update is a reflash from preloaded media that wipes device data, after which cloud state is patched "as if the device was online". The page has nothing on connectivity-degradation tracking. The blog post itself is unread. |
+| T54 | [24] balena | cited URL failed twice (blog.balena.io and www.balena.io/blog); read https://docs.balena.io/learn/deploy/offline-updates, which links to that post | P §2.3 L396-398: balenaCloud solves "offline-tolerant updates, connectivity-degradation tracking" | overstated. The documented offline update is a reflash from preloaded media that wipes device data, after which cloud state is patched "as if the device was online". The page has nothing on connectivity-degradation tracking. The blog post itself was read 2026-11-13 at the cited URL (HTTP 200): "all data on the device is wiped at this point, making this different from a typical software update process"; nothing on degradation tracking; the verdict and the replacement text in P-§2.3-s26 stand. |
 | T55 | [24] | same docs page | P §2.3 L398-400: "it is centralized, and devices phone home to it" | accurate (devices are registered in balenaCloud and "should eventually establish a connection to balenaCloud") |
 | T56 | [25] Kleppmann et al. | https://martin.kleppmann.com/papers/local-first.pdf (author PDF, 25 pages) | P L414: local-first literature, bibliographic data | accurate (Onward! '19, four authors; the "seven ideals" are wider grounds than the paper's, as P says) |
 | T57 | [27] Dolstra | https://edolstra.github.io/pubs/phd-thesis.pdf | P §2.2 L327-328: purity "Nix's own build model is named for" | accurate (Utrecht, defended 18 January 2006; "a purely functional deployment model, which we implemented in the Nix system") |
 | T58 | [23] Augments link | https://docs.cfengine.com/docs/3.21/reference-language-concepts-augments.html | G L215 link | accurate. Nit: it pins the 3.21 docs; LTS is now under `/docs/lts/` (https://docs.cfengine.com/docs/lts/reference/language-concepts/augments/, listed but not fetched). |
-| T59 | [29] Jira CFE-4715 | https://northerntech.atlassian.net/browse/CFE-4715 (HTTP 200, empty body titled "Jira") | P refs only (uncited) | unverifiable (needs a browser session or login) |
+| T59 | [29] Jira CFE-4715 | https://northerntech.atlassian.net/browse/CFE-4715 (HTTP 200, empty body titled "Jira") | P refs only (uncited) | confirmed (read 2026-11-13). The browse page renders empty, but the tracker's public REST endpoint answers anonymously: CFE-4715 is a feature request, status Rejected, resolution Won't Do; all 26 tickets CFE-4715 to CFE-4740 were resolved on 2026-08-19 |
 
 ## B. Response items
 
@@ -371,7 +384,7 @@ For §9.5:
 > (§5.1, after "repeats while the number of pending operations decreases") — convergence of exactly this kind has an algebraic treatment [7].
 
 **Merge:** insert. Cut [5], [8] and [29], or cite them where they apply
-**Checked:** verified (count, and the abstracts or first pages of [5], [7], [8]); not checked ([29], which did not render)
+**Checked:** verified (count, and the abstracts or first pages of [5], [7], [8]); [29] read 2026-11-13 through the tracker's public REST endpoint (T59: confirmed); sources re-fetched 2026-11-13: confirmed
 
 ### P-§3.1-s18: Contextual Reasoning Failure is not the main cause
 
@@ -424,14 +437,14 @@ For §9.5:
 **Kind:** reword
 **Goal:** G3
 **Weight:** improves
-**Finding:** The fetched landing page for [6] describes Promise Theory as modelling "autonomous agencies" and "voluntary cooperation". It does not state the narrower purpose of ruling out push protocols, and the book was not read. The autonomy point is enough for G3.
-**Evidence:** https://markburgess.org/promises.html
+**Finding:** The claim that Promise Theory was formalised "specifically to rule out client-server protocols that push data to a controller" is refuted. The book [6] (ch. 17.2) says Promise Theory was "originally invented to discuss the issues surrounding this autonomous operation, and voluntary cooperation" and "is not about protocol modeling". Burgess's 2005 DSOM paper introduced the promise as a measure of voluntary cooperation and builds client-server interactions out of promises, so the theory does not rule them out. Both sources support "no other agent can impose a promise on it", not "cannot be obliged". The autonomy point is enough for G3. This item and 01 P-§2.3-02 carry the same proposed text.
+**Evidence:** https://markburgess.org/promises.html (landing page); the book, https://markburgess.org/BookOfPromises.pdf, ch. 1 and 17 ("originally invented to discuss the issues surrounding this autonomous operation, and voluntary cooperation"; "It is not about protocol modeling"); Burgess, DSOM 2005, LNCS 3775, DOI 10.1007/11568285_9, read through the library proxy ("no external agent can tell it what to do, without its consent"; promises rebuild "client-server interactions, dependencies and access control"). Read 2026-11-13.
 **Proposed text:**
 
-> Promise Theory models a system as autonomous agents that can only make promises about their own behaviour, never impose it on others [6]; nothing about "no control node" is this paper's invention …
+> In Promise Theory, which was developed to describe CFEngine's decentralised mode of operation, an agent can promise only its own behaviour and no other agent can impose a promise on it [6]. A design with no control node is the natural reading of that model, not this paper's invention, and it is one reason CFEngine is the current engine (§2.2).
 
-**Merge:** replace that sentence's first clause, as one merged edit with 01 P-§2.3-02, which edits the same sentence and now follows this item's weight (`improves`)
-**Checked:** not checked against the book; the page was read; independently checked 2026-11-13: confirmed
+**Merge:** replace that sentence, as one merged edit with 01 P-§2.3-02, which edits the same sentence and now follows this item's weight (`improves`)
+**Checked:** verified (the book and Burgess 2005 read 2026-11-13); independently checked 2026-11-13: confirmed; sources re-fetched 2026-11-13: corrected
 
 ### X-s22: Desai's published view of CFEngine needs an answer
 
@@ -499,8 +512,8 @@ For §9.5:
 **Kind:** correct
 **Goal:** G3 (often-off devices are the case the comparison is about)
 **Weight:** improves
-**Finding:** balena's documented offline update preloads a release onto boot media and reflashes the device, which wipes its local data. Cloud state is then patched "as if the device was online". That is a sneakernet path, not an agent that tolerates being offline, and the page says nothing about connectivity-degradation tracking. The "centralized, phone home" contrast is accurate. The cited blog URL failed on both balena blog hosts, so the reference should point at the docs page.
-**Evidence:** https://docs.balena.io/learn/deploy/offline-updates
+**Finding:** balena's documented offline update preloads a release onto boot media and reflashes the device, which wipes its local data. Cloud state is then patched "as if the device was online". That is a sneakernet path, not an agent that tolerates being offline, and the page says nothing about connectivity-degradation tracking. The "centralized, phone home" contrast is accurate. The blog post at the cited URL (blog.balena.io, "Offline Updates", 2021-02-12) was read on 2026-11-13: it says "all data on the device is wiped at this point, making this different from a typical software update process" and does not mention degradation tracking, so the reference URL may stay and the docs page is an alternative.
+**Evidence:** https://docs.balena.io/learn/deploy/offline-updates; https://blog.balena.io/offline-updates-make-it-easier-to-update-balena-devices-without-the-internet/ (read 2026-11-13)
 **Proposed text:**
 
 > … balenaCloud is the closest working system solving the same problem — including offline updates for air-gapped devices by reflashing them from preloaded media [24] — with one real architectural difference …
@@ -510,7 +523,7 @@ and
 > [24] balena. *Offline Updates.* balena documentation. https://docs.balena.io/learn/deploy/offline-updates
 
 **Merge:** replace that dash clause and reference [24]. If the author has another source for degradation tracking, cite it instead of cutting the clause
-**Checked:** verified (docs page); not checked (the blog post); independently checked 2026-11-13: confirmed (docs only)
+**Checked:** verified (docs page; the blog post read 2026-11-13); independently checked 2026-11-13: confirmed (docs only); sources re-fetched 2026-11-13: confirmed
 
 ### G-§13-s27: deep-link the Bcfg2 `altsrc` page
 
@@ -526,6 +539,36 @@ and
 
 **Merge:** replace the link target
 **Checked:** verified; independently checked 2026-11-13: confirmed
+
+### P-§3.1-s28: region logic supports heap-local reasoning, not "global invariants from purely local reasoning"
+
+**Target:** paper §3.1, at "Banerjee, Naumann, and Rosenberg's region logic [9], which derives global heap invariants from purely local reasoning about mutation and separation" (paper L991-992; the later mention near L1907 is only "[9]", so no edit there)
+**Kind:** correct
+**Goal:** G6 (the premise needs accurate evidence)
+**Weight:** misleads
+**Finding:** [9] supports "heap-local reasoning about mutation and separation". Its introduction handles global invariants by factoring "parts as they are relevant", and the paper says it "facilitates heap-local reasoning about object invariants". "Derives global heap invariants from purely local reasoning" claims more than that. This replaces T44's earlier "unverifiable" verdict.
+**Evidence:** Banerjee, Naumann and Rosenberg, J. ACM 60(3), Art. 18, 2013, DOI 10.1145/2485982. Read in the author's copy in the JACM layout, software.imdea.org/~ab/Publications/lrgi1.pdf (the ACM Reference Format line matches; the official ACM page answered HTTP 403, a Cloudflare challenge, on all three URL forms via the library proxy). Quotes: "heap-local reasoning about mutation and separation"; "facilitates heap-local reasoning about object invariants". Read 2026-11-13 (`checks/v7-refetch.md`, R1).
+**Proposed text:**
+
+> Banerjee, Naumann, and Rosenberg's region logic [9], which supports heap-local reasoning about mutation and separation, so that a global object invariant can be maintained by reasoning only about the part of the heap a command touches.
+
+**Merge:** replace that sentence
+**Checked:** verified (full text read 2026-11-13, in the author's JACM-layout copy; the official ACM copy was not reachable)
+
+### P-§3.2-s29: [28] evaluates mostly against a reference solution, not by "textual similarity" alone
+
+**Target:** paper §3.2, at "evaluated by textual similarity to a reference rather than by semantic or idempotence correctness [28]" (paper L1130-1132)
+**Kind:** correct
+**Goal:** G6
+**Weight:** misleads
+**Finding:** Srivatsa et al. report Exact Match, BLEU, "Ansible Aware" and "Schema Correct" metrics, and for Terraform compare the plan with a reference. So "textual similarity ... rather than semantic" is half right: schema and plan checks exist. Idempotence is absent from the paper (no hit for "idempot"). This replaces T40's "unverifiable" verdict.
+**Evidence:** Srivatsa et al., arXiv:2404.00227, full text read 2026-11-13 from the PDF (6.4k words): "Exact Match, BLEU ... Ansible Aware ... Schema Correct". `checks/v7-refetch.md`, R17.
+**Proposed text:**
+
+> evaluated mostly against a reference solution (exact match, BLEU, schema checks, plan equality) rather than by running the result and checking idempotence [28]
+
+**Merge:** replace that sentence
+**Checked:** verified (full text read 2026-11-13)
 
 ## C. Missing prior work
 
@@ -552,9 +595,9 @@ Fetched in this review: the Bcfg2 papers list, Pay As You Go, Hummer et al. and 
 
 ## D. What I did not check
 
-1. Still unread: [9]'s text (paywalled; the publisher elided the abstract and the ACM DL page refused the fetch); the [24] blog post (both https://blog.balena.io/… and https://www.balena.io/blog/… failed; the balena docs page was read); [29] (the Jira page rendered as an empty shell, so it needs a browser session or login). Read only in part: [5] (first pages), [7], [8] and [14] (abstracts), [19] (repository listing, not module bodies). ncf/Rudder and the Puppet catalogue claims were not checked.
+1. Still unread: the official ACM copy of [9] (the ACM DL page answers HTTP 403, a Cloudflare challenge; [9] was read in the author's JACM-layout copy on 2026-11-13). Read 2026-11-13: the [24] blog post at the cited URL (earlier failures were the web tool's, not the page's), and [29] through the tracker's public REST endpoint. Read only in part: [5] (first pages), [7], [8] and [14] (abstracts), [19] (repository listing, not module bodies). ncf/Rudder and the Puppet catalogue claims were not checked.
 2. Round 1's docs.bcfg2.org failures were https; the site works over plain http. docs.cfengine.com works with markdown output. Both are now checked (T3-T9, T15, T18, T23, T28, T58). The https `docs.bcfg2.org` link in guide §4 was not retried.
-3. The Promise Theory book [6], Srivatsa [28] beyond its abstract, and the single YAML-over-JSON case in [16] were not read.
+3. The single YAML-over-JSON case in [16] was not read. The Promise Theory book [6] and Srivatsa [28] were read in full on 2026-11-13.
 4. The guide's "Further reading" list (G:1649-1672) was not checked link by link.
 5. Paper sections outside the Bcfg2, AI-literature and related-work passages were read only where they cite a source.
 

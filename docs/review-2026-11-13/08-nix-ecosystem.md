@@ -33,7 +33,7 @@ Sources consulted: shared `mcp__firecrawl__*` only (search + scrape), 2026-11-13
 |---|---|---|---|---|---|
 | nix-darwin | `darwinSystem`, its own module tree on nixpkgs | Nix (Nix or Lix); README recommends the Lix installer because the official one has no automated uninstaller | `sudo darwin-rebuild switch`; activation scripts; manages the Nix install itself | MIT (not re-checked); active, 26.05 branch current. README still says flakes are "an experimental feature in Nix currently" ([README](https://raw.githubusercontent.com/nix-darwin/nix-darwin/master/README.md), fetched 2026-11-13) | passthrough host (already D12); **option-name source** for the frontend (X-nix-05) |
 | home-manager | same module system, user scope | Nix | activation script per user | MIT (not checked) | competitor for dotfiles; `programs.*` mostly emit store-path-laden files: low carry-over |
-| system-manager (numtide) | "builds on the many modules that already exist in NixOS"; a subset of NixOS-compatible modules | Nix (≥ 2.32); supported on NixOS, Ubuntu, Debian ([repo](https://github.com/numtide/system-manager)) | own diff engine, "can only modify files in `/etc` and systemd units", local state file "similar to Terraform"; "no central controller or agents", local or over SSH ([1.0 post, 2026-01-08](https://numtide.com/blog/system-manager-1-0/)) | 1.8k stars; 1.0 stable Jan 2026 | **closest competitor on Linux** (G5 items 4-5); its narrow-surface diff engine is the same idea as tendcf's unit-writer domains |
+| system-manager (numtide) | "builds on the many modules that already exist in NixOS"; a subset of NixOS-compatible modules | Nix, tested against 2.32 and above (the README says "tested", not required); supported on NixOS, Ubuntu, Debian ([repo](https://github.com/numtide/system-manager)) | own diff engine, "can only modify files in `/etc` and systemd units", local state file "similar to Terraform"; "no central controller or agents", local or over SSH ([1.0 post, 2026-01-08](https://numtide.com/blog/system-manager-1-0/)) | 1.8k stars; 1.0 stable Jan 2026 | **closest competitor on Linux** (G5 items 4-5); its narrow-surface diff engine is the same idea as tendcf's unit-writer domains |
 | nix-on-droid | own module set (`environment.packages`, etc.) | the app from F-Droid; "relies on `proot` and other hacks"; "prototype-grade"; aarch64 only ([repo](https://github.com/nix-community/nix-on-droid)) | `nix-on-droid switch` inside the proot userland | MIT; 2.2k stars; last commits 2026-10-26, 2026-08-21, one main maintainer ([commits API](https://api.github.com/repos/nix-community/nix-on-droid/commits?per_page=3)); no GitHub releases | not a frontend or backend: it configures a userland, not Android. No overlap with Island/Insular/Shizuku (G5) |
 | NixOS-WSL | NixOS modules | WSL | `nixos-rebuild` | listed in [awesome-nix](https://raw.githubusercontent.com/nix-community/awesome-nix/main/README.md) | out of scope (no Windows target) |
 | disko | NixOS module for disk layout | Nix at install | partitions at install (with nixos-anywhere) | used by clan | out of scope |
@@ -87,7 +87,7 @@ Answer to "is any of them already most of G3 for NixOS hosts?": For NixOS and ni
 
 ## 4. Nix on macOS and Android in 2026
 
-1. macOS: installers are upstream, Lix (recommended by nix-darwin) and Determinate Nix (a downstream distribution with lazy trees and parallel eval, [docs, 2026-10-08](https://docs.determinate.systems/)). Known upgrade breakage: macOS overwrites `/etc/zshrc`/`/etc/bashrc` on updates (a fixer LaunchDaemon exists: [nix-darwin-fixer](https://github.com/mrhenry/nix-darwin-fixer), snippet only). macOS 15 needed a `_nixbld` UID migration ([NixOS/nix#11075](https://github.com/NixOS/nix/pull/11075), merged 2024-09, snippet only). A third-party 2026-05 design note rejects nix-darwin for "sudo on every apply, four open Tahoe-incompatibility issues" (snippet only, not verified). nix-darwin now needs `sudo darwin-rebuild` and has a `system.primaryUser` option ([README](https://raw.githubusercontent.com/nix-darwin/nix-darwin/master/README.md); [option](https://mynixos.com/nix-darwin/option/system.primaryUser), snippet only).
+1. macOS: installers are upstream, Lix (recommended by nix-darwin) and Determinate Nix (a downstream distribution with lazy trees and parallel eval, [docs, 2026-10-08](https://docs.determinate.systems/)). Known upgrade breakage: macOS overwrites `/etc/zshrc`/`/etc/bashrc` on updates (a fixer LaunchDaemon exists but the repository is archived, last pushed 2024-04-16: [nix-darwin-fixer](https://github.com/mrhenry/nix-darwin-fixer), read). macOS 15 needed a `_nixbld` UID migration ([NixOS/nix#11075](https://github.com/NixOS/nix/pull/11075), merged 2024-09, snippet only). A third-party 2026-05 design note rejects nix-darwin for "sudo on every apply, four open Tahoe-incompatibility issues" (snippet only, not verified). nix-darwin now needs `sudo darwin-rebuild` and has a `system.primaryUser` option ([README](https://raw.githubusercontent.com/nix-darwin/nix-darwin/master/README.md); [option](https://mynixos.com/nix-darwin/option/system.primaryUser), snippet only).
 2. Android: nix-on-droid only (above). Proot, aarch64 only, prototype-grade, low commit rate. It cannot set Android settings, profiles or app state. Nix on the phone is not a viable tendcf dependency, and D6/D46 already keep it off.
 
 ## 5. AI and Nix
@@ -109,7 +109,7 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 4. Flakes are experimental upstream. Determinate's downstream differs. The hook's flake-free `nix-instantiate` is the conservative choice. linux-targets §5 contradicts it (X-nix-14).
 5. Evaluation cost: full NixOS evaluation imports every module (4.0 s → 1.4 s for `toplevel` when the list is cut, per [nixpkgs#137168](https://github.com/NixOS/nixpkgs/issues/137168), open since 2021; a 2026-10 comment reports "gigabytes of extra memory" for dense import graphs). A carry-over import of a NixOS config pays this on the author machine, never on a phone.
 6. The reimplementation trap: each NixOS `services.<x>` carried over is a module rewrite. That is the system-manager road (a curated subset), and it never ends. Refuse it: carry over only pure-data option families and report the rest.
-7. Nix on the evaluating machine: G1's long-run user may own only a phone and a Mac. Evaluation then needs Nix on the Mac (G5 item 1) or a pure evaluator (snix is a Tvix fork with "no drop-in binary", snippet only). Nix is a build-host dependency, not a device one.
+7. Nix on the evaluating machine: G1's long-run user may own only a phone and a Mac. Evaluation then needs Nix on the Mac (G5 item 1) or a pure evaluator (snix is a Tvix fork with "no drop-in binary", snippet only; snix.dev's home page and /docs/ were read 2026-11-13 and the phrase is not there: the page says "Nix-compatible surface" and "Designed to be embedded", so the quoted phrase is still unlocated). Nix is a build-host dependency, not a device one.
 
 ## Response items
 
@@ -308,13 +308,13 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 **Goal:** G5, G8
 **Weight:** improves
 **Finding:** G5 puts macOS-as-server first and G8 state 1 needs a Mac to converge from Nix-authored config. Nix on macOS breaks on OS updates (`/etc/zshrc` overwrite; the Sequoia `_nixbld` UID migration), and nix-darwin needs root on every apply. Nix belongs on that Mac only as the evaluating toolchain, and the Mac's convergence must not stop when Nix breaks.
-**Evidence:** [nix-darwin README](https://raw.githubusercontent.com/nix-darwin/nix-darwin/master/README.md); NixOS/nix#11075 and nix-darwin-fixer (snippet only).
+**Evidence:** [nix-darwin README](https://raw.githubusercontent.com/nix-darwin/nix-darwin/master/README.md); NixOS/nix#11075 ("add UID migration script for macOS Sequoia 15", closed 2024-07-10) and nix-darwin-fixer (archived, last pushed 2024-04-16), both read 2026-11-13.
 **Proposed text:**
 
 > On the Mac that evaluates the site (G5 item 1), Nix is a build-host tool only: a macOS update that breaks the Nix install stops new compiles, never convergence of the approved release already on the device.
 
 **Merge:** insert after that sentence
-**Checked:** partly (README verified; breakage reports snippet only)
+**Checked:** partly (README verified; the breakage reports read 2026-11-13); sources re-fetched 2026-11-13: corrected
 
 ### X-nix-13: say where evaluation runs for a phone-only user
 

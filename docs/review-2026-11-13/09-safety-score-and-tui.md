@@ -154,16 +154,16 @@ Findings (each source fetched unless marked):
    open-weight models are up to 26% more confident in an answer framed as their
    own chat turn than in the same answer given as user input
    ([arXiv 2606.03437](https://arxiv.org/abs/2606.03437), ACL 2026 Findings).
-   The authoring AI (R13) should not score its own change. The 2404.13076
-   citation was not fetched by the checker, so fetch it before merging
-   (independently checked 2026-11-13: weakened, corrected).
+   The authoring AI (R13) should not score its own change
+   (independently checked 2026-11-13: weakened, corrected; arXiv 2404.13076
+   was fetched and read on 2026-11-13).
 5. **False reassurance.** Explanations increased acceptance of AI advice
    "regardless of its correctness"
    ([Bansal et al., arXiv 2006.14779](https://arxiv.org/abs/2006.14779), CHI'21).
    A displayed confidence helps calibrate trust but is not sufficient
    ([arXiv 2001.02114](https://arxiv.org/abs/2001.02114), FAT* 2020;
    independently checked 2026-11-13: confirmed).
-   Automation-bias review: Goddard et al. 2012 (pubmed 21685142, snippet only).
+   Automation-bias review: Goddard et al. 2012 (pubmed 21685142, read 2026-11-13).
 
 Posture that follows:
 
@@ -264,9 +264,13 @@ Evidence:
 2. Comprehension was hard to improve, but opinionated design made "nearly 30%
    more total users" choose safety
    ([Felt et al., CHI 2015](https://research.google.com/pubs/archive/43265.pdf)).
-3. Habituation is real and polymorphic warnings slow it. Snippet only:
-   Anderson et al., CHI 2015 (fMRI); Anderson et al., CHI 2017 (workweek);
-   Vance et al., MISQ 2018. All dl.acm.org, which firecrawl could not fetch.
+3. Habituation is real and polymorphic warnings slow it. Anderson et al.,
+   CHI 2015 (fMRI study of polymorphic warnings); Vance et al., CHI 2017
+   (five-day workweek: "a dramatic drop in attention throughout the workweek
+   despite partial recovery between workdays"); Vance et al., MISQ 2018
+   (longitudinal fMRI, eye tracking, field experiments). Titles, authors and
+   the CHI 2017 abstract were checked through Crossref and Semantic Scholar
+   on 2026-11-13; the paper bodies were not read.
 4. In tendcf's own register, "big-diff rubber-stamping is TC-09 reborn" (residue R5,
    `docs/architecture/e1-adjudication-xhigh-2026-08-15.md:478`),
    and Q10 asks whether a diff is consentable at all (map:1281;
@@ -303,7 +307,7 @@ Licences were read from the raw LICENSE file unless marked.
 | Project | Language | Licence | Termux | Fit |
 |---|---|---|---|---|
 | [Textual](https://github.com/Textualize/textual) | Python | MIT | reported working in an old Textual discussion (#583); not tested | Same language as the compiler and `tendcf-validate`; `textual serve` gives a browser view for free |
-| [Toad](https://github.com/batrachianai/toad) | Python (Textual) | AGPL-3.0; "commercial licenses are available" ([README](https://raw.githubusercontent.com/batrachianai/toad/main/README.md), fetched 2026-11-13) | snippet only: resolved natively via uv (OpenHCSDev/agent-comms#4339, 2026-11-08) | An agent client with "side-by-side or unified diffs"; the closest existing "AI proposes, human approves a diff" screen; the README claims Linux and macOS only; last push 2026-05-26 |
+| [Toad](https://github.com/batrachianai/toad) | Python (Textual) | AGPL-3.0; "commercial licenses are available" ([README](https://raw.githubusercontent.com/batrachianai/toad/main/README.md), fetched 2026-11-13) | merged PR OpenHCSDev/agent-comms#4339 (2026-11-08, read): uv resolved 91 packages natively on a phone and selected Toad and textual-diff-view; the diff widget's backend built on Android CPython 3.14; "Full app install/import still running; not claimed complete." | An agent client with "side-by-side or unified diffs"; the closest existing "AI proposes, human approves a diff" screen; the README claims Linux and macOS only; last push 2026-05-26 |
 | textual-diff-view (batrachianai) | Python | AGPL-3.0 | as Toad | The diff widget; last push 2026-05-27 |
 | [Rich](https://github.com/Textualize/rich) | Python | MIT (not re-fetched) | yes | Syntax and tables for the CLI mode |
 | [Ratatui](https://github.com/ratatui/ratatui) | Rust | MIT | yes | Wrong language; Codex CLI uses it (snippet) |
@@ -316,14 +320,18 @@ Licences were read from the raw LICENSE file unless marked.
 
 Table: independently checked 2026-11-13: weakened, corrected (the Textual,
 Toad, textual-diff-view and Mosaic licences are confirmed; the Termux,
-platform and activity cells were corrected).
+platform and activity cells were corrected); sources re-fetched 2026-11-13:
+corrected (the Toad on Termux cell).
 
 **Recommend Textual, with Toad's approval and diff screens as the borrowed
 scaffold.** tendcf code is GPL-3.0-or-later (map R7 / R10, map:118-120). GPLv3 §13 allows
-combining with AGPLv3 code; this is from knowledge, because the gnu.org fetch
-timed out. Not checked: the independent checker did not fetch it either; fetch
-https://www.gnu.org/licenses/gpl-3.0.html §13 before the licence ruling. The combined program would carry AGPL's network clause for the
-borrowed parts. That is a licence ruling for the operator (X-safety-11).
+combining with AGPLv3 code: the GPL terms continue for the GPL part, and "the
+special requirements of the GNU Affero General Public License, section 13,
+concerning interaction through a network will apply to the combination as
+such" (read 2026-11-13 in a verbatim copy of the licence text; gnu.org itself
+would not load). The combined program would therefore carry AGPL's network
+clause as a whole, not only for the borrowed parts. That is a licence ruling
+for the operator (X-safety-11).
 **Runner-up:** Textual plus MIT-only parts (Rich Syntax, our own hunk list in
 the lazygit/gitui style). It is more code to write but has no licence question.
 
@@ -558,14 +566,15 @@ regardless of correctness)
 **Goal:** G4
 **Weight:** misleads
 **Finding:** R13 makes AIs the authors, and the owner's AI is the advisor. If
-the same model wrote the change and scans it, it is likely biased toward
-approving it: LLM evaluators favour their own generations (arXiv 2404.13076),
-and models grow more confident in answers framed as their own turn
+the same model wrote the change and scans it, it may be biased toward
+approving it: LLM evaluators favour their own generations in news-summary
+tasks (arXiv 2404.13076; GPT-4, GPT-3.5 and Llama 2; code review was not
+tested), and models grow more confident in answers framed as their own turn
 (arXiv 2606.03437). The
 diff is also attacker-controlled input to the scanner (JudgeDeceiver;
 LongPIBench).
 **Evidence:** map:975-976; [arXiv 2404.13076](https://arxiv.org/abs/2404.13076)
-(not fetched by the checker; fetch it before merging);
+(abstract and full text read 2026-11-13);
 [arXiv 2606.03437](https://arxiv.org/abs/2606.03437);
 [arXiv 2403.17710](https://arxiv.org/abs/2403.17710);
 [arXiv 2608.28411](https://arxiv.org/abs/2608.28411)
@@ -577,7 +586,7 @@ LongPIBench).
 > them, are better than one; their disagreement caps the score.
 
 **Merge:** insert after it
-**Checked:** verified (read map:953-976); independently checked 2026-11-13: weakened, corrected
+**Checked:** verified (read map:953-976); independently checked 2026-11-13: weakened, corrected; sources re-fetched 2026-11-13: corrected
 
 ### X-safety-07: Q10 gets its counters
 
@@ -682,8 +691,10 @@ textual-diff-view 2026-05-27).
 > | Review TUI | [Textual](https://github.com/Textualize/textual) (MIT); approval and diff screens from [Toad](https://github.com/batrachianai/toad) and textual-diff-view (AGPL-3.0, licence ruling D__); MIT-only fallback: Rich + our own hunk list |
 
 **Merge:** needs the operator's ruling first (AGPL code in a GPL-3.0 project)
-**Checked:** verified (licence files fetched); GPLv3 §13 compatibility not
-fetched (gnu.org fetch timed out); independently checked 2026-11-13: confirmed
+**Checked:** verified (licence files fetched); GPLv3 §13 compatibility read
+2026-11-13 in a verbatim copy of the licence text (gnu.org itself would not
+load); independently checked 2026-11-13: confirmed; sources re-fetched
+2026-11-13: confirmed
 
 ### X-safety-12: "exact difference" is of the goal file, not of effects
 
@@ -744,14 +755,17 @@ files and packages; the activation gap remains.
 2. Not fetched (described from knowledge): Terraform plan JSON, OPA/conftest,
    Checkov, KICS, Trivy, Semgrep, tfsec, deadnix, vulnix, nvd, nix-diff,
    `nixos-rebuild dry-activate`.
-3. GPLv3 §13 and AGPL compatibility: the gnu.org fetch timed out.
+3. GPLv3 §13 and AGPL compatibility: read 2026-11-13 in a verbatim copy of
+   the licence text; gnu.org itself would not load.
 4. Licences not checked: diffnav (LICENSE 404), tview, Ink, Codex CLI, Rich
    (not re-fetched).
-5. Textual and Mosaic on Termux: not run. The Toad on Termux claim is snippet
-   only.
-6. Snippet only, not read (dl.acm.org and PubMed blocked fetches):
-   Anderson et al. CHI 2015 and CHI 2017; Vance et al. MISQ 2018; Goddard et
-   al. 2012.
+5. Textual and Mosaic on Termux: not run. The Toad on Termux claim rests on
+   one merged PR that reports dependency resolution only; Toad itself has not
+   been shown running there.
+6. Not read in full (dl.acm.org blocked the fetch; metadata and abstracts
+   only): Anderson et al. CHI 2015; Vance et al. MISQ 2018. Vance et al. CHI
+   2017: abstract only. Goddard et al. 2012 was read (PubMed record,
+   2026-11-13).
 7. No real non-operator user tested; this matches the digest's G1 finding.
 
 ## Sources (all fetched 2026-11-13 unless marked)
@@ -785,10 +799,11 @@ files and packages; the activation gap remains.
 25. LICENCE files (raw, main or master branch): textual, ratatui, bubbletea,
     lazygit, gitui, jjui, delta, k9s, toad, textual-diff-view, mosaic.
 26. termux-packages build.sh: lazygit, gitui, git-delta.
-27. Snippet only: OpenHCSDev/agent-comms#4339 (2026-11-08) and #4333;
-    dl.acm.org/doi/abs/10.1145/2702123.2702322;
-    dl.acm.org/doi/10.1145/3025453.3025896; dl.acm.org/doi/10.25300/MISQ/2018/14124;
-    pubmed 21685142.
+27. OpenHCSDev/agent-comms#4339 (2026-11-08) and #4333 (read);
+    dl.acm.org/doi/abs/10.1145/2702123.2702322 (metadata and abstract only);
+    dl.acm.org/doi/10.1145/3025453.3025896 (abstract only);
+    dl.acm.org/doi/10.25300/MISQ/2018/14124 (metadata and abstract only);
+    pubmed 21685142 (read).
 
 Last search run: a gnu.org search for GPLv3 §13 found the licence page; the
 scrape of it timed out (one URL, not a firecrawl outage). No new source found

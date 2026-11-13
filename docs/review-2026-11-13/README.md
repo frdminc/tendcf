@@ -31,7 +31,7 @@ is the merge map.
 | `12-fork-management.md` | Research: branch and fork management (G9) | new design material |
 | `13-premortem-and-ideas.md` | Pre-mortem, tensions, process, ideas | (reference) |
 | `14-synthesis-and-rulings.md` | Synthesis, rulings needed, defects, path to the first finish-line state | (reference) |
-| `checks/v1` to `v6` | The independent checkers' verdict tables and corrections | (evidence; cited as "vN Cn") |
+| `checks/v1` to `v7` | The independent checkers' verdict tables and corrections; v7 is the source re-fetch | (evidence; cited as "vN Cn"; v7's corrections are "v7 R1" to "R21") |
 
 ## How it was produced
 
@@ -42,6 +42,9 @@ is the merge map.
    **Checked:** line. A weakened item carries the corrected text. A refuted
    item is listed under "Withdrawn after checking" in its file.
 4. One agent wrote the synthesis from the reports and the checks.
+5. One agent (Claude Sonnet) re-fetched sources the first pass could not read,
+   once the web and library tools were repaired; its corrections R1 to R21 are
+   applied and its table is `checks/v7-refetch.md`.
 
 Every reviewer and checker is the same model family. This is not the
 cross-model frontier review the repository's standing rule requires before a

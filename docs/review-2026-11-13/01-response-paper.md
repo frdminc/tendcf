@@ -452,17 +452,18 @@ sources check's verdict and names its item.
 **Kind:** correct
 **Goal:** G7
 **Weight:** improves
-**Finding:** (c) Promise Theory models autonomous agents that can only promise their own behaviour, so cooperation is voluntary. That makes push-imposed obligations inexpressible. It was not formalised "specifically to rule out client-server protocols that push data to a controller", and [6] (a 2014 book) is not the formalising source. Burgess's 2005 autonomy papers are. The sources reviewer should check [6]. The sources check treats the same sentence as 06 P-§2.3-s21 (weight `improves`); this item follows it, and the two should merge as one text.
-**Evidence:** paper lines 379-383; reference [6] at line 1969. Not checked against the book. The markburgess.org FAQ says Promise Theory "emerged from the software CFEngine"; the promises page states no "specifically to rule out" purpose (06 T27).
+**Finding:** (c) Promise Theory models autonomous agents that can only promise their own behaviour, so cooperation is voluntary. That makes push-imposed obligations inexpressible. It was not formalised "specifically to rule out client-server protocols that push data to a controller": that purpose claim is refuted by the book and by Burgess 2005 (see 06 T27 and R2c in `checks/v7-refetch.md`). Burgess's 2005 DSOM paper introduced the promise as a measure of voluntary cooperation, and the book says Promise Theory "is not about protocol modeling" (checked against the book and the 2005 paper, 2026-11-13). Burgess 2005 even builds client-server interactions from promises, so the theory does not rule them out. The 2014 book [6] is the later full formalisation of that 2005 motivation. The sources check treats the same sentence as 06 P-§2.3-s21 (weight `improves`); this item follows it, and the two now agree and merge as one text.
+**Evidence:** paper lines 379-383; reference [6] at line 1969. Checked against the book (Burgess and Bergstra, *Promise Theory: Principles and Applications*, 2014, ch. 1 and 17: "originally invented to discuss the issues surrounding this autonomous operation, and voluntary cooperation"; "It is not about protocol modeling") and against Burgess, DSOM 2005, LNCS 3775 (no external agent can tell an agent what to do "without its consent"; promises rebuild "client-server interactions, dependencies and access control"), both read 2026-11-13. The book and the paper support "no other agent can impose a promise on it", not "cannot be obliged". The markburgess.org FAQ says Promise Theory "emerged from the software CFEngine"; the promises page states no "specifically to rule out" purpose (06 T27).
 **Proposed text:**
 
-> In Promise Theory, which underlies CFEngine, an agent can promise only its
-> own behaviour and cannot be obliged by another [6]. A design with no
+> In Promise Theory, which was developed to describe CFEngine's
+> decentralised mode of operation, an agent can promise only its own
+> behaviour and no other agent can impose a promise on it [6]. A design with no
 > control node is the natural reading of that model, not this paper's
 > invention, and it is one reason CFEngine is the current engine (§2.2).
 
-**Merge:** replace that sentence, as one merged edit with 06 P-§2.3-s21; the sources reviewer should check [6] and consider citing Burgess 2005
-**Checked:** not checked (source); inferred from general knowledge of Promise Theory; independently checked 2026-11-13: weakened, corrected
+**Merge:** replace that sentence, as one merged edit with 06 P-§2.3-s21; [6] and Burgess 2005 are now checked (see Finding); consider citing Burgess 2005
+**Checked:** verified (the book, ch. 1 and 17, and Burgess 2005 read 2026-11-13); independently checked 2026-11-13: weakened, corrected; sources re-fetched 2026-11-13: corrected
 
 ### P-§2.3-03: "No equivalent to phone home to" is false once logs are archived
 

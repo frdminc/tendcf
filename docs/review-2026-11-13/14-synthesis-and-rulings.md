@@ -2,7 +2,7 @@
 
 Base commit `eefea3c`. Inputs: the goal definition (G1 to G9, rulings rows 1 to 8, differences 1 to 9), thirteen reports (01 to 13) and six refutation checks (v1 to v6). Where a check weakened or refuted a claim, this file uses only the corrected form. Item IDs point at the report that carries the detail. "vN Cn" points at a correction in check file vN. Nothing here is a new finding; it connects what the reports and checks found.
 
-Scale: 355 items across thirteen reports. The six checks tested about 340 rows. Roughly 240 were confirmed, about 105 weakened, 3 refuted, and about 10 left unverifiable or inferred (counts summed from v1 to v6). The three refutations: 04 Idea 1 (with L-§5-09's remedy), 07's Insular licence, and 07's work-profile install timeout.
+Scale: 357 items across thirteen reports (355 before the 2026-11-13 re-fetch added 06 P-§3.1-s28 and P-§3.2-s29). The six checks tested about 340 rows. Roughly 240 were confirmed, about 105 weakened, 3 refuted, and about 10 left unverifiable or inferred (counts summed from v1 to v6). The three refutations: 04 Idea 1 (with L-§5-09's remedy), 07's Insular licence, and 07's work-profile install timeout. A later pass re-fetched 35 source groups (checks/v7): 15 confirmed, 18 weakened, 1 refuted, 1 still unfetched.
 
 ## A. What the review found, in one page
 
@@ -18,7 +18,7 @@ Scale: 355 items across thirteen reports. The six checks tested about 340 rows. 
 
 6. **The Android differentiator has no design, and the documents still defer Android.** "Island", "Insular", "work profile" and "ShizukuPlus" appear nowhere outside the goal file (13 E5, M-§12-04, G-§6-03). D22, the map's Step 2 and the linux-targets header still record the 2026-10-29 deferral (X-android-01 to -03). The schema has no Android vocabulary, and the compiler refuses `android` (C-schema-03, C-compiler-05, X-CO-04). The Site Model needs a user/profile dimension (X-android-05). Shell into an Island profile works unless its owner sets `DISALLOW_DEBUGGING_FEATURES` (v5 row for 07 §4).
 
-7. **Android has hard 2026 constraints that the state-1 plan must budget for.** Developer verification applies from 2026-09-30 in four countries through participating stores and to all certified devices in 2027. ADB installs are exempt (X-android-07, corrected by v5). Android 17 blocks cross-profile loopback by default (X-android-06). The privileged helper dies at every reboot. ShizukuTendCF documents an unattended boot start. The fleet's one open boot failure is on a Fire OS tablet (X-android-08, corrected by v5). The helper is a single point of failure on a one-person fork chain (07 Idea 1, 01 Idea 3).
+7. **Android has hard 2026 constraints that the state-1 plan must budget for.** Developer verification applies from 2026-09-30 in four countries through participating stores and to all certified devices in 2027. ADB installs are exempt. An unregistered app otherwise needs the "advanced flow", which has a one-time one-day wait before it can be turned on. Limited distribution covers up to 20 devices per Google's overview page and FAQ, and 50 per its 2026-10-28 guide; plan for 20 (X-android-07, corrected by v5 and v7 R12). Android 17 blocks cross-profile loopback by default (X-android-06). The privileged helper dies at every reboot. ShizukuTendCF documents an unattended boot start. The fleet's one open boot failure is on a Fire OS tablet (X-android-08, corrected by v5). The helper is a single point of failure on a one-person fork chain (07 Idea 1, 01 Idea 3).
 
 8. **"Nix first" (G2) has no frontend, and "carry over" is undefined.** `eval-nix` is a bare `nix-instantiate --eval --strict --json`, with no modules, no options and no `lib` (C-compiler-01, corrected by v4). CI has never evaluated the repo's Nix file. The docs disclose this (X-nix-09, weakened to `improves` by v3 C15). No tool was found that evaluates a NixOS or nix-darwin config to data and applies it without Nix (08 Summary 1, v3 C16). NixOS modular services do not solve this: they are refuted as a fit (v3 C4). Three alternative carry-over designs need one ruling (X-nix-02, L-§5-09, X-nix-05; v3 C13).
 
@@ -118,7 +118,7 @@ Sub-rulings: the cap values and whether 100 may ever be shown (01 Idea 1 says ne
 Recommendation: reviewers favour option 2 or 3 with ceilings. Support: the evidence is real but measured on QA tasks, judges and a tool-call classifier, never on configuration diffs. Transfer is by analogy (v6 answer (a)).
 
 **B9. "Comprehensive" in the Android differentiator (G5), and the public claim.**
-Why: at shell UID some surfaces are out of reach (other apps' data, user restrictions, profiles whose owner forbids debugging). AMAPI and Fleet are declarative too, but enterprise-owned (X-android-15).
+Why: at shell UID some surfaces are out of reach (other apps' data, user restrictions, profiles whose owner forbids debugging). AMAPI and Fleet are declarative too, but enterprise-owned (X-android-15). A public install path must also state the developer-verification terms: ADB installs are exempt, the "advanced flow" has a one-time one-day wait, and limited distribution is 20 devices per Google's overview page and FAQ but 50 per its guide (X-android-07, v7 R12).
 Options:
 1. Keep G5 as is, and word only the public claim carefully. The claim: "we know of no other tool that converges an owner's own unrooted phone, including its Island/Insular work profile, from a signed goal file, without MDM enrollment or root" (X-android-15; v5 differentiator section).
 2. Also qualify "comprehensive" in G5 itself.
@@ -147,7 +147,7 @@ Options:
 1. Borrow the AGPL screens. Consequence: the review TUI becomes AGPL in effect (09 Idea 4). Both projects have been idle since May 2026 (v6 C9).
 2. Textual (MIT, Python 3.9+) with MIT-only borrowing (Rich, interaction patterns from lazygit or gitui). Consequence: more code of our own (09 Summary 3, runner-up).
 3. Mosaic (Kotlin, Apache-2.0, experimental) if a Kotlin TUI is ever wanted.
-Recommendation: reviewers lean to option 2 given the idle AGPL projects. Support: licences confirmed. Fetch the GPLv3 §13 text before ruling; nobody did (v6 row for 09 Q5). Textual on Termux and over SSH is untested.
+Recommendation: reviewers lean to option 2 given the idle AGPL projects. Support: licences confirmed. GPLv3 §13 was read on 2026-11-13 in a verbatim copy of the licence text (gnu.org itself would not load): the AGPL network clause applies to the combination as a whole, not only to the borrowed parts (v7 R5). Textual on Termux and over SSH is untested.
 
 **B13. Should the goal file's wording change where reviewers found it unsafe or undefined?**
 Why: the goal is agreed and verbatim. Every proposal below is marked "needs the operator's ruling" in its item. Each exact replacement:
@@ -262,12 +262,12 @@ Which rulings unblock which steps:
 6. **The change-process rule does not forbid a person's own fork.** Rule 5 covers only the project's tool forks (X-forks-05, corrected by v5).
 7. **Insular's licence is Apache-2.0, not GPL-family.** Its last release was 6.4.2 (2025-08-07), and commits resumed 2026-09-11. Island has had no public commits since 2021-09 (07 table, refuted by v5).
 8. **The 81% figure.** It is an end-to-end false-negative rate for an agent harness's tool-call classifier. 36.8% of actions never reached the classifier. On the actions it saw, it missed 70.3% and wrongly flagged 31.9%. It is not a diff reviewer (09 Summary 5 and Q2-1, corrected by v6 C2).
-9. **Android verification and distribution.** From 2026-09-30, verification covers certified devices in four countries through participating stores, and all certified devices in 2027. Limited distribution allows 20 devices per the FAQ but 50 per the guide updated 2026-10-28 (X-android-07, corrected by v5).
+9. **Android verification and distribution.** From 2026-09-30, verification covers certified devices in four countries through participating stores, and all certified devices in 2027. ADB installs are exempt. Unregistered apps can otherwise be installed or updated only while the "advanced flow" is on, and turning it on takes a one-time one-day wait, then biometric or PIN confirmation. Limited distribution allows 20 devices per Google's overview page and FAQ but 50 per the guide updated 2026-10-28; Google's pages disagree, so plan for 20 (X-android-07, corrected by v5 and v7 R12).
 10. **G3 does not obviously put trust in the transport layer.** That is one possible reading. G3's last sentence and ruling 6b keep the existing content-signature architecture (10 A5 and X-trust-01, weakened by v6 C12).
 11. **Hardware keys.** The Secure Enclave also offers ML-DSA, not only P-256. Curve25519 in KeyMint v2 depends on the device (10 D1, X-trust-05, corrected by v6 C16/C17).
 12. **Mesh coordinators.** A Tailscale or Headscale coordinator controls membership and key refresh, but traffic mostly survives an outage. A Nebula lighthouse is optional discovery; its offline CA is the trust root (10 C, X-trust-10, corrected by v6 C14, C15, C20).
 13. **TUI facts.** Textual needs Python 3.9+, not 3.11+. Termux support rests on an old discussion. Toad's README claims only Linux and macOS and does not mention permission prompts (09 Summary 3, Q5, corrected by v6 C1, C9).
-14. **Paper citations in 09.** TerraProbe's 71.4% are fixes that leave the vulnerability in place, not behaviour changes (v6 C3). SecLLMHolmes's flips include adding library functions (C4). The self-confidence paper does not test diff scanning; cite self-preference work instead, which is not yet fetched (C6). The AUROC figure is a white-box against black-box gap (C7). P(IK) generalises partly (C8).
+14. **Paper citations in 09.** TerraProbe's 71.4% are fixes that leave the vulnerability in place, not behaviour changes (v6 C3). SecLLMHolmes's flips include adding library functions (C4). The self-confidence paper does not test diff scanning; cite self-preference work instead (C6); arXiv 2404.13076, read on 2026-11-13, tests news summaries on GPT-4, GPT-3.5 and Llama 2, not code review, so "may be biased" rather than "likely biased" (v7 R3). The AUROC figure is a white-box against black-box gap (C7). P(IK) generalises partly (C8).
 15. **Merge-conflict figures.** About 55 to 60% of AI resolutions match the developer's, and 55% is a floor. PortGPT's 62 to 89% is for backporting. "4 of 5 did not parse" was a structural check on n=5 (X-forks-02 and 12 §4, corrected by v5).
 16. **Prior art for Nix.** "Nobody evaluates…" becomes "no tool found evaluates…". comin covers pull and signature checks on Nix hosts; clan pushes. Neither shows a refusable diff (08 Summary 1 and 4, corrected by v3 C16, C17).
 17. **Repo facts.** There are 159 broken fixtures, not 182 (v2 on M-§4-01). There are two live hosts, not one (v2 on G-§5-02). The guide lists Macs first and never says "Linux first" (v2 on G-§1-01). The guide's table never recorded D22's deferral (v2 on G-§18-02). The validate proposal does plan a bundled interpreter (v3 C8). No ruling "pauses" Linux (v3 C1). Nobody decided that the server Mac is the first enforced host (v3 C3). The commit counts are 446/400/242 at `eefea3c` (v6 C21).
@@ -275,6 +275,8 @@ Which rulings unblock which steps:
 19. **Code response details.** NixOS hosts are passthrough by design, which is not "the inverse of carrying over" (v4 C-compiler-01). The `-` argument claim applies only after `--` (C-compiler-02). The perms claim in C-policy-05 was overstated. The agent does log the CMDB rejection (C-policy-06).
 20. **The upstream count.** Four small simulate PRs merged, with backports. The guide's "twenty-three fixes" and the proposed "twenty-six" both need the corrected text (X-engine-03, v4).
 21. **Proposals that silently decided rulings.** All are now bracketed. The operator's "%" was reworded (X-safety-01, X-safety-02(d), 13 B5; v6 C10, C11, C23). Pull was made the default (X-trust-03; v6 C19). Peer mutual-key admission was settled (M-§2-08, M-§9-07, M-§10-02; v2). D48 and D49 attributed text to the operator that the goal does not contain (v2). Nix on the release path contradicted change-process (PL-§2-02, X-CO-02; v3 C5).
+22. **The Promise Theory purpose claim is refuted.** The paper says Promise Theory was formalised "specifically to rule out client-server protocols that push data to a controller". The book says it was "originally invented to discuss the issues surrounding this autonomous operation, and voluntary cooperation" and "is not about protocol modeling", and Burgess's 2005 paper builds client-server interactions out of promises. What the sources support is that no other agent can impose a promise on an agent (01 P-§2.3-02, 06 P-§2.3-s21, 06 T27; v7 R2).
+23. **iroh has no published Android build.** Its Kotlin package (computer.iroh:iroh 1.2.0) is a standard-JVM jar with desktop libraries only, and iroh-ffi puts iroh-blobs out of scope. Android needs its own build (10 iroh row, N3; v7 R9).
 
 ## F. Merge map
 
@@ -291,16 +293,16 @@ Order inside each document: rulings first (items whose Merge says "needs the ope
 | 04 plans (V) | `docs/architecture/tendcf-validate-proposal-2026-11-03.md` | 11: add 8, correct 1, reword 1, question 1 | about 8. V-§2-03 is ruling-first (v3 C6). V-§13-11 lands with #41 (C9). V-§3-05 is `improves` (C7) |
 | 04 plans (X) | change-process, upstream-overlay, README, compiler docs, AGENTS.md, handoffs | 18: add 5, question 5, correct 4, ruling-drift 3, reword 1 | about 10. X-CO-02 is ruling-first (C5). X-RM-02 needs the C11 tense fix. X-WIP and X-HO-01/-02 are rulings (B11) |
 | 05 code | `compiler/`, `policy/`, `schema/`, `bin/`, `tests/`, `deploy/`, CI | 45: add 20, correct 16, question 7, ruling-drift 1, move 1 | 23 code fixes need no ruling (section C), each through the normal PR rule. Schema, Android and G4 items wait on B1 to B3 and B8 |
-| 06 sources | paper (19), guide (7), cross-cutting (1) | 27: correct 19, reword 6, cut 1, add 1 | 26, with v1 C15 to C18 and the relabels (s14 to §2.7, s19 and s20 to §3.2). Merge s11 with P-§9-02, and s13 with P-§6.4-01 |
+| 06 sources | paper (21), guide (7), cross-cutting (1) | 29: correct 21, reword 6, cut 1, add 1 | 28, with v1 C15 to C18 and the relabels (s14 to §2.7, s19 and s20 to §3.2). Merge s11 with P-§9-02, and s13 with P-§6.4-01 |
 | 07 Android | map R4, §12, §13, D22; linux-targets; goal (public claim) | 15: add 10, ruling-drift 3, question 2 | 7, using v5's corrected text (X-android-04, -06, -08). Drift items wait on B4 |
 | 08 Nix | map, linux-targets, nixos-plan, plugin-layout, paper | 15: add 8, correct 2, question 2, reword 2, ruling-drift 1 | 9. X-nix-09 is `improves` (v3 C15). X-nix-02 waits on B7 |
-| 09 safety and TUI | map §2, §6, §9; validate proposal; goal | 12: add 10, ruling-drift 1, question 1 | 5. X-safety-01 is now ruling-first (v6 C10). X-safety-06 needs the C6 citation fetched first |
+| 09 safety and TUI | map §2, §6, §9; validate proposal; goal | 12: add 10, ruling-drift 1, question 1 | 5. X-safety-01 is now ruling-first (v6 C10). X-safety-06's C6 citation was read on 2026-11-13 (v7 R3) |
 | 10 trust | map §9.11, §10; guide; schema; goal | 12: add 8, reword 3, question 1 | 5. X-trust-03 (v6 C19) and X-trust-12 are now ruling-first. X-trust-01 is a question (C12) |
 | 11 engine | guide §7, §19; overlay; policy; map | 10: add 4, correct 3, question 2, reword 1 | 6, with v4's replacement texts for X-engine-01, -02 and -03 |
 | 12 forks | guide, overlay doc, map, change-process | 10: add 8, question 1, correct 1 | 7, with v5 C9 to C12 |
 | 13 pre-mortem | goal, guide, overlay doc, AGENTS.md | 7: question 2, add 3, ruling-drift 2 | 1 (X-pm-06). The rest are rulings (B10, B13) |
 
-Total: 355 items. About 210 can merge today with the checkers' corrections. The rest wait on B1 to B13.
+Total: 357 items. About 210 can merge today with the checkers' corrections. The rest wait on B1 to B13.
 
 ## G. What nobody checked
 
@@ -322,13 +324,13 @@ Total: 355 items. About 210 can merge today with the checkers' corrections. The 
 11. The carry-over fractions are estimates, with no corpus (08 Not checked 3).
 
 **Sources unread**
-12. Paywalled or failed: the body of [9] (ACM), the balena blog post [24] (three routes failed), the [29] Jira ticket (empty shell) (06 D1; v1 Not checked 2).
-13. Read only in part: [5], [7], [8], [14], [28]. The Promise Theory book [6]. Burgess's 2005 autonomy papers. The 2008 booklet's printed section numbers (v1 Not checked 3, 5; 06 D3).
+12. Still unread: the official ACM copy of [9] (a Cloudflare challenge blocks every scripted client; the author's JACM-layout copy was read on 2026-11-13 instead). The balena blog post [24] and the [29] ticket were read on 2026-11-13 and confirmed (06 D1; v7). Of the CHI and MISQ papers cited in 09 Q4, only titles, authors and abstracts were read: the bodies of Anderson et al. CHI 2015 and Vance et al. MISQ 2018 are unread (v7 R4).
+13. Read only in part: [5], [7], [8]. The Promise Theory book [6], Burgess's 2005 DSOM paper, [14] and [28] were read in full on 2026-11-13 (v7). The 2008 booklet's printed section numbers (v1 Not checked 3, 5; 06 D3).
 14. Prior work listed but not fetched: Traugott and Brown, Traugott and Huddleston, LCFG and Anderson's survey, Delaet et al., Tortoise, the Seven Sins, the IaC smells papers, Pearce et al., Perry et al., Kadavath et al., Ansible Lightspeed, the TUF CCS 2010 paper, Uptane at escar, in-toto, Reproducible Builds, Darcs/Pijul patch theory, Computer Immunology (06 C).
-15. The GPLv3 §13 text, needed for B12 (v6). Self-preference in LLM evaluators, arXiv 2404.13076, needed for X-safety-06 (v6 C6). The TUF delegation semantics (v3 Not checked 6).
-16. Android: Sui, Flyve, Obtainium, Canta, the GrapheneOS tools, the AOSP Shell permission list, Fleet's Android GitOps, the Termux Play build, the phantom-process source, the stayturgid #188 page itself, the ShizukuPlus Dhizuku licence question, "AMAPI/Fleet would own the work profile" (07; v5 Not checked).
-17. Trust and transport: Tailscale Android mechanics, iroh on Android, Mobile Nebula, SSB, Briar, Yggdrasil, Radicle, Sigstore, OSTree, journald `Seal=`, Mac log tools, the CHAINIAC body (10 N3 to N8; v6).
-18. Nix: licences of clan, home-manager and nix-darwin; garnix; deploy-rs and colmena; system-manager's Nix version; comin's per-remote key pinning (08 Not checked; v3 Not checked 4).
+15. The TUF delegation semantics (v3 Not checked 6). The GPLv3 §13 text (B12) and arXiv 2404.13076 (X-safety-06) were read on 2026-11-13 (v7 R3, R5).
+16. Android: Sui, Flyve, Obtainium, Canta, the GrapheneOS tools, the AOSP Shell permission list, Fleet's Android GitOps, the Termux Play build, the phantom-process source, the stayturgid #188 page itself, "AMAPI/Fleet would own the work profile" (07; v5 Not checked). The ShizukuPlus Dhizuku licence question was checked on 2026-11-13 (v7 R13).
+17. Trust and transport: Tailscale Android non-root mechanics, SSB, Briar, Yggdrasil, Radicle, Sigstore, OSTree, Mac log tools, the CHAINIAC body (10 N4 to N8; v6). Read on 2026-11-13: the Tailscale licences, iroh on Android (no published build), Mobile Nebula, and journald `Seal=` (v7 R7 to R10).
+18. Nix: licences of clan, home-manager and nix-darwin; garnix; deploy-rs and colmena; comin's per-remote key pinning (08 Not checked; v3 Not checked 4).
 19. Forks: gbp-pq, quilt, stgit, git-branchless, Homebrew taps, Renovate, Radicle, the jdguillot dotfiles PR, PortGPT's body for "of 18" (12 Not checked; v5 Not checked 7, 8).
 20. Engine: libntech upstream since 2026-08-20; the 3.28.0 release date; what backports #6499/#6500 carry; the † claims about Salt, Ansible, chezmoi, OpenVox and mgmt (11 Not checked; v4 Not checked 2).
 
