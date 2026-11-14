@@ -366,8 +366,10 @@ stay closed unmerged. The overlay manifest's B-5b entry (`overlay/overlay.json`)
 still describes and reproduces `8f0076b81`, not this behaviour; it now carries
 a `superseded_on_fork` note saying so, and
 [`upstream-overlay.md`](upstream-overlay.md) section 7 repeats it. Whether the
-overlay keeps, retires or replaces that patch is left to a separate ruling,
-because it changes what the overlay reproduces.
+overlay keeps, retires or replaces that patch was ruled on 2026-11-14 (Replace:
+the overlay will carry the all-or-nothing loader instead of the per-entry skip),
+and is done in a later, separate PR because it changes what the overlay
+reproduces.
 
 B-2 through B-7 are described, measured and sourced in
 [`cfengine-upstream-candidates-2026-08-16.md`](cfengine-upstream-candidates-2026-08-16.md);

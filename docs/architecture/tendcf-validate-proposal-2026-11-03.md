@@ -1228,8 +1228,13 @@ is limited, not complete: the loader's strict parse (a repeated member or
 trailing input refuses the file; fork `6505f488a`) belongs to the CMDB loader
 only, while this check's `readjson` stays lenient and sees the last of a
 repeated member or `vars` section, so an earlier container the loader refused
-is not named by the check (it still refuses, as nothing the file lists was
-loaded). The check does not detect such a file when the loader is lenient and
+is not named by the check. The check reports a refusal when that lenient view
+still lists variables the loader did not install (or another feature it refuses
+on its own); when the lenient view is empty (`{"vars":{},"vars":{}}`, or
+`{"vars":{}}` followed by non-whitespace) nothing is installed and nothing
+actuates, but the check has nothing to report, so no actuation is not a refusal
+report and the loader's own error is the only trace (`run.sh` 9b, empty-view
+controls). The check does not detect such a file when the loader is lenient and
 the repeated member is invisible to both parsers.
 
 Two findings from the implementation, both about the proof above. (1) The

@@ -226,9 +226,10 @@ CMDB loader that replaces B-5b's per-entry skip (a skipped interlock leaves the
 services it guards unguarded). The manifest entry still reproduces `8f0076b81`
 and carries a `superseded_on_fork` note; the table above is the 2026-10-09
 state and is not updated. Upstream plus this overlay skips a bad entry; the
-pinned fork installs nothing from the file. Keeping, retiring or replacing the
-patch is a separate ruling ([`upstream-register.md`](upstream-register.md) B-5b
-note).
+pinned fork installs nothing from the file. The operator ruled on 2026-11-14
+to replace the patch: a later, separate PR makes the overlay carry the
+all-or-nothing loader in its place ([`upstream-register.md`](upstream-register.md)
+B-5b note).
 
 So the overlay reproduces exactly the inputs whose build was verified on
 2026-08-19, from this repository alone, and would still apply to a build
