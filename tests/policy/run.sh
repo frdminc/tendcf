@@ -91,10 +91,11 @@
 #  11. the engine's evaluation of tendcf_cmdb, measured on a real
 #      cf-agent with -d: how often the checker's variables and classes are
 #      visited, with the file replaced (same keys and ids, another pre_action)
-#      by a common bundle resolved after tendcf_cmdb. The policy reads the file
-#      once, so the run is not refused, the loaded pre_action runs and the
-#      replaced one does not; a second run with the debug log counts the reads
-#      (the doc promise is evaluated once) and prints the other counts (`info:`).
+#      by a common bundle, in two deterministic timings: before the check's read
+#      (refused, "content differs", nothing runs) and after it (the policy reads
+#      the file once, so not refused, the loaded pre_action runs and the replaced
+#      one does not); a debug run counts the reads (the doc promise is evaluated
+#      once) and prints the other counts (`info:`).
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -768,18 +769,28 @@ check "data loaded with no file: reported" \
     grep -q "host_specific.json does not exist but CFEngine loaded data:variables.stray" "$out"
 check "data loaded with no file: nothing actuated" no_actuation "$out"
 
-echo "# 11. when does the engine evaluate tendcf_cmdb? (tests/policy/probe-mutate.cf)"
-# The file is consistent with what the loader installed (A). A common bundle
-# resolved after tendcf_cmdb replaces it with B: same keys and ids, another
-# pre_action command. If the engine evaluated tendcf_cmdb's variables or classes
-# again and read the file, the policy would see B and, were the comparison
-# repeated, refuse. The policy reads the file once (the `doc` promise is skipped
-# once `doc` exists), so the one expected outcome is: A was compared, the loaded
-# pre_action (A's) runs, B's never does.
-# Measured on the pinned fork (2026-11-14, Linux CI): tendcf_cmdb is resolved
-# twice and its vars are visited on every pass, its classes once. The debug log
-# (-d) counts the visits, so a later engine change shows up as a changed count.
-cat > "$work/inputs/probe-entry.cf" <<EOF2
+echo "# 11. a file replaced during the run (tests/policy/probe-mutate.cf)"
+# A (interlock-satisfied.json) is consistent with what the loader installed. A
+# common bundle replaces it with B: same keys and ids, pre_action /usr/bin/false.
+# Two timings, each with one expected outcome:
+#   before: B is on disk before the check reads the file. The check compares B
+#     with the loaded A and refuses ("content differs"); nothing runs.
+#   after: B appears only once tendcf_cmdb.doc exists (the probe's own guard), so
+#     after the check's read. The policy reads the file once (the `doc` promise
+#     is skipped once `doc` exists), so it never sees B: not refused, the loaded
+#     pre_action (true) runs, B's (false) never does, and doc is evaluated once.
+# Ordering is evidenced by the outcome itself (a refusal naming a content
+# difference only follows a read of B; the true/false split only a read of A) and
+# by the probe's guard, not by text of a debug log: a debug log (-d) echoes the
+# policy's own report strings, so it is only used for the visit counts.
+cat > "$work/inputs/probe-before.cf" <<EOF2
+body common control
+{
+      inputs => { "$repo/tests/policy/probe-mutate.cf", "$repo/policy/tendcf_services.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_services" };
+}
+EOF2
+cat > "$work/inputs/probe-after.cf" <<EOF2
 body common control
 {
       inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/probe-mutate.cf" };
@@ -792,28 +803,34 @@ echo ran >> "$work/probe-count"
 cp "$work/probe-B.json" "$work/data/host_specific.json"
 EOF2
 chmod 700 "$work/probe-mutate.sh"
-cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_specific.json"
 probe_a="$(cat "$repo/tests/policy/fixtures/interlock-satisfied.json")"
 printf '%s\n' "${probe_a//\"\/usr\/bin\/true\"/\"\/usr\/bin\/false\"}" > "$work/probe-B.json"
-rm -f "$work/probe-count"
-# Outcome: a run without -d, so that the log holds only what the agent did. (A
-# debug log (-d) prints the policy's own report strings, so grepping it for a
-# refusal line finds the policy text, not a refusal: the first version of this
-# check read "refused" from exactly that.)
-out="$work/xc-probe.out"
-"$cf_agent" -K -I -f "$work/inputs/probe-entry.cf" >"$out" 2>&1 || true
-check "probe: the file was replaced during the run" \
-    bash -c "[ \"\$(cat '$work/data/host_specific.json')\" = \"\$(cat '$work/probe-B.json')\" ]"
-check "probe: not refused: the policy never saw the replacement (it reads the file once)" \
-    no_crosscheck "$out"
-check "probe: the loaded pre_action (true) ran" grep -q "info: Executing .*'/usr/bin/true'" "$out"
-check "probe: the replaced pre_action (false) did not" \
+probe_replaced() { [ "$(cat "$work/data/host_specific.json")" = "$(cat "$work/probe-B.json")" ]; }
+probe_start() { cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_specific.json"; rm -f "$work/probe-count"; }
+
+probe_start
+out="$work/xc-probe-before.out"
+"$cf_agent" -K -I -D probe_before -f "$work/inputs/probe-before.cf" >"$out" 2>&1 || true
+check "probe before the read: the file was replaced" probe_replaced
+check "probe before the read: refused" refusal_reported "$out"
+check "probe before the read: the content difference is named" \
+    grep -q "key 'tendcf_interlock' content differs between" "$out"
+check "probe before the read: nothing ran (neither the loaded nor the replaced pre_action)" no_actuation "$out"
+
+probe_start
+out="$work/xc-probe-after.out"
+"$cf_agent" -K -I -D probe_after -f "$work/inputs/probe-after.cf" >"$out" 2>&1 || true
+check "probe after the read: the file was replaced" probe_replaced
+check "probe after the read: not refused (the policy never saw the replacement)" no_crosscheck "$out"
+check "probe after the read: the loaded pre_action (true) ran" \
+    grep -q "info: Executing .*'/usr/bin/true'" "$out"
+check "probe after the read: the replaced pre_action (false) did not" \
     bash -c "! grep -q \"info: Executing .*'/usr/bin/false'\" '$out'"
-# Counts: a second run with the debug log, from the same starting file.
-cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_specific.json"
-rm -f "$work/probe-count"
+
+# Visit counts, from a debug run of the after case.
+probe_start
 dbg="$work/xc-probe-debug.out"
-"$cf_agent" -K -I -d -f "$work/inputs/probe-entry.cf" >"$dbg" 2>&1 || true
+"$cf_agent" -K -I -d -D probe_after -f "$work/inputs/probe-after.cf" >"$dbg" 2>&1 || true
 n_doc="$(grep -c 'Evaluating vars promise: doc$' "$dbg" || true)"
 n_json="$(grep -c 'Evaluating vars promise: file_json\[' "$dbg" || true)"
 n_cls="$(grep -c 'Evaluating classes promise: tendcf_cmdb_refused$' "$dbg" || true)"
@@ -825,7 +842,7 @@ check "probe (debug run): the file is read once (doc promise evaluated once)" [ 
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
