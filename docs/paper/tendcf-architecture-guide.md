@@ -233,24 +233,40 @@ archived. In the restructure still to come the command becomes
 `--host` renders one. The name `nix2cf` moves to what it describes: the
 Nix module frontend (§3), one of the compiler's plugins. Frontends,
 supervisor renderers and one-shot importers from other tools are
-plugins. Frontends and importers are found through Python entry points,
-so a third party can ship one as an ordinary package; supervisor
-renderers are in tree only. Plugins run only at compile time, never on a
-device.
+plugins. Third-party frontends and importers are found through Python
+entry points, so a third party can ship one as an ordinary package;
+plugins in this repository are to be found through a static import table,
+never entry points (planned: no loader exists yet); supervisor renderers
+are in tree only. Plugins run only at
+compile time, never on a device.
 
 A plugin is trusted build-time code that the operator explicitly allows,
 not sandboxed code, and the claim it supports is narrow. A plugin cannot
-make a device accept anything that device's own diff does not show (§7),
-and it cannot emit a shape the schema forbids. (An operator host applies
-without a local yes, so there the pull request's preview diff is the only
-human check.) It can make the goal file
+make a device accept anything that device's own diff does not show (§7;
+`tendcf-validate`, the device-side command for Linux and macOS, is planned, not built), and it cannot emit a shape
+the schema forbids. (An operator host applies without a local yes, so
+there the pull request's preview diff is the only human check, and that
+check is advisory until what is signed is tied to what was reviewed:
+planned, Step 6.) It can make the goal file
 say something other than what the Site Model says, and it sees the
-site's private data. So the release gates (schema lint, projector,
-preview diff) and signing run in a separate environment with no plugin
-installed, and the compile step holds no signing key; a release loads
-only the plugins site-private names, and only in-tree ones until
-out-of-tree plugins can be pinned. The rules, the layout and the order
-of the move are in [`plugin-layout.md`](../architecture/plugin-layout.md).
+site's private data; it can also copy one host's private data into
+another host's goal file, which nothing checks yet. So the release gates
+(schema lint, projector, preview diff) and signing are to run in a
+separate environment with no plugin installed, and the compile step is to
+hold no signing key (**planned, Step 6**: nothing enforces this today;
+the interim is a separate Unix user on the builder, the default before the
+first real release is a two-job split whose release may be signed by the CI
+key (which alone suffices), by any one of at least two optional hardware
+tokens, or by an opt-in Unix user (which lowers every release to its level;
+a break-glass release is one person's act, bounded only by the trust in
+that signer, and the gates run from the previous release's tendcf pin, so
+a tools bump ships alone first),
+and frontend recipes from other
+sites are imported, pinned and scanned before they run). A release is to
+load only the plugins site-private names (planned: the loader), and only
+in-tree ones until out-of-tree plugins can be pinned. The rules, the
+layout and the order of the move are in
+[`plugin-layout.md`](../architecture/plugin-layout.md) §4.
 
 **The two files are not read by the same code, and they do not land in the
 same place.** `def.json` goes through the augments loader and its keys

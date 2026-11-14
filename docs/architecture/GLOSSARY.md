@@ -149,6 +149,43 @@ points in §12.
 Authority: `architecture-DEFINITIVE-v3.md` D46 (amending D12 and D21);
 layout and order of the move in `plugin-layout.md`.
 
+### import
+
+**Two live senses.**
+
+- **An importer** — a compiler plugin that migrates another tool's
+  configuration (Ansible, Salt) into Site Model files, once, after which
+  the site keeps and edits those files (`plugin-layout.md` §3). Not run on
+  every compile.
+- **An external import** — the planned step that brings a site-shared or
+  foreign-site recipe into a site: it pins the recipe by content digest,
+  scans it, has an AI review it and records the verdict with the pin;
+  compile evaluates only pinned recipes with an accepting verdict bound to
+  the recipe's digest, and refuses on a failed scan, a rejection or a
+  missing verdict. The recorded verdict is advisory: the plugin-free job
+  B′ re-runs the scan and the AI review, and only the gate-5 ceremony
+  marker overrides a negative result (`plugin-layout.md` §4, "Frontend
+  inputs are code"). Planned, Step 6; no command exists.
+
+Authority: `architecture-DEFINITIVE-v3.md` D46 (9) (decision D-b, issue #48);
+`plugin-layout.md` §3 and §4.
+
+### trust root
+
+**Three live senses.**
+
+- **The device-local trust root** — what the release path cannot write on
+  a device (advisor key, consent policy and the like; DC-1).
+- **The TUF `root` role** — the offline signing keys (map §9.11).
+- **The site's trust root** — a planned site-private declaration of which
+  tendcf repository and branches the site accepts; the tendcf pin's `url`
+  and `ref` must match it. It holds no keys. Gate 1 reads it from the
+  protected base, never from the pull request under test (`plugin-layout.md`
+  §4, "Signed is what was reviewed", item 5). Location and format open.
+
+Authority: `architecture-DEFINITIVE-v3.md` DC-1 and §9.11; `plugin-layout.md`
+§4 and §7 (operator rulings 16 and 17, issue #48 decisions).
+
 ### coverage
 
 **One enum, three values**: `comprehensive`, `not-yet-migrated`,

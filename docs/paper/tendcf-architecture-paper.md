@@ -266,20 +266,23 @@ to fold that repository into tendcf with its history, under `compiler/`
 restructure, with no alias, and to give the name
 `nix2cf` to what it describes: the optional Nix module frontend of §2.1.
 Frontends, supervisor renderers and one-shot importers from other tools
-become plugins; frontends and importers are found through Python entry
-points, supervisor renderers stay in tree. Plugins run at compile time
+become plugins; third-party frontends and importers are found through
+Python entry points, plugins in the repository through a static import
+table, and supervisor renderers stay in tree. Plugins run at compile time
 only.
 
 A plugin is trusted build-time code that the operator explicitly allows,
 not sandboxed code, and the guarantee is correspondingly narrow. A plugin
 cannot make a device accept anything that device's own diff does not
-show (§2.5), and it cannot emit a shape the schema forbids. It can make
-the goal file say something other than what the Site Model says, and it
-sees the site's private data. The release gates (schema lint, projector,
-preview diff) and signing therefore run in a separate environment with no
-plugin installed, the compile step holds no signing key, and a release
-loads only the plugins site-private names, in-tree ones only until
-out-of-tree plugins can be pinned. The rules and the layout are in
+show (§2.5; `tendcf-validate`, the device-side command for Linux and macOS, is planned, not built), and it cannot
+emit a shape the schema forbids. It can make the goal file say something
+other than what the Site Model says, and it sees the site's private data.
+The release gates (schema lint, projector, preview diff) and signing are
+therefore to run in a separate environment with no plugin installed, the
+compile step is to hold no signing key, and a release is to load only the
+plugins site-private names, in-tree ones only until out-of-tree plugins
+can be pinned. All of this is planned (Step 6 and the restructure): none
+of it is enforced today. The rules and the layout are in
 [`plugin-layout.md`](../architecture/plugin-layout.md).
 
 Two details of that layer are load-bearing and neither is obvious from the
