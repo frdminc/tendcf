@@ -59,15 +59,35 @@ path cannot preserve these checks, hold the review and report the missing check.
    `route_agent.py plan` picks, through `/bigteam`. Never use a weaker tier
    (GLM, Gemini Flash, Cursor Auto, `gpt-6-luna`) in these repos. A slice
    climbs a tier only on evidence of failure.
-3. **Review is cross-model, never same-model.** An Opus review of Opus work is
+3. **Review is cross-model, never same-model, and its depth is tiered by what
+   the change can break.** An Opus review of Opus work is
    one model with a fresh context, not an independent check. No PR merges on a
    review by the model family that wrote the change. For Opus- or
    Sonnet-authored work, astra, Fable or Argon count; for a Codex-authored
-   slice, Fable or Argon count.
-   - Every PR, docs-only included (this rule's own PR was reviewed this way),
-     gets one frontier review before merge. `docs/handoffs/` commits are not
-     PRs and keep the push-in-place exception above. Try the reviewers in this
-     order:
+   slice, Fable or Argon count. Operator ruling, 2026-11-14, B10: "1. Spike
+   lane, 2. Tiered review, 3. Docs freeze" (options O1, O2 and O4). **O6 was
+   not chosen** and O5 (dogfood the gate) was not asked; neither is in force.
+   - **Tiered review (O2).** *Light* review for docs and spike notes: a review
+     that is not a frontier review (no frontier admission, quota reading or
+     reviewer order), though the cross-model rule above still decides who may
+     review it, and a docs PR that carries a design ruling takes the
+     design-ruling tier below. **One frontier review** for device code.
+     **Two frontier reviews** for root, trust-root, key and handshake code (the
+     second is the independent astra-and-Fable pair described under design
+     rulings below). A PR that is neither docs, a spike note nor device code
+     (compiler, CI or tooling, say) keeps the one frontier review this rule
+     required of every PR before 2026-11-14. This supersedes the earlier text
+     "Every PR, docs-only included, gets one frontier review before merge"
+     (this rule's own first PR was reviewed that way).
+   - **Spike lane (O1).** A `spike/*` branch is never merged, so it gets no
+     frontier review. Each spike runs on a real, non-production device and
+     leaves a one-page note, which is reviewed under the light tier. What a
+     spike proves is then built in a normal PR that takes its own tier.
+   - **Docs freeze (O4).** No new design doc is written for a state-1 piece
+     until a spike for that piece has run.
+   - A PR that needs a frontier review gets it before merge. `docs/handoffs/`
+     commits are not PRs and keep the push-in-place exception above. Try the
+     reviewers in this order:
      1. Astra: Codex provider, `gpt-6-astra`, `high`.
      2. Fable: Claude provider, its current Fable frontier model, `high`.
      3. Gemini 4 Argon: Antigravity provider, `gemini-4-argon`, `high`.
@@ -127,8 +147,9 @@ path cannot preserve these checks, hold the review and report the missing check.
      comparison alone did not establish that astra was short. Only fresh quota, fit and admission
      evidence establish availability.
    - Design rulings (a `schema_version` bump, the privilege or enforcement
-     scope on a host, a deploy plan, the unit-writer or consent-diff design)
-     get two independent frontier reviews, astra and Fable. Argon stands in
+     scope on a host, a deploy plan, the unit-writer or consent-diff design),
+     and root, trust-root, key and handshake code (O2, above), get two
+     independent frontier reviews, astra and Fable. Argon stands in
      for one of them and never counts twice. With both astra and Fable short,
      take the Argon review now and wait for a reset for the second. A
      disagreement goes to djbclark, not to the lead to settle.
@@ -138,8 +159,9 @@ path cannot preserve these checks, hold the review and report the missing check.
    - The additional adversary round still runs where the current ADE workflow
      calls for it, using an eligible judgment route. It never counts as the
      cross-model frontier review and must not revive the retired omp client.
-   - The PR body names each reviewer model and effort, quotes the verdict (or
-     "no findings") and lists what was fixed.
+   - The PR body names each reviewer model and effort (for a light review,
+     the reviewer and the tier), quotes the verdict (or "no findings") and
+     lists what was fixed.
 4. **Limits that still hold.** Preserve the effective frontier allowance
    and per-wave caps from ADE's `config/gates.toml [frontier]`, estimate
    floors/caps, headroom and in-flight reservation accounting. The 20-point
@@ -253,8 +275,12 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
   `SKIP (loader not all-or-nothing): <name>`, never passes silently, and the
   run is expected to pass with SKIP lines and a count (not yet run on the Mac:
   derived from the parser behaviour). The Mac dev build stays a target
-  (operator, 2026-11-14, "keep Mac, SKIPs"). The Linux CI legs set
-  `TENDCF_REQUIRE_FORK_LOADER=1`, which makes a skip a failure. Run it through
+  (operator ruling, 2026-11-14, B11 round 2 item 2, adversary D1 / Astra r2 B3:
+  "1. Keep Mac, SKIPs"). The Linux CI legs set
+  `TENDCF_REQUIRE_FORK_LOADER=1`, which makes a skip a failure. Follow-up of the
+  same ruling: assertions that hold only with the strict loader (the
+  `strict_case` policy refusals) are gated the same way, so a non-fork run
+  passes with SKIPs rather than failing (pending where not yet done). Run it through
   `~/ops/site-private/bin/bg`. Two checks are opt-in because they reshape the
   host and need root: `TENDCF_TEST_SYSTEMD=1` (check 6, the real-systemd
   lifecycle; the ubuntu VM jobs) and `TENDCF_TEST_NIXOS_SHAPE=1` (check 7,
@@ -278,6 +304,60 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
 - Plan and status: `docs/architecture/linux-targets.md` §3; the NixOS side in
   `docs/architecture/nixos-passthrough-plan.md`. Live hosts: pastebin (root
   install, canary enforced), get.sipb.cloud (module installed, nothing scheduled).
+- **macOS check 8 of PR 52 (gate 2) runs on WarpBuild.** Operator ruling,
+  2026-11-14, PR 52 gate 2: "let's finish the codewarp setup and then try
+  running on their fastest mac setup". `frdminc/tendcf` is added to WarpBuild
+  runner group 1 (the app already sees all repos); the spike branch
+  `spike/macos-check8-warp` builds the fork pin on `warp-macos-26-arm64-12x`
+  and runs `tests/policy/run.sh` (worker 68cf038a). **The merge of PR 52 waits
+  on that run.** Like every spike branch (rule 3, spike lane) the branch is
+  never merged.
+- **PR 52 follow-ups: three issues and one tracker.** Operator ruling,
+  2026-11-14, PR 52 follow-ups 1-8: "1. 3 issues + 1 tracker". Filed the same
+  day, each linking PR 52: item 2 (install data skips the projector) is
+  [frdminc/tendcf#53](https://github.com/frdminc/tendcf/issues/53), item 3
+  (projector filter scope) is
+  [frdminc/tendcf#54](https://github.com/frdminc/tendcf/issues/54), item 4 (re
+  `$` before a trailing newline) is
+  [frdminc/tendcf#55](https://github.com/frdminc/tendcf/issues/55), and the
+  tracker, with checkboxes for items 1 and 5-8, is
+  [frdminc/tendcf#56](https://github.com/frdminc/tendcf/issues/56).
+
+## Android work: ShizukuTendCF builds (2026-11-14)
+
+Operator ruling, 2026-11-14, Smaller 1 (ShizukuTendCF fleet-signer override,
+C-android-03): "2. Dev mode + separate dev build" (the operator first asked
+"Is there a way we could make this of equal high convienience to everyone?
+Maybe have a development mode and/or build?").
+
+1. **Every build has a developer mode, open to any owner:** an owner-enrolled
+   standing approval for a signer of the owner's choice (the B2 mechanism);
+   revoke and deny are always honoured; a persistent indicator shows the mode
+   is on.
+2. **A separate developer build** exists for tendcf contributors' test
+   devices. It keeps the ignore-revoke override. It is never the published
+   public build.
+3. **Build only the appropriate flavour.** Operator ruling, 2026-11-14,
+   Smaller 1 rider: "We don't have to always do both builds when in
+   development, just the modt [sic] appropriate one for any given situation."
+   A development task builds and tests only the flavour that fits it (the
+   public build with developer mode, or the dev build), not both every time.
+
+## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
+
+Operator ruling, 2026-11-14, B12: "2. Borrow both freely; raise Python" (first:
+"I am thinking 2, May 26th isn't that long ago, but see if there are any
+important ignored issues or other traffic in the repos. AGPL is a fine license
+for us, as long as it doesn't prevent us from using any other code we need.").
+
+1. Toad and textual-diff-view (AGPL-3.0) may be borrowed as needed. The review
+   TUI becomes **AGPL-3.0-only** and moves to **Python >=3.14** (Toad's floor;
+   Toad pins `textual==8.2.7`).
+2. **Keep licences that AGPL-3.0 cannot combine with out of the TUI module**:
+   GPL-2.0-only, CDDL, EPL-2.0 without a secondary-licence designation, and
+   proprietary code. Nothing tendcf uses today is affected (research:
+   `b12-agpl-research.md`, no security or licence red flags).
+3. Follow-ups: check that Python >=3.14 is available on Termux and on the Mac.
 
 ## Editing in a worktree: absolute paths only (2026-10-31)
 

@@ -150,7 +150,7 @@ By report: guide 32 checked (25 confirmed, 7 weakened); map 42 checked (24 confi
 4. Step 0: replace "the Android profile model (§16 Q20) ... and the scan-report shape" with "whatever of these has been ruled by then (Q19, Q20, scan-report shape); unruled items ride a later bump".
 5. Add to the Merge: "also amends D16 (inference) and D22".
 
-**M-§15-02.** In D48, end the operator text at "...and Android deferral ([`linux-targets.md`](linux-targets.md))." Move "Linux work already done stays: pastebin's canary keeps running as the standing proof (operator, 2026-10-31), and Linux-only design work waits for G8 state 2" into a separate sentence marked "Proposed, needs ruling:". The standing-proof part is the operator's 2026-10-31 ruling; the deferral of Linux-only design work is not.
+**M-§15-02.** In D48, end the operator text at "...and Android deferral ([`linux-targets.md`](../../architecture/linux-targets.md))." Move "Linux work already done stays: pastebin's canary keeps running as the standing proof (operator, 2026-10-31), and Linux-only design work waits for G8 state 2" into a separate sentence marked "Proposed, needs ruling:". The standing-proof part is the operator's 2026-10-31 ruling; the deferral of Linux-only design work is not.
 
 **M-§15-03.** In D49, replace "The byte-identical YAML twin stays as the frontend's test. `schema/` remains the authority over the data form (direction of generation: §16 Q23)." with: "Open, needs the operator's ruling: whether `schema/` or the Nix module options is the schema authority (map §4.1 currently says JSON Schema is generated from the module options; §16 Q23), and whether a byte-identical YAML twin stays as the frontend's test."
 

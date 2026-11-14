@@ -248,7 +248,9 @@ Any failed gate means no ChangePlan is issued. The device stays on the last good
 
 > A person's own fork (G9, later) is not a tool fork in this sense. Its build, like a tool fork's, reaches a device only as a digest-bound artifact; its upstream pin is in `site.lock`, and its patches are site content.
 
-**Merge:** needs the operator's ruling first (whether a person's fork is a source input in `site.lock`); then insert after it
+**Ruled:** "1. Yes, a site.lock source input" (operator ruling, 2026-11-14, Smaller 4, X-forks-05). The text is added after change-process rule 5, as proposed above: "A person's own fork (G9, later) is not a tool fork in this sense. Its build, like a tool fork's, reaches a device only as a digest-bound artifact; its upstream pin is in `site.lock`, and its patches are site content." What the finding called open, whether a person's fork is recorded as a source input in `site.lock`, is answered yes. Ruled; implementation pending.
+
+**Merge:** ruled; insert after rule 5
 **Checked:** verified (text read); independently checked 2026-11-13: the claim that rule 5 forbids a person's fork was refuted (rule 5 is scoped to the project's tool forks); item rewritten to keep only what holds
 
 ### X-forks-06: Step 10+ names fork builds
@@ -330,7 +332,7 @@ Any failed gate means no ChangePlan is issued. The device stays on the last good
 
 No item was withdrawn.
 
-1. **X-forks-05, rewritten in place.** Claim: change-process rule 5 "as worded forbids" a person's own fork, so a ruling is needed to permit one. Evidence: `change-process.md:76` scopes "tool forks" to `djbclark/core`, `djbclark/libntech` and `frdminc/ShizukuTendCF`; rule 5 (`:121-125`) says such a fork's binary enters a release only as a digest-bound fetched artifact and says nothing about a person's fork. The item no longer asks for that ruling.
+1. **X-forks-05, rewritten in place.** Claim: change-process rule 5 "as worded forbids" a person's own fork, so a ruling is needed to permit one. Evidence: `change-process.md:76` scopes "tool forks" to `djbclark/core`, `djbclark/libntech` and `frdminc/ShizukuTendCF`; rule 5 (`:121-125`) says such a fork's binary enters a release only as a digest-bound fetched artifact and says nothing about a person's fork. The item no longer asks for that ruling. The one question it kept (whether a person's fork is a source input in `site.lock`) is ruled: "1. Yes, a site.lock source input" (operator ruling, 2026-11-14, Smaller 4).
 
 ## Ideas and risks
 

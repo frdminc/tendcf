@@ -36,14 +36,17 @@ Ranked by my estimate of likelihood. Each story gives the early sign that would 
 2. **Android stalled on the substrate question.** The map's design (CFEngine under Termux, Kotlin agent, Shizuku helper) cannot reach Island or Insular profiles: those are a separate Android user, and Termux runs in the main user. Nobody decided whether CFEngine runs on the phone at all, and G7 forbids changing it without a ruling. So both "Android first" and "nothing changes without a ruling" held, and nothing moved.
    - **Early sign:** by mid-December, no tendcf-produced action has run on the phone, and the profile question has no answer in any doc.
    - **Countermeasure:** a two-day spike. The Mac renders a JSON goal file. A ShizukuTendCF build applies one item as shell UID (for example `pm disable-user --user <island-id> <pkg>`) and writes one JSONL line. Then ask the owner the CFEngine-on-Android question with that evidence in hand (E-1).
+   - **Ruled (B3):** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only (05 Idea 4). Sub-rulings: "1. Field on entries" (one host per phone; each Android promise names its target user and the work profile's owner app; unreachable profile reports `not_kept`), "1. Termux + Kotlin trust check", "1. Never" (tendcf never holds a DPC slot), "1. Native screen + Termux" (see 07 and 09).
 
 3. **The Mac in state 1 was the daily driver, and enforcing on it felt too risky.** The guide makes dry-run "the standing posture" on the primary workstation (guide:1376-1378). A root `cf-execd` built from a fork on the machine that "cannot easily be reimaged" stayed in dry-run for good.
    - **Early sign:** no launchd item enforced on any Mac within a month, and no macOS CI leg.
    - **Countermeasure:** use a spare Mac or a macOS VM (UTM or tart) for state 1. Start with user-level LaunchAgents, which need no root. Ask for a GitHub macOS CI leg by name: global rule 37 requires the request to be explicit.
+   - **Ruled (B6):** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix for authoring and building only. "1. macOS VM on bigmac" (B6 sub 1, E-2): state 1's Mac is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1), with snapshot and rollback; CI can run the same image; it is a client, not an always-on server. "1. Dry-run only" (B6 sub 2, M-§12-01 / Q18): bigmac may run tendcf in dry-run only (compute and report the diff, log drift, apply nothing); the VM is the only enforcing Mac in state 1; the VM is also the G8 log-archive server, reachable only while bigmac is awake, and devices buffer JSONL. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon; bigmac's dry-run runs as a user LaunchAgent, no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work (research the floor).
 
 4. **The handshake was built to the map's TUF-subset floor.** That means an offline 2-of-3 root, targets and snapshot roles, and a key ceremony (map:880-886). It needed hardware and a ceremony nobody scheduled.
    - **Early sign:** a handshake doc names TUF roles or thresholds before a single signed byte has been verified on the phone.
    - **Countermeasure:** handshake v0 is `ssh-keygen -Y sign/verify` over the goal-file bytes plus a monotonic release counter, with an `allowed_signers` file written at enrolment that no release can modify. That is also the cheap form of guide §17's "device-local trust root". It needs a ruling, because the map calls 2-of-3 a floor.
+   - **Ruled (B1):** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): G3's handshake means content checks (signed by trusted keys, fresh, names this device, owner approval); transport auth decides only who may talk. First build: SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the map's 2-of-3 offline-root floor may lag until TUF. Also "3 but also the existance of standing wait for user and standing refusal" (B2): a hold window or owner-enrolled standing approval, shown and refusable before apply, with a new approval-record shape without a per-change nonce (a schema bump), plus a standing "wait for user" and a standing refusal.
 
 5. **The Nix frontend became "carry over NixOS configs".** G2's promise that existing configs carry over pulled the compiler into NixOS option semantics and nixpkgs imports. Android has no matching options anyway, so this was work for state 3 done before state 1.
    - **Early sign:** compiler commits about `mkOption`/`mkMerge` compatibility or nixpkgs pinning before any Android option exists.
@@ -64,6 +67,7 @@ Ranked by my estimate of likelihood. Each story gives the early sign that would 
 9. **The score and the TUI were built before there was a diff to show.** G4's visible, novel parts are fun to build, and the "see and refuse" wording was read as "no state 1 without the TUI".
    - **Early sign:** TUI scaffold research or a scoring prototype before two real goal files have ever been diffed on the Mac.
    - **Countermeasure (an option for the owner, since G4 applies to every change):** state 1's see-and-refuse could start as a CLI diff plus `y/N`, with the score, explanation, graded highlighting and TUI following as state 1.5, if the owner rules that G4's display may lag state 1. Needs the operator's ruling first (independently checked 2026-11-13: weakened (ruling), corrected).
+   - **Ruled:** "1. Build order, not scope" (operator ruling, 2026-11-14, B8 sub 3, 13 A(i)-9 / v6 C22). G4 stays whole in state 1, so the "state 1.5" in the countermeasure above is not adopted: there is no "state 1.5". The CLI diff plus y/N is built first and used on the VM and dev devices before any TUI or score work; state 1 is declared only once score, explanation, highlighting and TUI land. This is a build order, not a lag in G4's display.
 
 10. **The phone could not reach the Mac's log archive.** The Mac sleeps (the predecessor's named pain, final-v1:57-58), and Android kills background work. A log "server" got designed instead of moving files.
     - **Early sign:** no transport chosen within a month.
@@ -128,14 +132,16 @@ B3. **A non-expert approving exact diffs** (G1 long-run user against G4). **Real
 
 B4. **A safety figure produced partly by the same class of system that wrote the change** (G4, G6). **Real.** Failures are correlated, and a prompt-injected author can write text aimed at the scorer.
    - **Fix:** deterministic checks set a ceiling. The AI can only lower the score, never raise it. The scorer runs on a different vendor from the author, never sees the author's rationale text, and the display names each contributor.
+   - **Ruled:** "2. Should not (as written)" (operator ruling, 2026-11-14, B8 sub 4, X-safety-06 / v6 C6): the scanning AI SHOULD NOT be the authoring model; it sees only the canonical diff as quoted data, never the author's prose; the diff is hostile input; two model families where the owner has them, and their disagreement caps the score (70). The same model is allowed with no extra cap. The citation for self-preference bias, arXiv:2404.13076 (Panickssery, Bowman and Feng, 15 Apr 2024), was fetched and verified on 2026-11-14, so no fetch is outstanding for v6 C6. The "different vendor" fix above is the stronger form; the ruling is "should not".
 
 B5. **"Confidence out of 100%"** (G4). **Real, and nobody has flagged it.** A percentage reads as a calibrated probability, and there is no labelled corpus to calibrate against.
    - **Option for the owner (X-pm-03):** call it a "safety score (0-100)" until it is calibrated against a seeded corpus of known-bad diffs. Then report its measured hit rate next to it. Needs the operator's ruling first (independently checked 2026-11-13: weakened (ruling), corrected).
+   - **Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8): "score from 0 to 100", mechanical checks set a ceiling that AI review can lower but never raise, an explanation of each part, a measured hit rate once a corpus exists (B13 wording 3 / X-pm-03). Values: "1. 09's table, top 95" (B8 sub 1): base 95, never 100 (09 Q3). Owner-set auto-refuse floor: "1. Allowed, off by default" (B8 sub 2).
 
 B6. **Nix-first authoring for devices that will not run Nix** (G2, G5). **Mostly not a conflict:** evaluation happens on any device with Nix, and the phone receives JSON. Two real residues:
    - "Existing NixOS configs carry over" means nothing for Android options.
    - The long-run user may own only a phone. Nix exists on Android (nix-on-droid), which contradicts the predecessor's original "no Nix on Android" constraint (history §D).
-   - **Fix:** in G2, "carry over" applies to options that exist on the target. State whether a phone may evaluate Nix itself (E-6).
+   - **Fix:** in G2, "carry over" applies to options that exist on the target. State whether a phone may evaluate Nix itself (E-6). **Ruled (partly):** "2. Allow on release path" with scope "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): Nix may be required to build a release; devices never need Nix at run time. And "1. Importer + matching names" (B7): a one-shot importer for pure-data option families, with tendcf option names matching nix-darwin and NixOS where the meaning is the same.
 
 B7. **Android first while every live host is Linux** (G5). **Real for effort, not for design.** The only enforced adapter (systemd) and the only CI are Linux.
    - **Fix:** one sentence in the plan: "Linux remains the CI and regression substrate; it is not a target before step 4." Keep pastebin running as the regression canary and stop extending it.
@@ -193,7 +199,9 @@ B13. **"Directly at the code level" with Nix and hand-written YAML both allowed*
 - **O5. Dogfood the gate.** Once state 1 exists, a config change to the owner's own devices is reviewed by tendcf's own diff, score and approval, not by a PR review. The process becomes the product test.
 - **O6. Status quo plus one metric.** Keep every rule, and report "lines of code that ran on a device this week" in each handoff. The number makes the drift visible without changing any rule.
 
-My recommendation (inferred, not ruled): O1 + O2 + O4 now, O5 once state 1 holds.
+My recommendation (inferred): O1 + O2 + O4 now, O5 once state 1 holds.
+
+**Ruled:** "1. Spike lane, 2. Tiered review, 3. Docs freeze" (operator ruling, 2026-11-14, B10): O1, O2 and O4 are chosen (details at X-pm-07). O6 was not chosen; O5 was not asked.
 
 ---
 
@@ -208,16 +216,16 @@ Novel ones (not found in any document or digest I read) are marked **[new]**.
    - Every other piece of the architecture waits. Each line of the checklist must be demonstrable with a log.
 2. **Stop list** (G8; zero cost, frees most of the time). Until state 1: freeze s5, the validate proposal's Linux-only parts (keep `adopt` and the device-side gate state 1 needs on the Mac), the D46 restructure, the Guix, Ansible and Salt importers, issue #47's OpenPGP web of trust, Linux-only schema bumps (not the key-type, signer or `briefing_sha256` changes G3 and G4 need) and the simulate-json *upstream* track (keep `--simulate-json` itself, which the preview uses). Merge or close #41 and #42 so they stop costing attention (independently checked 2026-11-13: weakened, corrected: the original list also froze the validate proposal's device-side gate, which carries `adopt` and G4's see-and-refuse and which D1 and A(i)-9 need, and schema changes G3 and G4 need that are not Linux-specific).
 3. **Spike lane plus tiered review** (C, O1 and O2; G8; one AGENTS.md PR). Lets code meet devices without spending frontier quota on throwaway work.
-4. **Handshake v0 with SSH signatures** (G3, G4; a few days) **[new]**. `ssh-keygen -Y sign/verify` over the goal-file bytes plus a counter, with `allowed_signers` written at enrolment into storage no release writes. On Android that is app-private storage; on macOS a root-owned file outside the policy tree. It is the cheap realisation of guide §17's device-local trust root. TUF comes later; needs a ruling against the map's floor.
-5. **Android applier inside ShizukuTendCF for state 1** (G5; 2-4 weeks; needs a G7 ruling). A Kotlin applier reads the goal file and acts as shell UID through `pm`, `cmd appops`, `settings` and `dumpsys`, with `--user` reaching the Island or Insular profile. It reports JSONL. CFEngine on Android becomes a later choice, not a prerequisite.
+4. **Handshake v0 with SSH signatures** (G3, G4; a few days) **[new]**. `ssh-keygen -Y sign/verify` over the goal-file bytes plus a counter, with `allowed_signers` written at enrolment into storage no release writes. On Android that is app-private storage; on macOS a root-owned file outside the policy tree. It is the cheap realisation of guide §17's device-local trust root. TUF comes later; needs a ruling against the map's floor. **Ruled:** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): the first build is SSH-signature v0; the map's 2-of-3 offline-root floor may lag until TUF.
+5. **Android applier inside ShizukuTendCF for state 1** (G5; 2-4 weeks; needs a G7 ruling). A Kotlin applier reads the goal file and acts as shell UID through `pm`, `cmd appops`, `settings` and `dumpsys`, with `--user` reaching the Island or Insular profile. It reports JSONL. CFEngine on Android becomes a later choice, not a prerequisite. **Ruled otherwise:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only. So the Kotlin applier here is not state 1's path.
 6. **Borrow Syncthing whole for the log archive** (G3, G8.1; days) **[new]**. Each device appends to its own JSONL file and Syncthing syncs the directory to the Mac. There is no server code, sleeping is tolerated, and "server" is just the peer that keeps everything.
 7. **Borrow `lib.evalModules` from nixpkgs for the Nix frontend** (G2; 1-2 weeks). Typed options, `mkIf` and `mkDefault`, and generated option docs come with it. Keep tendcf's own small option tree, so no NixOS option compatibility is needed for state 1. numtide's system-manager is prior art for Nix modules on non-NixOS hosts.
 8. **Risk annotations in the option schema** (G4, G1; small per option) **[new]**. Every option carries `risk: {class, why, reversible}` and an example. The safety score's deterministic part, the plain-language rendering and the AI's warnings all read this one source, so the explanation is written once, by a human-reviewed PR.
 9. **Ship an MCP server and an agent skill with the tool** (G1, G8.3; 1-2 weeks) **[new]**. Tools: `options.search`, `options.explain`, `compile`, `diff --explain`, `score`, `check`. The stranger's AI calls the tool instead of recalling a tendcf it has never seen, which answers the main risk G6 creates.
 10. **Error messages as repair prompts, tested on the existing 159 broken fixtures** (G1; small) **[new]**. Every error carries a code, the offending path, a fix hint and a doc link. CI checks that each broken fixture's message names the field to change. This tests the messages, not G6.
 11. **Stranger rehearsal in CI** (G8.3; medium). A clean macOS runner and a fresh AI session given only the README quickstart and the MCP server, with time-to-first-converge recorded. The job runs from state 1 onward, so state 3 is rehearsed for a year before a human tries it.
-12. **A safety score with a deterministic ceiling** (G4; medium). Rule checks set the ceiling, AI reviewers from another vendor can only lower it, and each component is shown. Calibrate on a seeded corpus of bad diffs (from broken fixtures and red-team cases) and show the measured hit rate.
-13. **Borrow Textual for the TUI** (G4; medium). It is Python like the compiler, has a diff and highlight widget pattern, and runs in a terminal or browser. Severity grading maps onto colour, weight and blink tiers. The CLI mode is the same renderer without the TUI.
+12. **A safety score with a deterministic ceiling** (G4; medium). Rule checks set the ceiling, AI reviewers from another vendor can only lower it, and each component is shown. Calibrate on a seeded corpus of bad diffs (from broken fixtures and red-team cases) and show the measured hit rate. **Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8), with "1. 09's table, top 95" (B8 sub 1).
+13. **Borrow Textual for the TUI** (G4; medium). It is Python like the compiler, has a diff and highlight widget pattern, and runs in a terminal or browser. Severity grading maps onto colour, weight and blink tiers. The CLI mode is the same renderer without the TUI. **Ruled:** "2. Borrow both freely; raise Python" (operator ruling, 2026-11-14, B12): Textual, with Toad and textual-diff-view (AGPL-3.0) borrowed as needed; the review TUI is AGPL-3.0-only and needs Python >=3.14 (see 09 X-safety-11).
 14. **Source maps from goal-file entries back to Nix lines** (G2, G4; medium) **[new]**. The owner sees "line 12 of phone.nix: disable com.example in Work", not a JSON path. This is what makes "reads clearly without manuals" possible for an exact diff.
 15. **Use tendcf on itself** (G9, G8; small to start) **[new]**. Manage the dev Mac's agent tooling and the CI runner configuration with tendcf. Track the two forks (CFEngine, ShizukuPlus) as G9's first users: their drift checks become "your fork is N patches ahead; upstream changed these files".
 16. **Replace the stranger's first meeting** (G8.3; small). README: ten lines of what it does today, a 90-second terminal recording of the state-1 pair, and a quickstart. The architecture guide moves behind "How it works".
@@ -230,10 +238,10 @@ Novel ones (not found in any document or digest I read) are marked **[new]**.
 
 ## E. Questions nobody has asked
 
-E-1. **Does CFEngine have to run on the phone for state 1?** Or may a Kotlin applier in ShizukuTendCF apply goal files directly, with CFEngine on Android as a later option?
-E-2. **Which Mac is state 1's Mac?** The daily driver, a spare or a VM? And is user-level only (no root daemon) acceptable for state 1?
-E-3. **Is a single-key ssh signature with a device-pinned allowed-signers file enough for state 1's handshake?** Or does the map's 2-of-3 offline-root floor apply from the first byte?
-E-4. **On a Mac that already runs nix-darwin, what is tendcf's job:** replace it, coexist, or only add the handshake and logs?
+E-1. **Does CFEngine have to run on the phone for state 1?** Or may a Kotlin applier in ShizukuTendCF apply goal files directly, with CFEngine on Android as a later option? **Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): yes, Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only.
+E-2. **Which Mac is state 1's Mac?** The daily driver, a spare or a VM? And is user-level only (no root daemon) acceptable for state 1? **Ruled:** "1. macOS VM on bigmac" (operator ruling, 2026-11-14, B6 sub 1): an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1), a client and not an always-on server. "1. Dry-run only" (B6 sub 2): bigmac may run tendcf in dry-run only; the VM is the only enforcing Mac in state 1. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon; bigmac's dry-run runs as a user LaunchAgent, no root; state 1 must verify the root launchd render path. Image rider (B6 sub 1): minimise the VM image, smallest base, strip what state 1 does not need; queued as build work.
+E-3. **Is a single-key ssh signature with a device-pinned allowed-signers file enough for state 1's handshake?** Or does the map's 2-of-3 offline-root floor apply from the first byte? **Ruled:** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): the first build is SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the map's 2-of-3 offline-root floor may lag until TUF.
+E-4. **On a Mac that already runs nix-darwin, what is tendcf's job:** replace it, coexist, or only add the handshake and logs? (For state 1's own Mac: "1. Plain Mac, launchd by tendcf", operator ruling, 2026-11-14, B6; no nix-darwin there. The question for other people's Macs is not ruled.)
 E-5. **What are the first ten things you actually want managed on the phone?** Which apps, which profile, which settings. The Android design should come from that list.
 E-6. **May a phone-only person evaluate Nix on the phone** (nix-on-droid)? Or must authoring always happen on a device with Nix?
 E-7. **What date makes state 1 late, and what do you do then?** A rethink, a cut, or switching instruments?
@@ -287,7 +295,9 @@ E-10. **Do spikes fall under the cross-model review rule?** If they do, what is 
 
 > The owner is shown a safety score from 0 to 100, set as a ceiling by mechanical checks that AI review can lower but never raise, with an explanation of each part of it and its measured hit rate once a test corpus exists.
 
-**Merge:** needs the operator's ruling first (G4 wording)
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8; B13 items 2/3 are settled by it, wording 3): "score from 0 to 100", mechanical checks set a ceiling AI review can lower but never raise, an explanation of each part, a measured hit rate once a corpus exists. The proposed text above is the ruled wording. Ruled; implementation pending.
+
+**Merge:** ruled (G4 wording)
 **Checked:** inferred; independently checked 2026-11-13: confirmed
 
 ### X-pm-04: G8 state 3 has no rehearsal
@@ -302,7 +312,9 @@ E-10. **Do spikes fall under the cross-model review rule?** If they do, what is 
 
 > 3. … and keeps using it. From state 1 on, a clean machine with a fresh AI session that has only the public docs rehearses this in CI.
 
-**Merge:** needs the operator's ruling first
+**Ruled:** "1. Add the rehearsal sentence" (operator ruling, 2026-11-14, B13 item 5, G8 item 3 rehearsal): append "From state 1 on, a clean machine with a fresh AI session that has only the public docs rehearses this in CI." Ruled; implementation pending.
+
+**Merge:** ruled
 **Checked:** inferred; independently checked 2026-11-13: confirmed
 
 ### X-pm-05: State 3 need not wait for state 2
@@ -317,7 +329,9 @@ E-10. **Do spikes fall under the cross-model review rule?** If they do, what is 
 
 > Three states. Each is reached in this order, but work toward state 3 may start once state 1 holds.
 
-**Merge:** needs the operator's ruling first
+**Ruled:** "1. Adopt the clarification" (operator ruling, 2026-11-14, B13 item 4, G8 order): replace "Three states, in order:" with "Three states. Each is reached in this order, but work toward state 3 may start once state 1 holds." Ruled; implementation pending.
+
+**Merge:** ruled
 **Checked:** inferred; independently checked 2026-11-13: confirmed
 
 ### X-pm-06: Minimum fork delta for state 1
@@ -347,7 +361,9 @@ E-10. **Do spikes fall under the cross-model review rule?** If they do, what is 
 
 > Spikes are the exception: code on a `spike/*` branch under `spikes/` is never merged, needs no review, runs only on a test device, a spare machine or as an unprivileged user, and leaves a one-page note in `docs/spikes/`. Anything from a spike reaches master only by a new PR under this rule.
 
-**Merge:** needs the operator's ruling first (section C options)
+**Ruled:** "1. Spike lane, 2. Tiered review, 3. Docs freeze" (operator ruling, 2026-11-14, B10): O1 spike/* branches are never merged, get no frontier review, each runs on a real non-production device and leaves a one-page note; O2 tiered review (light for docs and spike notes, one frontier review for device code, two for root, trust-root, key and handshake code); O4 no new design doc for a state-1 piece until a spike for it has run. O6 was not chosen; O5 (dogfood the gate) was not asked. The change to tendcf AGENTS.md standing rule 3 is written there in the rulings PR. The proposed text above is the O1 form; the final wording of the rule is the rulings PR's. Ruled.
+
+**Merge:** ruled (section C options O1, O2, O4)
 **Checked:** verified (read); independently checked 2026-11-13: confirmed
 
 ---

@@ -112,8 +112,8 @@ C5. P-§2.1-02, proposed text. Replace the first sentence with:
 
 Narrow the Merge to: "needs the operator's ruling first (what G2's carry-over means on non-Nix hosts)".
 
-C6. P-§2.2-03, proposed text. Replace "Which one tendcf does on the first Mac is open (§9.19)." with:
-> On a Mac that runs nix-darwin, passthrough is the path (linux-targets §5: the adapter "is required either way"); whether the first Mac runs nix-darwin is open (§9.19).
+C6. P-§2.2-03, proposed text. Replace "Which one tendcf does on the first Mac is open (the open question on what carries over)." with:
+> On a Mac that runs nix-darwin, passthrough is the path (linux-targets §5: the adapter "is required either way"); whether the first Mac runs nix-darwin is open (the open question on what carries over).
 
 Change Merge to "replace that sentence".
 

@@ -109,7 +109,7 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 4. Flakes are experimental upstream. Determinate's downstream differs. The hook's flake-free `nix-instantiate` is the conservative choice. linux-targets §5 contradicts it (X-nix-14).
 5. Evaluation cost: full NixOS evaluation imports every module (4.0 s → 1.4 s for `toplevel` when the list is cut, per [nixpkgs#137168](https://github.com/NixOS/nixpkgs/issues/137168), open since 2021; a 2026-10 comment reports "gigabytes of extra memory" for dense import graphs). A carry-over import of a NixOS config pays this on the author machine, never on a phone.
 6. The reimplementation trap: each NixOS `services.<x>` carried over is a module rewrite. That is the system-manager road (a curated subset), and it never ends. Refuse it: carry over only pure-data option families and report the rest.
-7. Nix on the evaluating machine: G1's long-run user may own only a phone and a Mac. Evaluation then needs Nix on the Mac (G5 item 1) or a pure evaluator (snix is a Tvix fork with "no drop-in binary", snippet only; snix.dev's home page and /docs/ were read 2026-11-13 and the phrase is not there: the page says "Nix-compatible surface" and "Designed to be embedded", so the quoted phrase is still unlocated). Nix is a build-host dependency, not a device one.
+7. Nix on the evaluating machine: G1's long-run user may own only a phone and a Mac. Evaluation then needs Nix on the Mac (G5 item 1) or a pure evaluator (snix is a Tvix fork with "no drop-in binary", snippet only; snix.dev's home page and /docs/ were read 2026-11-13 and the phrase is not there: the page says "Nix-compatible surface" and "Designed to be embedded", so the quoted phrase is still unlocated). Nix is a build-host dependency, not a device one. **Ruled:** "2. Allow on release path" with scope "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): Nix may be required to build a release; devices never need Nix at run time.
 
 ## Response items
 
@@ -140,7 +140,9 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 
 > 3. **Carry-over import.** A person's existing NixOS or nix-darwin configuration is evaluated once, with its own pinned nixpkgs and nix-darwin, on the authoring machine or in CI (never on a device). The importer reads a fixed list of pure-data option families (nix-darwin `system.defaults`, `homebrew`, `launchd.agents`/`launchd.daemons`/`launchd.user.agents` `serviceConfig`, raw `systemd.services`, `users.users`, `networking.hostName`, `time.timeZone`, `environment.etc.<path>.text`) into Site Model files. It then reports every other defined option by path and file as **not carried over**, and refuses any value containing a `/nix/store/` path. High-level `services.<name>.enable` modules are never reimplemented one by one. The import is a plugin of kind importer (plugin-layout §3), not a frontend: after it runs, the site keeps the written files.
 
-**Merge:** needs the operator's ruling first (scope of G2's "carry over"; one choice with 04's L-§5-09 and X-nix-05)
+**Ruled:** "1. Importer + matching names" (operator ruling, 2026-11-14, B7): a one-shot importer for pure-data option families (it lists what it did not carry), plus tendcf option names matching nix-darwin and NixOS where the meaning is the same. This settles the one choice that X-nix-02, X-nix-05 and 04's L-§5-09 were to present together. Ruled; implementation pending.
+
+**Merge:** ruled (scope of G2's "carry over"; one choice with 04's L-§5-09 and X-nix-05)
 **Checked:** inferred (option families from nix-darwin option lists fetched; no corpus measured); independently checked 2026-11-13: weakened, corrected
 
 ### X-nix-03: the paper's Nix example declares options instead of setting them
@@ -204,7 +206,9 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 
 > Where a Site Model fact has a nix-darwin or NixOS option of the same meaning, the Nix frontend accepts that option's name and shape (for example `launchd.user.agents.<name>.serviceConfig.{Label,ProgramArguments,RunAtLoad,KeepAlive,UserName}` and `systemd.services.<name>.serviceConfig.{User,Restart}` with `wantedBy`). It maps them to the Site Model and refuses, by path, any key it does not map.
 
-**Merge:** needs the operator's ruling first (option-tree design; a data-shape choice)
+**Ruled:** "1. Importer + matching names" (operator ruling, 2026-11-14, B7): tendcf option names match nix-darwin and NixOS where the meaning is the same (the proposed text above), alongside the one-shot importer of X-nix-02. Ruled; implementation pending.
+
+**Merge:** ruled (option names); the wider option-tree design is still the operator's
 **Checked:** verified (nix-darwin option names fetched); mapping completeness not checked
 
 ### X-nix-06: packages are the largest part of a shared config and have no home
@@ -313,6 +317,8 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 
 > On the Mac that evaluates the site (G5 item 1), Nix is a build-host tool only: a macOS update that breaks the Nix install stops new compiles, never convergence of the approved release already on the device.
 
+**Ruled (Nix on the release path):** "2. Allow on release path" (operator ruling, 2026-11-14, B4 rider): Nix may be required to build a release; change-process §2 and map R5/D6 are amended. Scope: "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): devices never need Nix at run time, which is the text above. With "1. Plain Mac, launchd by tendcf" (B6): state 1's Mac has no nix-darwin and Nix is for authoring and building only. Ruled; implementation pending.
+
 **Merge:** insert after that sentence
 **Checked:** partly (README verified; the breakage reports read 2026-11-13); sources re-fetched 2026-11-13: corrected
 
@@ -327,6 +333,8 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 **Proposed text:**
 
 > **Where it runs:** any machine the site's owner trusts to compile: their own Mac or Linux box, CI, or a peer offering compilation as a service (a server in the goal's sense, G3). Never on the device being configured. A device accepts only the signed result.
+
+**Ruled (part):** "2. Allow on release path" (operator ruling, 2026-11-14, B4 rider): Nix may be required to build a release, so evaluation on the compile host is on the release path; the ruling does not say which hosts may compile for a phone-only user.
 
 **Merge:** needs the operator's ruling first
 **Checked:** verified (read anchor)

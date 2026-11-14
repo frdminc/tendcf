@@ -85,7 +85,7 @@ http://docs.bcfg2.org/getting_started/index.html.
 | T20 | [2] | LISA '05 URL | P §8: 3 FTE before, 1/3 to 1/2 FTE after, about 200 people | accurate |
 | T21 | [3] | LISA '06 URL | P §6.5: the limits of the state machine | accurate |
 | T22 | [3] | B06:201, 211 | P §2.7 (the helpers paragraph, "those stall the *fleet*") and G §13 | overstated. LISA '06 offers mitigations: "limit per-operation checks to a series of machines that are pertinent", and "query a workflow for blocking issues". |
-| T23 | [4] A.1.2 / §6.8 | B08:1954-1964, 2268; BS | P §6.5, G §13: `altsrc` | accurate (BS: "entry name remapping for the purpose of data binding", new in 0.9.5) |
+| T23 | [4] A.1.2 / booklet 6.8 | B08:1954-1964, 2268; BS | P §6.5, G §13: `altsrc` | accurate (BS: "entry name remapping for the purpose of data binding", new in 0.9.5) |
 | T24 | G §12 hyperlink "Bcfg2 Actions" pointing to the LISA '06 PDF | LISA '06 URL | G §12 | **wrong link**. LISA '06 does not describe Actions; the source is [4] §A.2.1. |
 | T25 | internal count | P:38, P:1917, P:1941, G:129-134, G:1638 | Abstract "four of its load-bearing ideas"; G "Six ideas" (six if Actions and bundle scope count separately); Acknowledgements "four Bcfg2 papers" | **wrong** (inconsistent). Desai's AUUG 2005 "Pay As You Go" is a fifth paper, listed in the Bcfg2 papers appendix, and is not cited. |
 | T26 | [1]-[3] bibliographic data | papers.txt URL; LISA PDFs | author lists, venues, pages | accurate |

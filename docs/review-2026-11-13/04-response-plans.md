@@ -73,7 +73,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Targets for the first milestone (G8 state 1) live in a separate file, `docs/architecture/first-milestone-targets.md` (to be written): M1, the operator's server Mac (receives and archives logs); A1, one Android device (Island/Insular profiles, ShizukuPlus). The rows below are the Linux targets. Their work is paused (G5 places Linux fourth and fifth).
 
-**Merge:** needs the operator's ruling first (which Mac, which Android device)
+**Ruled (which Mac):** "1. macOS VM on bigmac" (operator ruling, 2026-11-14, B6 sub 1, 13 E-2): state 1's Mac (M1, the server Mac) is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1): current macOS, snapshot and rollback, CI can run the same image; it is a client, not an always-on server. "1. Dry-run only" (B6 sub 2, M-§12-01 / Q18): bigmac may run tendcf in dry-run (compute and report the diff, log drift, apply nothing); the VM is the only enforcing Mac in state 1. Note: the VM is also the G8 log-archive server, reachable only while bigmac is awake; devices buffer JSONL. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent, no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work. Which Android device (A1) is not ruled. Ruled; implementation pending.
+
+**Merge:** the Mac is ruled (M1 is the VM on bigmac); which Android device still needs the operator's ruling
 **Checked:** verified (table read; grep); independently checked 2026-11-13: confirmed
 
 ### L-§3-03: say what each Linux step is worth to the macOS-plus-Android milestone
@@ -180,7 +182,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Open, for the operator: whether the Nix frontend accepts NixOS modular services (`system.services.<name>`, NixOS 25.11, in development) as one input shape, given that their `process.argv` normally names a store path. Options tendcf cannot honour on the target refuse the compile by name.
 
-**Merge:** insert after the path 2 paragraph; needs the operator's ruling first (whether the Nix frontend accepts modular services as one input shape; one choice with 08's X-nix-02, a one-shot carry-over import, and X-nix-05, nix-darwin option names)
+**Ruled:** "1. Importer + matching names" (operator ruling, 2026-11-14, B7): a one-shot importer for pure-data option families (it lists what it did not carry), plus tendcf option names matching nix-darwin and NixOS where the meaning is the same. This is the one choice named in the merge line below with 08's X-nix-02 (the importer) and X-nix-05 (the names). Whether the Nix frontend also accepts NixOS modular services as an input shape is not separately ruled. Ruled; implementation pending.
+
+**Merge:** insert after the path 2 paragraph; the carry-over choice (08's X-nix-02, a one-shot carry-over import, and X-nix-05, nix-darwin option names) is ruled as above; whether the Nix frontend accepts modular services as one input shape is not
 **Checked:** verified against an unofficial mirror of the manual (no modular service evaluated); independently checked 2026-11-13: weakened, corrected (the original remedy, modular services as a ready carry-over route, was refuted and is withdrawn below)
 
 ### L-§5-10: path 1 promises distribution and a consent diff on Nix hosts that the NixOS plan withdrew
@@ -210,7 +214,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > 2. nix-darwin has no adapter design yet; Step 8 covers NixOS only. Before the first macOS milestone the operator rules map §14.1 for the server Mac: (a) the Mac runs nix-darwin, and tendcf passes its configuration through (a nix-darwin analogue of nixos-passthrough-plan.md, including how the launchd bundle refuses a label nix-darwin owns); or (b) the Mac has no Nix runtime, and its Nix configuration is compiled by the Nix frontend to a launchd goal file (path 2). G8 state 1 is reachable either way; the two differ in where Nix must be installed.
 
-**Merge:** replace item 2; needs the operator's ruling first (map §14.1)
+**Ruled:** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix is for authoring and building only. That is option (b) in the proposed text: the Mac has no Nix runtime, and its Nix configuration is compiled by the Nix frontend to a launchd goal file. Map §14.1 is answered for state 1. Sub-rulings: "1. macOS VM on bigmac" (B6 sub 1), "1. Dry-run only" (B6 sub 2), "1. Root in VM, user on bigmac" (B6 sub 3); see L-§1-02. Ruled; implementation pending.
+
+**Merge:** replace item 2; map §14.1 is ruled for state 1 (option (b))
 **Checked:** verified (files read; this Mac checked for Nix); independently checked 2026-11-13: confirmed
 
 ### L-§5-12: consequence 3 restates a writer vocabulary that v4 retired
@@ -306,6 +312,8 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > **For macOS (2026-11-13):** the same derivation, built for `aarch64-darwin`, plus a nix-darwin module using `launchd.daemons`, is one candidate for the server Mac's CFEngine install if map §14.1 rules for nix-darwin. Untested on Darwin.
 
+**Ruled (B6):** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin. The nix-darwin module candidate in the proposed text is therefore not state 1's path; whether the derivation alone, built for `aarch64-darwin`, is used for the Mac's CFEngine install is not ruled (Nix for building is allowed on the release path, "2. Allow on release path", B4 rider).
+
 **Merge:** insert after stage A's paragraph
 **Checked:** not checked (Darwin build)
 
@@ -340,7 +348,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Open (G2): where the Nix frontend's evaluator runs for a release build, and how its version is pinned. A Nix evaluator is release-path code once Nix is the primary authoring language; until it is pinned, a Nix-authored release is not reproducible from `site.lock` alone.
 
-**Merge:** needs the operator's ruling first (Nix on the release path vs change-process §2 and map R5/D6); then insert as a bullet in §7
+**Ruled:** "2. Allow on release path" (operator ruling, 2026-11-14, B4 rider, Nix on release path): Nix may be required to build a release; change-process §2 and map R5/D6 are amended. Scope: "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): devices never need Nix at run time. How the evaluator is pinned is not ruled. Ruled; implementation pending.
+
+**Merge:** ruled (Nix on the release path vs change-process §2 and map R5/D6); insert as a bullet in §7
 **Checked:** verified (this Mac); CI images not checked; independently checked 2026-11-13: weakened, corrected
 
 ### PL-§2-03: no Android supervisor or platform in the planned tree
@@ -355,7 +365,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > `plugins/renderers/android/` (planned, G5): renders Site Model records for an Android device into goal-file entries tendcf-agent actuates. Whether this is a supervisor or a new renderer kind waits on the Android adapter design (linux-targets.md §4).
 
-**Merge:** insert in the §2 tree and table; needs the operator's ruling first (Android adapter shape)
+**Ruled (part):** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1, Q20 / M-§12-04 / X-android-05): one host per phone; each Android promise names its target user (owner/work/private) and the work profile's owner app (island/insular/none); unreachable profile reports `not_kept`; the schema bump is a design ruling (two frontier reviews) that rides the agent-id bump (M-§12-05 item 4). Also "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. Whether the renderer is a supervisor or a new renderer kind is not ruled.
+
+**Merge:** insert in the §2 tree and table; the Android adapter shape is partly ruled (above)
 **Checked:** verified; independently checked 2026-11-13: confirmed
 
 ### PL-§4-04: "valid is not faithful" is the gap G4's safety scan fills, so say so
@@ -648,7 +660,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > **macOS and Android (2026-11-13, G5):** the first milestone runs on a Mac and an Android device, and neither has a pinned build of the fork today (the Mac's dev build is at another revision). Open, for the operator: how the macOS build is produced and pinned (a named macOS CI job, a nix-darwin derivation, or a `bg` build recorded against `overlay/fork.json`), and whether Android runs CFEngine at all. Whichever is chosen, the binary enters a release only as a digest-bound fetched artifact (change-process.md §2 rule 5, 'A tool fork is never an input of its own'; the rule covers the project's own tool forks, which this is, and says nothing about a person's fork), so a local `bg` build counts only once it is published and its digest recorded.
 
-**Merge:** insert after the ruling paragraph; needs the operator's ruling first
+**Ruled:** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5): full fork pin on every platform, macOS fork build in CI; the 2-3 day stock/Termux spike (11-engine-alternatives §7) runs before the adopter path is decided. Whether Android runs CFEngine at all: "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. The macOS fork build's check on the WarpBuild runner is PR 52 gate 2 (worker 68cf038a; merge of PR 52 waits on that run). Ruled; implementation pending.
+
+**Merge:** insert after the ruling paragraph; the build question is ruled as above
 **Checked:** verified (workflows grep; PR body); the Mac build's version was not rerun; independently checked 2026-11-13: confirmed (clause on rule 5 added)
 
 ### X-OV-02: the overlay is the "existing patch pattern" G9 should extend
@@ -676,7 +690,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `tendcf-validate-proposal-2026-11-03.md:489`.
 **Proposed text:**
 
-> on Linux and macOS the proposed caller is `tendcf-validate propose` ([`tendcf-validate-proposal-2026-11-03.md`](tendcf-validate-proposal-2026-11-03.md) §3), as a human-facing confirmation and one input to the G4 safety scan.
+> on Linux and macOS the proposed caller is `tendcf-validate propose` ([`tendcf-validate-proposal-2026-11-03.md`](../architecture/tendcf-validate-proposal-2026-11-03.md) §3), as a human-facing confirmation and one input to the G4 safety scan.
 
 **Merge:** replace the clause
 **Checked:** verified
@@ -706,7 +720,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `README.md:3-10`; goal G1, G5.
 **Proposed text:**
 
-> Free software that gives people control of their own computing devices: a configuration management system you use through your own AI or directly in code. Configuration is to be written in Nix, with plain YAML/JSON beneath it; today the compiler reads the YAML/JSON form only. Nothing changes a device except as a checked difference its owner can see, with a safety score and the reasons, and refuse. First platforms: macOS, and Android with Island/Insular profiles and ShizukuPlus; then Linux. Goal: [`docs/review-2026-11-13/00-goal-definition.md`](docs/review-2026-11-13/00-goal-definition.md) (to move to a permanent home).
+> Free software that gives people control of their own computing devices: a configuration management system you use through your own AI or directly in code. Configuration is to be written in Nix, with plain YAML/JSON beneath it; today the compiler reads the YAML/JSON form only. Nothing changes a device except as a checked difference its owner can see, with a safety score and the reasons, and refuse. First platforms: macOS, and Android with Island/Insular profiles and ShizukuPlus; then Linux. Goal: [`docs/review-2026-11-13/00-goal-definition.md`](00-goal-definition.md) (to move to a permanent home).
 
 **Merge:** replace the first two paragraphs; needs the operator's ruling first (wording, and where the goal file lives)
 **Checked:** verified; independently checked 2026-11-13: weakened, corrected (the Nix frontend is not built, so the present tense was wrong)
@@ -721,7 +735,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `docs/architecture/README.md:20-28`.
 **Proposed text:**
 
-> Platform plans: [`linux-targets.md`](linux-targets.md) and [`nixos-passthrough-plan.md`](nixos-passthrough-plan.md) (Linux and NixOS; Linux is fourth and fifth in the goal's order, G5, 2026-11-13); the device-side gate: [`tendcf-validate-proposal-2026-11-03.md`](tendcf-validate-proposal-2026-11-03.md) (a proposal, unruled). There is no macOS or Android plan yet.
+> Platform plans: [`linux-targets.md`](../architecture/linux-targets.md) and [`nixos-passthrough-plan.md`](../architecture/nixos-passthrough-plan.md) (Linux and NixOS; Linux is fourth and fifth in the goal's order, G5, 2026-11-13); the device-side gate: [`tendcf-validate-proposal-2026-11-03.md`](../architecture/tendcf-validate-proposal-2026-11-03.md) (a proposal, unruled). There is no macOS or Android plan yet.
 
 **Merge:** insert after the paragraph; needs the operator's ruling first if "paused" is to be kept
 **Checked:** verified; independently checked 2026-11-13: not in the verdict table, but correction C1 applies to it ("paused" replaced by order language)
@@ -768,7 +782,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > 3. **Nix at compile time, never on the device.** Under the goal of 2026-11-13 (G2) Nix is the authoring language, so the compile host evaluates Nix; devices never need it (D6); this amends change-process.md §2's 'Nix is an optional builder', pending the operator's ruling. The evaluator's pinning is open (plugin-layout.md §7). Until the module frontend exists the hook is `nix2cf eval-nix FILE` (`nix-instantiate --eval --strict --json`). YAML/JSON stays the data form, written by hand or produced by Nix.
 
-**Merge:** needs the operator's ruling first (Nix on the release path vs change-process §2 and map R5/D6); then replace item 3
+**Ruled:** "2. Allow on release path" (operator ruling, 2026-11-14, B4 rider, Nix on release path): Nix may be required to build a release; change-process §2 and map R5/D6 are amended. Scope: "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): devices never need Nix at run time. How the evaluator is pinned is not ruled. Ruled; implementation pending.
+
+**Merge:** ruled (Nix on the release path vs change-process §2 and map R5/D6); replace item 3, with "pending the operator's ruling" removed
 **Checked:** verified; independently checked 2026-11-13: weakened, corrected
 
 ### X-CO-03: compiler AGENTS.md says it compiles from Nix expressions
@@ -870,10 +886,10 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 Idea 1 was withdrawn after checking (see the last section); the remaining ideas keep their numbers.
 
-2. **Decide map §14.1 first.** Whether the server Mac runs nix-darwin decides everything else: where Nix evaluates, how the fork is built for macOS (a Nix derivation solves both), and whether macOS needs a passthrough design or only the launchd renderer that already exists. It is a single ruling, and it unblocks most of the first-milestone plan.
-3. **Risk: the Android model is unknown and the schema assumes Termux.** No document mentions Island/Insular. If Android configuration is profile and app state through ShizukuPlus rather than services, the goal file needs a new domain, not a supervisor. That is cheapest before any device holds a baseline, which is true today.
-4. **One assessment, three views.** Make the G4 safety assessment a schema'd JSON artifact (`safety-assessment.schema.json`, digest-bound to the goal diff). CLI, TUI and the Android screen then become renderers of it. The same artifact goes on the PR (X-CP-04) and the device, so reviewer and owner see identical scores.
-5. **Risk: the score becomes the gate by habit.** If owners learn to accept anything at 90% or above, a scanner blind spot becomes a policy hole. Keep the minimum-over-hunks rule, show which scanners did not run, and make any automatic acceptance an explicit owner setting that the device records, never a project default.
+2. **Decide map §14.1 first.** Whether the server Mac runs nix-darwin decides everything else: where Nix evaluates, how the fork is built for macOS (a Nix derivation solves both), and whether macOS needs a passthrough design or only the launchd renderer that already exists. It is a single ruling, and it unblocks most of the first-milestone plan. **Ruled:** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix for authoring and building only.
+3. **Risk: the Android model is unknown and the schema assumes Termux.** No document mentions Island/Insular. If Android configuration is profile and app state through ShizukuPlus rather than services, the goal file needs a new domain, not a supervisor. That is cheapest before any device holds a baseline, which is true today. **Ruled:** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1): a field on entries, not a new domain or supervisor, carries the Android user and profile owner app (see PL-§2-03).
+4. **One assessment, three views.** Make the G4 safety assessment a schema'd JSON artifact (`safety-assessment.schema.json`, digest-bound to the goal diff). CLI, TUI and the Android screen then become renderers of it. The same artifact goes on the PR (X-CP-04) and the device, so reviewer and owner see identical scores. **Ruled (device side):** "1. Native screen + Termux" (operator ruling, 2026-11-14, B3 sub 4, X-safety-08): one review document (R14) rendered three ways, with goldens for all three; renderers compute nothing.
+5. **Risk: the score becomes the gate by habit.** If owners learn to accept anything at 90% or above, a scanner blind spot becomes a policy hole. Keep the minimum-over-hunks rule, show which scanners did not run, and make any automatic acceptance an explicit owner setting that the device records, never a project default. **Ruled for the auto-refuse floor:** "1. Allowed, off by default" (operator ruling, 2026-11-14, B8 sub 2, v2 on G-§7-01): an owner may set a floor, a bundle below it is refused automatically, logged, and the owner notified with the diff; no default floor; tighten-only (no score ever auto-accepts); the owner can re-request and accept a refused bundle.
 6. **Rule scanners before AI scanners.** The privileged-region, `run_as`, tombstone, listener and interlock-removal checks are deterministic. They can ship with the first `adopt`, and they give the AI scanner a floor to explain. They also make the figure meaningful when no AI is reachable.
 7. **G9 grows from the overlay, not from git.** `bin/overlay.py` already gives named patches, drift detection without touching a checkout, and patch-id retirement. Generalised to plugins and to forks such as ShizukuTendCF, it hides merge and rebase, as G9 asks, and the AI's job becomes re-deriving one drifted patch.
 8. **Risk: review cost against the milestone.** Each docs PR costs two frontier reviews plus an adversary review, and the restructure rewrites every dated record. At the current queue, budget can run out on renames before a Mac converges. Split the restructure, as in PL-§5-06.

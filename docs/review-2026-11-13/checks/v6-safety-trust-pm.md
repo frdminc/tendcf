@@ -35,7 +35,7 @@ Verdicts: confirmed 43, weakened 24, refuted 0, unverifiable 3. Rows marked "rul
 | X-safety-10 | confirmed | Correctly a question, needing a ruling | none |
 | X-safety-11 | confirmed | Licences confirmed; map §6 "Take (code or a thin wrapper)" at :332; map:120 "GPL-3.0-or-later for code" | add that the AGPL candidates have had no push for about six months (C9) |
 | X-safety-12 | confirmed | map:853-876 ("Effects versus declarations" at :863); VAL:489 | none |
-| 10 A3 | confirmed | TUF 1.0.37 §1.5.2 "cannot prevent updates from good mirrors"; VAL:466-474 "before parsing anything else" | none |
+| 10 A3 | confirmed | TUF 1.0.37 section 1.5.2 "cannot prevent updates from good mirrors"; VAL:466-474 "before parsing anything else" | none |
 | 10 A4 | confirmed | map:929 "not tenable once devices belong"; Tailnet Lock page quote (validated 2025-12-02) | none |
 | 10 A5 | weakened | G3 itself ends "The architecture is not changed by these words"; row 6b says "I am not trying to change the architecture", and that architecture (map §9.11, §10) already authenticates by content signature and authorises by approval record | C12 |
 | 10 B1 (TUF) | confirmed | TUF 1.0.37 (2026-10-08): intermediate-root expiry (5.3.6), freeze limited by expiry, mix-and-match, step-11 deletion of timestamp/snapshot on key rotation | none |

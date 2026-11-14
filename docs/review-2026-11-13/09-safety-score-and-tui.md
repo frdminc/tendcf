@@ -41,6 +41,11 @@ reached through the arXiv export API via `firecrawl_scrape`.
    of this change passed named checks, weighted by what breaks if it is wrong",
    until a calibration corpus can back a "%" (X-safety-10; independently
    checked 2026-11-13: confirmed as a question for the operator).
+   **Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8): a
+   "score from 0 to 100"; mechanical checks set a ceiling that AI review can
+   lower but never raise; an explanation of each part; a measured hit rate once
+   a corpus exists (B13 wording 3 / X-pm-03). The values are Q3's table, top
+   95: "1. 09's table, top 95" (operator ruling, 2026-11-14, B8 sub 1).
 3. **TUI: Textual** (MIT, Python 3.9+, the same language as `tendcf-validate`
    and the compiler; a terminal app, so it should run over SSH, and an old
    Textual discussion reports it working in Termux; neither is tested here).
@@ -50,6 +55,11 @@ reached through the arXiv export API via `firecrawl_scrape`.
    MIT-only borrowing (Rich, lazygit/gitui interaction patterns). Mosaic
    (Kotlin, Apache-2.0, experimental) is the option if a Kotlin TUI is ever
    wanted (independently checked 2026-11-13: weakened, corrected).
+   **Ruled:** "2. Borrow both freely; raise Python" (operator ruling,
+   2026-11-14, B12): Toad and textual-diff-view (AGPL-3.0) may be borrowed as
+   needed; the review TUI becomes AGPL-3.0-only and moves to Python >=3.14
+   (Toad's floor; Toad pins `textual==8.2.7`), so the "Python 3.9+" above no
+   longer holds for the TUI. See X-safety-11.
 4. **One "review document"** (hunks, findings, score, band, template strings)
    is produced once, hashed into `briefing_sha256`, and rendered by dumb CLI,
    TUI and Android renderers held to golden fixtures. The CLI, TUI, Termux and
@@ -156,7 +166,8 @@ Findings (each source fetched unless marked):
    ([arXiv 2606.03437](https://arxiv.org/abs/2606.03437), ACL 2026 Findings).
    The authoring AI (R13) should not score its own change
    (independently checked 2026-11-13: weakened, corrected; arXiv 2404.13076
-   was fetched and read on 2026-11-13).
+   was fetched and read on 2026-11-13). **Ruled:** "2. Should not (as
+   written)" (operator ruling, 2026-11-14, B8 sub 4); see X-safety-06.
 5. **False reassurance.** Explanations increased acceptance of AI advice
    "regardless of its correctness"
    ([Bansal et al., arXiv 2006.14779](https://arxiv.org/abs/2006.14779), CHI'21).
@@ -208,12 +219,15 @@ config diff into a trustworthy probability, and an adversary controls the input
 distribution. So **the number must be defined by rules, with AI able only to
 lower it.**
 
-**Recommended design: capped checklist score.** The 95 ceiling and the
-"NN/100" wording below are options for the operator's ruling (X-safety-10);
-G4 as agreed says "out of 100%".
+**Ruled design: capped checklist score, "1. 09's table, top 95"** (operator
+ruling, 2026-11-14, B8 sub 1, Q25 / M-§9-03 / 09 Idea 1). The table below is
+the ruled table, top 95: base 95, never 100. Values are fixed in the schema
+and are changed only by a ruling, later backed by a labelled corpus (see "Path
+to "%"" below). The number is shown as a "score from 0 to 100" ("1. Capped
+0-100 score", operator ruling, 2026-11-14, B8; X-safety-10).
 
 ```
-base     = 95                      # proposed: never 100 (operator's ruling)
+base     = 95                      # ruled: never 100 (B8 sub 1)
 penalty  = sum over findings of weight[severity_if_wrong]
            lockout 60, privilege 50, management 45, data-loss 40,
            reversible 10, notice 3
@@ -226,15 +240,17 @@ caps     = min of the caps that apply:
            a hunk whose kind no rule covers            -> 70
            the two AI families disagree on a tier      -> 70
            a touched domain is not comprehensive        -> 80
+           an integrity flag                           -> 0
 score    = min(score, caps)
 band     = 0-39 danger, 40-69 caution, 70-89 notice, 90-95 plain
 ```
 
-The weights are starting values, not measured; the bands and caps are the
-load-bearing part.
+The weights are starting values, not measured, and the bands and caps are the
+load-bearing part. As ruled (B8 sub 1), the values are fixed in the schema and
+changed only by a ruling, later backed by a labelled corpus.
 
-**What the number means**, as the screen would say it under the "NN/100"
-option: "**NN/100: how much of
+**What the number means**, as the screen says it for the ruled "score from 0
+to 100": "**NN/100: how much of
 this change passed tendcf's named checks, weighted by what goes wrong if it is
 wrong. It is not the chance this change is safe.**" A second axis is always
 shown: "**If this is wrong:** you could be locked out / something gains root /
@@ -247,12 +263,12 @@ uncertainty. First-person uncertainty reduced over-reliance
 ([Kim et al., arXiv 2405.00623](https://arxiv.org/abs/2405.00623),
 FAccT 2024, N=404).
 
-**Path to "%":** collect a labelled corpus. Sources are real releases, the
+**Path to "%":** collect a labelled corpus. (Ruled, B8: the measured hit rate
+is shown once a corpus exists.) Sources are real releases, the
 fleet's own history and seeded red-team diffs; their labels are "an owner
 would want to refuse". Fit isotonic regression from score to refusal rate,
 publish a reliability figure, and re-fit per rule-set version. Only then show
-"%". Whether "out of 100%" in G4 is shown as "/100" until then is the
-operator's ruling (X-safety-10); it is not settled here.
+"%". Ruled: until then the figure is a "score from 0 to 100" (X-safety-10).
 
 ## Q4. Warnings for non-experts; stopping reflex approval
 
@@ -331,8 +347,9 @@ concerning interaction through a network will apply to the combination as
 such" (read 2026-11-13 in a verbatim copy of the licence text; gnu.org itself
 would not load). The combined program would therefore carry AGPL's network
 clause as a whole, not only for the borrowed parts. That is a licence ruling
-for the operator (X-safety-11).
-**Runner-up:** Textual plus MIT-only parts (Rich Syntax, our own hunk list in
+for the operator (X-safety-11). **Ruled:** "2. Borrow both freely; raise
+Python" (operator ruling, 2026-11-14, B12): the review TUI is AGPL-3.0-only.
+**Runner-up (not taken):** Textual plus MIT-only parts (Rich Syntax, our own hunk list in
 the lazygit/gitui style). It is more code to write but has no licence question.
 
 ## Q6. The same review on a phone
@@ -343,7 +360,13 @@ the lazygit/gitui style). It is more code to write but has no licence question.
 2. **Native Compose screen in tendcf-agent** (Kotlin, R4) serves the G1
    long-run user, with the same tiers, glyphs, words and friction. Step 2
    (Android) is deferred at `eefea3c` (map:1160) and G5 now puts Android
-   second, so this screen sits on the critical path.
+   second, so this screen sits on the critical path. **Ruled:** "1. Native
+   screen + Termux" (operator ruling, 2026-11-14, B3 sub 4, X-safety-08 /
+   X-android-14): one review document (R14) rendered three ways (CLI
+   `--plain`/`--json`, Textual TUI including Termux and SSH, native screen in
+   tendcf-agent); goldens hold all three; renderers compute nothing; the agent
+   notification opens the native screen with Accept and Refuse; the Termux
+   CLI/TUI is the operator's path; no answer is held; a refusal is logged.
 3. **Consistency mechanism:**
    1. The device produces one **review document**, in canonical JCS, holding:
       hunks with key paths, findings, tiers, score, caps applied, band,
@@ -355,7 +378,14 @@ the lazygit/gitui style). It is more code to write but has no licence question.
 4. **Rules once, interpreters twice:** `review-rules.json` is interpreted by
    Python (`tendcf-validate`) and Kotlin (tendcf-agent), with a shared
    conformance corpus (diff in → review document out, byte-identical). The AI
-   scan goes through the advisor on both platforms.
+   scan goes through the advisor on both platforms. **Note (B3 sub 2, "1.
+   Termux + Kotlin trust check", operator ruling, 2026-11-14):** the single
+   Python `tendcf-validate` runs in Termux and there is no full Kotlin port of
+   the validator (amends D45 (1)-(2)); the Kotlin agent re-checks signature and
+   high-water mark, keeps the trust anchor and approval record in its own
+   app-private storage, and shows consent. The ruling does not say whether the
+   Kotlin agent also interprets `review-rules.json`; that part of this item is
+   not settled by it.
 
 ## Q7. Where scan and screen attach; what to sign and log
 
@@ -402,8 +432,8 @@ authors."
 makes AIs the authors but nothing requires that what they write is scanned,
 scored or shown with graded emphasis. The goal definition says no document
 describes the score, the highlighting or the TUI (`00-goal-definition.md:102-103`).
-The proposed text keeps G4's wording, a confidence out of 100%; showing a score
-out of 100 instead is an option for the operator, with its reasoning in
+The proposed text below is rewritten to the ruling "1. Capped 0-100 score"
+(operator ruling, 2026-11-14, B8): a score from 0 to 100, with its reasoning in
 X-safety-10.
 **Evidence:** map:103-125; `docs/review-2026-11-13/00-goal-definition.md:31-37`
 **Proposed text:**
@@ -411,22 +441,25 @@ X-safety-10.
 > - **R14** Every change is shown before it applies. The device computes the
 >   exact structural diff (§9.1), runs the review rules
 >   (`schema/review-rules.json`) and, where the owner has enrolled one, an AI
->   scan through the advisor slot (§11). It shows the safety confidence out
->   of 100% (or a score out of 100, per the ruling on X-safety-10),
->   the checks behind it, and each hunk at a tier (plain, notice, caution,
->   danger) whose friction rises with risk. The owner can refuse every change.
->   AI findings may lower the score; they never raise it, never lift a cap or
->   a ceremony class, and never authorize. One review document is rendered by
+>   scan through the advisor slot (§11). It shows a safety score from 0 to
+>   100, set as a ceiling by mechanical checks that AI review can lower but
+>   never raise, with an explanation of each part of it and its measured hit
+>   rate once a test corpus exists, the checks behind it, and each hunk at a
+>   tier (plain, notice, caution, danger) whose friction rises with risk. The
+>   owner can refuse every change. AI findings may lower the score; they never
+>   raise it, never lift a cap or a ceremony class, and never authorize. One review document is rendered by
 >   the command line, the TUI and tendcf-agent alike, and its hash is bound
 >   into the approval record.
 
-**Merge:** needs the operator's ruling first (X-safety-10, the number's
-wording); otherwise insert after it (as a new requirement; the next free
-number is R14)
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8; see
+X-safety-10). Ruled; implementation pending.
+
+**Merge:** ruled (X-safety-10, the number's wording); insert after it (as a new
+requirement; the next free number is R14)
 **Checked:** verified (read map:103-125 at `eefea3c`; R6, R8 and R9 are absent
 from the list, R14 is unused); independently checked 2026-11-13: weakened
 (ruling), corrected: G4's "confidence" and "%" restored, and the "/100"
-alternative left to the operator's ruling
+alternative left to the operator's ruling (now ruled, above)
 
 ### X-safety-02: validator proposal §15, the safety review
 
@@ -463,12 +496,15 @@ section below is written in the proposal's item voice.
 > **(d) Recommendation.** Option 1 in the first build, through `adopt`
 > (§9). Option 2 before any second host is enforced. Option 3 at Step 9.
 > The output of all three is one review document (JCS), whose SHA-256 is
-> `briefing_sha256` in the approval record. The figure is shown as G4 words
-> it, a confidence out of 100%, unless the owner rules for "NN/100" until a
-> calibration corpus exists (X-safety-10). Caps: any lockout, privilege or
-> management finding ≤ 40; a check not run ≤ 60; an uncovered kind ≤ 70.
-> Option for the owner's ruling: a top figure of 95, never 100, because no
-> check makes a change certainly safe and a high number is read as authority.
+> `briefing_sha256` in the approval record. The figure is shown as a score
+> from 0 to 100 (X-safety-10). The values are Q3's ruled table, top 95: base
+> 95, never 100, because no check makes a change certainly safe and a high
+> number is read as authority. Caps: any lockout, privilege or management
+> finding ≤ 40; a check not run or failed (including an AI reviewer
+> unavailable) ≤ 60; an uncovered kind ≤ 70; the AI families disagree on a
+> tier ≤ 70; a touched domain not comprehensive ≤ 80; an integrity flag 0.
+> The values are fixed in the schema and changed only by a ruling, later
+> backed by a labelled corpus.
 >
 > **(e) Proof.** Golden fixtures: diff in, review document out,
 > byte-identical between Python and Kotlin; `--plain` text and TUI
@@ -476,13 +512,17 @@ section below is written in the proposal's item voice.
 > score; a test that an uncovered kind caps at 70; a test that a hostile
 > string in `command` reaches the AI quoted and capped.
 
-**Merge:** needs the operator's ruling first (the score semantics, X-safety-10;
-the scaffold licence, X-safety-11); the structure can merge once those are
-settled
+**Ruled:** "1. 09's table, top 95" (operator ruling, 2026-11-14, B8 sub 1,
+Q25 / M-§9-03) and "1. Capped 0-100 score" (B8); the scaffold licence is ruled
+under X-safety-11. The text above is rewritten to those rulings. Ruled;
+implementation pending.
+
+**Merge:** the score semantics (X-safety-10) and the scaffold licence
+(X-safety-11) are ruled; the structure can merge
 **Checked:** inferred (design); anchors verified by reading VAL at `eefea3c`;
 independently checked 2026-11-13: weakened (ruling), corrected: the figure's
-wording, and the cap at 95, are presented as options for the operator's
-ruling
+wording, and the cap at 95, were presented as options for the operator's
+ruling (now ruled, above)
 
 ### X-safety-03: the first build's `adopt` shows the diff
 
@@ -567,14 +607,17 @@ regardless of correctness)
 **Weight:** misleads
 **Finding:** R13 makes AIs the authors, and the owner's AI is the advisor. If
 the same model wrote the change and scans it, it may be biased toward
-approving it: LLM evaluators favour their own generations in news-summary
-tasks (arXiv 2404.13076; GPT-4, GPT-3.5 and Llama 2; code review was not
-tested), and models grow more confident in answers framed as their own turn
-(arXiv 2606.03437). The
-diff is also attacker-controlled input to the scanner (JudgeDeceiver;
-LongPIBench).
+approving it. Self-preference bias is documented: an LLM scores its own outputs
+higher than others', and models recognise their own outputs, with a
+correlation between recognition and preference (Arjun Panickssery, Samuel R.
+Bowman and Shi Feng, "LLM Evaluators Recognize and Favor Their Own
+Generations", arXiv:2404.13076 [cs.CL], 15 Apr 2024; cited for self-preference
+bias only, not for anything about code review). Separately, models grow more
+confident in answers framed as their own turn (arXiv 2606.03437). The diff is
+also attacker-controlled input to the scanner (JudgeDeceiver; LongPIBench).
 **Evidence:** map:975-976; [arXiv 2404.13076](https://arxiv.org/abs/2404.13076)
-(abstract and full text read 2026-11-13);
+(fetched and verified 2026-11-14: Panickssery, Bowman and Feng, arXiv:2404.13076
+[cs.CL], 15 Apr 2024; abstract and full text also read 2026-11-13);
 [arXiv 2606.03437](https://arxiv.org/abs/2606.03437);
 [arXiv 2403.17710](https://arxiv.org/abs/2403.17710);
 [arXiv 2608.28411](https://arxiv.org/abs/2608.28411)
@@ -583,9 +626,18 @@ LongPIBench).
 > The AI that scans a change SHOULD NOT be the model that authored it, and
 > sees only the canonical diff as quoted data, never the author's prose.
 > The diff is hostile input to it. Two model families, where the owner has
-> them, are better than one; their disagreement caps the score.
+> them, are better than one; their disagreement caps the score (70). The
+> same model is allowed, with no extra cap.
 
-**Merge:** insert after it
+**Ruled:** "2. Should not (as written)" (operator ruling, 2026-11-14, B8 sub
+4, X-safety-06 / v6 C6): X-safety-06's text is adopted as written, with the
+disagreement cap stated as 70 (the "AI families disagree on a tier" cap in Q3's
+table) and the same model allowed with no extra cap. The citation,
+arXiv:2404.13076, was fetched and verified on 2026-11-14, so v6 C6's
+"fetch before merging the citation" condition is met. Ruled; implementation
+pending.
+
+**Merge:** ruled; insert after it
 **Checked:** verified (read map:953-976); independently checked 2026-11-13: weakened, corrected; sources re-fetched 2026-11-13: corrected
 
 ### X-safety-07: Q10 gets its counters
@@ -621,10 +673,17 @@ user's surface. Consistency across CLI, TUI and phone needs one rendered object.
 **Evidence:** map:1167; map:1160 (Android deferred); G1, G5
 **Proposed text:**
 
-> | 9 | Consent surface + default prompt + advisor slot. One review document (R14) rendered three ways: command line (`--plain`, `--json`), TUI (Textual; also under Termux and SSH), and a native screen in tendcf-agent. Renderers compute nothing; golden fixtures hold all three. |
+> | 9 | Consent surface + default prompt + advisor slot. One review document (R14) rendered three ways: command line (`--plain`, `--json`), TUI (Textual; also under Termux and SSH), and a native screen in tendcf-agent. Renderers compute nothing; golden fixtures hold all three. The agent notification opens the native screen with Accept and Refuse; the Termux CLI/TUI is the operator's path. No answer is held; a refusal is logged. |
 
-**Merge:** replace that row; needs the operator's ruling first (the Android
-order is in other items' scope)
+**Ruled:** "1. Native screen + Termux" (operator ruling, 2026-11-14, B3 sub 4,
+X-safety-08 / X-android-14). One review document (R14) is rendered three ways
+(CLI `--plain`/`--json`, Textual TUI including Termux/SSH, native screen in
+tendcf-agent); goldens hold all three; renderers compute nothing. The agent
+notification opens the native screen with Accept/Refuse; the Termux CLI/TUI is
+the operator's path. No answer is held; a refusal is logged. This replaces the
+map's Step 9 row, per X-safety-08. Ruled; implementation pending.
+
+**Merge:** ruled; replace that row
 **Checked:** verified (read map:1152-1172); independently checked 2026-11-13: confirmed
 
 ### X-safety-09: tiers key to hunk paths; flagged hunks never collapse
@@ -669,7 +728,14 @@ stated meaning, and can become a "%" only after calibration on labelled diffs.
 > highlighted more dramatically the less safe it looks. It becomes a
 > percentage once calibrated against labelled changes.
 
-**Merge:** needs the operator's ruling first (wording of the agreed goal)
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8; B13
+wording 3 / X-pm-03). The wording is "score from 0 to 100", mechanical checks
+set a ceiling AI review can lower but never raise, with an explanation of each
+part and a measured hit rate once a corpus exists. The values are "1. 09's
+table, top 95" (B8 sub 1; Q3). The proposed text above stands as the wording
+of the ruled score. Ruled; implementation pending.
+
+**Merge:** ruled (wording of the agreed goal)
 **Checked:** inferred (from the cited papers); independently checked 2026-11-13: confirmed
 
 ### X-safety-11: borrow table gets a TUI row, and a licence ruling
@@ -688,9 +754,23 @@ textual-diff-view 2026-05-27).
 ("licensed under the AGPL"); map:118-120 (R7 / R10)
 **Proposed text:**
 
-> | Review TUI | [Textual](https://github.com/Textualize/textual) (MIT); approval and diff screens from [Toad](https://github.com/batrachianai/toad) and textual-diff-view (AGPL-3.0, licence ruling D__); MIT-only fallback: Rich + our own hunk list |
+> | Review TUI | [Textual](https://github.com/Textualize/textual) (MIT); approval and diff screens from [Toad](https://github.com/batrachianai/toad) and textual-diff-view (AGPL-3.0, licence ruling D__); the review TUI is AGPL-3.0-only and needs Python >=3.14 |
 
-**Merge:** needs the operator's ruling first (AGPL code in a GPL-3.0 project)
+**Ruled:** "2. Borrow both freely; raise Python" (operator ruling, 2026-11-14,
+B12; the operator first wrote: "I am thinking 2, May 26th isn't that long ago,
+but see if there are any important ignored issues or other traffic in the
+repos. AGPL is a fine license for us, as long as it doesn't prevent us from
+using any other code we need."). Toad and textual-diff-view (AGPL-3.0) are
+borrowed as needed; the review TUI becomes AGPL-3.0-only and moves to Python
+>=3.14 (Toad's floor; Toad pins `textual==8.2.7`). The MIT-only fallback is not
+taken. Research, with no security or licence red flags: AGPL blocks GPL-2.0-only,
+CDDL, EPL-2.0 without a secondary designation, and proprietary code, and
+nothing tendcf uses today is in those classes
+(`/Users/djbclark/.local/state/agent-reports/876751f7/b12-agpl-research.md`).
+Follow-ups, open: Termux and Mac Python >=3.14 availability; keep incompatible
+licences out of the TUI module. Ruled; implementation pending.
+
+**Merge:** ruled (AGPL code in a GPL-3.0 project, with the TUI module AGPL-3.0-only)
 **Checked:** verified (licence files fetched); GPLv3 §13 compatibility read
 2026-11-13 in a verbatim copy of the licence text (gnu.org itself would not
 load); independently checked 2026-11-13: confirmed; sources re-fetched
@@ -721,8 +801,8 @@ files and packages; the activation gap remains.
 
 1. **Risk: score as authority.** People anchor on numbers. A 95 on a change
    that drops an interlock, only because the rule set lacks a rule, is worse
-   than no score. Mitigation: the uncovered-kind cap, and, if the operator
-   rules for it, a 95 maximum.
+   than no score. Mitigation: the uncovered-kind cap and the 95 maximum, both
+   ruled ("1. 09's table, top 95", operator ruling, 2026-11-14, B8 sub 1).
 2. **Risk: AI budget.** Two families per change on every device is real
    cost. Default to one AI via the advisor, two for privileged or baseline
    ceremonies.
@@ -730,6 +810,9 @@ files and packages; the activation gap remains.
    shared conformance corpus, run in Linux CI and the Android build.
 4. **Risk: AGPL creep.** Borrowing Toad screens makes the review TUI AGPL in
    effect. The MIT-only runner-up avoids the question at the cost of more code.
+   Ruled: the AGPL-3.0-only TUI is accepted ("2. Borrow both freely; raise
+   Python", operator ruling, 2026-11-14, B12); the remaining control is to keep
+   incompatible licences out of the TUI module.
 5. **Idea: red-team corpus.** Seed hostile diffs: interlock removal hidden
    among 200 plain hunks, an injected "ignore previous" in `report`, `run_as`
    to root via a renamed id. Use them both as golden fixtures and as the start
@@ -748,6 +831,17 @@ files and packages; the activation gap remains.
 10. **Idea: `textual serve`.** It gives a browser review for free on the Mac
    server. The review document stays the authority; the web view is another
    dumb renderer.
+11. **Ruled: owner-set auto-refuse floor** ("1. Allowed, off by default",
+    operator ruling, 2026-11-14, B8 sub 2, v2 on G-§7-01). An owner may set a
+    floor; a bundle below it is refused automatically, logged, and the owner is
+    notified with the diff. There is no default floor. It is tighten-only: no
+    score ever auto-accepts. The owner can re-request and accept a refused
+    bundle. Ruled; implementation pending.
+12. **Ruled: build order, not scope** ("1. Build order, not scope", operator
+    ruling, 2026-11-14, B8 sub 3, 13 A(i)-9 / v6 C22). G4 stays whole in state
+    1. The CLI diff plus y/N is built first and used on the VM and dev devices
+    before any TUI or score work; state 1 is declared only once score,
+    explanation, highlighting and TUI land. There is no "state 1.5".
 
 ## Not checked
 

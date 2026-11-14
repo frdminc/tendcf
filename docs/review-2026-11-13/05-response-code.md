@@ -32,6 +32,8 @@ Sources consulted: firecrawl (scrape) — Nix manual `restrict-eval`/`pure-eval`
 
 The total is a guess of 3 to 5 months of focused work. Rows 4, 5 and 8 dominate.
 
+**Ruled, row 8:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only (Idea 4 below). The row's "less if Termux CFEngine converges: needs a ruling" is answered.
+
 **(b) Share of code by platform** (`wc -l` over the tracked files in the target dirs: 16,181 lines).
 1. Linux-only: about 5,200 lines (32%). This is `bin/unit_classifier.py` 896 plus `tests/unit_classifier/` 3,135, `deploy/` 405, `tests/deploy/` 162, `run.sh` check 6 (about 194 lines, :163-356), the systemd half of the policy (66 lines naming systemd) and its template (13), `linux.yml` 118 and `build-fork` 81.
 2. macOS-specific: about 60 lines, all policy and template, plus the launchd-only renderer inside `compiler/` (1,139 Python lines that render launchd units only).
@@ -55,7 +57,7 @@ Nothing in tendcf installs or schedules it on a Mac, and there is no macOS CI.
 2. The Mac pushes with `cf-runagent`, which makes it a control node.
 3. ShizukuTendCF's signer allowlist ignores the owner's revoke and deny.
 
-D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tension with the CFEngine that already runs on the fleet. Items C-android-01..05.
+D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tension with the CFEngine that already runs on the fleet. Items C-android-01..05. **Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3); see C-android-01.
 
 **(f) Defects.** The strongest:
 1. shell injection through interlock `pre_action` (C-policy-01);
@@ -236,7 +238,14 @@ With nested prefixes the compiler takes `owners[0]`, the first declared, not the
 **Evidence:** `policy/tendcf_services.cf:72-98`, `:370-374`; `schema/goal-file.schema.json:497-504`; `bin/projector.py:145`; CFEngine `commands` reference (<https://docs.cfengine.com/docs/master/reference/promise-types/commands/>: `arglist` is an slist, `useshell` defaults to `noshell`) and `getvalues()` reference (<https://docs.cfengine.com/docs/master/reference/functions/getvalues/>).
 **Proposed text:**
 
-> Step 1, certainly expressible today: set `useshell => "noshell"` (CFEngine's default) in `tendcf_interlock_contain`, so no shell parses the joined string, and require `pre_action.command[0]` to match `^/` and every item to match the systemd argv alphabet plus "no ASCII space" (schema bump), so that the joined string splits back into the same argv. Step 2, once proven against a real build: build an slist per interlock with `getvalues("data:variables.tendcf_interlock[$(id)][pre_action][command]")` under a canonified, non-bracket name, and pass its tail as `arglist` with its head as the promiser. Keep step 1's alphabet until step 2 passes a test.
+> Step 1, certainly expressible today: set `useshell => "noshell"` (CFEngine's default) in `tendcf_interlock_contain`, so no shell parses the joined string, and require `pre_action.command[0]` to match `^/` and every item to match the systemd argv alphabet plus "no ASCII space" (schema bump, to `schema_version` 6; `contract_version` is the exact pin `const: 2`), so that the joined string splits back into the same argv. Step 2, once proven against a real build: build an slist per interlock with `getvalues("data:variables.tendcf_interlock[$(id)][pre_action][command]")` under a canonified, non-bracket name, and pass its tail as `arglist` with its head as the promiser. Keep step 1's alphabet until step 2 passes a test.
+
+**Ruled:** two rulings on step 1's schema change, recorded by the operator on 2026-11-14.
+
+1. Schema version: "1. Bump to 6" (operator ruling, 2026-11-14, C-policy-01 schema version). A strict narrowing of `pre_action.command` still bumps `schema_version`; the same version means the same acceptance set. So step 1's "(schema bump)" is a bump to schema_version 6.
+2. Contract version: "1. Confirm const: 2" (operator ruling, 2026-11-14, C-policy-01 contract_version form). The `contract_version` is an exact pin (`const: 2`), not a floor; the lead's decision in PR 52 is confirmed.
+
+Ruled; implementation pending, apart from what PR 52 already carries. The bump changes `schema_version` and `contract_version`, so it is a design ruling with two frontier reviews under AGENTS.md rule 3.
 
 **Merge:** replace the vars and commands sections of `tendcf_interlocks`
 **Checked:** verified (read; not executed); independently checked 2026-11-13: confirmed (live on the deployed path as code: the deployed policy joins and shells every pre_action; the injection itself is latent, since the deployed canary pre_action is `/usr/bin/true`); no lint outside the schema restricts the strings: confirmed; proposed fix expressible as written: weakened, corrected (step 2 not proven; replaced by the fallback as step 1)
@@ -411,7 +420,9 @@ With nested prefixes the compiler takes `owners[0]`, the first declared, not the
 
 > `pre_action.command[0]` must be an absolute path (`^/`), and every item is held to the systemd argv alphabet plus "no ASCII space" until C-policy-01 removes the shell.
 
-**Merge:** insert into `interlock_entry` (schema bump)
+**Ruled:** this is the schema half of C-policy-01; "1. Bump to 6" and "1. Confirm const: 2" (operator ruling, 2026-11-14, C-policy-01) apply: the narrowing bumps `schema_version` to 6 and the `contract_version` is the exact pin `const: 2`.
+
+**Merge:** insert into `interlock_entry` (schema bump to 6)
 **Checked:** verified; independently checked 2026-11-13: confirmed (latent)
 
 ## bin
@@ -456,7 +467,9 @@ R22 requires the Kotlin agent to reproduce it byte for byte. If no `cf-agent` re
 
 > Decide per platform what the agent consumes: on Android, either the goal file directly (no projection, no CMDB rules) or the projection fed to Termux cf-agent; R22 applies only in the second case.
 
-**Merge:** needs the operator's ruling first
+**Ruled (by B3):** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3) picks the second case for state 1: the projection is fed to Termux cf-agent. With B3 sub 2 ("1. Termux + Kotlin trust check"), the single Python `tendcf-validate` runs in Termux and there is no full Kotlin port of the validator. The ruling does not say whether R22's byte-for-byte Kotlin projector port is still required; that part stays open.
+
+**Merge:** the per-platform decision is ruled for Android; the R22 question is open
 **Checked:** verified (read)
 
 ### C-bin-03: The only diff application and ceremony derivation live inside the lint
@@ -574,6 +587,8 @@ So the compiler and the policy can disagree, and the `env` drop (C-policy-02) is
 
 > Add `deploy/macos/tendcf-install.sh` with the same subcommands: tree under `/opt/tendcf` (root:wheel), `otool -L` check, `org.tendcf.execd` LaunchDaemon via `launchctl bootstrap system`, and the same data-restore-on-reject rule.
 
+**Ruled (B6):** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix is for authoring and building only. Sub-rulings: "1. macOS VM on bigmac" (B6 sub 1, 13 E-2): state 1's Mac is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1), current macOS, with snapshot and rollback, CI able to run the same image, a client and not an always-on server. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent with no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). The proposed `org.tendcf.execd` LaunchDaemon in the text above is the VM's path. Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work (research the floor: what macOS can drop in a guest, for example tart vanilla against base images). Ruled; implementation pending.
+
 **Merge:** insert as a new file (needs the operator's ruling on the location, AGENTS.md item 23)
 **Checked:** verified; independently checked 2026-11-13: confirmed
 
@@ -649,7 +664,9 @@ D45 chose no CFEngine on Android ("No daemon beside CFEngine off Android", `arch
 
 > Ruling requested: on Android, does tendcf converge with Termux cf-agent (fed the projection; Kotlin agent = trust, diff/consent UI, Shizuku actions), or with the Kotlin agent alone (no CFEngine on Android, R22 dropped)?
 
-**Merge:** needs the operator's ruling first (D45 scope)
+**Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3). The answer to the question above is the first option: on Android, state 1 converges with Termux CFEngine fed tendcf projections, and the Kotlin agent holds trust and consent only. Sub-rulings on this: "1. Field on entries" (B3 sub 1, X-android-05), "1. Termux + Kotlin trust check" (B3 sub 2: the single Python `tendcf-validate` runs in Termux; the Kotlin agent independently re-checks signature and high-water mark, keeps the trust anchor and approval record in app-private storage and shows consent; no full Kotlin port of the validator, which amends D45 (1)-(2)), "1. Never" (B3 sub 3, X-android-09) and "1. Native screen + Termux" (B3 sub 4, X-safety-08 / X-android-14). Ruled; implementation pending.
+
+**Merge:** ruled (D45 scope)
 **Checked:** verified (layout and README read; policy bodies not read; fleet version from README); independently checked 2026-11-13: confirmed (fleet version from the README only)
 
 ### C-android-02: stayturgid's trust is trust-on-first-use over the tailnet, pushed from a control node
@@ -681,9 +698,15 @@ The cf-serverd and cf-runagent path must not be reused as the update channel.
 **Evidence:** ShizukuTendCF `README.md:14-20`; ShizukuTendCF `server/src/main/java/rikka/shizuku/server/ShizukuService.java:2455-2601` (TrustedSigners outcomes).
 **Proposed text:**
 
-> For tendcf, the allowlist is an owner setting, not a build constant: the owner enrolls the agent's signer once, sees it listed, and can revoke it in the manager; the fleet's "locked on" stays a stayturgid-only build flavour.
+> For tendcf, the allowlist is an owner setting, not a build constant, in every build: a developer mode open to any owner, with an owner-enrolled standing approval for a signer of their choice (the B2 mechanism), revoke and deny always honoured, and a persistent indicator. The ignore-revoke "locked on" override exists only in a separate developer build for tendcf contributors' test devices, never in the published public build.
 
-**Merge:** needs the operator's ruling first
+**Ruled:** "2. Dev mode + separate dev build" (operator ruling, 2026-11-14, Smaller 1; the operator first asked: "Is there a way we could make this of equal high convienience to everyone? Maybe have a development mode and/or build?"). Every build gets a developer mode open to any owner: an owner-enrolled standing approval for a signer of their choice (the B2 mechanism), revoke and deny always honoured, a persistent indicator. In addition there is a separate developer build for tendcf contributors' test devices that keeps the ignore-revoke override; it is never the published public build. The proposed text above is rewritten to the ruling.
+
+Rider: "We don't have to always do both builds when in development, just the modt appropriate one for any given situation." (operator ruling, 2026-11-14, Smaller 1 rider). Development builds only the flavour that fits the task (the public build with developer mode, or the developer build), not both every time.
+
+Ruled; implementation pending.
+
+**Merge:** ruled
 **Checked:** verified (README and call sites read; TrustedSigners body not read); independently checked 2026-11-13: confirmed (live in the ShizukuTendCF build)
 
 ### C-android-04: Reusable Android substrate, and what is missing
@@ -708,7 +731,9 @@ The cf-serverd and cf-runagent path must not be reused as the update channel.
 
 > Seed tendcf-agent from stayturgid's native agent (rename package, drop stayturgid-specific repair loops), and port the android_common module semantics into on-device Kotlin appliers behind the Shizuku UserService, one per C-schema-03 kind, each with the module's existing tests as its specification.
 
-**Merge:** insert into the Android plan
+**Ruled (scope for state 1):** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3). For state 1 the Kotlin agent holds trust and consent only, and Termux CFEngine converges. The on-device Kotlin appliers in the proposed text above are therefore not state 1's path; "Missing" items 2.1 and 2.4 (goal-file parsing and verification, and an on-device apply engine) are met in state 1 by the single Python `tendcf-validate` in Termux plus the Kotlin trust re-check ("1. Termux + Kotlin trust check", B3 sub 2). The ruling does not rule on later states.
+
+**Merge:** insert into the Android plan (state 1 per the ruling above)
 **Checked:** verified (layouts, READMEs, one Kotlin file read); module bodies not read
 
 ### C-android-05: ShizukuTendCF's fleet profile is best-effort per key, not an exact difference
@@ -748,6 +773,8 @@ A Mac "server" for logs and monitoring (G3) needs at least the log paths, a rece
 **Proposed text:**
 
 > Grow `unit.launchd` with `stdout_path`, `stderr_path` and `start_calendar_interval` (schema bump) as the minimum the Mac log-archive role needs; LaunchAgents and preferences wait until G5 step 3.
+
+**Ruled (B6 sub 3, "1. Root in VM, user on bigmac", operator ruling, 2026-11-14):** bigmac's dry-run runs as a user LaunchAgent, no root, so a per-user LaunchAgent (item 1 of the finding) is needed in state 1 for that dry-run role, ahead of the proposed text's "LaunchAgents ... wait until G5 step 3". Rendering them is a schema question; the ruling does not say which schema field carries it.
 
 **Merge:** needs the operator's ruling first (schema bump)
 **Checked:** verified
@@ -814,7 +841,9 @@ The AI review is one more scanner with its own weight. The figure out of 100 and
 
 > Add `tendcf.safety`: input a goal-diff, output `{score: 0-100, reasons: [...], findings: [{pointer, severity, scanner, why}]}`; scanners are plug-ins (rule scanners first, an AI scanner second); the device recomputes and shows its own result.
 
-**Merge:** needs the operator's ruling first (the scoring method is not described anywhere)
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8) and "1. 09's table, top 95" (B8 sub 1): the scoring method is 09 Q3's table (base 95, never 100; penalties; AI reviewer subtracts up to 30 on key-path-cited findings only; caps; bands; values fixed in the schema, changed only by a ruling, later backed by a labelled corpus). The AI scanner is not the authoring model ("2. Should not (as written)", B8 sub 4, X-safety-06). An owner may set an auto-refuse floor ("1. Allowed, off by default", B8 sub 2): a bundle below it is refused automatically, logged, and the owner notified with the diff; no default floor; tighten-only (no score ever auto-accepts); the owner can re-request and accept a refused bundle. Ruled; implementation pending.
+
+**Merge:** ruled (scoring method: 09 Q3)
 **Checked:** verified (absence: no scoring code); independently checked 2026-11-13: confirmed
 
 ### C-g4-02: Graded highlighting needs a source map back to the authored line
@@ -844,6 +873,8 @@ The AI review is one more scanner with its own weight. The figure out of 100 and
 
 > Add `review`, `accept` and `refuse` subcommands to the planned `tendcf` entry point; `review` exits non-zero below a configurable score so an AI caller cannot skip it.
 
+**Ruled (build order):** "1. Build order, not scope" (operator ruling, 2026-11-14, B8 sub 3, 13 A(i)-9 / v6 C22). G4 stays whole in state 1. The CLI diff plus y/N is built first and used on the VM and dev devices before any TUI or score work; state 1 is declared only once score, explanation, highlighting and TUI land. No "state 1.5". The command names are still not ruled.
+
 **Merge:** needs the operator's ruling first (command names)
 **Checked:** verified
 
@@ -859,7 +890,9 @@ The AI review is one more scanner with its own weight. The figure out of 100 and
 
 > The TUI reads the same `review --json` output as the CLI and adds per-finding accept/refuse; choose the borrowed scaffold by operator ruling.
 
-**Merge:** needs the operator's ruling first (scaffold)
+**Ruled:** "2. Borrow both freely; raise Python" (operator ruling, 2026-11-14, B12): the scaffold is Textual with Toad and textual-diff-view (AGPL-3.0) borrowed as needed; the review TUI is AGPL-3.0-only and needs Python >=3.14 (Toad's floor; Toad pins `textual==8.2.7`); see 09 X-safety-11 and 12-fork-management. On Android the consent screen is native, with the Termux CLI/TUI as the operator's path ("1. Native screen + Termux", B3 sub 4, X-safety-08 / X-android-14). Ruled; implementation pending.
+
+**Merge:** ruled (scaffold)
 **Checked:** not checked (scaffold candidates)
 
 ## Withdrawn after checking
@@ -868,11 +901,11 @@ None. The independent check refuted no item in this file.
 
 ## Ideas and risks
 
-1. **Import before inventing.** nix-darwin's `launchd.daemons` and NixOS's `systemd.services` are already typed Nix option trees covering exactly what `services.yml` hand-encodes. An importer that evaluates them and emits the Site Model would make G2's "carry over" real in weeks, and would give the first adopters (G1) a reason to try it.
+1. **Import before inventing.** nix-darwin's `launchd.daemons` and NixOS's `systemd.services` are already typed Nix option trees covering exactly what `services.yml` hand-encodes. An importer that evaluates them and emits the Site Model would make G2's "carry over" real in weeks, and would give the first adopters (G1) a reason to try it. **Ruled:** "1. Importer + matching names" (operator ruling, 2026-11-14, B7): a one-shot importer for pure-data option families, which lists what it did not carry, plus tendcf option names that match nix-darwin and NixOS where the meaning is the same.
 2. **One contract library, three consumers.** The lint, the compiler and the projector each restate rules (patterns, duplicate-key hooks, cross-file checks). The projector docstring already counts the drift this causes. A single `tendcf.contract` module, imported by all three and later by the Kotlin port's test vectors, would remove a whole class of "lint-only" safety (C-compiler-08, C-policy-04).
 3. **What runs can differ from what the owner sees.** Three cases already exist: argv becomes a shell string (C-policy-01), `env` is dropped (C-policy-02), and an edited plist is not reloaded (C-policy-03). G4's promise needs a property test: for each goal-file field, assert it changes the actuated artefact. A field that changes nothing is a bug.
-4. **Termux CFEngine is a shortcut worth a ruling.** The fleet already runs cf-agent on Android. Feeding it tendcf projections could reach G8 state 1 months earlier than a full Kotlin converger. The Kotlin agent would hold trust and consent only.
-5. **Owner control versus fleet convenience.** ShizukuTendCF's locked-on signer and stayturgid's TOFU key trust are the operator's fleet choices. Shipped to strangers (G8 state 3), they would contradict G1 directly. Keep them as a separate "operator fleet" flavour from day one.
+4. **Termux CFEngine is a shortcut worth a ruling.** The fleet already runs cf-agent on Android. Feeding it tendcf projections could reach G8 state 1 months earlier than a full Kotlin converger. The Kotlin agent would hold trust and consent only. **Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only. Sub-rulings: see C-android-01.
+5. **Owner control versus fleet convenience.** ShizukuTendCF's locked-on signer and stayturgid's TOFU key trust are the operator's fleet choices. Shipped to strangers (G8 state 3), they would contradict G1 directly. Keep them as a separate "operator fleet" flavour from day one. **Ruled for the signer allowlist:** "2. Dev mode + separate dev build" (operator ruling, 2026-11-14, Smaller 1; see C-android-03).
 6. **The contract is CFEngine-shaped at its core.** CMDB size caps, `$(` refusals and container naming are CFEngine 3.27 facts frozen into a "neutral" format. If G7's instrument is ever challenged, the goal file should not need a version bump. Keep CMDB rules in the projector and out of the goal-file schema.
 7. **The schema-version meter is driven by Linux.** v4 and v5 were both Linux/NixOS bumps. Without per-platform domain schemas (C-schema-05), every Debian detail will version Mac and Android files and their consent diffs, adding noise to exactly what the owner must read.
 8. **The safety score is itself an attack surface.** If the author's toolchain computes the score, a compromised AI can make it 100%. The device must recompute it from the diff alone, and the score must never gate anything without the owner's yes.

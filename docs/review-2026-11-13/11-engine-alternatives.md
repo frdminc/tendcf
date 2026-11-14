@@ -287,7 +287,9 @@ implementation.
 
 ## 7. Recommendation
 
-An option that has not been tested, not a settled recommendation:
+**Ruled:** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5). The full fork pin stays on every platform, with a macOS fork build in CI; the 2-3 day stock/Termux spike below is run before the adopter path (options 2-4) is decided. So the recommendation that follows (stock packaged CFEngine as the supported build, the fork as a research branch) is not adopted now: it is held until the spike has run. Spike: ruled; not yet run.
+
+An option that has not been tested, not a settled recommendation (held until the spike below has run):
 
 **Keep CFEngine on macOS and Linux for now, drive the fork to zero for the
 adopter path, and write the applier contract so the engine is replaceable.**
@@ -336,7 +338,7 @@ What would change it:
 4. The operator lifts R4/R5: nix-darwin becomes the strongest macOS server
    applier for G2's first adopters, with tendcf's consent layer over it.
 
-Cheapest test (2-3 days, CI or `bg`, not run here): run `tests/policy/run.sh`
+Cheapest test (the 2-3 day stock/Termux spike that "1. Keep fork; spike stock", operator ruling, 2026-11-14, B5, orders run before the adopter path is decided; CI or `bg`, not run here): run `tests/policy/run.sh`
 unchanged against stock Homebrew 3.29.0 on the Mac (`--bindir
 /opt/homebrew/bin`) and Termux 3.28.0 on one phone, plus one new check (a
 pre_action that sleeps past its timeout must refuse); record each failure and
@@ -518,6 +520,8 @@ from neither the pinned fork nor stock.
 > Every Linux or macOS result must name the build it ran: the fork revision,
 > or "stock" with its version.
 
+**Ruled (B5, build):** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5) puts a macOS fork build in CI, so a macOS result names the fork revision it ran, or "stock" with its version when the spike runs stock.
+
 **Merge:** replace that sentence
 **Checked:** verified (commands run); independently checked 2026-11-13: confirmed (`086d27749` was authored 2026-09-30 and committed 2026-10-15)
 
@@ -545,7 +549,9 @@ packages would suffice.
 > validator or interlock wrapper, so that a packaged stock CFEngine is a
 > correct build.
 
-**Merge:** needs the operator's ruling first (engine change: fork-to-zero)
+**Ruled (B5):** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5): the full fork pin stays on every platform, so fork-to-zero is not taken now; it waits on the spike in §7.
+
+**Merge:** needs the operator's ruling first (engine change: fork-to-zero); held until the §7 spike has run
 **Checked:** not checked: a design proposal, not prototyped (independently checked 2026-11-13: unverifiable); needs the §7 spike against stock builds, with each outside-the-engine fix prototyped, to show every load-bearing patch can be made unreachable
 
 ### X-engine-09: write the applier contract so the engine is one implementation
@@ -569,6 +575,8 @@ one conformance suite.
 > reads, what it may change, which cases refuse, and what it reports. A
 > shared conformance suite holds each to it.
 
+**Ruled (B5):** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5): CFEngine stays, on the full fork pin; the adopter path is decided after the §7 spike. This item's ruling on the engine's status is not made by B5.
+
 **Merge:** needs the operator's ruling first (changes the engine's status)
 **Checked:** inferred
 
@@ -590,7 +598,9 @@ system-manager READMEs (fetched).
 > Under G2 (2026-11-13), Nix is the authoring language, not a device
 > dependency; R4 and R5 [stand | are reopened] because [operator's reason].
 
-**Merge:** needs the operator's ruling first (R4/R5)
+**Ruled (partly):** "2. Allow on release path" (operator ruling, 2026-11-14, B4 rider, Nix on release path): Nix may be required to build a release; change-process §2 and map R5/D6 are amended. Scope: "1. Build-time only" (operator ruling, 2026-11-14, B4 rider): devices never need Nix at run time. So under G2 Nix is the authoring and build language, not a device dependency. The ruling does not say whether R4 stands.
+
+**Merge:** needs the operator's ruling first (R4/R5); R5 and D6 amended as above
 **Checked:** verified (requirements read); ruling not presumed
 
 ## Withdrawn after checking

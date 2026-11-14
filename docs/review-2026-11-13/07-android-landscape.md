@@ -200,9 +200,12 @@ The nearest competitors and their gaps:
    - Each would be a promise module served by tendcf-agent and the helper.
    - Custom promise types exist since 3.17. Modules that advertise `action_policy` support `--dry-run`/`--simulate` and must make "no changes" under `warn` ([docs](https://docs.cfengine.com/docs/lts/reference/promise-types/custom/)). That gives G4 one mechanically checked diff path across all platforms. G7 keeps CFEngine as the instrument, and D45's Kotlin agent becomes the module host, scheduler and log owner rather than a second convergence engine.
    - A native-only agent consuming the goal file would re-implement CFEngine's convergence semantics a second time, against the golden bytes.
+   - **Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3). State 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only (05 Idea 4). So the Kotlin agent is not the module host, scheduler or log owner described above. The custom-promise-type recommendation (X-android-10) is not part of this ruling and stays open.
+   - **Ruled:** "1. Termux + Kotlin trust check" (operator ruling, 2026-11-14, B3 sub 2, Q21 / M-§12-06). The single Python `tendcf-validate` runs in Termux. The Kotlin agent independently re-checks the signature and the high-water mark, keeps the trust anchor and the approval record in its own app-private storage, and shows consent. This amends D45 (1)-(2): there is no full Kotlin port of the validator. Ruled; implementation pending.
 2. **Update path for a phone that is asleep or offline.**
    - Pull, not listen. The agent fetches a signed goal bundle from any peer when an opportunity comes: charging, unmetered network, a WorkManager window, or Termux:Boot.
    - It verifies the bundle offline with the G3 handshake key set and keeps the last approved bundle.
+   - **Ruled:** the verification is done twice, by design: `tendcf-validate` in Termux, and the Kotlin agent's own re-check of signature and high-water mark against the trust anchor in its app-private storage ("1. Termux + Kotlin trust check", operator ruling, 2026-11-14, B3 sub 2).
    - Peers push opportunistically only when the phone is reachable. Never require an inbound port: cf-serverd in Termux dies with the process, and cross-profile loopback is blocked on 17.
    - Logs queue locally and upload to the Mac on the next contact (G8.1).
 3. **G4 on a phone.**
@@ -210,6 +213,7 @@ The nearest competitors and their gaps:
    - Native: a notification opens an agent activity showing the projected diff, the 0–100 score with its reason, and highlighted risky lines, with Accept and Refuse.
    - A refusal is recorded and logged, and the bundle is held.
    - Because the device must be self-sufficient (G3), the default with no answer is to hold.
+   - **Ruled:** "1. Native screen + Termux" (operator ruling, 2026-11-14, B3 sub 4, X-safety-08 / X-android-14). One review document (R14) is rendered three ways: CLI (`--plain`, `--json`), Textual TUI (including Termux and SSH), and a native screen in tendcf-agent. Goldens hold all three; renderers compute nothing. The agent notification opens the native screen with Accept and Refuse; the Termux CLI/TUI is the operator's path. No answer is held; a refusal is logged. This replaces the map's Step 9 row, per X-safety-08 (09). Ruled; implementation pending.
 4. **Privilege degradation is a state, not an error.** When the helper is down after a reboot, the agent:
    - converges what the app tier can
    - marks shell-tier promises `not_kept: privilege-unavailable`
@@ -229,7 +233,7 @@ The nearest competitors and their gaps:
 **Evidence:** `architecture-DEFINITIVE-v3.md:1221` at `eefea3c`; `docs/review-2026-11-13/00-goal-definition.md` G5 (at `c3ae530`).
 **Proposed text:**
 
-> | D22 | Platform sequence | macOS as server, Android as client, macOS as client, Linux as server, Linux as client (operator, 2026-11-13, goal G5). Superseded: Android deferred (2026-10-29, [`linux-targets.md`](linux-targets.md)). |
+> | D22 | Platform sequence | macOS as server, Android as client, macOS as client, Linux as server, Linux as client (operator, 2026-11-13, goal G5). Superseded: Android deferred (2026-10-29, [`linux-targets.md`](../architecture/linux-targets.md)). |
 
 **Merge:** needs the operator's ruling first (whether G5 supersedes the 2026-10-29 ruling, or orders goals but not build steps)
 **Checked:** verified (read both files); independently checked 2026-11-13: confirmed
@@ -300,7 +304,9 @@ The nearest competitors and their gaps:
 
 > Each Android promise names its target user (`owner`, `work`, `private`) and the work profile's owner app (`island`, `insular`, `none`). Promises into a work profile go through that owner's API when shell is refused there; an unreachable profile reports `not_kept`, never a silent skip.
 
-**Merge:** needs the operator's ruling first (a new schema field: a `schema_version` bump, a design ruling with two frontier reviews); then insert after that sentence
+**Ruled:** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1, Q20 / M-§12-04 / X-android-05). One host per phone (one key, one baseline, one review). Each Android promise names its target user (owner, work, private) and the work profile's owner app (island, insular, none), per the proposed text above. An unreachable profile reports `not_kept`. The schema bump is a design ruling (two frontier reviews) and rides the same bump as the agent id (M-§12-05 item 4). Ruled; implementation pending.
+
+**Merge:** ruled; insert after that sentence. The new schema field is a `schema_version` bump and a design ruling, so two frontier reviews are still required before it merges
 **Checked:** inferred from stayturgid code and the Island README; not tested on a device; independently checked 2026-11-13: weakened, corrected
 
 ### X-android-06: Android 17 blocks cross-profile loopback
@@ -388,9 +394,13 @@ The nearest competitors and their gaps:
 
 **Proposed text:**
 
-> | D-new | Android device-owner slot | Open: Island/Insular as profile owner of the work profile on every device; the device-owner slot is (a) unused, (b) Insular Managed Mainland, or (c) Dhizuku shared through the helper. tendcf never requires an MDM enrollment. |
+> | D-new | Android device-owner slot | Ruled: "1. Never" (operator ruling, 2026-11-14, B3 sub 3, X-android-09). tendcf never holds a DPC slot (profile owner or device owner). It works with Island/Insular through shell (`--user N`) and the owner app's API; an unreachable profile reports `not_kept`. tendcf never requires MDM enrolment. |
 
-**Merge:** needs the operator's ruling first (design ruling: two frontier reviews)
+The earlier proposal listed the device-owner slot as open between (a) unused, (b) Insular Managed Mainland and (c) Dhizuku shared through the helper. The ruling replaces that list: tendcf holds no DPC slot.
+
+**Ruled:** "1. Never" (operator ruling, 2026-11-14, B3 sub 3, X-android-09). Ruled; implementation pending.
+
+**Merge:** ruled; insert as the new row (flagged before the ruling as a design ruling: two frontier reviews)
 **Checked:** verified (sources); combinations not tested; independently checked 2026-11-13: confirmed, except "AMAPI/Fleet would delete or own the work profile", not checked (needs Google's AMAPI and Fleet documentation on what happens to an existing Island/Insular work profile at enrollment)
 
 ### X-android-10: Android surfaces as CFEngine custom promise types
@@ -471,6 +481,8 @@ The nearest competitors and their gaps:
 
 > Android pulls: on wake, charge or network change the agent fetches the newest signed goal bundle from any reachable peer, verifies the handshake offline, keeps the last approved bundle, and queues logs for the Mac. Peers push only when the device is reachable; no inbound port is required.
 
+**Ruled (validator, not the pull design):** "1. Termux + Kotlin trust check" (operator ruling, 2026-11-14, B3 sub 2, Q21 / M-§12-06). "Verifies the handshake offline" means two checks. The single Python `tendcf-validate` runs in Termux. The Kotlin agent independently re-checks signature and high-water mark, keeps the trust anchor and approval record in its own app-private storage, and shows consent. No full Kotlin port of the validator (amends D45 (1)-(2)). The pull-on-wake design itself is not ruled by this line.
+
 **Merge:** needs the operator's ruling first (the Android update design: pull on wake, no inbound port); then insert after that sentence
 **Checked:** not checked (design inference; its premises, loopback and Termux, were checked under X-android-06 and X-android-12; confirming it needs a pull-on-wake prototype run on a real phone)
 
@@ -489,9 +501,11 @@ The nearest competitors and their gaps:
 **Evidence:** G4 text; `docs/architecture/deprecated/architecture-proposal-openai-v1.md` §4.
 **Proposed text:**
 
-> On Android the diff is reviewed in Termux (`tendcf review`, CLI or TUI) or from the agent's notification, which opens the same diff, score, reason and highlighting with Accept and Refuse. With no answer the bundle is held; a refusal is logged.
+> On Android the review is one review document (R14) rendered three ways: CLI (`--plain`, `--json`), Textual TUI (also under Termux and SSH), and a native screen in tendcf-agent. Goldens hold all three; renderers compute nothing. The agent's notification opens the native screen, with the same diff, score, reason and highlighting, and Accept and Refuse. The Termux CLI/TUI is the operator's path. With no answer the bundle is held; a refusal is logged.
 
-**Merge:** needs the operator's ruling first (the Android review surface: Termux plus an agent notification); then insert after X-android-13's text
+**Ruled:** "1. Native screen + Termux" (operator ruling, 2026-11-14, B3 sub 4, X-safety-08 / X-android-14). The proposed text above is rewritten to the ruling. It replaces the map's Step 9 row, per X-safety-08 (09). Ruled; implementation pending.
+
+**Merge:** ruled; insert after X-android-13's text
 **Checked:** inferred (design); the deprecated section was read in an earlier pass, not re-read; independently checked 2026-11-13: confirmed
 
 ### X-android-15: qualify "comprehensive" in public claims

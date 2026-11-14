@@ -322,7 +322,7 @@ sources check's verdict and names its item.
 > their option names in tendcf's modules is cheaper and covers only what we
 > declare. Carrying the module style without the configs is cheapest and
 > carries nothing. In each case a package reference (`pkgs.caddy`) needs a
-> meaning on hosts where nothing is built by Nix. §9.19 asks the question.
+> meaning on hosts where nothing is built by Nix. The open question on what carries over asks it.
 
 **Merge:** needs the operator's ruling first (what G2's carry-over means on non-Nix hosts); insert after the sentence once ruled
 **Checked:** inferred (standard NixOS module structure; not checked against a real carry-over attempt); independently checked 2026-11-13: weakened, corrected
@@ -395,7 +395,7 @@ sources check's verdict and names its item.
 > enforcing layer, as NixOS is on NixOS hosts today. On a Mac that runs
 > nix-darwin, passthrough is the path (linux-targets §5: the adapter "is
 > required either way"); whether the first Mac runs nix-darwin is open
-> (§9.19). Neither is a runtime dependency of the compiler.
+> (the open question on what carries over). Neither is a runtime dependency of the compiler.
 
 **Merge:** replace that sentence
 **Checked:** inferred; independently checked 2026-11-13: weakened, corrected (`docs/architecture/linux-targets.md:99`: "The nix-darwin passthrough adapter is required either way")
@@ -502,7 +502,9 @@ sources check's verdict and names its item.
 > runs on Android, as a native helper or behind a Termux reporter, is open
 > (§2.4; the compiler does not yet offer an `android` platform).
 
-**Merge:** replace the paragraph; needs the operator's ruling on how cf-agent runs on Android (map R4; `compiler/nix2cf/cli.py` --platform)
+**Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections, and the Kotlin agent holds trust and consent only (05 Idea 4). So "as a native helper or behind a Termux reporter" is answered for state 1: CFEngine runs in Termux. Also "1. Field on entries" (B3 sub 1, X-android-05): one host per phone, each Android promise names its target user and the work profile's owner app. Ruled; implementation pending.
+
+**Merge:** replace the paragraph; the question on how cf-agent runs on Android is ruled (map R4; `compiler/nix2cf/cli.py` --platform)
 **Checked:** verified (rg over paper); not checked: ShizukuPlus's cross-user behaviour on a real device, and the clause "reaches the other profiles through ShizukuPlus's privileged process" (the ShizukuPlus README, https://github.com/thejaustin/ShizukuPlus, describes "a privileged process started with adb or root" and says nothing about work profiles); independently checked 2026-11-13: weakened, corrected (no D45/R4 conflict: `docs/architecture/architecture-DEFINITIVE-v3.md:105-115`)
 
 ### P-§2.4-02: "Any central or shared view is optional" against a required archive
@@ -547,7 +549,9 @@ sources check's verdict and names its item.
 > owner's yes does, against the exact difference, and refusing is always
 > one keystroke (§2.7).
 
-**Merge:** needs the operator's ruling first (how the score is computed: the mechanical ceiling, provenance counting and never showing 100% in the proposed text are not in G4); then insert after the paragraph (and see P-§S-01 for the full section)
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8): "score from 0 to 100", mechanical checks set a ceiling that AI review can lower but never raise, an explanation of each part, a measured hit rate once a corpus exists (B13 wording 3 / X-pm-03). So "one figure out of 100%" in the proposed text above reads "a safety score from 0 to 100". The values are "1. 09's table, top 95" (B8 sub 1): base 95, never 100; the table is in 09 Q3. Ruled; implementation pending.
+
+**Merge:** the score computation is ruled (the mechanical ceiling and never showing 100 are in the B8 rulings); insert after the paragraph (and see P-§S-01 for the full section)
 **Checked:** verified (no scoring in docs per goal difference 4; the ceiling rule is a proposal); independently checked 2026-11-13: confirmed
 
 ### P-§2.5-02: The owner's AI may be both author and advisor
@@ -567,7 +571,9 @@ sources check's verdict and names its item.
 > own model is shown as such and cannot lift the figure above the
 > mechanical ceiling.
 
-**Merge:** needs the operator's ruling first (whether a different-model reviewer is required, preferred or only disclosed); insert after that sentence once ruled
+**Ruled:** "2. Should not (as written)" (operator ruling, 2026-11-14, B8 sub 4, X-safety-06 / v6 C6). X-safety-06's text is adopted: the scanning AI SHOULD NOT be the authoring model; it sees only the canonical diff as quoted data, never the author's prose; the diff is hostile input; two model families where the owner has them, and their disagreement caps the score (70). The same model is allowed with no extra cap. So the proposed text above, which asks for "a different model, or at least a fresh context" and says which on the screen, is superseded by X-safety-06's text in 09. The citation (arXiv:2404.13076) was fetched and verified on 2026-11-14. Ruled; implementation pending.
+
+**Merge:** ruled; insert after that sentence, in X-safety-06's wording
 **Checked:** inferred; independently checked 2026-11-13: confirmed
 
 ### P-§2.5-03: "The correct cryptographic handshake" is undefined against the TUF text
@@ -588,7 +594,9 @@ sources check's verdict and names its item.
 > decides whether a change is acceptable; the second only decides who may
 > talk to it.
 
-**Merge:** needs the operator's ruling first (which of (a), (b), (c) "the correct cryptographic handshake" means)
+**Ruled:** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): G3's handshake means content checks (signed by trusted keys, fresh, names this device, owner approval); transport auth decides only who may talk. This is reading (c)'s split, with the content checks as the handshake. First build: SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the map's 2-of-3 offline-root floor may lag until TUF. Ruled; implementation pending.
+
+**Merge:** ruled (which of (a), (b), (c) "the correct cryptographic handshake" means)
 **Checked:** inferred (TUF mirrors: general knowledge, not re-fetched); independently checked 2026-11-13: confirmed
 
 ### P-§2.6-01: The Nix illustration is not NixOS style
@@ -1139,7 +1147,9 @@ Disposition of the existing sixteen, under the goal:
 > open. Our provisional answers: mechanical findings cap it, it never
 > shows 100%, and the reasons are shown before the figure.
 
-**Merge:** needs the operator's ruling first (how the score is computed: the cap by mechanical findings and never showing 100% are not in G4); then insert as a new item
+**Ruled:** "1. Capped 0-100 score" (operator ruling, 2026-11-14, B8) and "1. 09's table, top 95" (B8 sub 1): the provisional answers in the proposed text are adopted. The figure is a score from 0 to 100, never 100 (base 95), capped by mechanical findings that AI review can lower but never raise, with an explanation of each part and a measured hit rate once a corpus exists. The item's title and "percentage" wording then read "score from 0 to 100". Ruled; implementation pending.
+
+**Merge:** the score computation is ruled; insert as a new item, worded as the ruling
 **Checked:** inferred; independently checked 2026-11-13: confirmed
 
 ### P-§9-08: New question from G2: what carries over?
@@ -1179,7 +1189,9 @@ Disposition of the existing sixteen, under the goal:
 > The first is simpler. The second is right if a profile's owner can
 > differ from the phone's. We have not decided.
 
-**Merge:** insert as a new item
+**Ruled:** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1, Q20 / M-§12-04 / X-android-05): one host per phone (one key, baseline, review); each Android promise names its target user (owner/work/private) and the work profile's owner app (island/insular/none); an unreachable profile reports `not_kept`. So a work profile is not a device: the question is answered "one agent per phone". The schema bump is a design ruling (two frontier reviews) and rides the same bump as the agent id (M-§12-05 item 4). Ruled; implementation pending.
+
+**Merge:** insert as a new item, with the answer above
 **Checked:** not checked: reasoning from G5 with no source to check (the Android multi-user model comes from a search snippet); it needs a device test of Island/Insular profiles with ShizukuPlus
 
 ### P-§9-10: New question from G9: can a non-technical person keep a fork?
@@ -1378,9 +1390,9 @@ Also for the sources reviewer, not itemised: §2.2 "3.7.3 back-ported `def.json`
 
 ## Ideas and risks
 
-1. **The figure becomes the authority.** A well-calibrated 96% will be read as "safe", and the cheapest attack left on G4 is a malicious change that scores high. Show the reasons before the figure, never show 100%, and let mechanical findings cap what the AI can award. Measure how often owners open un-highlighted entries.
+1. **The figure becomes the authority.** A well-calibrated 96% will be read as "safe", and the cheapest attack left on G4 is a malicious change that scores high. Show the reasons before the figure, never show 100%, and let mechanical findings cap what the AI can award. Measure how often owners open un-highlighted entries. **Ruled:** "1. 09's table, top 95" (operator ruling, 2026-11-14, B8 sub 1): base 95, never 100; penalties lockout 60, privilege 50, management 45, data-loss 40, reversible 10, notice 3; the AI reviewer subtracts up to 30 (findings that cite a key path only); caps: lockout, privilege or management finding 40, a check not run or failed (including AI reviewer unavailable) 60, uncovered hunk kind 70, AI families disagree on a tier 70, touched domain not comprehensive 80, integrity flag 0; bands 0-39 danger, 40-69 caution, 70-89 notice, 90-95 plain. The values are fixed in the schema, changed only by a ruling, later backed by a labelled corpus (table in 09 Q3).
 
-2. **Use the project's own review rule on owners' devices.** The repo already forbids a model family from reviewing its own work. Applying the same rule to the safety reading (a different model from the author's, or a disclosed fallback) is a real differentiator, and it costs a configuration option, not a new system.
+2. **Use the project's own review rule on owners' devices.** The repo already forbids a model family from reviewing its own work. Applying the same rule to the safety reading (a different model from the author's, or a disclosed fallback) is a real differentiator, and it costs a configuration option, not a new system. **Ruled:** "2. Should not (as written)" (operator ruling, 2026-11-14, B8 sub 4, X-safety-06): "should not", with two model families where the owner has them and their disagreement capping the score (70); the same model is allowed with no extra cap.
 
 3. **Android rests on a third-party fork.** ShizukuPlus is one person's fork of a fork (thejaustin over thedjchi over RikkaApps), and ShizukuTendCF forks it again, last touched 2026-10-22. Android releases have repeatedly narrowed wireless debugging. The paper should name this dependency as the platform's largest risk, and the Android section should say what degrades when the privileged process cannot be started.
 

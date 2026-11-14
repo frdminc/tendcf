@@ -9,8 +9,22 @@ Base commit for every anchor: `eefea3c` (master).
 ## Where to start
 
 Read `14-synthesis-and-rulings.md` first. Section B lists the rulings the
-operator has to make; section C lists defects that need no ruling; section F
-is the merge map.
+operator had to make, and each is now ruled (2026-11-14); its opening index
+maps every line of the rulings record (L4 to L56) to its item and to the files
+that carry it. Section C lists defects that need no ruling; section F is the
+merge map.
+
+## Rulings of 2026-11-14
+
+The operator ruled B1 to B13, their riders and sub-rulings, the seven smaller
+items, the PR 52 follow-ups and the B11 round-2 items on 2026-11-14. Each
+response item that the rulings decide carries a **Ruled** paragraph quoting
+the chosen option exactly and citing it as `operator ruling, 2026-11-14,
+<item>`; proposals that a ruling settled are rewritten and no longer read as
+open. Three edits reached the goal text itself: the G4 figure sentence, the G8
+lead sentence and G8 item 3 (`00-goal-definition.md`, "Later rulings"). A
+ruled item that is not yet built says "ruled; implementation pending" (or the
+exact status).
 
 ## Files
 

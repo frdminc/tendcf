@@ -31,7 +31,7 @@ A2. **Properties the content layer must prove** (the device checks each, in this
 6. *Approved by this device's owner.* An approval record for exactly this baseline-to-proposed pair, with a device-issued nonce and a higher `approval_seq`, signed by a key the owner holds and the release path cannot replace (map §9.1, §17 of the guide).
 7. *Relay irrelevant.* None of 1-6 depends on who delivered the bytes. The relaying peer's transport identity decides only whether to talk to it.
 
-A3. **Is "any device that passes the handshake may deliver" safe?** Yes, if delivery means courier and 1-6 are enforced on content: this is TUF's mirror model ("A repository mirror cannot prevent updates from good mirrors", TUF spec §1.5.2) and the validate proposal's option 2, which already treats the spool as untrusted and verifies signatures "before parsing anything else" (`docs/architecture/tendcf-validate-proposal-2026-11-03.md:466-474`). The residual risk is freeze: a peer that is the only route can withhold. It is bounded by metadata expiry, not prevented (independently checked 2026-11-13: confirmed).
+A3. **Is "any device that passes the handshake may deliver" safe?** Yes, if delivery means courier and 1-6 are enforced on content: this is TUF's mirror model ("A repository mirror cannot prevent updates from good mirrors", TUF spec section 1.5.2) and the validate proposal's option 2, which already treats the spool as untrusted and verifies signatures "before parsing anything else" (`docs/architecture/tendcf-validate-proposal-2026-11-03.md:466-474`). The residual risk is freeze: a peer that is the only route can withhold. It is bounded by metadata expiry, not prevented (independently checked 2026-11-13: confirmed).
 
 A4. **If trust rests on the handshake alone:** every device holding a transport key becomes root on every other device, which is the full mesh that map §10 rejects ("not tenable once devices belong to more than one person", `architecture-DEFINITIVE-v3.md:926-930`). A lost phone with a mesh key could push arbitrary config. There is no rollback or freeze protection, no per-device binding, and no consent. And the mesh's own key distributor becomes the trust root: Tailscale's docs say that without Tailnet Lock, "If Tailscale were malicious, and stealthily inserted new nodes into your network, then Tailscale could send or receive traffic to your existing nodes" (https://tailscale.com/kb/1226/tailnet-lock, validated 2025-12-02; independently checked 2026-11-13: confirmed).
 
@@ -123,7 +123,7 @@ E3. **The open retention question is real:** about 288 rows a day per host at th
 **Goal:** G3, G8
 **Weight:** misleads
 **Finding:** Read alone, "completes the correct cryptographic handshake" could mean a transport handshake, which would make every peer holding a transport key root on every device: the full mesh map §10 rejects. G3's last sentence and ruling 6b keep the architecture, under which the handshake is the content check. The safe reading is that any peer may *deliver*, and the device *accepts* only content that proves its own authorship, freshness, binding and owner approval. The independent checker's judgment on row 6b: the owner's verbatim answer ("I am not trying to change the architecture; ... able to take updates from any other device that uses the correct crytoographic handshake") is compatible with content signatures, because the architecture it keeps already authenticates content by TUF signature and authorises by approval record (map §9.11, §10). Reading G3 as transport-gated is therefore not a fair definitive reading; it is a possible misreading to raise with the owner.
-**Evidence:** `docs/architecture/architecture-DEFINITIVE-v3.md:926-930`; TUF §1.5.2 mirror goals (https://theupdateframework.github.io/specification/latest/); Tailnet Lock (https://tailscale.com/kb/1226/tailnet-lock).
+**Evidence:** `docs/architecture/architecture-DEFINITIVE-v3.md:926-930`; TUF section 1.5.2 mirror goals (https://theupdateframework.github.io/specification/latest/); Tailnet Lock (https://tailscale.com/kb/1226/tailnet-lock).
 **Proposed text** (proposed wording for the operator's ruling, not a correction):
 
 > it accepts updates delivered by any other device, and applies one only when the update itself proves, whoever carried it:
@@ -136,7 +136,12 @@ E3. **The open retention question is real:** about 288 rows a day per host at th
 > The connection between two devices is authenticated too, but that only decides who may talk, never what is applied.
 
 (G8 item 1: replace "after the cryptographic handshake" with "after the checks G3 lists".)
-**Merge:** needs the operator's ruling first (the goal text is agreed)
+
+**Ruled:** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): G3's handshake means content checks (signed by trusted keys, fresh, names this device, owner approval); transport auth decides only who may talk. First build: SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the map's 2-of-3 offline-root floor may lag until TUF. Also "1. Keep text; B1 is the reading" (operator ruling, 2026-11-14, B13 item 1, G3/G8.1 handshake): the goal text is unchanged, and "the correct cryptographic handshake" means B1's content checks. So the proposed wording above records the reading and is not a goal-text change. Ruled; implementation pending.
+
+**Ruled (B2, standing modes):** "3 but also the existance of standing wait for user and standing refusal" (operator ruling, 2026-11-14, B2): option 3, a hold window or an owner-enrolled standing approval, shown and refusable before apply, with a new approval-record shape without a per-change nonce (that is, a schema bump); plus two further standing modes: a standing "wait for user" (hold until the owner answers) and a standing refusal. Check 4 above ("approved exactly this change", with a device-issued nonce) is therefore one of the owner's modes, not the only one. Ruled; implementation pending.
+
+**Merge:** ruled (goal text unchanged; the reading is B1's content checks)
 **Checked:** verified (read both texts and the cited sources); independently checked 2026-11-13: weakened, corrected
 
 ### X-trust-02: map §9.11 must say what expiry does to a sleeping device
@@ -211,6 +216,8 @@ E3. **The open retention question is real:** about 288 rows a day per host at th
 
 > The record also carries `signer` (the approving key's typed identifier, which MUST be present in the device's local trust root at verification time) and `sig_alg`. Both are inside the signed bytes.
 
+**Ruled (B2, the record's shape):** "3 but also the existance of standing wait for user and standing refusal" (operator ruling, 2026-11-14, B2) adds a new approval-record shape without a per-change nonce, which is a schema bump. The ruling does not say whether it shares a bump with `signer` and `sig_alg`.
+
 **Merge:** insert after that sentence; needs the operator's ruling first (schema change)
 **Checked:** verified (schema read); independently checked 2026-11-13: confirmed
 
@@ -233,6 +240,8 @@ E3. **The open retention question is real:** about 288 rows a day per host at th
 >
 > The Mac's keys can propose, freeze and re-sign. They cannot apply a change to a `consented` device, because that needs the device's own approval signature, the second signature Uptane gets from its Image repository.
 
+**Ruled (part):** "1. Content checks; v0 first" (operator ruling, 2026-11-14, B1): the first build is SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter), and the map's 2-of-3 offline-root floor may lag until TUF. So the key layout above is the TUF target, not the first build's requirement. The `root` ceremony itself is not ruled.
+
 **Merge:** insert after that paragraph; needs the operator's ruling first (deploy plan / key ceremony is a design ruling)
 **Checked:** inferred (design); sources verified; independently checked 2026-11-13: confirmed; Uptane analogy note added
 
@@ -247,6 +256,8 @@ E3. **The open retention question is real:** about 288 rows a day per host at th
 **Proposed text:**
 
 > On Android and macOS, the narrowest version exists in the platform. An approval key generated in the Keystore (StrongBox where present) or the Secure Enclave cannot be exported, and can be bound to a fresh biometric or PIN check for every signature. No release can read it or sign with it. That makes "the current advisor key plus a local human act" a hardware property for approvals on those devices. It does not cover the policy the validator reads, nor the agent's own app-update channel.
+
+**Ruled (part):** "1. Termux + Kotlin trust check" (operator ruling, 2026-11-14, B3 sub 2, Q21 / M-§12-06): the Kotlin agent independently re-checks signature and high-water mark, keeps the trust anchor and approval record in its own app-private storage, and shows consent; the single Python `tendcf-validate` runs in Termux (no full Kotlin port; amends D45 (1)-(2)). Whether that storage is Keystore- or StrongBox-backed is not ruled.
 
 **Merge:** insert after that sentence
 **Checked:** verified (vendor docs); not built or tested; independently checked 2026-11-13: confirmed
