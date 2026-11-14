@@ -1153,31 +1153,34 @@ that is not a `vars` key of the file, a file that exists but cannot be
 parsed, and loaded data with no file. A missing file with nothing loaded is
 the normal empty case and says nothing.
 
-Round 2 of the review (Astra A1, adversary M1) added the loaded-state check.
-A preset reaches the checker itself: a vars promise whose rvalue is a function
-call (`readjson`, `getindices`, `difference`, every variable the checker
-computes and the non-refused id lists) is skipped when the variable already
-exists (`verify_vars.c`, "Already did this"; only a promise with a literal
-rvalue redefines it). So `default:tendcf_cmdb.doc`,
-`default:tendcf_cmdb.bad_keys` or `default:tendcf_services.interlock_ids` in
-the file keeps its value, and the check passes while the loaded interlock is
-ignored. The policy therefore reads the loaded state directly, in class
-expressions that call the functions inline (no variable to preset): any
-variable tagged `source=cmdb` or `source=augments_file` outside
+Round 2 of the review (Astra A1, adversary M1) added the loaded-state check
+and the single read. A preset reaches the checker itself: a `vars` key such as
+`default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` is
+installed before the policy runs. Whether it survives depends on the promise: a
+promise whose rvalue is a function call is skipped when the variable exists
+(`verify_vars.c`, "Already did this") if the call was not already evaluated,
+and otherwise redefines it; the CI runs of check 9 saw presets of both kinds.
+The policy does not rely on which: it reads the loaded state directly, in class
+expressions that call the functions inline (no variable to preset), and refuses
+any variable tagged `source=cmdb` or `source=augments_file` outside
 `data:variables.<identifier>` (`variablesmatching`) and any class with either
-tag (`classmatch`) is refused. tendcf ships no `def.json`, so augments are
-refused too (a host that needs one must be exempted in the policy, on
-purpose). The content comparison no longer reads the negation of a class set
-once and never cleared (`tendcf_cmdb_json_equal_*`, which a later mismatch
-could not unset); `tendcf_cmdb_problem_differs_<key>` is defined from the
-current texts and `..._uncomparable_<key>` from a side that could not be
-serialised. Whether the engine evaluates `tendcf_cmdb` more than once is
-measured by `tests/policy/run.sh` check 11 (debug-log counts on a real
-cf-agent, with the file replaced between the evaluations); the check does not
-depend on the answer. Reports print file-derived text only with characters
-outside `[A-Za-z0-9._:@/-]` replaced by `?` and cut to a fixed length.
-`tendcf-install.sh data` installs by atomic rename. Not checked: a file replaced
-after the last evaluation (no check can see it).
+tag (`classmatch`). tendcf ships no `def.json`, so augments are refused too (a
+host that needs one must be exempted in the policy, on purpose). The content
+comparison no longer reads the negation of a class set once and never cleared
+(`tendcf_cmdb_json_equal_*`); `tendcf_cmdb_problem_differs_<key>` is defined
+from the current texts and `..._uncomparable_<key>` from a side that could not
+be serialised. Measured on the pinned fork (check 11, debug log of a real
+cf-agent): `tendcf_cmdb` is resolved twice, its vars are visited on every pass
+(the `readjson` of `doc` included) and its classes are decided once, so a
+later vars pass could have read a file the classes never compared. `doc` is
+therefore read once (its promise is skipped once it exists) and every
+comparison input derives from that snapshot. Check 11 pins both timings of a
+file replaced during the run: before the read the comparison refuses ("content
+differs", nothing runs); after it the policy never sees the replacement and
+acts on the loaded data it checked. Reports print file-derived text only with
+characters outside `[A-Za-z0-9._:@/-]` replaced by `?` and cut to a fixed
+length. `tendcf-install.sh data` installs by atomic rename. Not checked: a file
+replaced after the last read (no check can see it).
 
 On any mismatch it defines the one
 class `tendcf_cmdb_refused`, and `tendcf_interlocks` reports what differs
