@@ -135,7 +135,7 @@ def test_example_site_mac_golden(schemas: Schemas) -> None:
     assert ilk == {
         "state": "present",
         "bundle": "fleet-vpn",
-        "pre_action": {"command": ["tailscale", "status", "--json"], "expect_exit": 0, "timeout_seconds": 15},
+        "pre_action": {"command": ["/usr/local/bin/tailscale", "status", "--json"], "expect_exit": 0, "timeout_seconds": 15},
         "defines_class": "tailscale_authenticated",
         "blocks": "enclosing-bundle",
         "report": True,

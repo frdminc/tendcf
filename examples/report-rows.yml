@@ -23,7 +23,7 @@
   mode: enforce
   outcome: n-a
   blocked_by_interlock: tailscale-authenticated-before-lockdown
-  message: "Bundle blocked: pre-action `tailscale status --json` exited 1"
+  message: "Bundle blocked: pre-action `/usr/local/bin/tailscale status --json` exited 1"
 
 - row_type: promise_outcome
   device: hd8
