@@ -78,22 +78,32 @@ bundle agent tendcf_interlocks
       # a hunch). join() over the container path (a proven idiom: pass
       # the path as a plain string, CFEngine resolves it) sidesteps that.
       #
-      # The joined string is NOT handed to a shell: tendcf_interlock_contain
-      # sets useshell => "noshell", so cf-agent splits it itself
+      # Guarantee, stated exactly: CFEngine starts no shell of its own for
+      # this promise. tendcf_interlock_contain sets useshell => "noshell",
+      # so cf-agent splits the joined string itself
       # (libpromises/exec_tools.c ArgSplitCommand: on whitespace, and an
       # argument that BEGINS with " ' or ` runs to the matching quote) and
-      # execs argv directly. `;`, `|`, `&&`, redirection and backticks mid-
-      # word are inert arguments, never operators. The join is still lossy
-      # for an element with a space or a leading quote, so the schema holds
-      # pre_action.command to an alphabet with neither (common.schema.json
-      # $defs/interlock_argv: absolute command[0], then [A-Za-z0-9._+@:=,/-]
-      # only), and examples/broken/156-159 and tests/policy check 8 pin both
-      # halves. Remaining limit: a projection that skips the schema (the
+      # execv()s the result: argv[0] is the program, the rest reach it
+      # unchanged. `;`, `|`, `&&`, redirection and backticks mid-word are
+      # plain arguments, never operators, and there is no PATH search.
+      # That is NOT a sandbox: an author who declares ["/bin/sh", "-c", ...]
+      # (schema-valid) still gets that shell, because the chosen program
+      # interprets its own arguments. What is removed is the implicit
+      # root shell over a joined string.
+      #
+      # The join is lossy for an element with a space, a leading quote or
+      # an empty string, so the schema holds pre_action.command to an
+      # alphabet with none of them (common.schema.json $defs/interlock_argv:
+      # absolute command[0], then [A-Za-z0-9._+@:=,/-] only), pinned by
+      # examples/broken/156-168 and tests/policy/run.sh check 8, which
+      # records the argv a program receives. Remaining limit: nothing on
+      # the device re-checks the schema. A projection that skipped it (the
       # projector only refuses `$(`, `${`, `@(`, `@{`; `tendcf-install.sh
-      # data` installs without it) can still carry a space or quote, which
-      # would shift argv, though never reach a shell. Removing the join
-      # altogether (an slist per interlock from getvalues(), passed as
-      # arglist) is deliberately not done until proven against a real build.
+      # data` installs without it) can carry a space or leading quote,
+      # which shifts argv, or a relative command[0], which the guard on the
+      # commands promise below refuses. Removing the join altogether (an
+      # slist per interlock from getvalues(), passed as arglist) is
+      # deliberately not done until proven against a real build.
       "pre_action_cmd[$(interlock_ids)]"
         string => join(" ",
           "data:variables.tendcf_interlock[$(interlock_ids)][pre_action][command]");
@@ -102,7 +112,14 @@ bundle agent tendcf_interlocks
       # pre_action: run the interlock's check under its own timeout, and
       # classify strictly by the entry's own expect_exit -- not bare
       # zero, since the schema allows any code 0-255.
+      #
+      # `if` fails closed on a relative command[0]: cf-agent would stat it
+      # and execv() it against its own working directory (it is not a PATH
+      # lookup), so the schema's absolute-path rule is re-enforced here for
+      # a projection that skipped the schema. A skipped promise leaves
+      # interlock_ok_* undefined and the bundle blocked and reported.
       "$(pre_action_cmd[$(interlock_ids)])"
+        if => regcmp("/.*", "$(pre_action_cmd[$(interlock_ids)])"),
         contain => tendcf_interlock_contain(
           "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][timeout_seconds])"),
         classes => tendcf_interlock_result(
@@ -381,9 +398,9 @@ bundle agent tendcf_services
 
 body contain tendcf_interlock_contain(timeout)
 {
-      # noshell: the pre_action argv is exec'd directly (see the comment on
-      # pre_action_cmd). Never "useshell": it would run the joined string
-      # through /bin/sh as root.
+      # noshell: cf-agent splits the joined pre_action string itself and
+      # execv()s it (see the comment on pre_action_cmd). Never "useshell":
+      # it would run the joined string through /bin/sh as root.
       useshell     => "noshell";
       exec_timeout => "$(timeout)";
 }
