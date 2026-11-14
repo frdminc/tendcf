@@ -387,8 +387,9 @@ check "';' was an argument, not an operator: interlock satisfied" \
 #     (the `Executing` log line is emitted before the exec, and /usr/bin/true
 #     ignores its arguments, so neither shows what arrived). Exit 0 with
 #     expect_exit 0 means the interlock must not be refused.
-#       alphabet: every character the schema's interlock_argv alphabet admits
-#                 ([A-Za-z0-9._+@:=,/-]) must arrive element for element.
+#       alphabet: every punctuation character the schema's interlock_argv
+#                 alphabet admits (`. _ + @ : = , / -`) and a sample of
+#                 letters and digits must arrive element for element.
 #       meta:     shell metacharacters, which the schema refuses but a
 #                 projection that skipped it could carry, must arrive as the
 #                 plain arguments they are.
@@ -439,6 +440,8 @@ cf_agent_abs="$(cd "$(dirname "$cf_agent")" && pwd)/$(basename "$cf_agent")"
 ( cd "$work/rel" && "$cf_agent_abs" -K -I -f "$work/inputs/entry.cf" ) >"$out" 2>&1 || true
 check "relative command[0]: interlock refused" \
     grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
+check "relative command[0]: the reason is reported" \
+    grep -q "tendcf: interlock 'demo-check' pre_action command\\[0\\] is not an absolute path; refused" "$out"
 check "relative command[0]: nothing was run" \
     bash -c "[ ! -e '$work/rel/ran' ]"
 

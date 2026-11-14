@@ -91,11 +91,11 @@ bundle agent tendcf_interlocks
       # interprets its own arguments. What is removed is the implicit
       # root shell over a joined string.
       #
-      # The join is lossy for an element with a space, a leading quote or
+      # The join is lossy for an element with whitespace, a leading quote or
       # an empty string, so the schema holds pre_action.command to an
       # alphabet with none of them (common.schema.json $defs/interlock_argv:
       # absolute command[0], then [A-Za-z0-9._+@:=,/-] only), pinned by
-      # examples/broken/156-168 and tests/policy/run.sh check 8, which
+      # examples/broken/156-175 and tests/policy/run.sh check 8, which
       # records the argv a program receives. Remaining limit: nothing on
       # the device re-checks the schema. A projection that skipped it (the
       # projector only refuses `$(`, `${`, `@(`, `@{`; `tendcf-install.sh
@@ -116,7 +116,8 @@ bundle agent tendcf_interlocks
       # `if` fails closed on a relative command[0]: cf-agent would stat it
       # and execv() it against its own working directory (it is not a PATH
       # lookup), so the schema's absolute-path rule is re-enforced here for
-      # a projection that skipped the schema. A skipped promise leaves
+      # a projection that skipped the schema (so a quoted absolute command[0],
+      # "/bin/x", is refused too: the guard wants a leading `/`). A skipped promise leaves
       # interlock_ok_* undefined and the bundle blocked and reported.
       "$(pre_action_cmd[$(interlock_ids)])"
         if => regcmp("/.*", "$(pre_action_cmd[$(interlock_ids)])"),
@@ -125,6 +126,12 @@ bundle agent tendcf_interlocks
         classes => tendcf_interlock_result(
           "interlock_ok_$(interlock_canon[$(interlock_ids)])",
           "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][expect_exit])");
+
+  reports:
+      # Why the promise above was skipped, so the blocked bundle's report
+      # (tendcf_services, "not satisfied ... refused") has a cause beside it.
+      "tendcf: interlock '$(interlock_ids)' pre_action command[0] is not an absolute path; refused"
+        if => not(regcmp("/.*", "$(pre_action_cmd[$(interlock_ids)])"));
 }
 
 bundle agent tendcf_services
