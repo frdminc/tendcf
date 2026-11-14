@@ -148,7 +148,15 @@ put_data() {  # put_data FILE
         backup="$data.previous"
         cp -p "$data" "$backup"
     fi
-    install -m 0600 -o root -g root "$src" "$data"
+    # Write beside the live file, then rename over it: the agent (cf-execd runs
+    # it on a schedule) never reads a half-written host_specific.json, and the
+    # loader and the policy's cross-check cannot see two different halves.
+    local tmp="$data.new"
+    if ! install -m 0600 -o root -g root "$src" "$tmp"; then
+        rm -f "$tmp"
+        die "could not write $tmp"
+    fi
+    mv -f "$tmp" "$data"
     if ! "$cf_promises" -f "$entry" >/dev/null; then
         if [ -n "$backup" ]; then mv -f "$backup" "$data"; else rm -f "$data"; fi
         die "cf-promises rejected $src; previous data restored"

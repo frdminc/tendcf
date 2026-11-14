@@ -1127,6 +1127,113 @@ also bears on pastebin, which already is (see above).
 Run test 1 against the current policy first: it must actuate the
 service. That reproduces the fail-open before the fix.
 
+**Implemented 2026-11-06: option 3, per djbclark's ruling Q10 (2026-11-02).**
+`bundle common tendcf_cmdb` in `policy/tendcf_services.cf` reads
+`$(sys.workdir)/data/host_specific.json` with `readjson` (5 MiB cap) and
+compares it with the data the loader installed. For every `vars` key it
+requires `data:variables.<key>` to exist, the key's entry ids to equal the
+loaded container's indices (a half-loaded container is caught), and the whole
+container to be identical: `storejson()` of the file's `vars[<key>]` against
+`storejson()` of `data:variables.<key>`, string-equal, with a comparison that
+cannot be computed counted as a problem of its own (not as the absence of a
+difference). (Ids alone were the first
+version; same ids with another value, which a `variables` section gives, passed
+it. Both texts come from the one parser, so key order and number formatting
+cannot differ on a consistent file; a `vars` value that is not an object is
+refused when it reads back differently: the loader installs a scalar as a
+string, which `storejson()` cannot read, and a list of numbers as an slist of
+strings, while a list of strings reads back equal and is accepted.) It
+also refuses any top-level key of the file other than `vars` (the fork's
+loader also applies `variables`, loaded after `vars`, and `classes`, which can
+define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
+is not a plain identifier `[A-Za-z0-9_]+` (the loader reads a key as a variable
+reference, `GetCMDBVariableRef`, so `default:tendcf_services.service_ids`
+presets a variable of the policy's own bundles), a loaded `data:variables.*`
+that is not a `vars` key of the file, a file that exists but cannot be
+parsed, and loaded data with no file. A missing file with nothing loaded is
+the normal empty case and says nothing.
+
+Round 2 of the review (Astra A1, adversary M1) added the loaded-state check
+and the single read. A preset reaches the checker itself: a `vars` key such as
+`default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` is
+installed before the policy runs. Whether it survives depends on the promise: a
+promise whose rvalue is a function call is skipped when the variable exists
+(`verify_vars.c`, "Already did this") if the call was not already evaluated,
+and otherwise redefines it; the CI runs of check 9 saw presets of both kinds.
+The policy does not rely on which: it reads the loaded state directly, in class
+expressions that call the functions inline (no variable to preset), and refuses
+any variable tagged `source=cmdb` or `source=augments_file` outside
+`data:variables.<identifier>` (`variablesmatching`) and any class with either
+tag (`classmatch`). tendcf ships no `def.json`, so augments are refused too (a
+host that needs one must be exempted in the policy, on purpose). The content
+comparison no longer reads the negation of a class set once and never cleared
+(`tendcf_cmdb_json_equal_*`); `tendcf_cmdb_problem_differs_<key>` is defined
+from the current texts, `..._uncomparable_<key>` from a side that could not be
+serialised, and `..._noverdict_<key>` when both texts exist but neither
+equality nor a difference could be evaluated (`strcmp()` is skipped when an
+argument still holds `$(`, which a file replaced after the loader's read can
+give; the positive `tendcf_cmdb_json_same_<key>` it reads only silences that
+one refusal and cannot hide a difference). Measured on the pinned fork (check
+11, debug run of a real cf-agent, the replaced-file case, CI run 43626676907
+at 87a4b58): `tendcf_cmdb` was resolved 2 times, the `doc` promise visited 1
+time, `file_json[..]` 10 times and `tendcf_cmdb_refused` 2 times, and the
+mutation script ran 1 time. A class is set once and never cleared; a class
+still unset is evaluated again on the second resolution, from the same
+snapshot. Its vars are visited on every resolution, so a later pass could have
+read a file the classes never compared. `doc` is
+therefore read once (its promise is skipped once it exists) and every
+comparison input derives from that snapshot. Check 11 pins both timings of a
+file replaced during the run: before the read the comparison refuses ("content
+differs", nothing runs); after it the policy never sees the replacement and
+acts on the loaded data it checked. Reports print file-derived text only with
+characters outside `[A-Za-z0-9._:@/-]` replaced by `?` and cut to a fixed
+length (64 characters for a key, section name or id, whether or not it is a
+plain identifier). The check and the gated bundles share one file because the
+fork resolves each file when it is loaded and the whole policy again after;
+were they split, the literal empty id lists under a refusal would still
+redefine the ids, so the split would fail closed. `tendcf-install.sh data`
+installs by atomic rename. Not checked: a file
+replaced after the last read (no check can see it).
+
+On any mismatch it defines the one
+class `tendcf_cmdb_refused`, and `tendcf_interlocks` reports what differs
+once. Both bundles then set `interlock_ids` and `service_ids` to explicitly
+empty lists (an undefined list would leave a preset one in place; a literal
+rvalue does redefine a preset, a function call does not), and the two
+`daemon-reload` commands, which iterate no id, carry the refusal themselves:
+no pre_action, no service, no tombstone. The vars and classes of a
+`bundle common` are pre-evaluated before the vars of any non-common bundle,
+whatever `bundlesequence` says (`PolicyResolve` and `BundleResolve`,
+`libpromises/expand.c` lines 846-871 and 1145-1177 at the pinned fork commit
+`b8abf28408b1`, [expand.c](https://github.com/djbclark/core/blob/b8abf28408b1b54e285d372a9bc5f2d850c960ad/libpromises/expand.c#L846)),
+so `tendcf_cmdb_refused` is decided before a gate is first read. That is a
+statement about vars and classes only, not that every promise type of a common
+bundle completes first, and the classes inside the check rely on their written
+order within the one pass. `bundlesequence` guard classes in `promises.cf` are
+not needed for this check. This is a consistency check, not a sandbox: a CMDB
+author (root) already chooses each pre_action executable, `/bin/sh` included,
+and the unit commands, so it does not stop a hostile but self-consistent file.
+The fork-side all-or-nothing loader (PR #41) and this check are independent:
+with the loader failing closed, the file's keys are not loaded and the check
+refuses and reports it, which is correct and louder.
+
+Two findings from the implementation, both about the proof above. (1) The
+Mac dev build (`3.29.0a.086d27749`) does not carry the per-entry loader
+(`8f0076b81` is not an ancestor): an unresolved `$(...)` anywhere in `vars`
+makes it install nothing at all, so the fail-open cannot be reproduced there
+with a file. `tests/policy/sim-loader.cf` therefore installs
+`data:variables.*` in the loader's place, from the same file, to emulate the
+per-entry skip; the original policy was run against it first and did
+process the service with its interlock skipped. The Linux CI legs build the
+pinned fork and so also exercise the real per-entry skip with the literal
+fixture (`tests/policy/fixtures/interlock-malformed.json`). (2) The check
+needs `readjson` and `variablesmatching` to compose on the loader's
+installed variables; they do on the dev build (checks 9-10 of
+`tests/policy/run.sh`), so option 4 stays unneeded. The policy-tree digest
+changes with this change (§13(b) option 3, §13(c)).
+
+PR: https://github.com/frdminc/tendcf/pull/42
+
 ## 14. Review record
 
 Gemini 4 Argon reviewed commit `a7b7c31` (2026-11-02; verdict "sound

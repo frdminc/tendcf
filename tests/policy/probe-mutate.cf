@@ -1,0 +1,23 @@
+# Test only (tests/policy/run.sh check 11). A `bundle common` whose one job is to
+# replace host_specific.json with a file that has the same keys and entry ids but
+# another pre_action command, i.e. a publication during the run. Two timings, by
+# class (cf-agent -D), so each is deterministic rather than a matter of
+# evaluation order:
+#   probe_before  the replacement is made from the first evaluation of this
+#                 bundle; the entry lists this file BEFORE tendcf_services.cf,
+#                 so it runs before tendcf_cmdb reads the file.
+#   probe_after   the replacement is made only once tendcf_cmdb.doc exists, i.e.
+#                 after tendcf_cmdb's read of the file, whatever the order.
+
+bundle common tendcf_probe_mutate
+{
+  vars:
+    probe_before::
+      "ran_before"
+        string => execresult("$(sys.workdir)/probe-mutate.sh", "noshell");
+
+    probe_after::
+      "ran_after"
+        string => execresult("$(sys.workdir)/probe-mutate.sh", "noshell"),
+        ifvarclass => isvariable("tendcf_cmdb.doc");
+}
