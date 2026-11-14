@@ -43,6 +43,10 @@
 #      second run that does nothing; then a tombstone naming an alias link, a
 #      mask (link to /dev/null) and a dangling link in /etc/systemd/system,
 #      none of which it may touch: reported, no systemctl, links left as found.
+#   8. no shell on the interlock pre_action: `/usr/bin/false || /usr/bin/true`
+#      must be refused and `/usr/bin/true ; /usr/bin/false` satisfied, the
+#      opposite of what a shell would do (C-policy-01; numbered 8 because 7 is
+#      the opt-in NixOS-shape check, which runs first).
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -346,8 +350,36 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
     fi
 fi
 
+# 8. no shell on the interlock pre_action (C-policy-01). The argv is joined
+#    with spaces and exec'd by cf-agent itself (useshell => "noshell"), so a
+#    shell operator is a plain argument. The two fixtures give opposite
+#    answers under a shell, and neither has a service, so both reach the
+#    refusal report on every host (Linux CI included):
+#      or:   `/usr/bin/false || /usr/bin/true`, expect_exit 0. A shell runs
+#            the right-hand side and exits 0 (satisfied). Without one,
+#            /usr/bin/false gets the arguments `||` and `/usr/bin/true`, exits
+#            1, and the bundle must be refused.
+#      semi: `/usr/bin/true ; /usr/bin/false`, expect_exit 0. A shell exits
+#            with the last command's 1 (refused). Without one,
+#            /usr/bin/true ignores its arguments and exits 0: satisfied.
+echo "# 8. pre_action runs without a shell"
+cp "$repo/tests/policy/fixtures/interlock-noshell-or.json" "$work/data/host_specific.json"
+out="$work/noshell-or.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "'false || true' ran as one command line" \
+    grep -q "Executing .*'/usr/bin/false || /usr/bin/true'" "$out"
+check "'||' was an argument, not an operator: interlock refused" \
+    grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
+cp "$repo/tests/policy/fixtures/interlock-noshell-semi.json" "$work/data/host_specific.json"
+out="$work/noshell-semi.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "'true ; false' ran as one command line" \
+    grep -q "Executing .*'/usr/bin/true ; /usr/bin/false'" "$out"
+check "';' was an argument, not an operator: interlock satisfied" \
+    bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
+    for f in refused satisfied noshell-or noshell-semi flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
