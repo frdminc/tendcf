@@ -1225,16 +1225,20 @@ The fork-side all-or-nothing loader (PR #41) and this check hold each without
 the other: with the loader failing closed, the file's keys are not loaded and
 the check refuses and reports it, which is correct and louder. The independence
 is limited, not complete: the loader's strict parse (a repeated member or
-trailing input refuses the file; fork `6505f488a`) belongs to the CMDB loader
+trailing input refuses the file; fork `4443504`) belongs to the CMDB loader
 only, while this check's `readjson` stays lenient and sees the last of a
 repeated member or `vars` section, so an earlier container the loader refused
 is not named by the check. The check reports a refusal when that lenient view
 still lists variables the loader did not install (or another feature it refuses
-on its own); when the lenient view is empty (`{"vars":{},"vars":{}}`, or
-`{"vars":{}}` followed by non-whitespace) nothing is installed and nothing
+on its own); when the lenient view is empty nothing is installed and nothing
 actuates, but the check has nothing to report, so no actuation is not a refusal
 report and the loader's own error is the only trace (`run.sh` 9b, empty-view
-controls). The check does not detect such a file when the loader is lenient and
+controls, which pin two examples: `{"vars":{},"vars":{}}` and `{"vars":{}}`
+followed by non-whitespace). The examples are not the whole class; the one that
+matters operationally is `{"vars":{<the real configuration>},"vars":{}}`: the
+lenient parser keeps the last, empty `vars`, the strict loader refuses the file,
+and the whole intended configuration is silently not applied, with the loader's
+error as the only trace. The check does not detect such a file when the loader is lenient and
 the repeated member is invisible to both parsers.
 
 Two findings from the implementation, both about the proof above. (1) The
