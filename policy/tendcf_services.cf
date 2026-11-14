@@ -138,8 +138,9 @@
 # Presets. The loader installs a `vars` key under any name, so a key such as
 # `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
 # that variable before any policy runs. What a preset does then depends on the
-# promise (verify_vars.c VerifyVarPromise, commit b8abf28408b1 pinned in
-# overlay/fork.json): a promise with a LITERAL rvalue (`slist => { }`) always
+# promise (verify_vars.c VerifyVarPromise, read at commit b8abf28408b1; the
+# pin in overlay/fork.json is now d32cade13, which differs from it only in
+# libpromises/cmdb.c, cmdb.h and tests): a promise with a LITERAL rvalue (`slist => { }`) always
 # redefines it, so the policy's value stands. A promise whose rvalue is a
 # FUNCTION CALL is skipped when the variable exists ("Already did this") if the
 # call was not already evaluated to a value when the promise runs, and
