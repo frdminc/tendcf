@@ -47,7 +47,8 @@
 #      must be refused and `/usr/bin/true ; /usr/bin/false` satisfied, the
 #      opposite of what a shell would do (C-policy-01; numbered 8 because 7 is
 #      the opt-in NixOS-shape check, which runs first). 8c records the argv a
-#      program receives (element-for-element, the full schema alphabet and a
+#      program receives (element-for-element: every punctuation character the
+#      schema alphabet admits plus a sample of letters and digits, and a
 #      metacharacter set); 8d refuses a relative command[0] from a projection
 #      that skipped the schema.
 #
@@ -138,6 +139,8 @@ check "pre_action executed" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
 check "no refusal reported for the satisfied interlock" \
     bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+check "no reason line for an absolute command[0]" \
+    bash -c "! grep -q 'is not an absolute path' '$out'"
 
 echo "# 4. flavour guard: runit entry refused on every host"
 cp "$repo/tests/policy/fixtures/flavour-refused.json" "$work/data/host_specific.json"
@@ -418,6 +421,8 @@ argv_case() {  # argv_case NAME ELEMENT...  (writes the fixture, runs cf-agent, 
     check "$name: argv arrived element for element" cmp -s "$recorder.out" "$work/argv-$name.want"
     check "$name: exit 0 satisfied the interlock" \
         bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+    check "$name: no reason line for an absolute command[0]" \
+        bash -c "! grep -q 'is not an absolute path' '$out'"
 }
 argv_case alphabet 'a,b=c:d@e+f' '--k=v,w:/p@h+1._-' '-' 'A0z9' '/x/y'
 argv_case meta ';' '/usr/bin/false' '||' '>' '/dev/null' '&' '*' '~' '#'
@@ -441,7 +446,7 @@ cf_agent_abs="$(cd "$(dirname "$cf_agent")" && pwd)/$(basename "$cf_agent")"
 check "relative command[0]: interlock refused" \
     grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
 check "relative command[0]: the reason is reported" \
-    grep -q "tendcf: interlock 'demo-check' pre_action command\\[0\\] is not an absolute path; refused" "$out"
+    grep -q "^R: tendcf: interlock 'demo-check' pre_action command\\[0\\] is not an absolute path; refused" "$out"
 check "relative command[0]: nothing was run" \
     bash -c "[ ! -e '$work/rel/ran' ]"
 
