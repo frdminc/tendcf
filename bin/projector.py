@@ -409,10 +409,15 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
             # E-6/E-7: these are LEGAL to CFEngine, which is exactly why the
             # negative exists — `variables` loads after `vars` and overwrites
             # the same name, so a checker that only asks "is `vars` right?"
-            # never sees the document that replaced it.
+            # never sees the document that replaced it. (The fork pinned in
+            # overlay/fork.json instead refuses a file in which `variables`
+            # names a variable `vars` already names; upstream replaces it.)
             extra = (
-                " — legal to CFEngine, loaded after `vars` and overwriting the "
-                "same names, which is why envelope-shape checking misses it"
+                " — legal to upstream CFEngine, which loads it after `vars` and "
+                "lets it overwrite the same names, which is why envelope-shape "
+                "checking misses it; the fork pinned in overlay/fork.json "
+                "instead refuses a file in which `variables` or `classes` is "
+                "invalid or names a variable `vars` already names"
             )
         flag(
             RULE_PROJECTION,

@@ -38,6 +38,10 @@ runs:
         git -C /tmp/core/libntech checkout -q FETCH_HEAD
         echo "core=$core" >> "$GITHUB_OUTPUT"
         echo "libntech=$libntech" >> "$GITHUB_OUTPUT"
+        # In the job log, not only the summary: the libntech commit core's
+        # submodule pointer names exists on the fork, not on the upstream URL
+        # in .gitmodules, and is fetched from `libntech.repo` above.
+        echo "build-fork: core $core, libntech $libntech (from $libntech_repo)"
 
     - name: Build dependencies (core's own script; Debian/Ubuntu branch)
       shell: bash
