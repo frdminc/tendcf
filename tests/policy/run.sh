@@ -613,10 +613,12 @@ printf 'bundle agent main\n{\n}\n' > "$work/inputs/empty.cf"
 check "scoped-key preset (control): the loader installed default:tendcf_services.service_ids" \
     bash -c "grep 'default:tendcf_services.service_ids' '$work/xc-preset-vars.out' | grep -q demo-runit"
 
-# A `vars` value that is not an object (the loader turns a string into a scalar
-# and a list of primitives into an slist) cannot be compared as JSON text with
-# the file's: not computable, so refused, and named.
-printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"scalar":"x","plain_list":["a","b"]}}' >"$work/data/host_specific.json"
+# A `vars` value that is not an object is installed as a scalar (not
+# comparable: storejson() fails) or, for a list of primitives, as an slist of
+# strings, so numbers read back as "1","2" and differ from the file's [1,2]:
+# either way a difference, refused and named. (A list of strings would compare
+# equal and pass, which is correct.)
+printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"scalar":"x","plain_list":[1,2]}}' >"$work/data/host_specific.json"
 out="$work/xc-uncomparable.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
 check "uncomparable vars values: refusal reported" refusal_reported "$out"

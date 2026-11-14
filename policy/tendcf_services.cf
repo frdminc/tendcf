@@ -84,10 +84,11 @@
 #   - per key, the whole container the loader installed must equal the file's:
 #     storejson() of `doc[vars][<key>]` against storejson() of
 #     `data:variables.<key>`, string-equal (same parser and same bytes give the
-#     same text, key order and number formatting included; a key whose value is
-#     not an object is not comparable that way, because the loader turns a
-#     scalar into a string and a list of primitives into an slist, and is
-#     refused). Equal ids with changed values, as a `variables` entry or a
+#     same text, key order and number formatting included). A value that is not
+#     an object is refused when it reads back differently: the loader installs
+#     a scalar as a string (storejson() fails) and a list of primitives as an
+#     slist of strings (numbers read back as strings). Equal ids with changed
+#     values, as a `variables` entry or a
 #     replacement between the loader's read and ours would give, are caught;
 #     a comparison that cannot be computed counts as a difference;
 #   - every `data:variables.*` the loader installed must be a key of `vars`

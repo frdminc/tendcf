@@ -1139,8 +1139,9 @@ cannot be computed counting as a difference. (Ids alone were the first
 version; same ids with another value, which a `variables` section or a file
 replaced between the loader's read and the policy's gives, passed it. Both
 texts come from the one parser, so key order and number formatting cannot
-differ on a consistent file; a `vars` value that is not an object, which the
-loader turns into a string or an slist, is not comparable and is refused.) It
+differ on a consistent file; a `vars` value that is not an object is refused when it reads back
+differently: the loader installs a scalar as a string, which `storejson()`
+cannot read, and a list of numbers as an slist of strings.) It
 also refuses any top-level key of the file other than `vars` (the fork's
 loader also applies `variables`, loaded after `vars`, and `classes`, which can
 define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
