@@ -1,8 +1,9 @@
 # Test only (tests/policy/run.sh checks 9-10). Stands in for a CMDB loader that
 # skipped, or half installed, a container of host_specific.json. No loader the
 # tests run does that: the fork at the pin (overlay/fork.json) is all-or-nothing
-# (a file with any invalid entry installs nothing, since PR #41, operator ruling
-# R13) and the Mac dev build rejects the whole `vars`. The fork before R13
+# (a file it finds invalid, by the reasons listed in policy/tendcf_services.cf
+# tendcf_cmdb, installs nothing, since PR #41, operator ruling R13) and the Mac
+# dev build rejects the whole `vars`. The fork before R13
 # (`8f0076b81`, B-5b) did skip one bad entry, which was the 2026-11-02
 # fail-open; this stand-in keeps that state testable, and the cross-check
 # must refuse it however a loader came to leave it. Run
