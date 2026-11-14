@@ -55,10 +55,17 @@
 #      policy/tendcf_services.cf, proposal 2026-11-03 section 13 option 3): a
 #      file the loader cannot install whole is refused and reported and
 #      actuates nothing; the consistent files of checks 2-4 raise no report; no
-#      file at all, and a file with no vars, are the normal empty case. NB: the
-#      fork's loader skips a bad entry and installs the rest, but the Mac dev
-#      build rejects the whole `vars` instead (the same fixture refuses on both,
-#      as "nothing loaded"), so only the fork's CI legs see the per-entry skip.
+#      file at all, and a file with no vars, are the normal empty case. Also
+#      refused and reported, each actuating nothing: a `variables` section that
+#      replaces a container under the same ids with another command (the
+#      comparison is of the whole container, not of key names and ids), a
+#      `classes` section, and a `vars` key that is not a plain identifier, which
+#      the loader would file under another scope (a preset of the policy's own
+#      id lists). Every file of checks 2-8 and 6 is also a no-report control.
+#      NB: the fork's loader skips a bad entry and installs the rest, but the
+#      Mac dev build rejects the whole `vars` instead (the same fixture refuses
+#      on both, as "nothing loaded"), so only the fork's CI legs see the
+#      per-entry skip.
 #  10. the same cross-check against a loader that skips ONE container, which
 #      the Mac dev build cannot do: tests/policy/sim-loader.cf installs
 #      data:variables.* in the loader's place (cf-agent --no-host-specific-data)
@@ -68,7 +75,9 @@
 #      A skipped interlock container with the services loaded is the 2026-11-02
 #      fail-open; a skipped service container with the interlock loaded shows
 #      the first bundle (tendcf_interlocks, which runs pre_action commands) is
-#      gated too. Under TENDCF_TEST_SYSTEMD=1 the same stand-in is run against
+#      gated too. Same ids with a changed value (a service's command, or an
+#      interlock's pre_action) are refused as a content difference, which no
+#      key-and-id comparison could see. Under TENDCF_TEST_SYSTEMD=1 the same stand-in is run against
 #      the real manager (6b): no unit rendered, a tombstone leaves the unit alone.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
@@ -547,6 +556,54 @@ check "unparseable file: reported as unreadable" \
 check "unparseable file: refusal reported once" refusal_once "$out"
 check "unparseable file: nothing actuated" no_actuation "$out"
 
+# Consistent files from the other checks (8, 8c, 8d, and the systemd lifecycle
+# when it ran): the whole-container comparison must not refuse a normal file, so
+# key order and number formatting do not make a false refusal.
+for f in noshell-or noshell-semi argv-alphabet argv-meta relative sysd1 sysd2 sysd3 sysd4 sysd5; do
+    [ -f "$work/$f.out" ] || continue
+    check "consistent file of the $f run: no cross-check report" no_crosscheck "$work/$f.out"
+done
+
+# A `variables` section replaces `vars.tendcf_interlock` under the same id with
+# a pre_action that passes (the file's own vars say /usr/bin/false). The loader
+# applies `variables` after `vars` (cmdb.c LoadCMDBData), so the ids match and
+# only the content differs.
+cp "$repo/tests/policy/fixtures/cmdb-variables-collision.json" "$work/data/host_specific.json"
+out="$work/xc-collision.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "variables-section collision: refusal reported" refusal_reported "$out"
+check "variables-section collision: the content difference is named" \
+    grep -q "key 'tendcf_interlock' content differs between" "$out"
+check "variables-section collision: not an id difference" \
+    bash -c "! grep -q 'loaded differently' '$out'"
+check "variables-section collision: the section is named" \
+    grep -q "has top-level section 'variables' besides 'vars'" "$out"
+check "variables-section collision: refusal reported once" refusal_once "$out"
+check "variables-section collision: the replacement pre_action did not run" no_actuation "$out"
+
+# A `classes` section can define interlock_ok_demo_check, which would unblock the
+# bundle whatever the pre_action returns (it is /usr/bin/false here).
+cp "$repo/tests/policy/fixtures/cmdb-classes-section.json" "$work/data/host_specific.json"
+out="$work/xc-classes.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "classes section: refusal reported" refusal_reported "$out"
+check "classes section: the section is named" \
+    grep -q "has top-level section 'classes' besides 'vars'" "$out"
+check "classes section: nothing actuated (no pre_action, no service processed)" no_actuation "$out"
+
+# `vars` keys that name a variable of the policy's own bundles preset the id
+# lists before the policy loads; a refusal must overwrite them, not leave them.
+cp "$repo/tests/policy/fixtures/cmdb-scoped-preset.json" "$work/data/host_specific.json"
+out="$work/xc-preset.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "scoped-key preset: refusal reported" refusal_reported "$out"
+for k in default:tendcf_interlocks.interlock_ids default:tendcf_services.interlock_ids default:tendcf_services.service_ids; do
+    check "scoped-key preset: '$k' refused as not a plain identifier" \
+        grep -q "key '$k' under 'vars' in .* is not a plain identifier" "$out"
+done
+check "scoped-key preset: refusal reported once" refusal_once "$out"
+check "scoped-key preset: the preset id lists did not actuate" no_actuation "$out"
+
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
     if [ "$1" = none ]; then rm -f "$work/data/host_specific.json"
@@ -594,6 +651,29 @@ check "extra loaded variable: named" \
     grep -q "CFEngine loaded data:variables.stray, which is not a key under 'vars'" "$out"
 check "extra loaded variable: nothing actuated" no_actuation "$out"
 
+# Same ids, a changed value: what a loader that replaced an entry's value (or a
+# file replaced between the loader's read and the policy's) would leave. Ids and
+# keys match, so only the whole-container comparison can see it.
+out="$work/xc-sim-changed-service.out"
+sim_run flavour-refused.json sim_interlock,sim_service_changed "$out"
+check "service value changed under the same id: refusal reported" refusal_reported "$out"
+check "service value changed under the same id: the container is named" \
+    grep -q "key 'tendcf_service' content differs between" "$out"
+check "service value changed under the same id: not an id difference" \
+    bash -c "! grep -q 'loaded differently' '$out'"
+check "service value changed under the same id: tendcf_interlock not blamed" \
+    bash -c "! grep -q \"key 'tendcf_interlock'\" '$out'"
+check "service value changed under the same id: nothing actuated" no_actuation "$out"
+
+out="$work/xc-sim-changed-interlock.out"
+sim_run interlock-refused.json sim_interlock_changed,sim_service "$out"
+check "interlock value changed under the same id: refusal reported" refusal_reported "$out"
+check "interlock value changed under the same id: the container is named" \
+    grep -q "key 'tendcf_interlock' content differs between" "$out"
+check "interlock value changed under the same id: tendcf_service not blamed" \
+    bash -c "! grep -q \"key 'tendcf_service'\" '$out'"
+check "interlock value changed under the same id: the passing pre_action did not run" no_actuation "$out"
+
 out="$work/xc-sim-nofile.out"
 sim_run none sim_stray "$out"
 check "data loaded with no file: refusal reported" refusal_reported "$out"
@@ -603,7 +683,8 @@ check "data loaded with no file: nothing actuated" no_actuation "$out"
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset \
+             xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"

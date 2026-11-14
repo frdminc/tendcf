@@ -1131,21 +1131,44 @@ service. That reproduces the fail-open before the fix.
 `bundle common tendcf_cmdb` in `policy/tendcf_services.cf` reads
 `$(sys.workdir)/data/host_specific.json` with `readjson` (5 MiB cap) and
 compares it with the data the loader installed. For every `vars` key it
-requires `data:variables.<key>` to exist and the key's entry ids to equal
-the loaded container's indices (a half-loaded container is caught). It also
-refuses a loaded `data:variables.*` that is not a `vars` key of the file, a
-file that exists but cannot be parsed, and loaded data with no file. A missing
-file with nothing loaded is the normal empty case and says nothing. On any
-mismatch it defines the one class `tendcf_cmdb_refused`, and
-`tendcf_interlocks` reports what differs once. Both bundles then see empty
-`interlock_ids` and `service_ids`: no pre_action, no service, no tombstone.
-It is a `bundle common`, so cf-agent evaluates it to completion before the
-first agent bundle whatever `bundlesequence` says, which is what makes the
-class final before any gate is read. `bundlesequence` guard classes in
-`promises.cf` are not needed for this check. The fork-side all-or-nothing
-loader (PR #41) and this check are independent: with the loader failing
-closed, the file's keys are not loaded and the check refuses and reports
-it, which is correct and louder.
+requires `data:variables.<key>` to exist, the key's entry ids to equal the
+loaded container's indices (a half-loaded container is caught), and the whole
+container to be identical: `storejson()` of the file's `vars[<key>]` against
+`storejson()` of `data:variables.<key>`, string-equal, with a comparison that
+cannot be computed counting as a difference. (Ids alone were the first
+version; same ids with another value, which a `variables` section or a file
+replaced between the loader's read and the policy's gives, passed it. Both
+texts come from the one parser, so key order and number formatting cannot
+differ on a consistent file; a `vars` value that is not an object, which the
+loader turns into a string or an slist, is not comparable and is refused.) It
+also refuses any top-level key of the file other than `vars` (the fork's
+loader also applies `variables`, loaded after `vars`, and `classes`, which can
+define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
+is not a plain identifier `[A-Za-z0-9_]+` (the loader reads a key as a variable
+reference, `GetCMDBVariableRef`, so `default:tendcf_services.service_ids`
+presets a variable of the policy's own bundles), a loaded `data:variables.*`
+that is not a `vars` key of the file, a file that exists but cannot be
+parsed, and loaded data with no file. A missing file with nothing loaded is
+the normal empty case and says nothing. On any mismatch it defines the one
+class `tendcf_cmdb_refused`, and `tendcf_interlocks` reports what differs
+once. Both bundles then set `interlock_ids` and `service_ids` to explicitly
+empty lists (an undefined list would leave a preset one in place), and the two
+`daemon-reload` commands, which iterate no id, carry the refusal themselves:
+no pre_action, no service, no tombstone. The vars and classes of a
+`bundle common` are pre-evaluated before the vars of any non-common bundle,
+whatever `bundlesequence` says (`PolicyResolve` and `BundleResolve`,
+`libpromises/expand.c` lines 846-871 and 1145-1177 at the pinned fork commit
+`b8abf28408b1`, [expand.c](https://github.com/djbclark/core/blob/b8abf28408b1b54e285d372a9bc5f2d850c960ad/libpromises/expand.c#L846)),
+which is what makes the class final before any gate is read. That is a
+guarantee about vars and classes only, not that every promise type of a common
+bundle completes first, and the classes inside the check rely on their written
+order within the one pass. `bundlesequence` guard classes in `promises.cf` are
+not needed for this check. This is a consistency check, not a sandbox: a CMDB
+author (root) already chooses each pre_action executable, `/bin/sh` included,
+and the unit commands, so it does not stop a hostile but self-consistent file.
+The fork-side all-or-nothing loader (PR #41) and this check are independent:
+with the loader failing closed, the file's keys are not loaded and the check
+refuses and reports it, which is correct and louder.
 
 Two findings from the implementation, both about the proof above. (1) The
 Mac dev build (`3.29.0a.086d27749`) does not carry the per-entry loader
