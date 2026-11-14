@@ -398,7 +398,7 @@ one consistent set.
 
 | Repo | Gate | Exists today |
 | --- | --- | --- |
-| tendcf | `bin/schema_lint.py` incl. the 172 broken fixtures (138 schema-level, 6 byte-class, 28 projection; counted 2026-11-13) and projector goldens | yes |
+| tendcf | `bin/schema_lint.py` incl. the 179 broken fixtures (145 schema-level, 6 byte-class, 28 projection; counted 2026-11-14) and projector goldens | yes |
 | tendcf | `bin/xref_lint.py` | yes |
 | tendcf | `bin/overlay.py self-test` and `lint` (patch overlay applies; drift fails loudly) | yes, this change |
 | tendcf | overlay drift against upstream (`check --against upstream/master`) | scheduled / manual job, this change |
