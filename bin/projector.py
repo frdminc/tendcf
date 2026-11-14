@@ -413,8 +413,11 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
             # overlay/fork.json instead refuses a file in which `variables`
             # names a variable `vars` already names; upstream replaces it.)
             extra = (
-                " — legal to CFEngine, loaded after `vars` and overwriting the "
-                "same names, which is why envelope-shape checking misses it"
+                " — legal to upstream CFEngine, which loads it after `vars` and "
+                "lets it overwrite the same names, which is why envelope-shape "
+                "checking misses it; the fork pinned in overlay/fork.json "
+                "instead refuses a file in which `variables` or `classes` is "
+                "invalid or names a variable `vars` already names"
             )
         flag(
             RULE_PROJECTION,
