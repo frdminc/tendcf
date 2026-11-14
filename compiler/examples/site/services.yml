@@ -9,7 +9,7 @@
 # through this contract (D21). It exists so the schema has a regression
 # test and so a reader can see what the three D16 fields look like in use.
 
-contract_version: 1
+contract_version: 2
 
 domains:
   macos-launchd-services:
@@ -44,7 +44,7 @@ bundles:
           may be enforced. Setting lockdown on a device whose VPN is
           unauthenticated severs every management path to it.
         pre_action:
-          command: ["tailscale", "status", "--json"]
+          command: ["/usr/local/bin/tailscale", "status", "--json"]
           expect_exit: 0
           timeout_seconds: 15
         defines_class: tailscale_authenticated

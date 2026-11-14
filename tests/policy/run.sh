@@ -43,6 +43,14 @@
 #      second run that does nothing; then a tombstone naming an alias link, a
 #      mask (link to /dev/null) and a dangling link in /etc/systemd/system,
 #      none of which it may touch: reported, no systemctl, links left as found.
+#   8. no shell on the interlock pre_action: `/usr/bin/false || /usr/bin/true`
+#      must be refused and `/usr/bin/true ; /usr/bin/false` satisfied, the
+#      opposite of what a shell would do (C-policy-01; numbered 8 because 7 is
+#      the opt-in NixOS-shape check, which runs first). 8c records the argv a
+#      program receives (element-for-element: every punctuation character the
+#      schema alphabet admits plus a sample of letters and digits, and a
+#      metacharacter set); 8d refuses a relative command[0] from a projection
+#      that skipped the schema.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -131,6 +139,8 @@ check "pre_action executed" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
 check "no refusal reported for the satisfied interlock" \
     bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+check "no reason line for an absolute command[0]" \
+    bash -c "! grep -q 'is not an absolute path' '$out'"
 
 echo "# 4. flavour guard: runit entry refused on every host"
 cp "$repo/tests/policy/fixtures/flavour-refused.json" "$work/data/host_specific.json"
@@ -346,8 +356,102 @@ if [ "${TENDCF_TEST_NIXOS_SHAPE:-}" = 1 ]; then
     fi
 fi
 
+# 8. no shell on the interlock pre_action (C-policy-01). The argv is joined
+#    with spaces and exec'd by cf-agent itself (useshell => "noshell"), so a
+#    shell operator is a plain argument. The two fixtures give opposite
+#    answers under a shell, and neither has a service, so both reach the
+#    refusal report on every host (Linux CI included):
+#      or:   `/usr/bin/false || /usr/bin/true`, expect_exit 0. A shell runs
+#            the right-hand side and exits 0 (satisfied). Without one,
+#            /usr/bin/false gets the arguments `||` and `/usr/bin/true`, exits
+#            1, and the bundle must be refused.
+#      semi: `/usr/bin/true ; /usr/bin/false`, expect_exit 0. A shell exits
+#            with the last command's 1 (refused). Without one,
+#            /usr/bin/true ignores its arguments and exits 0: satisfied.
+echo "# 8. pre_action runs without a shell"
+cp "$repo/tests/policy/fixtures/interlock-noshell-or.json" "$work/data/host_specific.json"
+out="$work/noshell-or.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "'false || true' ran as one command line" \
+    grep -q "Executing .*'/usr/bin/false || /usr/bin/true'" "$out"
+check "'||' was an argument, not an operator: interlock refused" \
+    grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
+cp "$repo/tests/policy/fixtures/interlock-noshell-semi.json" "$work/data/host_specific.json"
+out="$work/noshell-semi.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "'true ; false' ran as one command line" \
+    grep -q "Executing .*'/usr/bin/true ; /usr/bin/false'" "$out"
+check "';' was an argument, not an operator: interlock satisfied" \
+    bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+
+# 8c. argv fidelity. A recorder executable writes the argv it was handed, one
+#     element per line, to a file it only renames into place after the last
+#     write, so the file's existence is the evidence that it ran to the end
+#     (the `Executing` log line is emitted before the exec, and /usr/bin/true
+#     ignores its arguments, so neither shows what arrived). Exit 0 with
+#     expect_exit 0 means the interlock must not be refused.
+#       alphabet: every punctuation character the schema's interlock_argv
+#                 alphabet admits (`. _ + @ : = , / -`) and a sample of
+#                 letters and digits must arrive element for element.
+#       meta:     shell metacharacters, which the schema refuses but a
+#                 projection that skipped it could carry, must arrive as the
+#                 plain arguments they are.
+#     Neither path may contain a space (the join would split it); mktemp's
+#     does not.
+recorder="$work/argv-recorder"
+case "$recorder" in *[[:space:]]*) check "scratch path has no whitespace" false ;; esac
+cat > "$recorder" <<'RECORDER'
+#!/bin/sh
+: > "$0.tmp"
+for a in "$@"; do printf '%s\n' "$a" >> "$0.tmp"; done
+mv "$0.tmp" "$0.out"
+RECORDER
+chmod 700 "$recorder"
+argv_case() {  # argv_case NAME ELEMENT...  (writes the fixture, runs cf-agent, compares)
+    local name="$1"; shift
+    local json="" el
+    for el in "$@"; do json="$json,\"$el\""; done
+    printf '{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["%s"%s],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{}}}\n' \
+        "$recorder" "$json" > "$work/data/host_specific.json"
+    rm -f "$recorder.out" "$recorder.tmp"
+    out="$work/argv-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    printf '%s\n' "$@" > "$work/argv-$name.want"
+    check "$name: the recorder ran to the end" test -s "$recorder.out"
+    check "$name: argv arrived element for element" cmp -s "$recorder.out" "$work/argv-$name.want"
+    check "$name: exit 0 satisfied the interlock" \
+        bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
+    check "$name: no reason line for an absolute command[0]" \
+        bash -c "! grep -q 'is not an absolute path' '$out'"
+}
+argv_case alphabet 'a,b=c:d@e+f' '--k=v,w:/p@h+1._-' '-' 'A0z9' '/x/y'
+argv_case meta ';' '/usr/bin/false' '||' '>' '/dev/null' '&' '*' '~' '#'
+
+# 8d. a relative command[0] (a projection that skipped the schema) is refused
+#     by the policy itself. Without the guard cf-agent stats and execv()s the
+#     name against its own working directory, so a `true` placed there would
+#     run and satisfy the interlock; with it the promise is skipped, the
+#     marker file is never written and the bundle is refused and reported.
+mkdir -p "$work/rel"
+cat > "$work/rel/true" <<'RELTRUE'
+#!/bin/sh
+: > ran
+RELTRUE
+chmod 700 "$work/rel/true"
+rm -f "$work/rel/ran"
+printf '%s\n' '{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{}}}' > "$work/data/host_specific.json"
+out="$work/relative.out"
+cf_agent_abs="$(cd "$(dirname "$cf_agent")" && pwd)/$(basename "$cf_agent")"
+( cd "$work/rel" && "$cf_agent_abs" -K -I -f "$work/inputs/entry.cf" ) >"$out" 2>&1 || true
+check "relative command[0]: interlock refused" \
+    grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
+check "relative command[0]: the reason is reported" \
+    grep -q "^R: tendcf: interlock 'demo-check' pre_action command\\[0\\] is not an absolute path; refused" "$out"
+check "relative command[0]: nothing was run" \
+    bash -c "[ ! -e '$work/rel/ran' ]"
+
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
+    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done

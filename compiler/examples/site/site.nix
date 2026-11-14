@@ -12,7 +12,7 @@
 #
 # FIXTURE, not site data (D21).
 {
-  contract_version = 1;
+  contract_version = 2;
 
   domains = {
     macos-launchd-services = {
@@ -45,7 +45,7 @@
           id = "tailscale-authenticated-before-lockdown";
           description = "The mesh VPN must be authenticated before always-on VPN lockdown may be enforced. Setting lockdown on a device whose VPN is unauthenticated severs every management path to it.";
           pre_action = {
-            command = [ "tailscale" "status" "--json" ];
+            command = [ "/usr/local/bin/tailscale" "status" "--json" ];
             expect_exit = 0;
             timeout_seconds = 15;
           };

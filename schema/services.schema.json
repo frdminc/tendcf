@@ -6,7 +6,11 @@
 
   "type": "object",
   "properties": {
-    "contract_version": { "$ref": "common.schema.json#/$defs/contract_version" },
+    "contract_version": {
+      "description": "2 since 2026-11-14 (C-policy-01): interlock pre_action.command is held to common.schema.json#/$defs/interlock_argv, a narrowing of what 1 accepted. An exact pin (`const`, as schema_version does): a document declaring 1, 3 or 99 fails here instead of being judged under rules it never claimed, because the same number must mean the same acceptance set. roles.yml and launchd-writers.yml are separate documents on their own axes and are unchanged.",
+      "$ref": "common.schema.json#/$defs/contract_version",
+      "const": 2
+    },
 
     "domains": {
       "description": "Coverage declaration per domain of device state this file describes (D16(d)). Keys are domain ids referenced by each service record.",

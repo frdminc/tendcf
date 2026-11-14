@@ -7,8 +7,8 @@
   "type": "object",
   "properties": {
     "schema_version": {
-      "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid.",
-      "const": 5
+      "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid. v6 (djbclark ruling 2026-11-14, C-policy-01): interlock pre_action.command is held to common.schema.json#/$defs/interlock_argv, a strict subset of v5's acceptance set, bumped because the same version number must mean the same acceptance set.",
+      "const": 6
     },
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
@@ -497,11 +497,7 @@
         "pre_action": {
           "type": "object",
           "properties": {
-            "command": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 },
-              "minItems": 1
-            },
+            "command": { "$ref": "common.schema.json#/$defs/interlock_argv" },
             "expect_exit": { "type": "integer", "minimum": 0, "maximum": 255 },
             "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
           },
