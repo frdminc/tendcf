@@ -66,8 +66,10 @@
 #      actuates nothing; the consistent files of checks 2-4 raise no report; no
 #      file at all, and a file with no vars, are the normal empty case. Also
 #      refused and reported, each actuating nothing: a `variables` section that
-#      replaces a container under the same ids with another command (the
-#      comparison is of the whole container, not of key names and ids), a
+#      names a container of `vars` again (the fork at the pin refuses the file
+#      as a duplicate variable and installs none of it; the whole-container
+#      comparison that would catch the same ids with another command is tested
+#      in checks 10 and 11), a
 #      `classes` section, and a `vars` key that is not a plain identifier, which
 #      the loader would file under another scope (a preset of the policy's own
 #      id lists), and a `vars` value that is not an object (not comparable as
@@ -659,18 +661,28 @@ for f in noshell-or noshell-semi argv-alphabet argv-meta relative sysd1 sysd2 sy
     check "consistent file of the $f run: no cross-check report" no_crosscheck "$work/$f.out"
 done
 
-# A `variables` section replaces `vars.tendcf_interlock` under the same id with
-# a pre_action that passes (the file's own vars say /usr/bin/false). The loader
-# applies `variables` after `vars` (cmdb.c LoadCMDBData), so the ids match and
-# only the content differs.
+# A `variables` section naming `tendcf_interlock` again, with a pre_action that
+# passes (the file's own vars say /usr/bin/false). The fork at the pin refuses the
+# whole file: two entries naming one variable are a duplicate (cmdb.c
+# CMDBPendingCheckNoDuplicates, fork commit 61065e551), so the loader logs the
+# duplicate, installs none of the file and the policy sees every `vars` key
+# missing. (A loader that applied `variables` after `vars` and replaced the
+# container, as upstream CFEngine does, would leave the same ids with another
+# command; that content difference is the cross-check's whole-container
+# comparison, tested in check 10 against the stand-in loader, "service|interlock
+# value changed under the same id", and in check 11 against a replaced file.)
 cp "$repo/tests/policy/fixtures/cmdb-variables-collision.json" "$work/data/host_specific.json"
 out="$work/xc-collision.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
 check "variables-section collision: refusal reported" refusal_reported "$out"
-check "variables-section collision: the content difference is named" \
-    grep -q "key 'tendcf_interlock' content differs between" "$out"
-check "variables-section collision: not an id difference" \
-    bash -c "! grep -q 'loaded differently' '$out'"
+check "variables-section collision: the loader refuses the duplicate variable" \
+    grep -q "Invalid variable specification in CMDB data: 'tendcf_interlock' names the variable 'data:variables.tendcf_interlock' that another entry names too" "$out"
+check "variables-section collision: the loader installs none of the file" \
+    grep -q "installing none of its contents" "$out"
+check "variables-section collision: tendcf_interlock is reported not installed" \
+    key_not_loaded "$out" tendcf_interlock
+check "variables-section collision: nothing was loaded to differ in content" \
+    bash -c "! grep -q 'content differs' '$out'"
 check "variables-section collision: the section is named" \
     grep -q "has top-level section 'variables' besides 'vars'" "$out"
 check "variables-section collision: refusal reported once" refusal_once "$out"

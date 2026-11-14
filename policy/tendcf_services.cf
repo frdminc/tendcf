@@ -74,8 +74,9 @@
 # does not, and for a gap in either. The check does not model WHY an entry was
 # dropped. It reads the file itself and compares it with what the loader installed:
 #   - the file's top-level keys must be exactly `vars`. The loader also applies
-#     a `variables` section (loaded AFTER `vars`, replacing a same-named
-#     variable) and a `classes` section (which can define `interlock_ok_*`);
+#     a `variables` section (after `vars`; upstream CFEngine lets it replace a
+#     same-named variable, the fork at the pin refuses a file that names one
+#     variable twice) and a `classes` section (which can define `interlock_ok_*`);
 #     the projector emits neither (N-2, bin/projector.py check_projection), so
 #     any other top-level key is refused rather than compared;
 #   - every key under `vars` must be a plain identifier ([A-Za-z0-9_]+). The
@@ -94,7 +95,8 @@
 #     a scalar as a string (storejson() fails) and a list of primitives as an
 #     slist of strings (numbers read back as strings; a list of strings reads
 #     back equal and is accepted). Equal ids with changed values, as a
-#     `variables` entry would give, are caught. A comparison that cannot be
+#     loader that replaced a container (upstream's `variables` section) would
+#     give, are caught. A comparison that cannot be
 #     computed is a problem of its own (`..._problem_uncomparable_<key>`, or
 #     `..._problem_noverdict_<key>` when both texts exist but neither equality
 #     nor a difference could be evaluated), not the absence of a difference;

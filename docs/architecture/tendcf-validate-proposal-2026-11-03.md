@@ -1148,9 +1148,11 @@ cannot differ on a consistent file; a `vars` value that is not an object is
 refused when it reads back differently: the loader installs a scalar as a
 string, which `storejson()` cannot read, and a list of numbers as an slist of
 strings, while a list of strings reads back equal and is accepted.) It
-also refuses any top-level key of the file other than `vars` (the fork's
-loader also applies `variables`, loaded after `vars`, and `classes`, which can
-define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
+also refuses any top-level key of the file other than `vars` (the loader also
+applies `variables`, loaded after `vars` (the fork at the pin refuses a file
+in which `variables` names a variable `vars` already names; upstream replaces
+it), and `classes`, which can define `interlock_ok_*`; the projector emits
+neither, N-2), any `vars` key that
 is not a plain identifier `[A-Za-z0-9_]+` (the loader reads a key as a variable
 reference, `GetCMDBVariableRef`, so `default:tendcf_services.service_ids`
 presets a variable of the policy's own bundles), a loaded `data:variables.*`
