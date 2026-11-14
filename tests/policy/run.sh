@@ -646,6 +646,21 @@ done
 check "uncomparable vars values: the object containers are not blamed" \
     bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content (differs|could not be compared)\" '$out'"
 
+# A key that is a plain identifier but longer than the 64 characters a report
+# may show (Astra round 3, A2): refused as before, and the report line shows at
+# most its first 64 characters. The 70-character key is the loader's own scalar
+# case again, so it is refused for the same reason as 'scalar' above.
+long_key="$(printf 'k%.0s' $(seq 1 70))"
+long_head="${long_key:0:64}"
+printf '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"%s":"x"}}\n' "$long_key" >"$work/data/host_specific.json"
+out="$work/xc-longkey.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "long key: refusal reported" refusal_reported "$out"
+check "long key: the report line shows its first 64 characters" \
+    grep -Eq "key '$long_head' content (differs|could not be compared) between" "$out"
+check "long key: no report line shows more than 64 characters of it" \
+    bash -c "! grep -q 'key .${long_head}[A-Za-z0-9_]' '$out'"
+
 # A `vars` key can preset any variable of the policy, the checker's own included
 # (adversary M1): a vars promise whose rvalue is a function call is skipped when
 # the variable already exists (verify_vars.c, "Already did this"), so a preset
@@ -840,9 +855,27 @@ echo "info: tendcf_cmdb resolved $n_res times; vars 'doc' visited $n_doc times, 
 check "probe (debug run): the mutation script ran" [ "$n_mut" -ge 1 ]
 check "probe (debug run): the file is read once (doc promise evaluated once)" [ "$n_doc" = 1 ]
 
+# A comparison that has no verdict (adversary round 3, L1): B is A with one
+# pre_action element changed to `/usr/bin/true$(nonexistent)`, swapped in before
+# the check's read. strcmp() is skipped when an argument still holds `$(`, so
+# neither a difference nor an equality is computed; the check must refuse anyway,
+# name the key and run nothing. (The loader refuses `$(` in a value, so this can
+# only be a file replaced after the loader's read, which is what the probe does.)
+printf '%s\n' "${probe_a//\"\/usr\/bin\/true\"/\"\/usr\/bin\/true\$(nonexistent)\"}" > "$work/probe-B.json"
+probe_start
+out="$work/xc-probe-noverdict.out"
+"$cf_agent" -K -I -D probe_before -f "$work/inputs/probe-before.cf" >"$out" 2>&1 || true
+check "probe no verdict: the file was replaced" probe_replaced
+check "probe no verdict: the replacement really holds a \$( element" \
+    grep -qF "true\$(nonexistent)" "$work/data/host_specific.json"
+check "probe no verdict: refused" refusal_reported "$out"
+check "probe no verdict: the key is named" \
+    grep -Eq "key 'tendcf_interlock' content (differs|comparison reached no verdict) between" "$out"
+check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_action)" no_actuation "$out"
+
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
