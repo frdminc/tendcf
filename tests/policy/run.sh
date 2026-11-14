@@ -657,11 +657,18 @@ for fx in checker-preset checker-preset-keys classes-hidden; do
     out="$work/xc-$fx.out"
     "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
     check "$fx: refusal reported" refusal_reported "$out"
-    check "$fx: the foreign variable is reported" foreign_var_reported "$out"
+    if [ "$fx" != classes-hidden ]; then
+        check "$fx: the foreign variable is reported" foreign_var_reported "$out"
+    fi
     check "$fx: refusal reported once" refusal_once "$out"
     check "$fx: nothing actuated (no pre_action, no service processed)" no_actuation "$out"
 done
+# Its presets of the checker's variables are replaced by the policy's own values
+# (check 11 shows function-call vars are re-evaluated), so the section and the
+# class are what the policy sees; the foreign class is the loaded-state evidence.
 check "classes-hidden: the foreign class is reported" foreign_class_reported "$work/xc-classes-hidden.out"
+check "classes-hidden: the section is reported too" \
+    grep -q "has top-level section 'classes' besides 'vars'" "$work/xc-classes-hidden.out"
 
 # Augments (def.json in inputs/) are loaded after the CMDB and can define classes
 # and variables just the same. tendcf ships none, so any is refused.
@@ -765,9 +772,13 @@ echo "# 11. when does the engine evaluate tendcf_cmdb? (tests/policy/probe-mutat
 # The file is consistent with what the loader installed (A). A common bundle
 # resolved after tendcf_cmdb replaces it with B: same keys and ids, another
 # pre_action command. If the engine evaluated tendcf_cmdb's variables or classes
-# again, the policy would read B; it must then refuse everything. If it does not,
-# the pre_action of A runs, never B's. Either way B is never acted on. The debug
-# log (-d) counts the evaluations, so a later engine change shows up here.
+# again and read the file, the policy would see B; it must then refuse
+# everything. The policy reads the file once (the `doc` promise is skipped once
+# `doc` exists), so the expected outcome is the second one: A was compared and
+# the loaded pre_action (A's) runs, never B's. Either way B is never acted on.
+# Measured on the pinned fork (2026-11-14, Linux CI): tendcf_cmdb is resolved
+# twice and its vars are visited on every pass, its classes once. The debug log
+# (-d) counts the visits, so a later engine change shows up as a changed count.
 cat > "$work/inputs/probe-entry.cf" <<EOF2
 body common control
 {

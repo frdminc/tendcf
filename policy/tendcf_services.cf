@@ -131,46 +131,45 @@
 #
 # Presets. The loader installs a `vars` key under any name, so a key such as
 # `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
-# that variable before any policy runs. Redefinition decides what a preset does,
-# and it differs by the kind of rvalue (verify_vars.c VerifyVarPromise and
-# CollectConvergeVariableOptions, commit b8abf28408b1 pinned in
-# overlay/fork.json). A promise with a LITERAL rvalue (`slist => { }`,
-# `string => "..."`) redefines an existing variable, so the preset is gone and
-# the policy's value stands. A promise whose rvalue is a FUNCTION CALL
-# (`readjson`, `getindices`, `difference`, `grep`, ... which is what every
-# variable the checker computes and the non-refused id lists are) is skipped
-# when the variable already exists ("Already did this"), so a preset keeps its
-# value and the policy's own promise never runs. Presetting the checker's `doc`,
-# `bad_keys` or `missing_keys`, or a gate's `interlock_ids`, would therefore
-# change what the check compares or which interlocks gate a service. The fix is
-# not to make each variable immune but to refuse the preset: a variable the
-# CMDB installed under any name but `data:variables.<identifier>` makes
-# `tendcf_cmdb_problem_foreign_var`, read from the variable table with the
-# `source=cmdb` tag, and a preset of a function-call variable keeps that tag.
-# (A preset of a literal-rvalue variable is overwritten with the policy's value
-# before it is read, and also refused when the tag is still there.) Under the
-# refusal the id lists are literal empty lists, which do redefine a preset.
+# that variable before any policy runs. What a preset does then depends on the
+# promise (verify_vars.c VerifyVarPromise, commit b8abf28408b1 pinned in
+# overlay/fork.json): a promise with a LITERAL rvalue (`slist => { }`) always
+# redefines it, so the policy's value stands. A promise whose rvalue is a
+# FUNCTION CALL is skipped when the variable exists ("Already did this") if the
+# call was not already evaluated to a value when the promise runs, and
+# otherwise redefines it; which of the two happens is not something this policy
+# relies on (tests/policy/run.sh check 9 saw both: some presets of the checker's
+# and the gates' variables stayed, some were replaced by the policy's value).
+# So the check does not try to make each variable immune: any variable the CMDB
+# (or an augments file) installed under a name other than
+# `data:variables.<identifier>` and still carrying the loader's tag when the
+# classes are evaluated makes `tendcf_cmdb_problem_foreign_var`, read from the
+# variable table, and a preset that was replaced is the policy's own value. The
+# checker's `doc` is guarded to be read once, so a preset of it is never
+# overwritten by a later pass and is refused by that class. Under the refusal
+# the id lists are literal empty lists, which redefine a preset.
 #
-# Order and evaluation. The fork evaluates the vars and the classes of every
+# Order and evaluation, as measured on the pinned fork (tests/policy/run.sh
+# check 11, debug log of a real cf-agent): `tendcf_cmdb` is resolved twice, its
+# vars are visited on every pass, the readjson of `doc` included, and its
+# classes are decided once. The fork evaluates the vars and the classes of every
 # `bundle common` before the vars of any other bundle, independently of
-# `bundlesequence`: PolicyResolve resolves the common bundles first and
-# BundleResolve runs their vars, then classes, then vars again
-# (libpromises/expand.c:846-871 and 1145-1177 at the pinned commit), so
-# `tendcf_cmdb_refused` is decided before the `!tendcf_cmdb_refused` on the agent
-# bundles' `*_ids` is first read. That is a statement about vars and classes
-# only, not that a common bundle's every promise type runs to completion first.
-# Whether and how often the engine evaluates `tendcf_cmdb` again after that is
-# measured, not assumed: tests/policy/run.sh check 11 counts the evaluations in
-# the debug log of a real cf-agent and replaces the file between them. The
-# check does not depend on the answer. Each problem class is defined from the
-# CURRENT comparison, in positive form (a difference, an uncomputable side, a
-# foreign variable), never as the negation of a class that was set once and
-# stays set: a class is never undefined, and a promise for an already-set class
-# is skipped (libpromises/promises.c), so "not equal" read from a sticky
-# "equal" class would stay false after a later mismatch. A problem class, once
-# set, stays set, which is the safe direction. The classes of the common bundle
-# run in one pass in written order: `tendcf_cmdb_refused` comes after every
-# `tendcf_cmdb_problem_*` class; do not reorder them.
+# `bundlesequence` (PolicyResolve and BundleResolve, libpromises/expand.c:846-871
+# and 1145-1177), so `tendcf_cmdb_refused` is decided, on the first pass over
+# the file, before the `!tendcf_cmdb_refused` on the agent bundles' `*_ids` is
+# first read. A later vars pass that re-read the file would see a replacement
+# the decision never compared, so `doc` is read ONCE: its promise is skipped
+# once `doc` exists, every comparison input is derived from that one snapshot,
+# and no later pass reads the file. The probe of check 11 replaces the file
+# between the passes and shows that the loaded data are acted on and the
+# replacement is not. Each problem class is defined from the current comparison,
+# in positive form (a difference, an uncomputable side, a foreign variable),
+# never as the negation of a class set once and never cleared: a promise for an
+# already-set class is skipped (libpromises/promises.c), so "not equal" read
+# from a sticky "equal" class would stay false after a later mismatch. The
+# classes of the common bundle run in one pass in written order:
+# `tendcf_cmdb_refused` comes after every `tendcf_cmdb_problem_*` class; do not
+# reorder them.
 #
 # What is NOT guaranteed: the check compares the file with the loader's state at
 # the evaluation. A file replaced after the last evaluation, or by a promise
@@ -192,9 +191,14 @@ bundle common tendcf_cmdb
 
       # 5242880 = the loader's HOST_SPECIFIC_DATA_MAX_SIZE (5 MiB). An absent
       # file leaves `doc` undefined and is not an error.
+      #
+      # Read ONCE (see "Order and evaluation"): the engine visits this promise on
+      # every later pass, and a second read could return a file the classes never
+      # compared. `not(isvariable("doc"))` skips it once `doc` exists, a preset
+      # included (which is then refused as a foreign variable).
       "doc"
         data => readjson("$(file)", 5242880),
-        ifvarclass => fileexists("$(file)");
+        ifvarclass => and(fileexists("$(file)"), not(isvariable("doc")));
 
       "file_keys"
         slist => getindices("doc[vars]"),
