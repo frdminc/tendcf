@@ -71,6 +71,16 @@
       "additionalProperties": false
     },
 
+    "interlock_argv": {
+      "description": "An interlock pre_action argv, held to an alphabet instead of being escaped. The bundle joins the argv with single spaces and hands the string to cf-agent's commands promise with useshell => noshell, which splits it again on whitespace and treats a leading \" ' or ` as a quote (libpromises/exec_tools.c ArgSplitCommand); no shell runs, so `;`, `|`, `&&`, redirection and `$(` are inert there. The alphabet keeps that join/split lossless and keeps a shell-shaped argv out of the file even if a shell were ever reintroduced: ASCII letters, digits and `. _ + @ : = , / -`, one or more characters, no space, quote, backslash, `$`, `%`, glob or control character. command[0] additionally starts with `/`: the executable is an absolute path, never a PATH lookup. `not` forbids a newline anywhere because a `$`-anchored pattern in some regex engines (Python's) also matches before a trailing newline.",
+      "type": "array",
+      "prefixItems": [
+        { "type": "string", "pattern": "^/[A-Za-z0-9._+@:=,/-]+$", "not": { "pattern": "\\n" } }
+      ],
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9._+@:=,/-]+$", "not": { "pattern": "\\n" } },
+      "minItems": 1
+    },
+
     "interlock": {
       "description": "A stated precondition (D16(c), Bcfg2 Actions semantics). Compiles to a CFEngine guard class plus a bundle-scoped refusal: if the pre-action fails, EVERY entry in the enclosing bundle is blocked from modification and the failure is reported. Blast radius and reporting are consts, not author choices — that is what structurally closes 'VPN must be authenticated before lockdown may be enforced' rather than leaving it as a safe default plus a comment.",
       "type": "object",
@@ -84,11 +94,7 @@
         "pre_action": {
           "type": "object",
           "properties": {
-            "command": {
-              "type": "array",
-              "items": { "type": "string" },
-              "minItems": 1
-            },
+            "command": { "$ref": "common.schema.json#/$defs/interlock_argv" },
             "expect_exit": { "type": "integer", "default": 0 },
             "timeout_seconds": { "type": "integer", "minimum": 1, "default": 30 }
           },

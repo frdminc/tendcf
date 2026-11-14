@@ -497,11 +497,7 @@
         "pre_action": {
           "type": "object",
           "properties": {
-            "command": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 },
-              "minItems": 1
-            },
+            "command": { "$ref": "common.schema.json#/$defs/interlock_argv" },
             "expect_exit": { "type": "integer", "minimum": 0, "maximum": 255 },
             "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
           },
