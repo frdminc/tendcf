@@ -242,15 +242,19 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
 
 - `tests/policy/run.sh --bindir DIR` runs the generic bundle against a real
   `cf-agent`/`cf-promises` (Mac dev build: `~/opt/cfengine-dev/bin`); it is
-  the test CI runs on Linux. The policy-layer assertions (the cross-check's
-  refusal, no actuation) run against any `cf-agent`. The assertions about the
-  CMDB loader itself (its log strings, "this container was not installed")
-  hold only for the pinned fork's all-or-nothing loader: a probe in check 4b
-  decides once, and on any other build (the Mac dev build today) those
-  assertions print `SKIP (loader not all-or-nothing): <name>`, never pass
-  silently. The Linux CI legs set `TENDCF_REQUIRE_FORK_LOADER=1`, which makes
-  a skip a failure. Whether the Mac dev build stays a test target is an open
-  operator question. Run it through
+  the test CI runs on Linux. Policy-layer assertions that hold on any loader
+  (most of the file) run against any `cf-agent`. Two kinds hold only with the
+  pinned fork's all-or-nothing, strict-parse loader: loader assertions (its log
+  strings, "this container was not installed") and loader+policy integration
+  assertions (9b: the cross-check's refusal and no actuation for a repeated
+  member, a repeated `vars`, trailing input; a lenient loader and the lenient
+  `readjson` see the same surviving data, so there is nothing to refuse). A
+  probe in check 4b decides once; on any other build each of those prints
+  `SKIP (loader not all-or-nothing): <name>`, never passes silently, and the
+  run is expected to pass with SKIP lines and a count (not yet run on the Mac:
+  derived from the parser behaviour). The Mac dev build stays a target
+  (operator, 2026-11-14, "keep Mac, SKIPs"). The Linux CI legs set
+  `TENDCF_REQUIRE_FORK_LOADER=1`, which makes a skip a failure. Run it through
   `~/ops/site-private/bin/bg`. Two checks are opt-in because they reshape the
   host and need root: `TENDCF_TEST_SYSTEMD=1` (check 6, the real-systemd
   lifecycle; the ubuntu VM jobs) and `TENDCF_TEST_NIXOS_SHAPE=1` (check 7,

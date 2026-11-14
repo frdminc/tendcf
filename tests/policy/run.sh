@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # Generic-bundle tests for policy/tendcf_services.cf against a real cf-agent.
 #
-# Nothing here touches launchd or /Library/LaunchDaemons. Most assertions are
-# policy-layer and hold on any cf-agent (a Linux CI runner, the Mac dev build).
-# The ones about the CMDB loader's own behaviour (its log strings, the
-# duplicate-variable message, "this container was not installed") hold only for
-# the pinned fork's all-or-nothing loader (overlay/fork.json). They go through
-# fork_only(): a one-time capability probe in check 4b (a file with a repeated
-# member of `vars`) decides whether the loader is the fork's, and on any other
-# build each such assertion prints `SKIP (loader not all-or-nothing): <name>`,
-# never a silent pass, and the run ends with a count of skips. The Linux CI legs
-# set TENDCF_REQUIRE_FORK_LOADER=1, which turns a non-fork loader (so, any skip)
-# into a failure. Whether the Mac dev build stays a target is an open operator
-# question; both states are honest here. Checks:
+# Nothing here touches launchd or /Library/LaunchDaemons. Two kinds of
+# assertion hold only with the pinned fork's all-or-nothing, strict-parse loader
+# (overlay/fork.json), and go through fork_only():
+#   - loader assertions: its log strings, the duplicate-variable message, "this
+#     container was not installed", the probe-absent lines;
+#   - loader+policy integration assertions: the cross-check's refusal and the
+#     absence of actuation for a repeated member, a repeated `vars` and trailing
+#     input (9b dup-member, dup-vars, trailing). A lenient loader and the lenient
+#     readjson see the same surviving data, so the cross-check has no difference
+#     to refuse and the interlock or service guard acts instead.
+# Everything else is policy-layer and holds on any cf-agent (the Linux CI
+# legs, the Mac dev build). A one-time capability probe in check 4b (a file with
+# a repeated member of `vars`) decides whether the loader is the fork's; on a
+# non-fork run (the Mac dev build, retained as a target by the operator,
+# 2026-11-14) each fork_only assertion prints `SKIP (loader not all-or-nothing):
+# <name>` and the run is expected to pass with those SKIP lines and a final
+# count, never a silent pass. The Linux CI legs set TENDCF_REQUIRE_FORK_LOADER=1,
+# which turns a non-fork loader (so, any skip) into a failure. The non-fork
+# outcome has been derived from the parser behaviour, not yet run on the Mac.
+# Checks:
 #
 #   1. wiring: cf-promises parses the bundle with the example projection
 #      (examples/host_specific.json) installed as CMDB data, so every
@@ -113,8 +121,10 @@
 #      top-level `vars` whose later section drops the interlock (dup-vars),
 #      non-whitespace after a valid document (trailing), a whitespace-only
 #      default-namespace class name (class-space). Each must be refused and
-#      reported once by PR 42's cross-check and actuate nothing (unconditional);
-#      on the fork each also loads nothing, logs the loader's reason and
+#      reported once by PR 42's cross-check and actuate nothing (fork_only for
+#      the first three, the integration assertions above; unconditional for
+#      class-space, whose `classes` section the cross-check refuses on any
+#      loader); on the fork each also loads nothing, logs the loader's reason and
 #      reports each key as not loaded (fork_only). A class that already exists (class-exists,
 #      the host's own hard class) is not an error: the fork leaves it as it is
 #      and installs the rest, so no refusal is expected; the case asserts that
@@ -123,6 +133,12 @@
 #      `vars` section, so the report names only what that section holds
 #      (tendcf_service), not the interlock the loader dropped: the
 #      cross-check's independence from the loader is limited (proposal 13).
+#      Two empty-view controls (empty-dup-vars `{"vars":{},"vars":{}}`,
+#      empty-trailing `{"vars":{}}` plus trailing input) are refused by the
+#      strict loader but read as an empty `vars` by readjson: nothing installs,
+#      nothing actuates and no cross-check report is made (asserted on any
+#      loader; only the loader's refusal is fork_only). No actuation is not a
+#      refusal report.
 #  10. the same cross-check against a loader that skips ONE container, which
 #      neither the Mac dev build nor the pinned fork does: tests/policy/sim-loader.cf
 #      installs data:variables.* in the loader's place (cf-agent
@@ -217,9 +233,11 @@ check() {  # check NAME COND...
 }
 
 # Assertions that hold only on the pinned fork's CMDB loader (overlay/fork.json:
-# all-or-nothing, strict parse): its log strings, and "this container was not
-# installed". Policy-layer assertions (the cross-check's refusal, no actuation)
-# stay on `check` and run against every loader. fork_loader is set once, by the
+# all-or-nothing, strict parse): its log strings, "this container was not
+# installed", and the loader+policy integration assertions of 9b (the
+# cross-check's refusal and no actuation for a repeated member, a repeated
+# `vars`, trailing input). Policy-layer assertions that hold on every loader
+# stay on `check`. fork_loader is set once, by the
 # probe in check 4b. A loader that is not the fork's makes fork_only print a
 # SKIP line, never pass silently; TENDCF_REQUIRE_FORK_LOADER=1, which the Linux
 # CI legs set because they build the pinned fork, turns "not the fork's loader"
@@ -867,20 +885,35 @@ check "list of strings in vars: actuates normally (the pre_action ran)" \
 
 echo "# 9b. the real loader's strict parse and class handling (fork 6505f488a), policy level"
 # What the pinned loader does with each file is read from libpromises/cmdb.c at
-# 6505f488a (line numbers there), and each case asserts it. Whatever it does, the
-# cross-check refuses and nothing actuates: those assertions are unconditional.
+# 6505f488a (line numbers there), and each case asserts it. The cross-check's
+# refusal and the absence of actuation are asserted unconditionally only where
+# the policy refuses on its own (class-space, class-exists: a `classes` section)
+# or where nothing can actuate (the empty-view controls). For a repeated member,
+# a repeated `vars` and trailing input they are loader+policy integration
+# assertions (strict_case POLICY=fork): a lenient loader and the lenient readjson
+# see the same surviving data, the cross-check has nothing to refuse, and the
+# interlock or the service guard acts, so they SKIP on a non-fork loader.
 # Where the loader refuses the file, `key_not_loaded` reports each key of the
 # file the cross-check could read: it reads with readjson, which stays lenient,
 # so after a repeated member or a repeated `vars` section it sees the LAST one
 # only, and an earlier container (here the interlock of case b) is not named.
 # That is the limit of the cross-check's independence from the loader's parser.
-strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE KEY...
-    local name="$1" fixture="$2" pattern="$3" none="$4"; shift 4
+# POLICY is `any` when the cross-check refuses on any loader (the file has a
+# `classes` section, which it refuses on its own), `fork` when the refusal and
+# the absence of actuation depend on the strict loader: a lenient loader and the
+# lenient readjson read the same surviving member, section or prefix, so the
+# cross-check sees no difference, and the interlock (whose pre_action fails) or
+# the service's own guard actuates or reports. Those are loader+policy
+# integration assertions and SKIP on a non-fork loader.
+strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE POLICY KEY...
+    local name="$1" fixture="$2" pattern="$3" none="$4" policy="$5"; shift 5
+    local pcheck=check
+    [ "$policy" = fork ] && pcheck=fork_only
     out="$work/strict-$name.out"
     cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
     "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-    check "$name: the policy refuses and reports it" refusal_reported "$out"
-    check "$name: the policy reports it once" refusal_once "$out"
+    "$pcheck" "$name: the policy refuses and reports it" refusal_reported "$out"
+    "$pcheck" "$name: the policy reports it once" refusal_once "$out"
     fork_only "$name: the loader refuses the file" grep -q "$pattern" "$out"
     if [ "$none" = yes ]; then
         fork_only "$name: the loader installs none of the file" \
@@ -890,7 +923,7 @@ strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE KE
     for k in "$@"; do
         fork_only "$name: $k reported not installed" key_not_loaded "$out" "$k"
     done
-    check "$name: nothing actuated (no service, no interlock, no render)" no_actuation "$out"
+    "$pcheck" "$name: nothing actuated (no service, no interlock, no render)" no_actuation "$out"
     probe "$fixture" "$work/probe-strict-$name.out"
     fork_only "$name: no tendcf_interlock variable" \
         grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-strict-$name.out"
@@ -902,19 +935,19 @@ dup_member="Could not parse JSON file .*host_specific\\.json: Unwilling to parse
 # The lenient parser keeps the last (valid) one; the strict parse the loader reads
 # with (cmdb.c:59-84 ReadJsonFileMode, :1171-1177) refuses the file before any
 # validation, so the first value is no longer discarded unseen.
-strict_case dup-member loader-dup-member.json "$dup_member" no tendcf_interlock tendcf_service
+strict_case dup-member loader-dup-member.json "$dup_member" no fork tendcf_interlock tendcf_service
 # (b) `vars` twice at the top level, the later one without the interlock
-strict_case dup-vars loader-dup-vars.json "$dup_member" no tendcf_service
+strict_case dup-vars loader-dup-vars.json "$dup_member" no fork tendcf_service
 # (c) a complete valid document, then more input (the lenient parser stops after
 # the first document and ignores the rest)
 strict_case trailing loader-trailing.json \
     "Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with trailing non-whitespace characters" \
-    no tendcf_interlock tendcf_service
+    no fork tendcf_interlock tendcf_service
 # (d) a default-namespace class whose name is whitespace only: refused in
 # validation (CheckCMDBClassName, cmdb.c:776-), so nothing is installed, where it
 # used to reach insertion, fail, and be taken for "a class that exists already"
 strict_case class-space loader-class-space.json \
-    "Invalid CMDB class 'default: ': the class name starts or ends with whitespace" yes \
+    "Invalid CMDB class 'default: ': the class name starts or ends with whitespace" yes any \
     tendcf_interlock tendcf_service
 check "class-space: the classes section is named by the policy" \
     grep -q "has top-level section 'classes' besides 'vars'" "$out"
@@ -945,6 +978,26 @@ fork_only "class-exists: the good variables were installed" \
     bash -c "! grep -q 'but CFEngine did not load' '$out'"
 fork_only "class-exists: the existing class was not redefined by the CMDB" \
     bash -c "! grep -q 'defined a class' '$out'"
+
+# (f) empty-view controls (Astra r2 C1, adversary r2 I1). The strict loader refuses
+# each file, but the lenient readjson the cross-check reads with sees an EMPTY
+# `vars` (the last of two, or the prefix before the trailing input), the same as
+# `{"vars":{}}` in check 9: nothing is installed, nothing actuates, and the
+# cross-check has nothing to report. So there is no refusal report here, and none
+# is claimed: the loader's own ERR is the only trace. On any loader the file is
+# empty or lenient-empty, so no report and no actuation hold everywhere; only the
+# loader's refusal is fork-only.
+for spec in "empty-dup-vars:loader-empty-dup-vars.json:Unwilling to parse json data with a duplicate object member" \
+            "empty-trailing:loader-empty-trailing.json:Unwilling to parse json data with trailing non-whitespace characters"; do
+    name=${spec%%:*}; rest=${spec#*:}; fixture=${rest%%:*}; pattern=${rest#*:}
+    out="$work/strict-$name.out"
+    cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: the lenient view is empty, so no cross-check report" no_crosscheck "$out"
+    check "$name: nothing actuated" no_actuation "$out"
+    fork_only "$name: the loader refuses the file" \
+        grep -q "Could not parse JSON file .*host_specific\\.json: $pattern" "$out"
+done
 
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
@@ -1116,7 +1169,7 @@ if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
-             strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists \
+             strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
