@@ -242,7 +242,15 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
 
 - `tests/policy/run.sh --bindir DIR` runs the generic bundle against a real
   `cf-agent`/`cf-promises` (Mac dev build: `~/opt/cfengine-dev/bin`); it is
-  platform-independent and is the test CI runs on Linux. Run it through
+  the test CI runs on Linux. The policy-layer assertions (the cross-check's
+  refusal, no actuation) run against any `cf-agent`. The assertions about the
+  CMDB loader itself (its log strings, "this container was not installed")
+  hold only for the pinned fork's all-or-nothing loader: a probe in check 4b
+  decides once, and on any other build (the Mac dev build today) those
+  assertions print `SKIP (loader not all-or-nothing): <name>`, never pass
+  silently. The Linux CI legs set `TENDCF_REQUIRE_FORK_LOADER=1`, which makes
+  a skip a failure. Whether the Mac dev build stays a test target is an open
+  operator question. Run it through
   `~/ops/site-private/bin/bg`. Two checks are opt-in because they reshape the
   host and need root: `TENDCF_TEST_SYSTEMD=1` (check 6, the real-systemd
   lifecycle; the ubuntu VM jobs) and `TENDCF_TEST_NIXOS_SHAPE=1` (check 7,
