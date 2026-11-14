@@ -1168,18 +1168,31 @@ tag (`classmatch`). tendcf ships no `def.json`, so augments are refused too (a
 host that needs one must be exempted in the policy, on purpose). The content
 comparison no longer reads the negation of a class set once and never cleared
 (`tendcf_cmdb_json_equal_*`); `tendcf_cmdb_problem_differs_<key>` is defined
-from the current texts and `..._uncomparable_<key>` from a side that could not
-be serialised. Measured on the pinned fork (check 11, debug log of a real
-cf-agent): `tendcf_cmdb` is resolved twice, its vars are visited on every pass
-(the `readjson` of `doc` included) and its classes are decided once, so a
-later vars pass could have read a file the classes never compared. `doc` is
+from the current texts, `..._uncomparable_<key>` from a side that could not be
+serialised, and `..._noverdict_<key>` when both texts exist but neither
+equality nor a difference could be evaluated (`strcmp()` is skipped when an
+argument still holds `$(`, which a file replaced after the loader's read can
+give; the positive `tendcf_cmdb_json_same_<key>` it reads only silences that
+one refusal and cannot hide a difference). Measured on the pinned fork (check
+11, debug run of a real cf-agent, the replaced-file case, CI run 43626676907
+at 87a4b58): `tendcf_cmdb` was resolved 2 times, the `doc` promise visited 1
+time, `file_json[..]` 10 times and `tendcf_cmdb_refused` 2 times, and the
+mutation script ran 1 time. A class is set once and never cleared; a class
+still unset is evaluated again on the second resolution, from the same
+snapshot. Its vars are visited on every resolution, so a later pass could have
+read a file the classes never compared. `doc` is
 therefore read once (its promise is skipped once it exists) and every
 comparison input derives from that snapshot. Check 11 pins both timings of a
 file replaced during the run: before the read the comparison refuses ("content
 differs", nothing runs); after it the policy never sees the replacement and
 acts on the loaded data it checked. Reports print file-derived text only with
 characters outside `[A-Za-z0-9._:@/-]` replaced by `?` and cut to a fixed
-length. `tendcf-install.sh data` installs by atomic rename. Not checked: a file
+length (64 characters for a key, section name or id, whether or not it is a
+plain identifier). The check and the gated bundles share one file because the
+fork resolves each file when it is loaded and the whole policy again after;
+were they split, the literal empty id lists under a refusal would still
+redefine the ids, so the split would fail closed. `tendcf-install.sh data`
+installs by atomic rename. Not checked: a file
 replaced after the last read (no check can see it).
 
 On any mismatch it defines the one

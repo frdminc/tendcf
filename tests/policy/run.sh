@@ -70,7 +70,8 @@
 #      hidden from the file-based checks by such a preset; and an augments file
 #      (`def.json` in inputs/) that defines a class and a variable. A `vars`
 #      container that is a list of strings is the positive control: accepted,
-#      actuates. Every file of checks 2-8 and 6 is also a no-report control.
+#      actuates. A plain-identifier key longer than 64 characters is refused and
+#      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
 #      NB: the fork's loader skips a bad entry and installs the rest, but the
 #      Mac dev build rejects the whole `vars` instead (the same fixture refuses
 #      on both, as "nothing loaded"), so only the fork's CI legs see the
@@ -95,7 +96,9 @@
 #      (refused, "content differs", nothing runs) and after it (the policy reads
 #      the file once, so not refused, the loaded pre_action runs and the replaced
 #      one does not); a debug run counts the reads (the doc promise is evaluated
-#      once) and prints the other counts (`info:`).
+#      once) and prints the other counts (`info:`). A third case swaps in a file
+#      whose pre_action element holds `$(` (strcmp() is skipped, so the comparison
+#      has no verdict): refused as "reached no verdict", nothing runs.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -870,7 +873,7 @@ check "probe no verdict: the replacement really holds a \$( element" \
     grep -qF "true\$(nonexistent)" "$work/data/host_specific.json"
 check "probe no verdict: refused" refusal_reported "$out"
 check "probe no verdict: the key is named" \
-    grep -Eq "key 'tendcf_interlock' content (differs|comparison reached no verdict) between" "$out"
+    grep -q "key 'tendcf_interlock' content comparison reached no verdict between" "$out"
 check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_action)" no_actuation "$out"
 
 if [ "$fail" != 0 ]; then
