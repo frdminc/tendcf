@@ -1,0 +1,151 @@
+name: macOS check 8 spike (WarpBuild)
+
+# SPIKE, not a CI gate. Builds the CFEngine fork pinned in overlay/fork.json on
+# a WarpBuild macOS runner and runs tests/policy/run.sh (check 8 in particular)
+# against it, to get real macOS evidence for frdminc/tendcf PR 52.
+#
+# Triggers are deliberately only this branch and manual dispatch: this file
+# must never run on master or on pull requests. Never open a PR from the
+# spike branch and never merge it.
+#
+# The build recipe follows core's own macOS job (.github/workflows/
+# macos_unit_tests.yml in the fork: brew lmdb automake openssl pcre2 autoconf
+# libtool librsync libyaml) plus the explicit --with-* paths of the local Mac
+# dev build (docs/architecture/UPSTREAM-CFE4735-REVIEW-BRIEF.md). The fork is
+# fetched at the exact pinned commit, libntech at core's submodule pointer,
+# as .github/actions/build-fork does on Linux.
+
+on:
+  push:
+    branches: [spike/macos-check8-warp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: warp-macos-26-arm64-12x
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner identity
+        shell: bash
+        run: |
+          echo "runner_name=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+          echo "image: ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          bash --version | sed -n 1p
+          command -v bash python3 brew
+          python3 --version
+
+      - name: Build dependencies (Homebrew)
+        shell: bash
+        run: |
+          set -euo pipefail
+          date +%s > "$RUNNER_TEMP/t-deps-start"
+          brew install lmdb automake openssl@3 pcre2 autoconf libtool librsync libyaml
+          command -v libtool automake autoconf
+          libtool -V | sed -n 1p
+          automake --version | sed -n 1p
+          autoconf --version | sed -n 1p
+          echo "deps seconds: $(( $(date +%s) - $(cat "$RUNNER_TEMP/t-deps-start") ))"
+
+      - name: Fetch the fork at the pinned commit
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          core_repo=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["core"]["repo"])')
+          core=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["core"]["commit"])')
+          libntech_repo=$(python3 -c 'import json;print(json.load(open("overlay/fork.json"))["libntech"]["repo"])')
+          core_dir="$RUNNER_TEMP/core"
+          git init -q "$core_dir"
+          git -C "$core_dir" remote add origin "$core_repo"
+          git -C "$core_dir" fetch -q --depth 1 origin "$core"
+          git -C "$core_dir" checkout -q FETCH_HEAD
+          libntech=$(git -C "$core_dir" rev-parse HEAD:libntech)
+          git init -q "$core_dir/libntech"
+          git -C "$core_dir/libntech" remote add origin "$libntech_repo"
+          git -C "$core_dir/libntech" fetch -q --depth 1 origin "$libntech"
+          git -C "$core_dir/libntech" checkout -q FETCH_HEAD
+          test "$(git -C "$core_dir" rev-parse HEAD)" = "$core"
+          echo "core=$core" >> "$GITHUB_OUTPUT"
+          echo "libntech=$libntech" >> "$GITHUB_OUTPUT"
+          echo "core_dir=$core_dir" >> "$GITHUB_OUTPUT"
+          echo "core $core"
+          echo "libntech $libntech"
+
+      - name: Build prefix
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/tendcf
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cd "${{ steps.pin.outputs.core_dir }}"
+          b() { echo "$(brew --prefix "$1")"; }
+          ./autogen.sh --enable-debug --prefix=/opt/tendcf \
+            --with-openssl="$(b openssl@3)" \
+            --with-pcre2="$(b pcre2)" \
+            --with-lmdb="$(b lmdb)" \
+            --with-librsync="$(b librsync)" \
+            --with-libyaml="$(b libyaml)"
+          t1=$(date +%s)
+          make -j"$(sysctl -n hw.ncpu)" CFLAGS="-Wall"
+          t2=$(date +%s)
+          make install
+          t3=$(date +%s)
+          echo "configure seconds: $((t1 - t0))"
+          echo "make seconds: $((t2 - t1))"
+          echo "install seconds: $((t3 - t2))"
+          echo "build total seconds (configure+make+install): $((t3 - t0))"
+
+      - name: Record the revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### CFEngine fork build (macOS spike)"
+            echo
+            echo "- core: \`${{ steps.pin.outputs.core }}\` (${{ runner.os }} ${{ runner.arch }}, runner $RUNNER_NAME)"
+            echo "- libntech: \`${{ steps.pin.outputs.libntech }}\`"
+            echo "- $(/opt/tendcf/bin/cf-agent --version | sed -n 1p)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          /opt/tendcf/bin/cf-agent -V
+          /opt/tendcf/bin/cf-agent --version
+
+      - name: Generic-bundle tests (tests/policy/run.sh)
+        shell: bash
+        run: |
+          # No TENDCF_TEST_SYSTEMD / TENDCF_TEST_NIXOS_SHAPE: Linux-only.
+          t0=$(date +%s)
+          set +e
+          tests/policy/run.sh --bindir /opt/tendcf/bin > "$RUNNER_TEMP/run-sh.log" 2>&1
+          rc=$?
+          set -e
+          t1=$(date +%s)
+          cat "$RUNNER_TEMP/run-sh.log"
+          echo "run.sh exit=$rc seconds=$((t1 - t0))"
+          echo "run.sh exit=$rc seconds=$((t1 - t0))" >> "$RUNNER_TEMP/run-sh.log"
+          exit "$rc"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-check8-run-sh-log
+          path: ${{ runner.temp }}/run-sh.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: macos-check8-config-log
+          path: ${{ runner.temp }}/core/config.log
+          if-no-files-found: ignore
+          retention-days: 14
