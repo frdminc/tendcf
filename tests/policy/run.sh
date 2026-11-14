@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # Generic-bundle tests for policy/tendcf_services.cf against a real cf-agent.
 #
-# Platform-independent on purpose: nothing here touches launchd or
-# /Library/LaunchDaemons, so the same run passes on a Linux CI runner and on
-# the Mac dev build. Three checks:
+# Nothing here touches launchd or /Library/LaunchDaemons. Most assertions are
+# policy-layer and hold on any cf-agent (a Linux CI runner, the Mac dev build).
+# The ones about the CMDB loader's own behaviour (its log strings, the
+# duplicate-variable message, "this container was not installed") hold only for
+# the pinned fork's all-or-nothing loader (overlay/fork.json). They go through
+# fork_only(): a one-time capability probe in check 4b (a file with a repeated
+# member of `vars`) decides whether the loader is the fork's, and on any other
+# build each such assertion prints `SKIP (loader not all-or-nothing): <name>`,
+# never a silent pass, and the run ends with a count of skips. The Linux CI legs
+# set TENDCF_REQUIRE_FORK_LOADER=1, which turns a non-fork loader (so, any skip)
+# into a failure. Whether the Mac dev build stays a target is an open operator
+# question; both states are honest here. Checks:
 #
 #   1. wiring: cf-promises parses the bundle with the example projection
 #      (examples/host_specific.json) installed as CMDB data, so every
@@ -26,6 +35,19 @@
 #      (darwin) and systemd (Linux booted by systemd), so the entry must be
 #      refused by name and nothing rendered, on every host (linux-targets.md
 #      step 3: the fail-closed guard, with this as its negative test).
+#   4b. malformed CMDB entries, enforce mode: a host_specific.json with one
+#      malformed entry (an unresolved variable reference in the interlock;
+#      then a key 'tendcf_interlock[' that the variable parser reads as the
+#      interlock container) beside a valid interlock and a present service.
+#      The policy layer must refuse and report it (refusal_reported,
+#      refusal_once) and actuate nothing on any loader. On the pinned fork's
+#      all-or-nothing loader the file also installs nothing (loader log
+#      strings; a probe policy finds neither data:variables.tendcf_interlock
+#      nor ...tendcf_service): those assertions are fork_only. A loader that
+#      skipped only the bad entry would let the service through unguarded,
+#      which the policy-layer assertions would catch.
+#      The same block holds the capability probe (fork_loader) and the
+#      TENDCF_REQUIRE_FORK_LOADER=1 assertion.
 #   5. host guard, enforce mode, non-Darwin only: a satisfied interlock and
 #      two present launchd services. launchd exists only on darwin, so a
 #      Linux host must refuse both, write nothing under /Library and run no
@@ -57,8 +79,10 @@
 #      actuates nothing; the consistent files of checks 2-4 raise no report; no
 #      file at all, and a file with no vars, are the normal empty case. Also
 #      refused and reported, each actuating nothing: a `variables` section that
-#      replaces a container under the same ids with another command (the
-#      comparison is of the whole container, not of key names and ids), a
+#      names a container of `vars` again (the fork at the pin refuses the file
+#      as a duplicate variable and installs none of it; the whole-container
+#      comparison that would catch the same ids with another command is tested
+#      in checks 10 and 11), a
 #      `classes` section, and a `vars` key that is not a plain identifier, which
 #      the loader would file under another scope (a preset of the policy's own
 #      id lists), and a `vars` value that is not an object (not comparable as
@@ -72,14 +96,41 @@
 #      container that is a list of strings is the positive control: accepted,
 #      actuates. A plain-identifier key longer than 64 characters is refused and
 #      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
-#      NB: the fork's loader skips a bad entry and installs the rest, but the
-#      Mac dev build rejects the whole `vars` instead (the same fixture refuses
-#      on both, as "nothing loaded"), so only the fork's CI legs see the
-#      per-entry skip.
+#      NB: the fork at the pin (overlay/fork.json, core 6505f488a) loads
+#      all-or-nothing (PR #41, operator ruling R13): a file in which an entry is
+#      invalid, a class cannot be inserted, a `vars` member or section is
+#      repeated, or non-whitespace follows the document, installs none of its
+#      contents (libpromises/cmdb.c, strict libntech parse; the strict parse is
+#      the CMDB loader's alone, readjson and def.json stay lenient). On the
+#      Linux legs this check sees every `vars` key missing, as the Mac dev build
+#      does when it rejects the whole `vars`. The same fixture refuses the same
+#      way on both ("nothing loaded"). No loader this check runs against skips
+#      one entry and installs the rest; the fork did before R13 (`8f0076b81`,
+#      B-5b), which is the 2026-11-02 fail-open.
+#  9b. the loader's strict-parse and class refusals, one fixture each in
+#      tests/policy/fixtures/loader-*.json, each beside a valid interlock and a
+#      present service: a repeated member of `vars` (dup-member), a repeated
+#      top-level `vars` whose later section drops the interlock (dup-vars),
+#      non-whitespace after a valid document (trailing), a whitespace-only
+#      default-namespace class name (class-space). Each must be refused and
+#      reported once by PR 42's cross-check and actuate nothing (unconditional);
+#      on the fork each also loads nothing, logs the loader's reason and
+#      reports each key as not loaded (fork_only). A class that already exists (class-exists,
+#      the host's own hard class) is not an error: the fork leaves it as it is
+#      and installs the rest, so no refusal is expected; the case asserts that
+#      `classes` beside good vars is still refused by the cross-check's own
+#      `classes` rule. In dup-vars the lenient readjson sees only the last
+#      `vars` section, so the report names only what that section holds
+#      (tendcf_service), not the interlock the loader dropped: the
+#      cross-check's independence from the loader is limited (proposal 13).
 #  10. the same cross-check against a loader that skips ONE container, which
-#      the Mac dev build cannot do: tests/policy/sim-loader.cf installs
-#      data:variables.* in the loader's place (cf-agent --no-host-specific-data)
-#      from the very file the policy reads. Each case must report what differs
+#      neither the Mac dev build nor the pinned fork does: tests/policy/sim-loader.cf
+#      installs data:variables.* in the loader's place (cf-agent
+#      --no-host-specific-data) from the very file the policy reads. It stays
+#      valid after R13: the check compares the file with what is installed
+#      whatever the loader's policy, and this is the only way to test the
+#      partial states (a fork before the pin, another engine, a gap in the
+#      loader's validation). Each case must report what differs
 #      and run nothing; the control case (everything installed) must run as
 #      before, so the others cannot pass because the stand-in installed nothing.
 #      A skipped interlock container with the services loaded is the 2026-11-02
@@ -165,6 +216,22 @@ check() {  # check NAME COND...
     if "$@"; then echo "ok   $name"; else echo "FAIL $name"; fail=1; fi
 }
 
+# Assertions that hold only on the pinned fork's CMDB loader (overlay/fork.json:
+# all-or-nothing, strict parse): its log strings, and "this container was not
+# installed". Policy-layer assertions (the cross-check's refusal, no actuation)
+# stay on `check` and run against every loader. fork_loader is set once, by the
+# probe in check 4b. A loader that is not the fork's makes fork_only print a
+# SKIP line, never pass silently; TENDCF_REQUIRE_FORK_LOADER=1, which the Linux
+# CI legs set because they build the pinned fork, turns "not the fork's loader"
+# into a failure, so CI cannot pass by skipping.
+fork_loader=unknown
+skipped=0
+fork_only() {  # fork_only NAME COND...
+    if [ "$fork_loader" = 1 ]; then check "$@"; return 0; fi
+    echo "SKIP (loader not all-or-nothing): $1"
+    skipped=$((skipped + 1))
+}
+
 # The cross-check's report. "refusing to actuate anything" is the summary line
 # tendcf_interlocks prints once; no_actuation is what a refused run must not do:
 # run any command (-I logs every one, pre_action included), render, or process
@@ -223,6 +290,79 @@ check "nothing rendered for the runit entry" \
     bash -c "! grep -q 'Created file' '$out'"
 check "no launchctl invocation" \
     bash -c "! grep -q launchctl '$out'"
+
+echo "# 4b. malformed CMDB entries: the loader fails closed"
+# Each fixture is a host_specific.json with one malformed entry next to a
+# valid interlock and a present service. The interlock's pre_action would
+# fail if it ran, so a loader that dropped only the bad entry (or let it take
+# the place of another) would let the service through unguarded: the service
+# would be processed and reported (the runit flavour is refused by name on
+# every host, check 4). The fork's all-or-nothing CMDB loader installs
+# nothing from a file it finds invalid (this one is), so no service and no
+# interlock exists to act on.
+# Besides what the agent did, the probe policy asks it directly whether either
+# container exists, which a service-only or interlock-only leftover cannot hide
+# from; its positive control is a file that loads.
+cp "$repo/tests/policy/fixtures/cmdb-probe.cf" "$work/inputs/cmdb-probe.cf"
+probe() {  # probe FIXTURE OUT: run the probe policy over FIXTURE as CMDB data
+    cp "$repo/tests/policy/fixtures/$1" "$work/data/host_specific.json"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$2" 2>&1 || true
+}
+probe interlock-refused.json "$work/probe-control.out"
+check "probe control: a file that loads has tendcf_interlock" \
+    grep -q "cmdb-probe: tendcf_interlock present" "$work/probe-control.out"
+check "probe control: a file that loads has tendcf_service" \
+    grep -q "cmdb-probe: tendcf_service present" "$work/probe-control.out"
+
+# Loader capability, once: a repeated object member in `vars` must install
+# nothing (the fork's strict parse, LoadCMDBData reading with JsonParseFileStrict,
+# cmdb.c:1171 at 6505f488a), where a lenient loader keeps the last member and
+# installs both containers. Positive evidence only: both "absent" lines.
+probe loader-dup-member.json "$work/probe-capability.out"
+if grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-capability.out" &&
+   grep -q "cmdb-probe: tendcf_service absent" "$work/probe-capability.out"; then
+    fork_loader=1
+    echo "# loader capability: all-or-nothing with strict parse (the pinned fork)"
+else
+    fork_loader=0
+    echo "# loader capability: NOT the pinned fork's loader; fork-only assertions print SKIP"
+fi
+if [ "${TENDCF_REQUIRE_FORK_LOADER:-0}" = 1 ]; then
+    check "TENDCF_REQUIRE_FORK_LOADER=1: the loader is the pinned fork's (no skipping)" \
+        test "$fork_loader" = 1
+fi
+
+malformed_case() {  # malformed_case NAME FIXTURE ERROR-PATTERN
+    local name="$1" fixture="$2" pattern="$3"
+    out="$work/malformed-$name.out"
+    cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: the policy refuses and reports it" refusal_reported "$out"
+    check "$name: the policy reports it once" refusal_once "$out"
+    fork_only "$name: malformed entry named in the CMDB error" grep -q "$pattern" "$out"
+    fork_only "$name: loader reports that it installed none of the file" \
+        grep -q "installing none of its contents" "$out"
+    check "$name: no service processed (the sibling service entry was not installed)" \
+        bash -c "! grep -q \"tendcf: service 'demo-runit'\" '$out'"
+    check "$name: no interlock command executed" \
+        bash -c "! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
+    check "$name: nothing rendered" \
+        bash -c "! grep -q 'Created file' '$out'"
+    check "$name: no launchctl or systemctl invocation" \
+        bash -c "! grep -Eq 'launchctl|systemctl' '$out'"
+    probe "$fixture" "$work/probe-$name.out"
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-$name.out"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$work/probe-$name.out"
+}
+# an unresolved variable reference in the interlock's pre_action
+malformed_case unresolved interlock-malformed.json \
+    "offending value in entry 'tendcf_interlock'"
+# a key the variable parser reads as the interlock container itself
+# ('tendcf_interlock[' is 'tendcf_interlock' to it, with only a log message)
+malformed_case index-key interlock-malformed-key.json \
+    "Invalid variable specification in CMDB data: 'tendcf_interlock\\['"
 
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
@@ -552,6 +692,11 @@ out="$work/xc-malformed.out"
 check "malformed interlock: refusal reported" refusal_reported "$out"
 check "malformed interlock: the container the loader did not install is named" \
     key_not_loaded "$out" tendcf_interlock
+# All-or-nothing: the valid sibling container is not installed either (the
+# pre-R13 fork installed it, which was the fail-open; the Mac dev build rejects
+# the whole `vars`, so it agrees).
+fork_only "malformed interlock: the sibling tendcf_service is not installed either (all-or-nothing)" \
+    key_not_loaded "$out" tendcf_service
 check "malformed interlock: refusal reported once" refusal_once "$out"
 check "malformed interlock: nothing actuated, no pre_action run, no service processed" \
     no_actuation "$out"
@@ -586,18 +731,28 @@ for f in noshell-or noshell-semi argv-alphabet argv-meta relative sysd1 sysd2 sy
     check "consistent file of the $f run: no cross-check report" no_crosscheck "$work/$f.out"
 done
 
-# A `variables` section replaces `vars.tendcf_interlock` under the same id with
-# a pre_action that passes (the file's own vars say /usr/bin/false). The loader
-# applies `variables` after `vars` (cmdb.c LoadCMDBData), so the ids match and
-# only the content differs.
+# A `variables` section naming `tendcf_interlock` again, with a pre_action that
+# passes (the file's own vars say /usr/bin/false). The fork at the pin refuses the
+# whole file: two entries naming one variable are a duplicate (cmdb.c
+# CMDBPendingCheckNoDuplicates, fork commit 61065e551), so the loader logs the
+# duplicate, installs none of the file and the policy sees every `vars` key
+# missing. (A loader that applied `variables` after `vars` and replaced the
+# container, as upstream CFEngine does, would leave the same ids with another
+# command; that content difference is the cross-check's whole-container
+# comparison, tested in check 10 against the stand-in loader, "service|interlock
+# value changed under the same id", and in check 11 against a replaced file.)
 cp "$repo/tests/policy/fixtures/cmdb-variables-collision.json" "$work/data/host_specific.json"
 out="$work/xc-collision.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
 check "variables-section collision: refusal reported" refusal_reported "$out"
-check "variables-section collision: the content difference is named" \
-    grep -q "key 'tendcf_interlock' content differs between" "$out"
-check "variables-section collision: not an id difference" \
-    bash -c "! grep -q 'loaded differently' '$out'"
+fork_only "variables-section collision: the loader refuses the duplicate variable" \
+    grep -q "Invalid variable specification in CMDB data: 'tendcf_interlock' names the variable 'data:variables.tendcf_interlock' that another entry names too" "$out"
+fork_only "variables-section collision: the loader installs none of the file" \
+    grep -q "installing none of its contents" "$out"
+fork_only "variables-section collision: tendcf_interlock is reported not installed" \
+    key_not_loaded "$out" tendcf_interlock
+fork_only "variables-section collision: nothing was loaded to differ in content" \
+    bash -c "! grep -q 'content differs' '$out'"
 check "variables-section collision: the section is named" \
     grep -q "has top-level section 'variables' besides 'vars'" "$out"
 check "variables-section collision: refusal reported once" refusal_once "$out"
@@ -709,6 +864,87 @@ out="$work/xc-strlist.out"
 check "list of strings in vars: no cross-check report" no_crosscheck "$out"
 check "list of strings in vars: actuates normally (the pre_action ran)" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
+
+echo "# 9b. the real loader's strict parse and class handling (fork 6505f488a), policy level"
+# What the pinned loader does with each file is read from libpromises/cmdb.c at
+# 6505f488a (line numbers there), and each case asserts it. Whatever it does, the
+# cross-check refuses and nothing actuates: those assertions are unconditional.
+# Where the loader refuses the file, `key_not_loaded` reports each key of the
+# file the cross-check could read: it reads with readjson, which stays lenient,
+# so after a repeated member or a repeated `vars` section it sees the LAST one
+# only, and an earlier container (here the interlock of case b) is not named.
+# That is the limit of the cross-check's independence from the loader's parser.
+strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE KEY...
+    local name="$1" fixture="$2" pattern="$3" none="$4"; shift 4
+    out="$work/strict-$name.out"
+    cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: the policy refuses and reports it" refusal_reported "$out"
+    check "$name: the policy reports it once" refusal_once "$out"
+    fork_only "$name: the loader refuses the file" grep -q "$pattern" "$out"
+    if [ "$none" = yes ]; then
+        fork_only "$name: the loader installs none of the file" \
+            grep -q "installing none of its contents" "$out"
+    fi
+    local k
+    for k in "$@"; do
+        fork_only "$name: $k reported not installed" key_not_loaded "$out" "$k"
+    done
+    check "$name: nothing actuated (no service, no interlock, no render)" no_actuation "$out"
+    probe "$fixture" "$work/probe-strict-$name.out"
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-strict-$name.out"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$work/probe-strict-$name.out"
+}
+dup_member="Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with a duplicate object member"
+# (a) a repeated member: an invalid earlier value (null), then a valid interlock.
+# The lenient parser keeps the last (valid) one; the strict parse the loader reads
+# with (cmdb.c:59-84 ReadJsonFileMode, :1171-1177) refuses the file before any
+# validation, so the first value is no longer discarded unseen.
+strict_case dup-member loader-dup-member.json "$dup_member" no tendcf_interlock tendcf_service
+# (b) `vars` twice at the top level, the later one without the interlock
+strict_case dup-vars loader-dup-vars.json "$dup_member" no tendcf_service
+# (c) a complete valid document, then more input (the lenient parser stops after
+# the first document and ignores the rest)
+strict_case trailing loader-trailing.json \
+    "Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with trailing non-whitespace characters" \
+    no tendcf_interlock tendcf_service
+# (d) a default-namespace class whose name is whitespace only: refused in
+# validation (CheckCMDBClassName, cmdb.c:776-), so nothing is installed, where it
+# used to reach insertion, fail, and be taken for "a class that exists already"
+strict_case class-space loader-class-space.json \
+    "Invalid CMDB class 'default: ': the class name starts or ends with whitespace" yes \
+    tendcf_interlock tendcf_service
+check "class-space: the classes section is named by the policy" \
+    grep -q "has top-level section 'classes' besides 'vars'" "$out"
+
+# (e) a class that exists already, beside good vars. The loader leaves it as it
+# is and goes on (InstallCMDBPending, cmdb.c:1095-1102: CMDBClassExists by
+# canonical identity, logged at VERBOSE only), so both containers are installed;
+# the policy refuses all the same, for the `classes` section. `linux` is a hard
+# class on the Linux legs (`darwin` on a Mac), set before the loader runs
+# (generic_agent.c:1234); a CMDB class of a name that is taken is not installed,
+# so it is not reported as a class the CMDB defined.
+hardclass=linux
+[ "$(uname)" = Darwin ] && hardclass=darwin
+exists_json=$(cat "$repo/tests/policy/fixtures/loader-class-exists.json")
+printf '%s\n' "${exists_json//default:linux/default:$hardclass}" >"$work/data/host_specific.json"
+out="$work/strict-class-exists.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "class-exists: the policy refuses and reports it" refusal_reported "$out"
+check "class-exists: the policy reports it once" refusal_once "$out"
+check "class-exists: the classes section is named by the policy" \
+    grep -q "has top-level section 'classes' besides 'vars'" "$out"
+check "class-exists: nothing actuated" no_actuation "$out"
+fork_only "class-exists: the loader did not fail on the existing class" \
+    bash -c "! grep -q 'Failed to add CMDB class' '$out'"
+fork_only "class-exists: the loader did not refuse the rest of the file" \
+    bash -c "! grep -q 'installing none of its contents' '$out'"
+fork_only "class-exists: the good variables were installed" \
+    bash -c "! grep -q 'but CFEngine did not load' '$out'"
+fork_only "class-exists: the existing class was not redefined by the CMDB" \
+    bash -c "! grep -q 'defined a class' '$out'"
 
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
@@ -879,6 +1115,9 @@ check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_ac
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
+             malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
+             strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists \
+             probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
@@ -886,4 +1125,8 @@ if [ "$fail" != 0 ]; then
     done
     exit 1
 fi
-echo; echo "all policy tests passed"
+echo
+if [ "$skipped" != 0 ]; then
+    echo "NOTE: $skipped assertion(s) skipped (loader not all-or-nothing); see the SKIP lines"
+fi
+echo "all policy tests passed"

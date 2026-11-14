@@ -344,6 +344,31 @@ unmerged-libntech submodule dependency, and
 [#1](https://github.com/djbclark/core/issues/1) is the
 investigation trail behind P-1/P-2 and is not itself a defect.
 
+**B-5b reversed on the integration branch, 2026-11-02 (operator ruling R13).**
+`8f0076b81` made the CMDB loader skip one bad entry and install the rest. For
+tendcf that is fail-open: an interlock entry dropped at load leaves the
+services it guards actuated unguarded. `tendcf-integration` now carries
+`cmdb-fail-closed` (`a750b1dfe`, `dbf9dede6`, `61065e551`, `736becc07`, merged
+`d32cade13`; hardened by djbclark/core PR #98 and a strict libntech JSON parse,
+the pin now `6505f488a`): `LoadCMDBData()` validates every entry of
+`vars`/`variables`/`classes` first and installs nothing from
+`host_specific.json` if any one is invalid (also an unknown top-level key, a
+null section, a key with index brackets, a frame-dependent special scope, two
+entries naming one variable, a variable that exists already, a class name with
+whitespace at either end), logging each by name and returning false; the agent
+then runs with no CMDB variables. It reads the file with a strict parse
+(`JsonParseFileStrict`, libntech `cc892efae`): a repeated object member and
+anything but whitespace after the document refuse the file before validation.
+A class that exists already is left as it is and the rest is installed. Strict
+parsing is the CMDB loader's alone: `readjson` and `def.json` stay lenient.
+Upstream PRs #6315/#6320
+stay closed unmerged. The overlay manifest's B-5b entry (`overlay/overlay.json`)
+still describes and reproduces `8f0076b81`, not this behaviour; it now carries
+a `superseded_on_fork` note saying so, and
+[`upstream-overlay.md`](upstream-overlay.md) section 7 repeats it. Whether the
+overlay keeps, retires or replaces that patch is left to a separate ruling,
+because it changes what the overlay reproduces.
+
 B-2 through B-7 are described, measured and sourced in
 [`cfengine-upstream-candidates-2026-08-16.md`](cfengine-upstream-candidates-2026-08-16.md);
 B-1's full evidence is in

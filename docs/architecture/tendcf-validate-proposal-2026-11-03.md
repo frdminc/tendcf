@@ -15,8 +15,9 @@ TUF); map §11 (timeout is deny); [`change-process.md`](change-process.md)
 of [`projector-reconciliation-2026-08-16.md`](projector-reconciliation-2026-08-16.md).
 
 How the CFEngine claims were checked: the fork source at the commit
-`overlay/fork.json` pins (`b8abf28408b1b54e285d372a9bc5f2d850c960ad`,
-read with `git show` in `~/src/cfengine-core`). The book (*Learning
+`overlay/fork.json` pinned when this was written
+(`b8abf28408b1b54e285d372a9bc5f2d850c960ad`, read with `git show` in
+`~/src/cfengine-core`; PR #41 later moved the pin, see §13). The book (*Learning
 CFEngine*, 3.12) was searched first. It covers cf-execd's role and five-minute
 default schedule (ch. 23) and `cf-runagent` (ch. 35). `book-kb query`
 finds neither `host_specific` nor `exec_command` in it: both postdate or
@@ -33,8 +34,9 @@ Each was read in the pinned fork source or in this repository on
    (`libpromises/generic_agent.c:1234`) logs a failed load ("Failed to
    load CMDB data") and the run continues. `cf-agent
    --no-host-specific-data` skips the load entirely.
-2. **On the pinned fork, a bad entry is skipped on its own, not with the
-   whole file.** `ReadCMDBVars` `continue`s past an entry carrying an
+2. **On the fork at the pin of the time (`b8abf28408b1`), a bad entry is
+   skipped on its own, not with the whole file.** (Superseded: the pin
+   now carries an all-or-nothing loader, PR #41, §13.) `ReadCMDBVars` `continue`s past an entry carrying an
    unexpanded variable reference or an invalid key, and still installs
    the others. The cause is fork commit `8f0076b81` ("Fixed one bad CMDB
    entry discarding every entry in its section"), merged into
@@ -981,8 +983,9 @@ that hold the stale text, per its brief.
    a function of.
 5. **Map §12 item 1** ("deleting or withholding the projection is not a
    demonstrated fail-closed launch protocol") is right, and fact 2
-   strengthens it: on the pinned fork, a *malformed* projection is not
-   even all-or-nothing.
+   strengthens it: on the fork pinned when this was written (`b8abf28408b1`),
+   a *malformed* projection was not even all-or-nothing (the pin has since
+   moved to the fail-closed loader, §13).
 6. **`deploy/linux/tendcf-install.sh` `put_data`** is not atomic against
    a concurrent cf-agent (fact 8). This matters once a scheduler runs,
    which stage B enables.
@@ -1022,8 +1025,11 @@ projection that `tendcf-install.sh install --data` puts on pastebin
 (deploy/linux/README.md) carries both containers: its `vars` keys are
 `tendcf_interlock` and `tendcf_service`, checked 2026-11-02. Any skip of
 the first leaves the second ungated. No skip is known to happen with the
-current bytes, which pass the N-series. It is flagged for djbclark, not
-decided here.
+current bytes, which pass the N-series. It was flagged for djbclark.
+**Ruled 2026-11-02:** option 3 (Q10), implemented in PR #42, which records it
+below; and option 5 (R13, Q49), the fork's all-or-nothing loader pinned by PR
+#41 ([`upstream-register.md`](upstream-register.md) B-5b note). Each holds
+without the other.
 
 **(a) Question.** When the CMDB loader installs `tendcf_service` but
 not `tendcf_interlock` (fact 2), how does the policy refuse, instead of
@@ -1143,9 +1149,11 @@ cannot differ on a consistent file; a `vars` value that is not an object is
 refused when it reads back differently: the loader installs a scalar as a
 string, which `storejson()` cannot read, and a list of numbers as an slist of
 strings, while a list of strings reads back equal and is accepted.) It
-also refuses any top-level key of the file other than `vars` (the fork's
-loader also applies `variables`, loaded after `vars`, and `classes`, which can
-define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
+also refuses any top-level key of the file other than `vars` (the loader also
+applies `variables`, loaded after `vars` (the fork at the pin refuses a file
+in which `variables` names a variable `vars` already names; upstream replaces
+it), and `classes`, which can define `interlock_ok_*`; the projector emits
+neither, N-2), any `vars` key that
 is not a plain identifier `[A-Za-z0-9_]+` (the loader reads a key as a variable
 reference, `GetCMDBVariableRef`, so `default:tendcf_services.service_ids`
 presets a variable of the policy's own bundles), a loaded `data:variables.*`
@@ -1204,8 +1212,8 @@ rvalue does redefine a preset, a function call does not), and the two
 no pre_action, no service, no tombstone. The vars and classes of a
 `bundle common` are pre-evaluated before the vars of any non-common bundle,
 whatever `bundlesequence` says (`PolicyResolve` and `BundleResolve`,
-`libpromises/expand.c` lines 846-871 and 1145-1177 at the pinned fork commit
-`b8abf28408b1`, [expand.c](https://github.com/djbclark/core/blob/b8abf28408b1b54e285d372a9bc5f2d850c960ad/libpromises/expand.c#L846)),
+`libpromises/expand.c` lines 846-871 and 1145-1177 at fork commit
+`b8abf28408b1` (the pin when this was written), [expand.c](https://github.com/djbclark/core/blob/b8abf28408b1b54e285d372a9bc5f2d850c960ad/libpromises/expand.c#L846)),
 so `tendcf_cmdb_refused` is decided before a gate is first read. That is a
 statement about vars and classes only, not that every promise type of a common
 bundle completes first, and the classes inside the check rely on their written
@@ -1213,9 +1221,16 @@ order within the one pass. `bundlesequence` guard classes in `promises.cf` are
 not needed for this check. This is a consistency check, not a sandbox: a CMDB
 author (root) already chooses each pre_action executable, `/bin/sh` included,
 and the unit commands, so it does not stop a hostile but self-consistent file.
-The fork-side all-or-nothing loader (PR #41) and this check are independent:
-with the loader failing closed, the file's keys are not loaded and the check
-refuses and reports it, which is correct and louder.
+The fork-side all-or-nothing loader (PR #41) and this check hold each without
+the other: with the loader failing closed, the file's keys are not loaded and
+the check refuses and reports it, which is correct and louder. The independence
+is limited, not complete: the loader's strict parse (a repeated member or
+trailing input refuses the file; fork `6505f488a`) belongs to the CMDB loader
+only, while this check's `readjson` stays lenient and sees the last of a
+repeated member or `vars` section, so an earlier container the loader refused
+is not named by the check (it still refuses, as nothing the file lists was
+loaded). The check does not detect such a file when the loader is lenient and
+the repeated member is invisible to both parsers.
 
 Two findings from the implementation, both about the proof above. (1) The
 Mac dev build (`3.29.0a.086d27749`) does not carry the per-entry loader
@@ -1224,9 +1239,15 @@ makes it install nothing at all, so the fail-open cannot be reproduced there
 with a file. `tests/policy/sim-loader.cf` therefore installs
 `data:variables.*` in the loader's place, from the same file, to emulate the
 per-entry skip; the original policy was run against it first and did
-process the service with its interlock skipped. The Linux CI legs build the
-pinned fork and so also exercise the real per-entry skip with the literal
-fixture (`tests/policy/fixtures/interlock-malformed.json`). (2) The check
+process the service with its interlock skipped. When this was written the
+Linux CI legs built the fork at `b8abf28408b1` and so also exercised the real
+per-entry skip with the literal fixture
+(`tests/policy/fixtures/interlock-malformed.json`). That no longer holds: PR
+#41 moved the pin to the all-or-nothing loader, which installs nothing from
+that fixture, so check 9 sees both keys missing and the partial states stay
+tested only through the stand-in (check 10), which remains valid because the
+check compares the file with what was installed whatever the loader's policy.
+(2) The check
 needs `readjson` and `variablesmatching` to compose on the loader's
 installed variables; they do on the dev build (checks 9-10 of
 `tests/policy/run.sh`), so option 4 stays unneeded. The policy-tree digest

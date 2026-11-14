@@ -62,15 +62,28 @@
 #
 # CMDB cross-check (`tendcf_cmdb`, proposal 2026-11-03 section 13, option 3,
 # operator ruling Q10 2026-11-02). Everything above assumes CFEngine's loader
-# installed what host_specific.json says. It does not promise that: the fork's
-# loader skips a bad entry on its own and still returns success, so a skipped
-# `tendcf_interlock` leaves every service ungated (services are gated
-# negatively, on `!interlock_blocked_*`, and that class only exists for an
-# interlock that loaded). The check does not model WHY an entry was dropped. It
-# reads the file itself and compares it with what the loader installed:
+# installed what host_specific.json says. Nothing promises that for every
+# engine: the fork before 2026-11-02 (`8f0076b81`, B-5b) skipped a bad entry on
+# its own and still returned success, and a skipped `tendcf_interlock` leaves
+# every service ungated (services are gated negatively, on
+# `!interlock_blocked_*`, and that class only exists for an interlock that
+# loaded). The fork at the pin (overlay/fork.json, PR #41, operator ruling R13)
+# loads all-or-nothing instead: an invalid entry, a repeated object member
+# anywhere, anything after the document, a class name with whitespace at either
+# end, a variable that exists already, and it installs none of the file, so this
+# check then sees every `vars` key missing and refuses. That strict parse is the
+# CMDB loader's only: `readjson`, which this check reads the file with, and
+# def.json stay lenient, so after a repeated member or a repeated `vars` section
+# the check sees the LAST one only (an earlier container is not named). It still
+# refuses, because the loader installed nothing the file lists. The two are not
+# fully independent for that reason, and each holds for a loader that fails
+# closed, for one that does not, and for a gap in either, to the extent the
+# other does not share the gap. The check does not model WHY an entry was
+# dropped. It reads the file itself and compares it with what the loader installed:
 #   - the file's top-level keys must be exactly `vars`. The loader also applies
-#     a `variables` section (loaded AFTER `vars`, replacing a same-named
-#     variable) and a `classes` section (which can define `interlock_ok_*`);
+#     a `variables` section (after `vars`; upstream CFEngine lets it replace a
+#     same-named variable, the fork at the pin refuses a file that names one
+#     variable twice) and a `classes` section (which can define `interlock_ok_*`);
 #     the projector emits neither (N-2, bin/projector.py check_projection), so
 #     any other top-level key is refused rather than compared;
 #   - every key under `vars` must be a plain identifier ([A-Za-z0-9_]+). The
@@ -89,7 +102,8 @@
 #     a scalar as a string (storejson() fails) and a list of primitives as an
 #     slist of strings (numbers read back as strings; a list of strings reads
 #     back equal and is accepted). Equal ids with changed values, as a
-#     `variables` entry would give, are caught. A comparison that cannot be
+#     loader that replaced a container (upstream's `variables` section) would
+#     give, are caught. A comparison that cannot be
 #     computed is a problem of its own (`..._problem_uncomparable_<key>`, or
 #     `..._problem_noverdict_<key>` when both texts exist but neither equality
 #     nor a difference could be evaluated), not the absence of a difference;
@@ -133,8 +147,9 @@
 # Presets. The loader installs a `vars` key under any name, so a key such as
 # `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
 # that variable before any policy runs. What a preset does then depends on the
-# promise (verify_vars.c VerifyVarPromise, commit b8abf28408b1 pinned in
-# overlay/fork.json): a promise with a LITERAL rvalue (`slist => { }`) always
+# promise (verify_vars.c VerifyVarPromise, read at commit b8abf28408b1; the
+# pin in overlay/fork.json is now 6505f488a, which differs from it only in
+# libpromises/cmdb.c, cmdb.h, tests and the libntech submodule pointer): a promise with a LITERAL rvalue (`slist => { }`) always
 # redefines it, so the policy's value stands. A promise whose rvalue is a
 # FUNCTION CALL is skipped when the variable exists ("Already did this") if the
 # call was not already evaluated to a value when the promise runs, and
@@ -544,7 +559,7 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: $(tendcf_cmdb.file) does not exist but CFEngine loaded data:variables.$(tendcf_cmdb.loaded_clean)";
 
       "tendcf_cmdb_problem_missing"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_clean)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_clean) (the loader skipped it)";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_clean)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_clean) (the loader did not install it)";
 
       "tendcf_cmdb_problem_unlisted"::
         "tendcf: CMDB cross-check: CFEngine loaded data:variables.$(tendcf_cmdb.unlisted_clean), which is not a key under 'vars' in $(tendcf_cmdb.file)";
