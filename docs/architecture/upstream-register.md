@@ -355,8 +355,12 @@ unknown top-level key, a null section, a key with index brackets, a
 frame-dependent special scope, two entries naming one variable), logging each
 by name and returning false; the agent then runs with no CMDB variables.
 Upstream PRs #6315/#6320
-stay closed unmerged; the overlay manifest's B-5b patch still describes
-`8f0076b81`, not this behaviour (see the PR that bumped `overlay/fork.json`).
+stay closed unmerged. The overlay manifest's B-5b entry (`overlay/overlay.json`)
+still describes and reproduces `8f0076b81`, not this behaviour; it now carries
+a `superseded_on_fork` note saying so, and
+[`upstream-overlay.md`](upstream-overlay.md) section 7 repeats it. Whether the
+overlay keeps, retires or replaces that patch is left to a separate ruling,
+because it changes what the overlay reproduces.
 
 B-2 through B-7 are described, measured and sourced in
 [`cfengine-upstream-candidates-2026-08-16.md`](cfengine-upstream-candidates-2026-08-16.md);
