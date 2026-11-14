@@ -1047,8 +1047,8 @@ change, because the list moves:
   this needs `schema/` to carry both versions for the window and
   tendcf's compiler-equals-schema check relaxed
   ([`change-process.md`](change-process.md) §4), not the multi-version
-  render, which D46 (6) still defers to the first host whose ceiling
-  differs. The whole schema-bump sequence of change-process §4 (gate
+  render, which D46 (6) still defers until the first device that is not
+  an operator host enrolls. The whole schema-bump sequence of change-process §4 (gate
   tools staged, device validator deployed, migration, data) is the
   intended order and stays open until that is answered, as does how the
   device validator update is delivered as a goal diff (D45). The guard

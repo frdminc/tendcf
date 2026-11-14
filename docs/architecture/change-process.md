@@ -308,7 +308,8 @@ open and is not asserted here.** With the authoring rule's commit split
 the compiler at each pinned rev still renders one version: the old one at
 the rev after 1(a), where the compiler has not changed, and the new one
 after 1(c). Releases 1 to 3 therefore need no multi-version compiler; D46
-(6) still defers that to the first host whose ceiling differs. Commit 1(a)
+(6) still defers that until the first device that is not an operator host
+enrolls. Commit 1(a)
 is not possible in tendcf as it stands. `schema/goal-file.schema.json`
 states `schema_version` as one `const`, and tendcf CI fails unless the
 compiler's `GOAL_FILE_SCHEMA_VERSION` equals it (`check.yml`,
