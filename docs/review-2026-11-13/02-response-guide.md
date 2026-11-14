@@ -193,7 +193,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > `nix2cf` (§4), is not built yet: today `nix2cf eval-nix` evaluates a
 > plain Nix attribute set to the same JSON, and the fixtures are YAML.
 
-**Ruled:** "1. Adopt D47-D50" (`operator ruling, 2026-11-14, B4`) adopts D49, which amends D12 (Nix first, not two equal frontends). Ruled; merge pending. Whether `schema/` or the Nix module options is the schema authority (Q23) and whether the YAML twin stays as a test remain open.
+**Ruled:** "1. Adopt D47-D50" (`operator ruling, 2026-11-14, B4`) adopts D49, which amends D12 (Nix first, not two equal frontends). Ruled; merged into the map's D49 and D12 (decision register) on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten. Whether `schema/` or the Nix module options is the schema authority (Q23) and whether the YAML twin stays as a test remain open.
 
 **Merge:** replace the paragraph; D12 is amended at the same time in the map (the map's orientation section, item 2, and D12 say "equal"); ruled (operator ruling, 2026-11-14, B4: D49 adopted)
 **Checked:** verified (read cli.py and the guide); independently checked 2026-11-13: confirmed
@@ -217,7 +217,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > implementation; an option it does not implement is a compile error that
 > names it, never a silent no-op.
 
-**Ruled:** B7: "1. Importer + matching names" (`operator ruling, 2026-11-14, B7`): a one-shot importer for pure-data option families (it lists what it did not carry), plus tendcf option names matching nix-darwin/NixOS where the meaning is the same. Ruled; merge pending. G2 gets no new text (B13 item 7: B7 supplies the meaning).
+**Ruled:** B7: "1. Importer + matching names" (`operator ruling, 2026-11-14, B7`): a one-shot importer for pure-data option families (it lists what it did not carry), plus tendcf option names matching nix-darwin/NixOS where the meaning is the same. Ruled; merged into the map's §5 and D49 (decision register) on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten. G2 gets no new text (B13 item 7: B7 supplies the meaning).
 
 **Merge:** ruled (operator ruling, 2026-11-14, B7: "1. Importer + matching names")
 **Checked:** verified (nix-darwin option via search results); NixOS option set not checked
@@ -241,7 +241,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > device. Discovery of out-of-tree plugins (Python entry points) is deferred
 > until a user needs one and out-of-tree plugins can be pinned.
 
-**Ruled:** Smaller 5: "1. Defer out-of-tree discovery" (`operator ruling, 2026-11-14, Smaller 5, G-§4-01 / map Step 0 / v2 C3`): amend D46 with this item's text: all plugins in tree, compile-time only, never on a device; Python entry-point discovery is deferred until a user needs one and out-of-tree plugins can be pinned. The proposed text above is adopted as written. The same ruling covers the map's Step 0 (`03-response-map.md` M-§13-01, which does the D46 restructure as decided). Ruled; merge pending.
+**Ruled:** Smaller 5: "1. Defer out-of-tree discovery" (`operator ruling, 2026-11-14, Smaller 5, G-§4-01 / map Step 0 / v2 C3`): amend D46 with this item's text: all plugins in tree, compile-time only, never on a device; Python entry-point discovery is deferred until a user needs one and out-of-tree plugins can be pinned. The proposed text above is adopted as written. The same ruling covers the map's Step 0 (`03-response-map.md` M-§13-01, which does the D46 restructure as decided). Ruled; merged into the map's D46 amendment (§5 and decision register) on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** replace "Frontends, supervisor renderers and one-shot importers ... never on a device." Ruled (operator ruling, 2026-11-14, Smaller 5); amends D46.
 **Checked:** verified (read §4); plugin-layout.md not re-read; independently checked 2026-11-13: confirmed
@@ -291,7 +291,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > dedicated central policy host, no SSH requirement, and no requirement to
 > push.
 
-**Ruled:** B1: "1. Content checks; v0 first" (`operator ruling, 2026-11-14, B1`): G3's handshake means content checks (signed by trusted keys, fresh, names this device, owner approval); transport auth decides only who may talk. The release is what is authenticated (not the sender). First build: SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the 2-of-3 offline-root floor may lag until TUF. Ruled; merge pending.
+**Ruled:** B1: "1. Content checks; v0 first" (`operator ruling, 2026-11-14, B1`): G3's handshake means content checks (signed by trusted keys, fresh, names this device, owner approval); transport auth decides only who may talk. The release is what is authenticated (not the sender). First build: SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter); the 2-of-3 offline-root floor may lag until TUF. Ruled; merged into the map's §9.11 ("The handshake is content checks (D50)") and D50 on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** replace the first paragraph of §5; ruled (operator ruling, 2026-11-14, B1): content checks
 **Checked:** verified (read §5, §7, §14); independently checked 2026-11-13: confirmed
@@ -443,7 +443,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 > owner's side, against the diff the device computed, because a score the
 > proposer computes is a claim the device cannot check.
 
-**Ruled:** B8 sub 2: "1. Allowed, off by default" (`operator ruling, 2026-11-14, B8 sub 2, G-§7-01 v2`): an owner may set a floor; a bundle below it is refused automatically, logged, and the owner notified with the diff; no default floor; tighten-only (no score ever auto-accepts); the owner can re-request and accept a refused bundle. B8: "1. Capped 0-100 score" (`operator ruling, 2026-11-14, B8`): "score from 0 to 100", mechanical checks set a ceiling that AI review can lower but never raise, an explanation of each part, and a measured hit rate once a corpus exists. B8 sub 1: "1. 09's table, top 95" (`operator ruling, 2026-11-14, B8 sub 1`): the cap values are in `03-response-map.md` M-§9-03. B8 sub 4: "2. Should not (as written)" (`operator ruling, 2026-11-14, B8 sub 4`), X-safety-06's text in `09-safety-score-and-tui.md`. The proposed text above is rewritten to carry the floor inside it. Ruled; merge pending.
+**Ruled:** B8 sub 2: "1. Allowed, off by default" (`operator ruling, 2026-11-14, B8 sub 2, G-§7-01 v2`): an owner may set a floor; a bundle below it is refused automatically, logged, and the owner notified with the diff; no default floor; tighten-only (no score ever auto-accepts); the owner can re-request and accept a refused bundle. B8: "1. Capped 0-100 score" (`operator ruling, 2026-11-14, B8`): "score from 0 to 100", mechanical checks set a ceiling that AI review can lower but never raise, an explanation of each part, and a measured hit rate once a corpus exists. B8 sub 1: "1. 09's table, top 95" (`operator ruling, 2026-11-14, B8 sub 1`): the cap values are in `03-response-map.md` M-§9-03. B8 sub 4: "2. Should not (as written)" (`operator ruling, 2026-11-14, B8 sub 4`), X-safety-06's text in `09-safety-score-and-tui.md`. The proposed text above is rewritten to carry the floor inside it. Ruled; merged into the map's §9.12 on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** insert after the semantic-layer paragraph. Ruled (operator ruling, 2026-11-14, B8, B8 sub 1, B8 sub 2, B8 sub 4).
 **Checked:** inferred (design); verified that no document describes scoring (goal diff 4; grep for "TUI" in docs found only the goal file and deprecated tooling notes); independently checked 2026-11-13: confirmed
@@ -470,7 +470,9 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 
 > On an `operator` device the owner may enrol a hold window or a standing approval, shown and refusable before apply; may set a standing "wait for user" (the device holds a change until the owner answers); and may set a standing refusal.
 
-Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a per-change nonce). Q19 in the map is answered (`03-response-map.md` M-§10-01).
+Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a per-change nonce). Q19 in the map is answered (`03-response-map.md` M-§10-01). The new shape takes the next unused schema version (v7 or later; shipped v6 is C-policy-01, PR 52, 83d7280), grouping not ruled.
+
+A reading of this ruling, not new policy: "without a per-change nonce" drops only the nonce. The other content checks of B1 still apply to a standing approval, and every standing mode (hold window, standing approval, standing "wait for user", standing refusal) is enrolled by the owner and refusable by the owner; none is a default.
 
 **Merge:** replace the §7 clause, the §4 parenthesis, and the §14 "Consent" row, using the ruled sentence above. Ruled (operator ruling, 2026-11-14, B2).
 **Checked:** verified (read the three places); independently checked 2026-11-13: confirmed
@@ -539,7 +541,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 > monochrome terminal and colour-blindness. None of this surface is built
 > yet (§18).
 
-**Ruled:** B12: "2. Borrow both freely; raise Python" (`operator ruling, 2026-11-14, B12`): borrow Toad and textual-diff-view (AGPL-3.0) as needed; the review TUI becomes AGPL-3.0-only and moves to Python >=3.14. B3 sub 4: "1. Native screen + Termux" (`operator ruling, 2026-11-14, B3 sub 4, X-safety-08 / X-android-14`): one review document (R14) rendered three ways (CLI `--plain`/`--json`, Textual TUI including Termux and SSH, native screen in `tendcf-agent`); goldens hold all three; renderers compute nothing; the agent notification opens the native screen with Accept and Refuse; the Termux CLI/TUI is the operator's path; no answer means held; a refusal is logged. Ruled; merge pending.
+**Ruled:** B12: "2. Borrow both freely; raise Python" (`operator ruling, 2026-11-14, B12`): borrow Toad and textual-diff-view (AGPL-3.0) as needed; the review TUI becomes AGPL-3.0-only and moves to Python >=3.14. B3 sub 4: "1. Native screen + Termux" (`operator ruling, 2026-11-14, B3 sub 4, X-safety-08 / X-android-14`): one review document (R14) rendered three ways (CLI `--plain`/`--json`, Textual TUI including Termux and SSH, native screen in `tendcf-agent`); goldens hold all three; renderers compute nothing; the agent notification opens the native screen with Accept and Refuse; the Termux CLI/TUI is the operator's path; no answer means held; a refusal is logged. Ruled; merged into the map's §6 ("Review TUI borrows (B12)") and §12 ("Phone review surface") on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** replace "None of this surface is built yet (§18)."; the scaffold is ruled (operator ruling, 2026-11-14, B12)
 **Checked:** not checked (which scaffold); Textual URL not fetched; independently checked 2026-11-13: confirmed
@@ -606,7 +608,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 > compiler does not derive ordering edges from them until a real site shows
 > retry-until-stable is not enough. Inference is demand-driven (§18).
 
-**Ruled:** B4 rider, D16: "1. Defer explicitly" (`operator ruling, 2026-11-14, B4 rider, D16`): record D16's ordering inference as deferred. Ruled; merge pending.
+**Ruled:** B4 rider, D16: "1. Defer explicitly" (`operator ruling, 2026-11-14, B4 rider, D16`): record D16's ordering inference as deferred. Ruled; merged into the map's D16 amendment (decision register) on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** replace "This design uses all three ... seen the rest of the system."; needs the operator's ruling (G7: compiler scope)
 **Checked:** verified (read §10, inventory); independently checked 2026-11-13: confirmed
@@ -651,7 +653,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 
 > | **Relay** | Who may hand me a release, or take my logs? | Release: [any device, if the handshake checks the release and not the carrier; only listed devices, if it also authenticates the sender: open, operator's ruling (G-§5-01)]. Logs: holders of the `log-archive` role on my allowlist |
 
-**Ruled:** B1: "1. Content checks; v0 first" (`operator ruling, 2026-11-14, B1`): content checks, so "who may relay" is any device and "who may sign" is the trusted keys; transport auth decides only who may talk. Ruled; merge pending.
+**Ruled:** B1: "1. Content checks; v0 first" (`operator ruling, 2026-11-14, B1`): content checks, so "who may relay" is any device and "who may sign" is the trusted keys; transport auth decides only who may talk. Ruled; merged into the map's §9.11 and D50 on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** insert after the "Release" row
 **Checked:** verified (read); independently checked 2026-11-13: confirmed
@@ -716,6 +718,8 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 > that refuses to act when the loaded data differs from the file
 > ([#42](https://github.com/frdminc/tendcf/pull/42)).
 
+**Status, 2026-11-14 (the proposed text above was written when both PRs were open):** both are merged, #42 at acec5b5 and #41 at daa4530, so "Two fixes are open" no longer holds; the paragraph would say that both fixes have merged, with the remaining fork-pin follow-ups tracked in `upstream-register.md`.
+
 **Merge:** insert after "...defines nothing."
 **Checked:** verified (read proposal §13); PR state from the inventory, not re-queried; independently checked 2026-11-13: confirmed
 
@@ -767,7 +771,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 > the safety mechanism the goal (G4) rests adoption on, and the part with
 > the most to lose.
 
-**Ruled:** Smaller 3: "1. Yes, supersede D8's wording" (`operator ruling, 2026-11-14, Smaller 3`): D47 is ruled; adoption is the aim and G4 see-and-refuse is its safety mechanism; it supersedes D8 "Sovereignty is the point" and §0 items 1 and 3. Ruled; merge pending.
+**Ruled:** Smaller 3: "1. Yes, supersede D8's wording" (`operator ruling, 2026-11-14, Smaller 3`): D47 is ruled; adoption is the aim and G4 see-and-refuse is its safety mechanism; it supersedes D8 "Sovereignty is the point" and §0 items 1 and 3. Ruled; merged into the map's D47 and D8 (decision register) on 2026-11-14 (the rulings commit of this PR); this guide's own text is not otherwise rewritten.
 
 **Merge:** replace that clause; the map §0 item 3 change is ruled (operator ruling, 2026-11-14, Smaller 3)
 **Checked:** verified (read both); independently checked 2026-11-13: confirmed
@@ -932,7 +936,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 **Kind:** correct
 **Goal:** G5, G8 (also G2, G3, G4)
 **Weight:** blocks-goal
-**Finding:** The table is the order from before 2026-10-29: macOS adapter, then Android, compiler, Linux, signing at Step 6 and consent at Step 9. It does not record D22's Android deferral, which the map's table does. G8 state 1 needs four things the table puts late or nowhere: signing with the handshake (Step 6), the device-side validator with see-and-refuse (Steps 6 and 9), the log archive (absent), and safety scoring (absent). It also needs two the table never schedules: the Nix module frontend and Android profiles. Below is a replacement ordered by state, with the reuse named per step. What the Linux work is worth: the root-install pattern, fork CI, the run.sh harness, the projector, the canary and the validate proposal all carry to macOS and Android almost unchanged. The systemd branch, schema v4/v5's dpkg claims, the unit classifier and the NixOS passthrough are parked until state 2 (Steps 12–13), where they are needed as built. Nothing is thrown away.
+**Finding:** The table is the order from before 2026-10-29: macOS adapter, then Android, compiler, Linux, signing at Step 6 and consent at Step 9. It does not record D22's Android deferral, which the map's table does. G8 state 1 needs four things the table puts late or nowhere: signing with the handshake (Step 6), the device-side validator with see-and-refuse (Steps 6 and 9), the log archive (absent), and safety scoring (absent). It also needs two the table never schedules: the Nix module frontend and Android profiles. Below is a replacement ordered by state, with the reuse named per step. What the Linux work is worth: the root-install pattern, fork CI, the run.sh harness, the projector, the canary and the validate proposal all carry to macOS and Android almost unchanged. The systemd branch, schema v4/v5's dpkg claims, the unit classifier and the NixOS passthrough come later in the order, in state 2 (Steps 12–13; not paused, B4 rider "1. Order language"), where they are needed as built. Nothing is thrown away.
 **Evidence:** guide:1359-1379; inventory §A, §C, §F, §H; goal G5, G8; `docs/architecture/PREMORTEM-BRIEF.md:20` (the Mac is a laptop that sleeps).
 **Proposed text:**
 
@@ -943,7 +947,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 >
 > | Step | What | Reuses |
 > | --- | --- | --- |
-> | 0 | **Close the open work, and restructure.** Merge #41 and #42 (after their reviews); the D46 restructure (`tendcf compile`, `plugins/`), with all plugins in tree, compile-time only, never on a device (Python entry-point discovery deferred); the schema additions that have been ruled, in one bump (the Android profile fields and the agent id share it). | PRs #41 and #42; `plugin-layout.md` (D46). |
+> | 0 | **Close the open work, and restructure.** Merge #42, then #41 (after their reviews; historical: both merged 2026-11-14, #42 at acec5b5 and #41 at daa4530); the D46 restructure (`tendcf compile`, `plugins/`), with all plugins in tree, compile-time only, never on a device (Python entry-point discovery deferred); the schema additions that have been ruled, at the next unused schema version (v7 or later; shipped v6 is C-policy-01, PR 52, 83d7280): the Android profile fields and the agent id share one bump (B3 sub 1), and whether the standing-modes approval record joins it is not ruled (grouping not ruled). | PRs #41 and #42; `plugin-layout.md` (D46). |
 > | 1 | **The fork on the Mac.** Build the pinned fork for macOS arm64 into `/opt/tendcf`, with a macOS CI job that builds the pin and runs `tests/policy/run.sh`; a root `cf-execd` under launchd on the state-1 Mac, which is a minimised macOS VM on bigmac (tart / Virtualization.framework); one canary launchd service enforced, everything else not yet named. bigmac itself runs dry-run only, as a user LaunchAgent. State 1 verifies the root launchd render path. | `overlay/fork.json` and the CI build action; `tendcf-install.sh` and the canary pattern, ported from systemd to launchd; the launchd branch of `policy/tendcf_services.cf`; `tests/policy/run.sh`. |
 > | 2 | **Nix authoring, minimal.** A module system (`lib.evalModules`) with tendcf options for services, interlocks and roles, named after nix-darwin where one exists, evaluating to today's Site Model JSON; YAML twins stay as fixtures and must be byte-identical. | `nix2cf eval-nix`; `buildfile` (renamed `tendcf compile`); the schemas and lint unchanged. |
 > | 3 | **`tendcf-validate`, first build.** Stored, integrity-checked baseline; the device computes the diff; the command-line review mode shows it and takes accept or refuse (a CLI diff and `y/N`, built first and used on the VM and dev devices before any TUI or score work); projection only after accept. Operator tier. | `bin/projector.py` (promoted, D45); `apply_diff` and `derive_ceremony_class` from `bin/schema_lint.py`; goal-diff and approval-record schemas; the validate proposal's options for trigger and atomic publication, which are platform-neutral. |
@@ -990,7 +994,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 
 **Differences from the other proposal** (the map response's build order, M-§13-01, as corrected after checking; from the independent checker's comparison; the two proposals are kept separate so the owner can choose):
 1. **First step.** Here the fork on the Mac comes first (1) and Nix authoring second (2); the map has the Nix frontend first and the Mac second. The checker notes the Mac today runs Homebrew upstream CFEngine 3.29.0 with the §19 data-path defects, which slightly favours the fork first; the two steps are otherwise independent.
-2. **Step 0.** The map adds a Step 0: merge #41 and #42, the D46 restructure, and one schema bump carrying whatever has been ruled by then. The proposal as first written had no schema step; the ruled order folds the map's Step 0 in (B4). The checker notes #41 and #42 touch only platform-neutral files, so they close the interlock fail-open on the Mac too.
+2. **Step 0.** The map adds a Step 0: merge #41 and #42 (done 2026-11-14), the D46 restructure, and the ruled schema changes (the version allocation and grouping are not ruled; see the table's Step 0). The proposal as first written had no schema step; the ruled order folds the map's Step 0 in (B4). The checker notes #41 and #42 touch only platform-neutral files, so they close the interlock fail-open on the Mac too.
 3. **Validator and signing.** Here the validator (3) precedes signing and the handshake (4), flagged for a ruling. The map, as corrected, has the validator (3), owner review (4), then signed releases with signature and high-water verification (5).
 4. **Safety scan and TUI.** Here all scanning, rules and AI, plus the TUI, is Step 7 inside state 1. The map has mechanical scanning and the CLI at Step 4 and the AI scanner and TUI at Step 8 ("1→2"), so its state 1 ships a partial G4. Ruled: B8 sub 3 "1. Build order, not scope" (`operator ruling, 2026-11-14`): G4 stays whole in state 1; the CLI diff and `y/N` is built first and used on the VM and dev devices before any TUI or score work; state 1 is declared only once score, explanation, highlighting and TUI land; no "state 1.5".
 5. **Owner signature.** The map has an owner key sign at Step 4 (supersedes D39, needs that ruling); this Step 3 takes accept or refuse with no key specified.
@@ -1004,7 +1008,7 @@ Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a
 13. **When state 1 is reached.** Here each device must refuse both a release failing the handshake and a diff its owner refused; the map requires refusing an unsigned or unhandshaken update in a test. The checker finds this test closer to G4.
 14. **Plugins.** The map's Step 0 does the D46 restructure as decided; G-§4-01 here cuts out-of-tree entry points (amends D46). One ruling covers both: "1. Defer out-of-tree discovery" (`operator ruling, 2026-11-14, Smaller 5`).
 
-**Ruled:** B4: "1. Adopt D47-D50" (`operator ruling, 2026-11-14, B4`): adopt draft D47-D50 as corrected (M-§15-01..04), with this guide's build order as base "with the map's Step 0 and an explicit macOS CI step folded in". The proposed table above is rewritten accordingly (Step 0, the macOS CI step in Step 1) and is the adopted order. Riders, each dated 2026-11-14: Linux "1. Order language" (later in the order, not paused); canary "1. Keep it" (the pastebin canary stays the standing end-to-end proof); Nix on the release path "2. Allow on release path" with scope "1. Build-time only"; monitor role "1. State 2"; D16 "1. Defer explicitly". Rulings applied in the table: B8 sub 3 "1. Build order, not scope" (Steps 3, 7 and the state-1 test); B6 sub 1, sub 2 and sub 3 (Step 1: macOS VM on bigmac, dry-run only on bigmac, root daemon in the VM); B3 "3. Termux CFEngine + thin Kotlin" with sub 1 "1. Field on entries" and sub 2 "1. Termux + Kotlin trust check" (Step 5); B1 "1. Content checks; v0 first" (Step 4); Smaller 5 "1. Defer out-of-tree discovery" (Step 0); Smaller 6 "make that both" (Step 6). This supersedes D22 and the 2026-10-29 Linux-first ruling (`linux-targets.md`) and defers D16's inference. The question of whether signing (step 4) may follow the validator (step 3) is settled by the adopted order. Ruled; merge pending. The map's §13 changes in the same commit (`03-response-map.md` M-§13-01).
+**Ruled:** B4: "1. Adopt D47-D50" (`operator ruling, 2026-11-14, B4`): adopt draft D47-D50 as corrected (M-§15-01..04), with this guide's build order as base "with the map's Step 0 and an explicit macOS CI step folded in". The proposed table above is rewritten accordingly (Step 0, the macOS CI step in Step 1) and is the adopted order. Riders, each dated 2026-11-14: Linux "1. Order language" (later in the order, not paused); canary "1. Keep it" (the pastebin canary stays the standing end-to-end proof); Nix on the release path "2. Allow on release path" with scope "1. Build-time only"; monitor role "1. State 2"; D16 "1. Defer explicitly". Rulings applied in the table: B8 sub 3 "1. Build order, not scope" (Steps 3, 7 and the state-1 test); B6 sub 1, sub 2 and sub 3 (Step 1: macOS VM on bigmac, dry-run only on bigmac, root daemon in the VM); B3 "3. Termux CFEngine + thin Kotlin" with sub 1 "1. Field on entries" and sub 2 "1. Termux + Kotlin trust check" (Step 5); B1 "1. Content checks; v0 first" (Step 4); Smaller 5 "1. Defer out-of-tree discovery" (Step 0); Smaller 6 "make that both" (Step 6). This supersedes D22 and the 2026-10-29 Linux-first ruling (`linux-targets.md`) and defers D16's inference. The question of whether signing (step 4) may follow the validator (step 3) is settled by the adopted order. Ruled; the map's §13 carries the adopted order as its stage table (2026-11-14, the rulings commit of this PR; `03-response-map.md` M-§13-01), and this guide's §18 original is not rewritten. Numbering: this table's Steps 0-15 and the map's Stages 0-16 are the same order. The map splits the macOS CI job out of Step 1 as its own Stage 2, so guide Step 0 and Step 1 are map Stage 0 and Stage 1, guide Steps 2-15 are map Stages 3-16 (Step N is Stage N+1), and "Step 8" or "Steps 3 and 7" in the other review documents use this guide numbering unless they say "Stage". Open: awaiting operator ruling (does the VM's root `cf-execd` enforcement at Step 1 stand as an operator-ruled exception to D45's "`tendcf-validate` before any further host is enforced", as pastebin's canary does, or does enforcement wait until the validator, Step 3, has landed?). The order is not changed here.
 
 **Merge:** replace the section with the ruled table. Ruled (operator ruling, 2026-11-14, B4).
 **Checked:** reuse claims verified against the inventory; feasibility of a macOS fork build and of CFEngine under Termux in a work profile not checked; independently checked 2026-11-13: weakened, corrected

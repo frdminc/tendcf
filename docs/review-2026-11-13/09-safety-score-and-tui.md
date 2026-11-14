@@ -607,12 +607,13 @@ regardless of correctness)
 **Weight:** misleads
 **Finding:** R13 makes AIs the authors, and the owner's AI is the advisor. If
 the same model wrote the change and scans it, it may be biased toward
-approving it. Self-preference bias is documented: an LLM scores its own outputs
-higher than others', and models recognise their own outputs, with a
-correlation between recognition and preference (Arjun Panickssery, Samuel R.
-Bowman and Shi Feng, "LLM Evaluators Recognize and Favor Their Own
-Generations", arXiv:2404.13076 [cs.CL], 15 Apr 2024; cited for self-preference
-bias only, not for anything about code review). Separately, models grow more
+approving it. Self-preference bias is documented: in news-summary tasks (CNN/DailyMail and
+XSUM) with GPT-4, GPT-3.5 and Llama 2, an LLM scores its own outputs higher
+than others', and models recognise their own outputs, with a correlation
+between recognition and preference (Arjun Panickssery, Samuel R. Bowman and
+Shi Feng, "LLM Evaluators Recognize and Favor Their Own Generations",
+arXiv:2404.13076 [cs.CL], 15 Apr 2024; cited for self-preference bias only,
+not for anything about code review, which the paper did not test). Separately, models grow more
 confident in answers framed as their own turn (arXiv 2606.03437). The diff is
 also attacker-controlled input to the scanner (JudgeDeceiver; LongPIBench).
 **Evidence:** map:975-976; [arXiv 2404.13076](https://arxiv.org/abs/2404.13076)
@@ -766,7 +767,8 @@ borrowed as needed; the review TUI becomes AGPL-3.0-only and moves to Python
 taken. Research, with no security or licence red flags: AGPL blocks GPL-2.0-only,
 CDDL, EPL-2.0 without a secondary designation, and proprietary code, and
 nothing tendcf uses today is in those classes
-(`/Users/djbclark/.local/state/agent-reports/876751f7/b12-agpl-research.md`).
+(the operator's separate AGPL research note, not kept in this repository; its
+conclusions are the ones stated here).
 Follow-ups, open: Termux and Mac Python >=3.14 availability; keep incompatible
 licences out of the TUI module. Ruled; implementation pending.
 

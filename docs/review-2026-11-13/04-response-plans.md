@@ -58,7 +58,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Operator ruling, 2026-10-29, **superseded in its ordering by the goal of 2026-11-13** (G5: macOS server, Android client, macOS client, Linux server, Linux client). Status: superseded in its ordering by the goal of 2026-11-13 (G5). Linux is fourth and fifth in line; finished pieces stay as standing proofs. Nothing here is deleted.
 
-**Merge:** replace the blockquote; needs the operator's ruling first if "paused" is to be kept (G5 orders the platforms; no ruling pauses Linux work)
+**Merge:** replace the blockquote; needs the operator's ruling first if "paused" is to be kept; ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept (G5 orders the platforms; no ruling pauses Linux work)
 **Checked:** verified (read both files); independently checked 2026-11-13: weakened, corrected
 
 ### L-§1-02: the target table has no macOS or Android device
@@ -71,9 +71,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `linux-targets.md:8-16`; `rg -il 'insular|island' docs/architecture` returns nothing.
 **Proposed text:**
 
-> Targets for the first milestone (G8 state 1) live in a separate file, `docs/architecture/first-milestone-targets.md` (to be written): M1, the operator's server Mac (receives and archives logs); A1, one Android device (Island/Insular profiles, ShizukuPlus). The rows below are the Linux targets. Their work is paused (G5 places Linux fourth and fifth).
+> Targets for the first milestone (G8 state 1) live in a separate file, `docs/architecture/first-milestone-targets.md` (to be written): M1, the operator's server Mac (receives and archives logs); A1, one Android device (Island/Insular profiles, ShizukuPlus). The rows below are the Linux targets. Their work comes later in the order, not paused (G5 places Linux fourth and fifth; B4 rider, "1. Order language").
 
-**Ruled (which Mac):** "1. macOS VM on bigmac" (operator ruling, 2026-11-14, B6 sub 1, 13 E-2): state 1's Mac (M1, the server Mac) is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1): current macOS, snapshot and rollback, CI can run the same image; it is a client, not an always-on server. "1. Dry-run only" (B6 sub 2, M-§12-01 / Q18): bigmac may run tendcf in dry-run (compute and report the diff, log drift, apply nothing); the VM is the only enforcing Mac in state 1. Note: the VM is also the G8 log-archive server, reachable only while bigmac is awake; devices buffer JSONL. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent, no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work. Which Android device (A1) is not ruled. Ruled; implementation pending.
+**Ruled (which Mac):** "1. macOS VM on bigmac" (operator ruling, 2026-11-14, B6 sub 1, 13 E-2): state 1's Mac (M1, the server Mac) is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1): current macOS, snapshot and rollback, CI can run the same image; it is a client, not an always-on server. "1. Dry-run only" (B6 sub 2, M-§12-01 / Q18): bigmac may run tendcf in dry-run (compute and report the diff, log drift, apply nothing); the VM is the only enforcing Mac in state 1. Note: the VM is also the G8 log-archive server, reachable only while bigmac is awake; devices buffer JSONL. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent, no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). Open: awaiting operator ruling (this root enforcement in the VM comes before `tendcf-validate` exists, while D45 says the validator is built "before any further host is enforced"; is the VM an operator-ruled exception, as pastebin's canary is, or does enforcement wait for the validator?). The order is not changed here. Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work. Which Android device (A1) is not ruled. Ruled; implementation pending.
 
 **Merge:** the Mac is ruled (M1 is the VM on bigmac); which Android device still needs the operator's ruling
 **Checked:** verified (table read; grep); independently checked 2026-11-13: confirmed
@@ -88,9 +88,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `linux-targets.md:35-40`; `policy/templates/launchd.plist.mustache` exists; `deploy/` holds only `linux/`; the compiler renders launchd only (`compiler/README.md` "Units for any supervisor but launchd").
 **Proposed text:**
 
-> **Under the 2026-11-13 goal (G5).** Finished, kept as standing proofs: steps 2, 3, 5, 7 (pastebin's canary, under its root `cf-execd`) and 8 stage C (get.sipb.cloud). Carried to macOS unchanged: step 3's guard; the schema v2-v5 vocabulary; `tests/policy/run.sh`. Carried to macOS as a pattern, to be rewritten: step 7's root-owned prefix and install (`deploy/linux/tendcf-install.sh` has no macOS twin; a LaunchDaemon replaces `tendcf-execd.service`); step 2's CI fork build (Linux runners only). Paused: step 6's systemd renderer, the v5 dpkg claims and detector, and step 8 beyond stage C. The macOS adapter (map Step 1) and the compiler's launchd renderer are already the most advanced pieces in the repository.
+> **Under the 2026-11-13 goal (G5).** Finished, kept as standing proofs: steps 2, 3, 5, 7 (pastebin's canary, under its root `cf-execd`) and 8 stage C (get.sipb.cloud). Carried to macOS unchanged: step 3's guard; the schema v2-v5 vocabulary; `tests/policy/run.sh`. Carried to macOS as a pattern, to be rewritten: step 7's root-owned prefix and install (`deploy/linux/tendcf-install.sh` has no macOS twin; a LaunchDaemon replaces `tendcf-execd.service`); step 2's CI fork build (Linux runners only). Later in the order, not paused: step 6's systemd renderer, the v5 dpkg claims and detector, and step 8 beyond stage C. The macOS adapter (map Step 1) and the compiler's launchd renderer are already the most advanced pieces in the repository.
 
-**Merge:** insert after the table; needs the operator's ruling first ("Paused": G5 orders the platforms, and no ruling pauses Linux work)
+**Merge:** insert after the table; needs the operator's ruling first ("Paused": G5 orders the platforms, and no ruling pauses Linux work); ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified (files listed; compiler README read); the macOS run of `run.sh` comes from AGENTS.md and was not rerun
 
 ### L-§3-04: step 6 should say it comes after macOS and Android, and name the compiler work G8 needs
@@ -105,7 +105,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > | 6 | Compiler (`tendcf compile`; map D46). **After macOS and Android in the goal's order (G5, 2026-11-13):** the systemd renderer and the Linux `TODO(operator)` markers. The compiler work for the first milestone is the Nix frontend (G2) and an Android platform and supervisor, neither in this file. The compiler emits only the goal file; Augments stay on the device (`projector.py`). |
 
-**Merge:** replace the row; needs the operator's ruling first if "paused" is to be kept
+**Merge:** replace the row; needs the operator's ruling first if "paused" is to be kept; ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified; independently checked 2026-11-13: weakened, corrected
 
 ### L-§4-05: the "Consequences of deferring Android" section is obsolete, and its Termux premise is open
@@ -250,7 +250,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Status: decided and executed through stage C (2026-10-31); stage D ruled (enforce nothing on a Nix host). Under the goal's platform order (G5) Linux and NixOS work comes fourth and fifth. get.sipb.cloud keeps the module as a standing proof; vps-primary stays imported, not enabled.
 
-**Merge:** replace the status paragraph; needs the operator's ruling first if "paused" is to be kept
+**Merge:** replace the status paragraph; needs the operator's ruling first if "paused" is to be kept; ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified; independently checked 2026-11-13: weakened, corrected
 
 ### N-§3-02: on a passthrough host nothing satisfies G4's device-side see-and-refuse
@@ -297,7 +297,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 >
 > 1. Bundle guard and negative test: done (`tendcf_systemd_units_writable`, check 7). 2. Writer vocabulary (v3) and `supervisor` fact (v4): done. 3. Stages A–C: done (C on get.sipb.cloud); D ruled. Next, **after macOS and Android in the goal's order (G5):** stage C on vps-primary.
 
-**Merge:** replace §5; needs the operator's ruling first if "paused" is to be kept
+**Merge:** replace §5; needs the operator's ruling first if "paused" is to be kept; ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified; independently checked 2026-11-13: confirmed
 
 ### N-§3A-05: what the NixOS derivation and module are worth to the Mac
@@ -365,7 +365,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > `plugins/renderers/android/` (planned, G5): renders Site Model records for an Android device into goal-file entries tendcf-agent actuates. Whether this is a supervisor or a new renderer kind waits on the Android adapter design (linux-targets.md §4).
 
-**Ruled (part):** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1, Q20 / M-§12-04 / X-android-05): one host per phone; each Android promise names its target user (owner/work/private) and the work profile's owner app (island/insular/none); unreachable profile reports `not_kept`; the schema bump is a design ruling (two frontier reviews) that rides the agent-id bump (M-§12-05 item 4). Also "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. Whether the renderer is a supervisor or a new renderer kind is not ruled.
+**Ruled (part):** "1. Field on entries" (operator ruling, 2026-11-14, B3 sub 1, Q20 / M-§12-04 / X-android-05): one host per phone; each Android promise names its target user (owner/work/private) and the work profile's owner app (island/insular/none); unreachable profile reports `not_kept`; the schema bump is a design ruling (two frontier reviews) that rides the agent-id bump (M-§12-05 item 4). That bump is the next unused schema version (v7 or later; shipped v6 is C-policy-01, PR 52); whether the standing-modes approval record shares it is not ruled. Also "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. Whether the renderer is a supervisor or a new renderer kind is not ruled.
 
 **Merge:** insert in the §2 tree and table; the Android adapter shape is partly ruled (above)
 **Checked:** verified; independently checked 2026-11-13: confirmed
@@ -406,7 +406,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Kind:** question
 **Goal:** G5, G8
 **Weight:** improves
-**Finding:** Step 4 renames `bin/` to `tools/`, renames the package, splits the compiler, removes older-version rendering and rewrites paths in every dated record. It waits on #41, #42 and #48. None of it moves G8 state 1 forward, except perhaps the frontend interface the Nix frontend will plug into. It is also the largest diff in the queue, and one cross-model review cycle each. One option is to do only the interface split now (`plugins/frontends/{yaml,nix}`, entry points) and defer the rename and the record rewrite. The rewrite of every dated record was djbclark's ruling, so this is his call.
+**Finding:** Step 4 renames `bin/` to `tools/`, renames the package, splits the compiler, removes older-version rendering and rewrites paths in every dated record. It waits on #41, #42 and #48 (#42 and #41 merged 2026-11-14, at acec5b5 and daa4530). None of it moves G8 state 1 forward, except perhaps the frontend interface the Nix frontend will plug into. It is also the largest diff in the queue, and one cross-model review cycle each. One option is to do only the interface split now (`plugins/frontends/{yaml,nix}`, entry points) and defer the rename and the record rewrite. The rewrite of every dated record was djbclark's ruling, so this is his call.
 **Evidence:** `plugin-layout.md:248-260`; handoff `3a99` "Where We're Going" item 3.
 **Proposed text:**
 
@@ -566,7 +566,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > **Ruled 2026-11-02:** option 3 (Q10), implemented in PR #42, which records it below; and option 5 (R13, Q49), the fork's all-or-nothing loader pinned by PR #41 (upstream-register B-5b note). Each holds without the other.
 
-**Merge:** needs the operator's ruling first (how #41 and #42 land: both still lack their required frontier cross-model review and adversary verdict, and #41 needs a rebase on #42); then land with #41, after #42; do not duplicate #42's 'Implemented 2026-11-06' paragraph
+**Merge:** needs the operator's ruling first (how #41 and #42 land: both still lack their required frontier cross-model review and adversary verdict, and #41 needs a rebase on #42); then land with #41, after #42; do not duplicate #42's 'Implemented 2026-11-06' paragraph. Status, 2026-11-14 (historical for the text above): ruled by B11, "1. Review+merge #42, then #41; park s5" (operator ruling, 2026-11-14, B11); #42 merged at acec5b5 and #41 at daa4530.
 **Checked:** verified (PR bodies read; grep); independently checked 2026-11-13: weakened, corrected (PR #42 itself adds the Q10 record to §13, and PR #41 records R13 in upstream-register)
 
 ### V-§4-12: Android needs the same validator and diff, and the Kotlin port is now critical path
@@ -660,7 +660,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > **macOS and Android (2026-11-13, G5):** the first milestone runs on a Mac and an Android device, and neither has a pinned build of the fork today (the Mac's dev build is at another revision). Open, for the operator: how the macOS build is produced and pinned (a named macOS CI job, a nix-darwin derivation, or a `bg` build recorded against `overlay/fork.json`), and whether Android runs CFEngine at all. Whichever is chosen, the binary enters a release only as a digest-bound fetched artifact (change-process.md §2 rule 5, 'A tool fork is never an input of its own'; the rule covers the project's own tool forks, which this is, and says nothing about a person's fork), so a local `bg` build counts only once it is published and its digest recorded.
 
-**Ruled:** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5): full fork pin on every platform, macOS fork build in CI; the 2-3 day stock/Termux spike (11-engine-alternatives §7) runs before the adopter path is decided. Whether Android runs CFEngine at all: "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. The macOS fork build's check on the WarpBuild runner is PR 52 gate 2 (worker 68cf038a; merge of PR 52 waits on that run). Ruled; implementation pending.
+**Ruled:** "1. Keep fork; spike stock" (operator ruling, 2026-11-14, B5): full fork pin on every platform, macOS fork build in CI; the 2-3 day stock/Termux spike (11-engine-alternatives §7) runs before the adopter path is decided. Whether Android runs CFEngine at all: "3. Termux CFEngine + thin Kotlin" (B3): state 1 on Android is Termux CFEngine fed tendcf projections. The macOS fork build's check on the WarpBuild runner was PR 52 gate 2 (worker 68cf038a; the merge of PR 52 waited on that run). Historical outcome: the run "macOS check 8 spike (WarpBuild)" (https://github.com/frdminc/tendcf/actions/runs/43602684071) completed with conclusion success, and PR 52 merged on 2026-11-14 at 2c78680. Ruled; the CI job that builds the pinned fork on macOS is still to be built (implementation pending, apart from that spike).
 
 **Merge:** insert after the ruling paragraph; the build question is ruled as above
 **Checked:** verified (workflows grep; PR body); the Mac build's version was not rerun; independently checked 2026-11-13: confirmed (clause on rule 5 added)
@@ -737,7 +737,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > Platform plans: [`linux-targets.md`](../architecture/linux-targets.md) and [`nixos-passthrough-plan.md`](../architecture/nixos-passthrough-plan.md) (Linux and NixOS; Linux is fourth and fifth in the goal's order, G5, 2026-11-13); the device-side gate: [`tendcf-validate-proposal-2026-11-03.md`](../architecture/tendcf-validate-proposal-2026-11-03.md) (a proposal, unruled). There is no macOS or Android plan yet.
 
-**Merge:** insert after the paragraph; needs the operator's ruling first if "paused" is to be kept
+**Merge:** insert after the paragraph; needs the operator's ruling first if "paused" is to be kept; ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified; independently checked 2026-11-13: not in the verdict table, but correction C1 applies to it ("paused" replaced by order language)
 
 ### X-AG-01: AGENTS.md's verification section has no macOS or Android path
@@ -750,9 +750,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 **Evidence:** `AGENTS.md:241-268`.
 **Proposed text:**
 
-> Under the 2026-11-13 goal the first platforms are macOS and Android. The Mac dev build (the one named above) is not the pinned fork; a result from it names its own `cf-agent --version`. No macOS install, macOS CI job or Android build of tendcf exists yet. Linux checks above stay as they are, for the paused Linux work.
+> Under the 2026-11-13 goal the first platforms are macOS and Android. The Mac dev build (the one named above) is not the pinned fork; a result from it names its own `cf-agent --version`. No macOS install, macOS CI job or Android build of tendcf exists yet. Linux checks above stay as they are, for the Linux work that is later in the order (not paused).
 
-**Merge:** insert after "Live hosts …"; needs the operator's ruling first ("paused": G5 orders the platforms, and no ruling pauses Linux work)
+**Merge:** insert after "Live hosts …"; needs the operator's ruling first ("paused": G5 orders the platforms, and no ruling pauses Linux work); ruled 2026-11-14, B4 rider, "1. Order language": Linux is later in the order, not paused, so "paused" is not kept
 **Checked:** verified
 
 ### X-CO-01: compiler README calls Nix optional and later
@@ -829,7 +829,7 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 
 > (For the next handoff, not a merge into the dated one.) Re-order under the 2026-11-13 goal: review (frontier + adversary) and merge #42, then #41; finish the D46 decisions PR; then ask the operator for the first-milestone rulings (server Mac and map §14.1, Android shape, macOS fork build, Nix evaluator) before the restructure.
 
-**Merge:** needs the operator's ruling first (queue order, and what happens to the open PRs: #41 and #42 both still lack their required frontier cross-model review and adversary verdict, and #41 needs a rebase on #42); dated handoffs are not edited
+**Merge:** needs the operator's ruling first (queue order, and what happens to the open PRs: #41 and #42 both still lack their required frontier cross-model review and adversary verdict, and #41 needs a rebase on #42); dated handoffs are not edited. Status, 2026-11-14 (historical for the text above): the order is ruled by B11, "1. Review+merge #42, then #41; park s5" (operator ruling, 2026-11-14, B11); #42 merged at acec5b5 and #41 at daa4530.
 **Checked:** verified (both handoffs read); independently checked 2026-11-13: weakened, corrected
 
 ### X-HO-02: the in-flight D46 decisions PR touches the same sections as PL items
@@ -864,6 +864,9 @@ plans a log archive or monitoring service, macOS install, Android install or pee
 > | **s5-design** report-only unit detector as a custom promise (873-line note, no PR, 54 commits behind master) | **Park.** | Its own §11 scopes it to systemd plus dpkg and puts macOS and Android out of scope. Under G5 it serves the fourth and fifth platforms. Keep the branch. The reusable part is the promise-module pattern and the row assembly (§6), worth reading when a launchd or Android extra-entry detector is designed. Do not spend two frontier reviews on it now. |
 
 **Merge:** needs the operator's ruling first (what to do with PRs #41 and #42 and the paused worktrees; both PRs still lack their required frontier cross-model review and adversary verdict, and #41 needs a rebase on #42)
+
+**Ruled:** "1. Review+merge #42, then #41; park s5" (operator ruling, 2026-11-14, B11): frontier and adversary review #42, merge; rebase #41, fix its two stale statements and stale pin hash, review, merge; record the two 2026-11-02 rulings with #41 without duplicating #42's paragraph; park s5-design. Outcome (historical for the text above): #42 merged at acec5b5 and #41 at daa4530, both on 2026-11-14; s5-design stays parked.
+
 **Checked:** verified (PR bodies, worktree list, s5 §11); PR diffs not read, CI state taken from the inventory digest; independently checked 2026-11-13: weakened, corrected
 
 ---
@@ -894,7 +897,7 @@ Idea 1 was withdrawn after checking (see the last section); the remaining ideas 
 7. **G9 grows from the overlay, not from git.** `bin/overlay.py` already gives named patches, drift detection without touching a checkout, and patch-id retirement. Generalised to plugins and to forks such as ShizukuTendCF, it hides merge and rebase, as G9 asks, and the AI's job becomes re-deriving one drifted patch.
 8. **Risk: review cost against the milestone.** Each docs PR costs two frontier reviews plus an adversary review, and the restructure rewrites every dated record. At the current queue, budget can run out on renames before a Mac converges. Split the restructure, as in PL-§5-06.
 9. **The log archive is the first "server" service, and a good first peer protocol.** Rows flowing from Android to the Mac, under the handshake G3 requires, exercise peer authentication with no actuation risk. Building that before signed releases flow peer to peer would test the handshake cheaply.
-10. **Keep pastebin as a regression host for the shared bundle.** Linux is paused, but `tendcf_services.cf` is one file for launchd and systemd. pastebin's canary under root `cf-execd` is the only enforced proof of the bundle. Re-installing it after each policy change, #41/#42 included, keeps a Mac-first edit from silently breaking it.
+10. **Keep pastebin as a regression host for the shared bundle.** Linux is later in the order, not paused, and `tendcf_services.cf` is one file for launchd and systemd. pastebin's canary under root `cf-execd` is the only enforced proof of the bundle. Re-installing it after each policy change, #41/#42 included, keeps a Mac-first edit from silently breaking it.
 
 Last search run: firecrawl search and scrape of the NixOS manual's modular-services section (an unofficial mirror), run after drafting L-§5-09; it confirmed `system.services.<name>`, `_class = "service"`, `process.argv`, and that the feature is "new in NixOS 25.11 ... in development". The independent check read the canonical manual page and nix-darwin/nix-darwin#1765 and corrected L-§5-09 accordingly. No search on TUF delegations, nix-darwin's current launchd options, or Android profiles; those statements are marked as unfetched.
 

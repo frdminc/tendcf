@@ -384,7 +384,9 @@ Ruled, one item per line. Quotes are the operator's chosen options, exactly.
    #42's own paragraph, which records the other (Q10, "Implemented
    2026-11-06"; V-§13-11, C9). `s5-design` (the report-only systemd/dpkg
    detector, 54 commits behind) is parked and the branch kept. Queued by the
-   lead; the reviews and merges are not yet done.
+   lead; at the time of the ruling the reviews and merges were not yet done
+   (historical). Outcome, 2026-11-14: #42 merged (`acec5b5`), then #41
+   (`daa4530`), in the ruled order; `s5-design` stays parked.
 2. **B-5b: overlay carries the all-or-nothing loader.** Operator ruling,
    2026-11-14, B11 round 2 item 1 (adversary D5, Astra C2, upstream queue C2):
    "1. Replace". The overlay carries the all-or-nothing CMDB loader (R13)
@@ -403,7 +405,9 @@ Ruled, one item per line. Quotes are the operator's chosen options, exactly.
    `TENDCF_REQUIRE_FORK_LOADER=1` and fails on any SKIP. Follow-up (Astra r2
    B3): assertions that hold only with the strict loader (the `strict_case`
    policy refusals) are gated the same way, so a non-fork run passes with
-   SKIPs rather than failing. How the script behaves is in `AGENTS.md`
+   SKIPs rather than failing (done in the base: the `strict_case` calls with
+   POLICY `fork` go through `fork_only` in `tests/policy/run.sh`; not yet run
+   on the Mac). How the script behaves is in `AGENTS.md`
    ("Verifying policy and the CFEngine build").
 4. **Upstream queue order.** Operator ruling, 2026-11-14, B11 round 2 item 3:
    "1. Leave order as is". The libntech strict parse stays queue item 6,

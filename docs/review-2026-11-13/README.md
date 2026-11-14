@@ -12,7 +12,9 @@ Read `14-synthesis-and-rulings.md` first. Section B lists the rulings the
 operator had to make, and each is now ruled (2026-11-14); its opening index
 maps every line of the rulings record (L4 to L56) to its item and to the files
 that carry it. Section C lists defects that need no ruling; section F is the
-merge map.
+merge map. The rulings record itself is `rulings-record-2026-11-14.md`, and
+`14-synthesis-and-rulings.md` lists the questions the record does not answer
+under "Open items awaiting operator ruling (2026-11-14)".
 
 ## Rulings of 2026-11-14
 
@@ -24,7 +26,10 @@ the chosen option exactly and citing it as `operator ruling, 2026-11-14,
 open. Three edits reached the goal text itself: the G4 figure sentence, the G8
 lead sentence and G8 item 3 (`00-goal-definition.md`, "Later rulings"). A
 ruled item that is not yet built says "ruled; implementation pending" (or the
-exact status).
+exact status). A ruled item that is built says so with its dated outcome (for
+example C-policy-01, implemented by PR 52, merged 2026-11-14 as `2c78680`).
+An item the record leaves undecided says "open: awaiting operator ruling (the
+question)" and is never decided by this directory.
 
 ## Files
 
@@ -45,6 +50,7 @@ exact status).
 | `12-fork-management.md` | Research: branch and fork management (G9) | new design material |
 | `13-premortem-and-ideas.md` | Pre-mortem, tensions, process, ideas | (reference) |
 | `14-synthesis-and-rulings.md` | Synthesis, rulings needed, defects, path to the first finish-line state | (reference) |
+| `rulings-record-2026-11-14.md` | The operator's rulings record, lines L4 to L56, verbatim except that absolute local paths are replaced by a neutral phrase | (reference; the L-numbers in 14 point here) |
 | `checks/v1` to `v7` | The independent checkers' verdict tables and corrections; v7 is the source re-fetch | (evidence; cited as "vN Cn"; v7's corrections are "v7 R1" to "R21") |
 
 ## How it was produced
@@ -62,7 +68,8 @@ exact status).
 
 Every reviewer and checker is the same model family. This is not the
 cross-model frontier review the repository's standing rule requires before a
-merge, and no adversary review has run. Nothing here was built or executed, no
+merge, and no adversary review had run when these files were written (the
+rulings PR, PR 62, has since had its own cross-model and adversary reviews). Nothing here was built or executed, no
 device or live host was touched, and nothing ran under Nix. Each file's "Not
 checked" list says what its author did not verify.
 

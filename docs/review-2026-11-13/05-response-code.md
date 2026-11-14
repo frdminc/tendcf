@@ -28,7 +28,7 @@ Sources consulted: firecrawl (scrape) — Nix manual `restrict-eval`/`pure-eval`
 | 8 | Android client | nothing in tendcf; substrate in stayturgid's Kotlin agent, Termux CFEngine and ShizukuTendCF | Receive, verify, diff/consent UI, apply via Shizuku, report | 3–6k Kotlin lines, 4–8 weeks (less if Termux CFEngine converges: needs a ruling) | C-android-01..05 |
 | 9 | Transport and peer handshake | nothing (inventory §H "Push: nothing") | Mac to Android delivery, and acceptance from any peer that completes the handshake | 1–2 weeks | C-schema-02 |
 | 10 | Logs archived on the Mac | `schema/report-row.schema.json` (only `bin/unit_classifier.py`, Linux, uses it) | A sender on Android, a receiver and archive on the Mac, and a goal-file shape for both | 300–500 lines, ~1 week | C-macos-02 |
-| 11 | Fail-closed CMDB on the Mac build | PR #41 (open) | Merge it, and add a policy-side guard | days | C-policy-06 |
+| 11 | Fail-closed CMDB on the Mac build | PR #41 (open when written; merged 2026-11-14, daa4530) | Merge it, and add a policy-side guard | days | C-policy-06 |
 
 The total is a guess of 3 to 5 months of focused work. Rows 4, 5 and 8 dominate.
 
@@ -245,7 +245,7 @@ With nested prefixes the compiler takes `owners[0]`, the first declared, not the
 1. Schema version: "1. Bump to 6" (operator ruling, 2026-11-14, C-policy-01 schema version). A strict narrowing of `pre_action.command` still bumps `schema_version`; the same version means the same acceptance set. So step 1's "(schema bump)" is a bump to schema_version 6.
 2. Contract version: "1. Confirm const: 2" (operator ruling, 2026-11-14, C-policy-01 contract_version form). The `contract_version` is an exact pin (`const: 2`), not a floor; the lead's decision in PR 52 is confirmed.
 
-Ruled; implementation pending, apart from what PR 52 already carries. The bump changes `schema_version` and `contract_version`, so it is a design ruling with two frontier reviews under AGENTS.md rule 3.
+Ruled; the schema half is implemented: `schema_version` 6 and `contract_version` `const: 2` shipped with PR 52 (merged 2026-11-14 at 2c78680; the schema bump is 83d7280), so these two values are already in the checked-in schemas and are no longer pending. This record does not restate what else PR 52 changed in the policy. The bump changes `schema_version` and `contract_version`, so it was a design ruling with two frontier reviews under AGENTS.md rule 3. Later schema changes (the Android `profile` field with the `agent` id, and the standing-modes approval record) cannot reuse v6: they take the next unused schema version (v7 or later), grouping not ruled.
 
 **Merge:** replace the vars and commands sections of `tendcf_interlocks`
 **Checked:** verified (read; not executed); independently checked 2026-11-13: confirmed (live on the deployed path as code: the deployed policy joins and shells every pre_action; the injection itself is latent, since the deployed canary pre_action is `/usr/bin/true`); no lint outside the schema restricts the strings: confirmed; proposed fix expressible as written: weakened, corrected (step 2 not proven; replaced by the fallback as step 1)
@@ -317,7 +317,7 @@ Ruled; implementation pending, apart from what PR 52 already carries. The bump c
 **Goal:** G4
 **Weight:** blocks-goal
 **Finding:** If `host_specific.json` fails to load (the upstream fail-open that PR #41 fixes in the fork), both containers are undefined, `getindices` is empty, and the bundle does nothing and reports nothing. Only cf-agent's own ERR log line about the CMDB data is left, and tendcf does not surface it. To the bundle, that run looks like a host with zero entries. The policy has no `isvariable` check. That makes a device that is not under control look converged.
-**Evidence:** `rg isvariable policy/` (no hits); `policy/tendcf_services.cf:104-108`; digest-current-plan-docs C1d and B12 (fail-open applies to pastebin; #41 open).
+**Evidence:** `rg isvariable policy/` (no hits); `policy/tendcf_services.cf:104-108`; digest-current-plan-docs C1d and B12 (fail-open applies to pastebin; #41 open when this was written, merged 2026-11-14 at daa4530).
 **Proposed text:**
 
 > Require a projection marker (`vars.tendcf_meta.goal_sha256`, per Q12) and report `tendcf: no goal data loaded` and actuate nothing when it is absent.
@@ -420,9 +420,9 @@ Ruled; implementation pending, apart from what PR 52 already carries. The bump c
 
 > `pre_action.command[0]` must be an absolute path (`^/`), and every item is held to the systemd argv alphabet plus "no ASCII space" until C-policy-01 removes the shell.
 
-**Ruled:** this is the schema half of C-policy-01; "1. Bump to 6" and "1. Confirm const: 2" (operator ruling, 2026-11-14, C-policy-01) apply: the narrowing bumps `schema_version` to 6 and the `contract_version` is the exact pin `const: 2`.
+**Ruled:** this is the schema half of C-policy-01; "1. Bump to 6" and "1. Confirm const: 2" (operator ruling, 2026-11-14, C-policy-01) apply: the narrowing bumps `schema_version` to 6 and the `contract_version` is the exact pin `const: 2`. Implemented by PR 52 (merged 2026-11-14, 2c78680; schema bump 83d7280).
 
-**Merge:** insert into `interlock_entry` (schema bump to 6)
+**Merge:** insert into `interlock_entry` (schema bump to 6; done, PR 52)
 **Checked:** verified; independently checked 2026-11-13: confirmed (latent)
 
 ## bin
@@ -587,7 +587,7 @@ So the compiler and the policy can disagree, and the `env` drop (C-policy-02) is
 
 > Add `deploy/macos/tendcf-install.sh` with the same subcommands: tree under `/opt/tendcf` (root:wheel), `otool -L` check, `org.tendcf.execd` LaunchDaemon via `launchctl bootstrap system`, and the same data-restore-on-reject rule.
 
-**Ruled (B6):** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix is for authoring and building only. Sub-rulings: "1. macOS VM on bigmac" (B6 sub 1, 13 E-2): state 1's Mac is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1), current macOS, with snapshot and rollback, CI able to run the same image, a client and not an always-on server. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent with no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). The proposed `org.tendcf.execd` LaunchDaemon in the text above is the VM's path. Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work (research the floor: what macOS can drop in a guest, for example tart vanilla against base images). Ruled; implementation pending.
+**Ruled (B6):** "1. Plain Mac, launchd by tendcf" (operator ruling, 2026-11-14, B6): state 1's Mac has no nix-darwin; tendcf renders launchd; Nix is for authoring and building only. Sub-rulings: "1. macOS VM on bigmac" (B6 sub 1, 13 E-2): state 1's Mac is an Apple Silicon macOS VM (tart / Virtualization.framework) on bigmac (MacBookPro18,1), current macOS, with snapshot and rollback, CI able to run the same image, a client and not an always-on server. "1. Root in VM, user on bigmac" (B6 sub 3): the enforcing VM runs tendcf as a root LaunchDaemon, bigmac's dry-run runs as a user LaunchAgent with no root; state 1 must verify the root launchd render path (skipped by the WarpBuild spike). Open: awaiting operator ruling (this root enforcement in the VM comes before `tendcf-validate` exists, while D45 says the validator is built "before any further host is enforced"; is the VM an operator-ruled exception, as pastebin's canary is, or does enforcement wait for the validator?). The order is not changed here. The proposed `org.tendcf.execd` LaunchDaemon in the text above is the VM's path. Rider: "Try to cut down the MacOS VM image so be smaller, remove stuff we don't need." (B6 sub 1 rider): the state-1 macOS VM image is minimised, starting from the smallest base (vanilla, not a dev-tools image) and stripping what state 1 does not need; queued as build work (research the floor: what macOS can drop in a guest, for example tart vanilla against base images). Ruled; implementation pending.
 
 **Merge:** insert as a new file (needs the operator's ruling on the location, AGENTS.md item 23)
 **Checked:** verified; independently checked 2026-11-13: confirmed
@@ -598,7 +598,7 @@ So the compiler and the policy can disagree, and the `env` drop (C-policy-02) is
 **Kind:** correct
 **Goal:** G4
 **Weight:** blocks-goal
-**Finding:** `data FILE` installs raw `host_specific.json`. The host never holds the goal file, so it cannot show a diff or refuse one, and it cannot check `host`, a signature or a baseline. "Validated by cf-promises" checks policy syntax. While the fork's CMDB loader is fail-open (#41), a bad data file passes it and is silently ignored. So the live canary path is the opposite of G4: the operator hand-copies opaque bytes.
+**Finding:** `data FILE` installs raw `host_specific.json`. The host never holds the goal file, so it cannot show a diff or refuse one, and it cannot check `host`, a signature or a baseline. "Validated by cf-promises" checks policy syntax. While the fork's CMDB loader is fail-open (#41, as written; #41 has since merged, 2026-11-14), a bad data file passes it and is silently ignored. So the live canary path is the opposite of G4: the operator hand-copies opaque bytes.
 **Evidence:** `deploy/linux/tendcf-install.sh:13-18`, `:144-158`; digest-current-plan-docs C1c and C1d.
 **Proposed text:**
 
@@ -705,6 +705,8 @@ The cf-serverd and cf-runagent path must not be reused as the update channel.
 Rider: "We don't have to always do both builds when in development, just the modt appropriate one for any given situation." (operator ruling, 2026-11-14, Smaller 1 rider). Development builds only the flavour that fits the task (the public build with developer mode, or the developer build), not both every time.
 
 Ruled; implementation pending.
+
+Recommended follow-up from the PR 62 adversary review, not ruled: the developer build should have a distinct `applicationId` and a distinct signing key, and the release pipeline should refuse to publish the developer flavour, so that "never the published public build" is enforced by the build and not only by this sentence. The operator has not ruled on this; it is recorded here as a recommendation only.
 
 **Merge:** ruled
 **Checked:** verified (README and call sites read; TrustedSigners body not read); independently checked 2026-11-13: confirmed (live in the ShizukuTendCF build)
