@@ -121,7 +121,7 @@ def test_site_model_inputs_validate(schemas: Schemas) -> None:
 def test_example_site_mac_golden(schemas: Schemas) -> None:
     result = compile_host(_model(SITE), _host(SITE), schemas)
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 5
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 6
     assert doc["host"] == HOST_KEY
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "launchd", "state": "present"}}
     sup = doc["domains"]["supervision"]
@@ -303,7 +303,7 @@ def test_nixos_host_without_services_is_deliberately_unmanaged(tendcf: Path, sch
     # no-op on a file with no entries): drift in either repo shows up here.
     assert result.canonical == (tendcf / "deploy" / "linux" / "passthrough" / "goal-file.json").read_bytes()
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 5
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 6
     assert doc["domains"]["supervision"] == {"coverage": "deliberately-unmanaged"}
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "nixos", "state": "present"}}
     assert set(doc["domains"]) == {"device-trust", "supervision"}  # no unit-writer registry travels
@@ -372,19 +372,20 @@ def _host_shapes() -> dict[str, HostSpec]:
     }
 
 
+@pytest.mark.parametrize("old_version", [4, 5])
 @pytest.mark.parametrize("shape", ["launchd", "nixos", "systemd", "runit"])
-def test_schema_v4_and_v5_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str) -> None:
-    """For inputs valid under the current Site Model contract, the v4 file is the
-    current file with the old version number, for every host shape. The v5 file is
-    validated against tendcf's schemas (the v4 file cannot be: the schema is a
-    const). Not a claim about arbitrary historical v4 output: see
+def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str, old_version: int) -> None:
+    """For inputs valid under the current Site Model contract, the v4 and v5 files
+    are the current file with the old version number, for every host shape. The
+    current file is validated against tendcf's schemas (an older file cannot be:
+    the schema is a const). Not a claim about arbitrary historical v4 output: see
     test_dpkg_writer_renders_at_v4_but_is_refused_at_v5."""
     host = _host_shapes()[shape]
-    old = compile_host(_model(SITE), host, None, schema_version=4).goal_file
-    new = compile_host(_model(SITE), host, schemas).goal_file  # validates against the v5 schema
-    assert old["schema_version"] == 4 and new["schema_version"] == 5
+    old = compile_host(_model(SITE), host, None, schema_version=old_version).goal_file
+    new = compile_host(_model(SITE), host, schemas).goal_file  # validates against the current schema
+    assert old["schema_version"] == old_version and new["schema_version"] == GOAL_FILE_SCHEMA_VERSION
     assert new["domains"]["device-trust"]["entries"]["supervisor"]["host"]["name"] == host.supervisor
-    assert {**old, "schema_version": 5} == new
+    assert {**old, "schema_version": GOAL_FILE_SCHEMA_VERSION} == new
     assert schemas.errors("goal-file.schema.json", new) == []
 
 

@@ -8,7 +8,7 @@ Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107, 123, 143-144, 146-154) or the goal-file
 family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159) stays as in the happy path.
 Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
-the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-159 are the interlock `pre_action` argv alphabet (C-policy-01; below).
+the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-159 are schema v6's: the interlock `pre_action` argv alphabet (C-policy-01; below).
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -57,7 +57,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 6`, one above the current 5 | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 7`, one above the current 6 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
