@@ -983,8 +983,9 @@ that hold the stale text, per its brief.
    a function of.
 5. **Map §12 item 1** ("deleting or withholding the projection is not a
    demonstrated fail-closed launch protocol") is right, and fact 2
-   strengthens it: on the pinned fork, a *malformed* projection is not
-   even all-or-nothing.
+   strengthens it: on the fork pinned when this was written (`b8abf28408b1`),
+   a *malformed* projection was not even all-or-nothing (the pin has since
+   moved to the fail-closed loader, §13).
 6. **`deploy/linux/tendcf-install.sh` `put_data`** is not atomic against
    a concurrent cf-agent (fact 8). This matters once a scheduler runs,
    which stage B enables.
@@ -1220,9 +1221,16 @@ order within the one pass. `bundlesequence` guard classes in `promises.cf` are
 not needed for this check. This is a consistency check, not a sandbox: a CMDB
 author (root) already chooses each pre_action executable, `/bin/sh` included,
 and the unit commands, so it does not stop a hostile but self-consistent file.
-The fork-side all-or-nothing loader (PR #41) and this check are independent:
-with the loader failing closed, the file's keys are not loaded and the check
-refuses and reports it, which is correct and louder.
+The fork-side all-or-nothing loader (PR #41) and this check hold each without
+the other: with the loader failing closed, the file's keys are not loaded and
+the check refuses and reports it, which is correct and louder. The independence
+is limited, not complete: the loader's strict parse (a repeated member or
+trailing input refuses the file; fork `6505f488a`) belongs to the CMDB loader
+only, while this check's `readjson` stays lenient and sees the last of a
+repeated member or `vars` section, so an earlier container the loader refused
+is not named by the check (it still refuses, as nothing the file lists was
+loaded). The check does not detect such a file when the loader is lenient and
+the repeated member is invisible to both parsers.
 
 Two findings from the implementation, both about the proof above. (1) The
 Mac dev build (`3.29.0a.086d27749`) does not carry the per-entry loader

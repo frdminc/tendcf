@@ -68,10 +68,17 @@
 # every service ungated (services are gated negatively, on
 # `!interlock_blocked_*`, and that class only exists for an interlock that
 # loaded). The fork at the pin (overlay/fork.json, PR #41, operator ruling R13)
-# loads all-or-nothing instead: any invalid entry and it installs none of the
-# file, so this check then sees every `vars` key missing and refuses. The two
-# are independent: the check holds for a loader that fails closed, for one that
-# does not, and for a gap in either. The check does not model WHY an entry was
+# loads all-or-nothing instead: an invalid entry, a repeated object member
+# anywhere, anything after the document, a class name with whitespace at either
+# end, a variable that exists already, and it installs none of the file, so this
+# check then sees every `vars` key missing and refuses. That strict parse is the
+# CMDB loader's only: `readjson`, which this check reads the file with, and
+# def.json stay lenient, so after a repeated member or a repeated `vars` section
+# the check sees the LAST one only (an earlier container is not named). It still
+# refuses, because the loader installed nothing the file lists. The two are not
+# fully independent for that reason, and each holds for a loader that fails
+# closed, for one that does not, and for a gap in either, to the extent the
+# other does not share the gap. The check does not model WHY an entry was
 # dropped. It reads the file itself and compares it with what the loader installed:
 #   - the file's top-level keys must be exactly `vars`. The loader also applies
 #     a `variables` section (after `vars`; upstream CFEngine lets it replace a
@@ -141,8 +148,8 @@
 # `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
 # that variable before any policy runs. What a preset does then depends on the
 # promise (verify_vars.c VerifyVarPromise, read at commit b8abf28408b1; the
-# pin in overlay/fork.json is now d32cade13, which differs from it only in
-# libpromises/cmdb.c, cmdb.h and tests): a promise with a LITERAL rvalue (`slist => { }`) always
+# pin in overlay/fork.json is now 6505f488a, which differs from it only in
+# libpromises/cmdb.c, cmdb.h, tests and the libntech submodule pointer): a promise with a LITERAL rvalue (`slist => { }`) always
 # redefines it, so the policy's value stands. A promise whose rvalue is a
 # FUNCTION CALL is skipped when the variable exists ("Already did this") if the
 # call was not already evaluated to a value when the promise runs, and
