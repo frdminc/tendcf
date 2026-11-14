@@ -1,0 +1,10 @@
+# Test-only completion marker. tests/policy/run.sh appends this bundle to the
+# entry policy's bundlesequence AFTER tendcf_interlocks and tendcf_services, so
+# its report appears in the same output only if cf-agent validated the policy
+# and evaluated both tendcf bundles in that very invocation. It is not part of
+# the shipped policy/ files and actuates nothing.
+bundle agent tendcf_test_done
+{
+  reports:
+      "tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services";
+}
