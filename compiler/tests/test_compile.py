@@ -378,7 +378,12 @@ def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: S
     """For inputs valid under the current Site Model contract, the v4 and v5 files
     are the current file with the old version number, for every host shape. The
     current file is validated against tendcf's schemas (an older file cannot be:
-    the schema is a const). Not a claim about arbitrary historical v4 output: see
+    the schema is a const). v5 differs from v6 only by the number because v6
+    narrowed the interlock pre_action argv (a strict subset of v5's acceptance
+    set): any Site Model valid now was valid at v5, so its v5 rendering is the
+    same file; v4 differs from v5 only by the unit-writer key language, the
+    `dpkg` retirement and the new kinds, none of which nix2cf emits. Not a
+    claim about arbitrary historical v4 output: see
     test_dpkg_writer_renders_at_v4_but_is_refused_at_v5."""
     host = _host_shapes()[shape]
     old = compile_host(_model(SITE), host, None, schema_version=old_version).goal_file
