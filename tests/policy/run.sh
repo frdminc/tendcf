@@ -81,14 +81,21 @@
 #      container that is a list of strings is the positive control: accepted,
 #      actuates. A plain-identifier key longer than 64 characters is refused and
 #      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
-#      NB: the fork's loader skips a bad entry and installs the rest, but the
-#      Mac dev build rejects the whole `vars` instead (the same fixture refuses
-#      on both, as "nothing loaded"), so only the fork's CI legs see the
-#      per-entry skip.
+#      NB: the fork at the pin (overlay/fork.json) loads all-or-nothing (PR #41,
+#      operator ruling R13): a file with any invalid entry installs none of its
+#      contents, so on the Linux legs this check sees every `vars` key missing,
+#      as the Mac dev build does when it rejects the whole `vars`. The same
+#      fixture refuses the same way on both ("nothing loaded"). No loader this
+#      check runs against skips one entry and installs the rest; the fork did
+#      before R13 (`8f0076b81`, B-5b), which is the 2026-11-02 fail-open.
 #  10. the same cross-check against a loader that skips ONE container, which
-#      the Mac dev build cannot do: tests/policy/sim-loader.cf installs
-#      data:variables.* in the loader's place (cf-agent --no-host-specific-data)
-#      from the very file the policy reads. Each case must report what differs
+#      neither the Mac dev build nor the pinned fork does: tests/policy/sim-loader.cf
+#      installs data:variables.* in the loader's place (cf-agent
+#      --no-host-specific-data) from the very file the policy reads. It stays
+#      valid after R13: the check compares the file with what is installed
+#      whatever the loader's policy, and this is the only way to test the
+#      partial states (a fork before the pin, another engine, a gap in the
+#      loader's validation). Each case must report what differs
 #      and run nothing; the control case (everything installed) must run as
 #      before, so the others cannot pass because the stand-in installed nothing.
 #      A skipped interlock container with the services loaded is the 2026-11-02
@@ -613,6 +620,11 @@ out="$work/xc-malformed.out"
 check "malformed interlock: refusal reported" refusal_reported "$out"
 check "malformed interlock: the container the loader did not install is named" \
     key_not_loaded "$out" tendcf_interlock
+# All-or-nothing: the valid sibling container is not installed either (the
+# pre-R13 fork installed it, which was the fail-open; the Mac dev build rejects
+# the whole `vars`, so it agrees).
+check "malformed interlock: the sibling tendcf_service is not installed either (all-or-nothing)" \
+    key_not_loaded "$out" tendcf_service
 check "malformed interlock: refusal reported once" refusal_once "$out"
 check "malformed interlock: nothing actuated, no pre_action run, no service processed" \
     no_actuation "$out"

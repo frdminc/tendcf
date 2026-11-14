@@ -62,12 +62,17 @@
 #
 # CMDB cross-check (`tendcf_cmdb`, proposal 2026-11-03 section 13, option 3,
 # operator ruling Q10 2026-11-02). Everything above assumes CFEngine's loader
-# installed what host_specific.json says. It does not promise that: the fork's
-# loader skips a bad entry on its own and still returns success, so a skipped
-# `tendcf_interlock` leaves every service ungated (services are gated
-# negatively, on `!interlock_blocked_*`, and that class only exists for an
-# interlock that loaded). The check does not model WHY an entry was dropped. It
-# reads the file itself and compares it with what the loader installed:
+# installed what host_specific.json says. Nothing promises that for every
+# engine: the fork before 2026-11-02 (`8f0076b81`, B-5b) skipped a bad entry on
+# its own and still returned success, and a skipped `tendcf_interlock` leaves
+# every service ungated (services are gated negatively, on
+# `!interlock_blocked_*`, and that class only exists for an interlock that
+# loaded). The fork at the pin (overlay/fork.json, PR #41, operator ruling R13)
+# loads all-or-nothing instead: any invalid entry and it installs none of the
+# file, so this check then sees every `vars` key missing and refuses. The two
+# are independent: the check holds for a loader that fails closed, for one that
+# does not, and for a gap in either. The check does not model WHY an entry was
+# dropped. It reads the file itself and compares it with what the loader installed:
 #   - the file's top-level keys must be exactly `vars`. The loader also applies
 #     a `variables` section (loaded AFTER `vars`, replacing a same-named
 #     variable) and a `classes` section (which can define `interlock_ok_*`);
@@ -544,7 +549,7 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: $(tendcf_cmdb.file) does not exist but CFEngine loaded data:variables.$(tendcf_cmdb.loaded_clean)";
 
       "tendcf_cmdb_problem_missing"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_clean)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_clean) (the loader skipped it)";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_clean)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_clean) (the loader did not install it)";
 
       "tendcf_cmdb_problem_unlisted"::
         "tendcf: CMDB cross-check: CFEngine loaded data:variables.$(tendcf_cmdb.unlisted_clean), which is not a key under 'vars' in $(tendcf_cmdb.file)";
