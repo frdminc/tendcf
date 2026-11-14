@@ -1,14 +1,14 @@
 # Negative fixtures
 
-One hundred forty-five deliberately broken overlays, plus six byte-class fixtures in
+One hundred forty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107, 123, 143-144, 146-154, 160, 167-168, 174-175) or the goal-file
-family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173) stays as in the happy path.
+family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173, 176) stays as in the happy path.
 Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
-the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-175 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below).
+the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-176 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below).
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -429,9 +429,9 @@ The report-row cases (143, 144, 146-154) and 123 overlay a whole Site Model file
 
 Measured in slice S2, one clause at a time. The goal cross-file rules: disabling the overlap check turns 62, 118 and 119 red; the cross-domain rule, 155 alone; package-id uniqueness, 142 alone; the `tendcf-install` rule, 125 alone; the present-service writer rule, 64 and 128. The schema cases each flip when the one clause they exercise is removed (the key regex for 113-117, each admitting only its own key; the launchd and runit members' `unit-writer` pattern for 120 and 121 and their `tendcf-install` ban for 126 and 127; the systemd prefix rule for 124; the nixos, launchd and runit `unit-package` bans for 132-134; each clause of `unit_package_map` for 135-141; and the row's `required`, `if/then` and `else` properties, one at a time, for 143-154), and the cases of the same group stay red. 126 and 127 are accepted by the whole pipeline (family noise aside) once the supervisor's `tendcf-install` prohibition is deleted. 113 replaces `tendcf.canary.*` with `*` so that no overlap or coverage rule fires beside the pattern, and 98 uses `third-party` (it used `dpkg`, which would also fire `enum`).
 
-## Interlock argv cases (156-175)
+## Interlock argv cases (156-176)
 
-`pre_action.command` is held to `common.schema.json#/$defs/interlock_argv`: an absolute `command[0]`, every element only `[A-Za-z0-9._+@:=,/-]`, no newline. The policy runs the argv without a shell (`useshell => "noshell"`), so these are the schema half of C-policy-01; `tests/policy/run.sh` check 8 is the policy half. The goal-file cases (156-159, 161-166, 169-173) take `examples/goal-file.json` as the base with the `caddy-config-valid` interlock's `pre_action.command` replaced; the Site Model cases (160, 167-168, 174-175) take `examples/services.yml` with the one value changed. 169-173 change only `command[0]`, so `prefixItems[0]` is pinned apart from the element pattern.
+`pre_action.command` is held to `common.schema.json#/$defs/interlock_argv`: an absolute `command[0]`, every element only `[A-Za-z0-9._+@:=,/-]`, no newline. The policy runs the argv without a shell (`useshell => "noshell"`), so these are the schema half of C-policy-01; `tests/policy/run.sh` check 8 is the policy half. The goal-file cases (156-159, 161-166, 169-173, 176) take `examples/goal-file.json` as the base with the `caddy-config-valid` interlock's `pre_action.command` replaced; the Site Model cases (160, 167-168, 174-175) take `examples/services.yml` with the one value changed. 169-173 and 176 change only `command[0]`, so `prefixItems[0]` is pinned apart from the element pattern (176 pins its own `not` clause: a trailing newline passes the `$`-anchored pattern in Python's `re`).
 
 | # | Case | Broken input | Caught by |
 |---|------|--------------|-----------|
@@ -455,6 +455,7 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 173 | `173-interlock-command-non-ascii` | `command[0]` is `/opt/homebrew/bin/càddy` (ASCII only) | schema (`pattern`) |
 | 174 | `174-site-interlock-command-space` | the Site Model interlock with `command[0]` `/usr/local/bin/tail scale`: the authoring-time half for the executable | schema (`pattern`) |
 | 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 3`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
+| 176 | `176-interlock-command-newline` | `command[0]` is `/opt/homebrew/bin/caddy\n` with a trailing newline, which the `$`-anchored pattern alone accepts: only `prefixItems[0]`'s `not` refuses it | schema (`not`) |
 
 ## Every class has a fixture
 
