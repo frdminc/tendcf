@@ -156,6 +156,8 @@ refusal_reported() { grep -q "tendcf: CMDB cross-check failed: refusing to actua
 refusal_once() { [ "$(grep -c "CMDB cross-check failed" "$1")" = 1 ]; }
 no_crosscheck() { ! grep -q "CMDB cross-check" "$1"; }
 no_actuation() { ! grep -Eq "Executing|Created file|launchctl|systemctl|tendcf: (service|interlock) '" "$1"; }
+foreign_var_reported() { grep -q "tendcf: CMDB cross-check: the CMDB or an augments file installed a variable outside" "$1"; }
+foreign_class_reported() { grep -q "tendcf: CMDB cross-check: the CMDB or an augments file defined a class" "$1"; }
 key_not_loaded() { grep -q "key '$2' is under 'vars' in .* but CFEngine did not load data:variables.$2" "$1"; }
 
 echo "# 1. wiring: cf-promises with examples/host_specific.json"
@@ -629,6 +631,45 @@ done
 check "uncomparable vars values: the object containers are not blamed" \
     bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content differs\" '$out'"
 
+# A `vars` key can preset any variable of the policy, the checker's own included
+# (adversary M1): a vars promise whose rvalue is a function call is skipped when
+# the variable already exists (verify_vars.c, "Already did this"), so a preset
+# `doc`, `bad_keys` or `missing_keys` of tendcf_cmdb, or an id list of the gates,
+# stays. The policy refuses any CMDB-installed variable that is not
+# data:variables.<identifier> and any CMDB-installed class, read from the loaded
+# state, so there is no variable of the checker's to preset.
+for fx in checker-preset checker-preset-keys classes-hidden; do
+    cp "$repo/tests/policy/fixtures/cmdb-$fx.json" "$work/data/host_specific.json"
+    out="$work/xc-$fx.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$fx: refusal reported" refusal_reported "$out"
+    check "$fx: the foreign variable is reported" foreign_var_reported "$out"
+    check "$fx: refusal reported once" refusal_once "$out"
+    check "$fx: nothing actuated (no pre_action, no service processed)" no_actuation "$out"
+done
+check "classes-hidden: the foreign class is reported" foreign_class_reported "$work/xc-classes-hidden.out"
+
+# Augments (def.json in inputs/) are loaded after the CMDB and can define classes
+# and variables just the same. tendcf ships none, so any is refused.
+cp "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json"
+printf '%s\n' '{"classes":{"interlock_ok_demo_check":["any"]},"vars":{"probe":"x"}}' >"$work/inputs/def.json"
+out="$work/xc-augments.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+rm -f "$work/inputs/def.json"
+check "augments: refusal reported" refusal_reported "$out"
+check "augments: the foreign variable is reported" foreign_var_reported "$out"
+check "augments: the foreign class is reported" foreign_class_reported "$out"
+check "augments: nothing actuated (the class would have unblocked the bundle)" no_actuation "$out"
+
+# Positive control (review B3): a `vars` container that is a list of strings
+# round-trips through the loader's slist, so it is accepted and the run actuates.
+printf '%s\n' '{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{},"plain_strings":["a","b"]}}' >"$work/data/host_specific.json"
+out="$work/xc-strlist.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "list of strings in vars: no cross-check report" no_crosscheck "$out"
+check "list of strings in vars: actuates normally (the pre_action ran)" \
+    grep -q "Executing .*'/usr/bin/true'" "$out"
+
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
     if [ "$1" = none ]; then rm -f "$work/data/host_specific.json"
@@ -706,9 +747,51 @@ check "data loaded with no file: reported" \
     grep -q "host_specific.json does not exist but CFEngine loaded data:variables.stray" "$out"
 check "data loaded with no file: nothing actuated" no_actuation "$out"
 
+echo "# 11. when does the engine evaluate tendcf_cmdb? (tests/policy/probe-mutate.cf)"
+# The file is consistent with what the loader installed (A). A common bundle
+# resolved after tendcf_cmdb replaces it with B: same keys and ids, another
+# pre_action command. If the engine evaluated tendcf_cmdb's variables or classes
+# again, the policy would read B; it must then refuse everything. If it does not,
+# the pre_action of A runs, never B's. Either way B is never acted on. The debug
+# log (-d) counts the evaluations, so a later engine change shows up here.
+cat > "$work/inputs/probe-entry.cf" <<EOF2
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/probe-mutate.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_services" };
+}
+EOF2
+cat > "$work/probe-mutate.sh" <<EOF2
+#!/bin/sh
+echo ran >> "$work/probe-count"
+cp "$work/probe-B.json" "$work/data/host_specific.json"
+EOF2
+chmod 700 "$work/probe-mutate.sh"
+cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_specific.json"
+probe_a="$(cat "$repo/tests/policy/fixtures/interlock-satisfied.json")"
+printf '%s\n' "${probe_a//\"\/usr\/bin\/true\"/\"\/usr\/bin\/false\"}" > "$work/probe-B.json"
+rm -f "$work/probe-count"
+out="$work/xc-probe.out"
+"$cf_agent" -K -I -d -f "$work/inputs/probe-entry.cf" >"$out" 2>&1 || true
+n_doc="$(grep -c 'Evaluating vars promise: doc$' "$out" || true)"
+n_json="$(grep -c 'Evaluating vars promise: file_json\[' "$out" || true)"
+n_cls="$(grep -c 'Evaluating classes promise: tendcf_cmdb_refused$' "$out" || true)"
+n_res="$(grep -c "Resolving classes and variables in 'bundle common tendcf_cmdb'" "$out" || true)"
+n_mut="$(wc -l < "$work/probe-count" 2>/dev/null || echo 0)"
+echo "info: tendcf_cmdb resolved $n_res times; vars 'doc' visited $n_doc times, 'file_json[..]' $n_json times; class 'tendcf_cmdb_refused' visited $n_cls times; mutation script ran $n_mut times"
+check "probe: the mutation script ran" [ "$n_mut" -ge 1 ]
+if refusal_reported "$out"; then
+    echo "info: the engine evaluated tendcf_cmdb again and the policy read the replaced file"
+    check "probe: refused after the replacement, nothing actuated" no_actuation "$out"
+else
+    echo "info: the policy did not read the replaced file (tendcf_cmdb is not evaluated again)"
+    check "probe: not refused, the loaded pre_action (true) ran and the replaced one (false) did not" \
+        bash -c "grep -q \"Executing .*'/usr/bin/true'\" '$out' && ! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
+fi
+
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue

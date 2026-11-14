@@ -1,0 +1,14 @@
+# Test only (tests/policy/run.sh check 11). A `bundle common` listed AFTER
+# policy/tendcf_services.cf in `inputs`, so PolicyResolve resolves it after
+# tendcf_cmdb has finished its first vars, classes and vars passes. Its one vars
+# promise runs a script that replaces host_specific.json with a file that has the
+# same keys and entry ids but another pre_action command, i.e. a publication
+# between two evaluations of tendcf_cmdb. What the policy does after that shows
+# whether, and when, the engine evaluates tendcf_cmdb again.
+
+bundle common tendcf_probe_mutate
+{
+  vars:
+      "ran"
+        string => execresult("$(sys.workdir)/probe-mutate.sh", "noshell");
+}
