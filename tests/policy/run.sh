@@ -61,7 +61,9 @@
 #      comparison is of the whole container, not of key names and ids), a
 #      `classes` section, and a `vars` key that is not a plain identifier, which
 #      the loader would file under another scope (a preset of the policy's own
-#      id lists). Every file of checks 2-8 and 6 is also a no-report control.
+#      id lists), and a `vars` value that is not an object (not comparable as
+#      JSON text with the file's). Every file of checks 2-8 and 6 is also a
+#      no-report control.
 #      NB: the fork's loader skips a bad entry and installs the rest, but the
 #      Mac dev build rejects the whole `vars` instead (the same fixture refuses
 #      on both, as "nothing loaded"), so only the fork's CI legs see the
@@ -603,6 +605,27 @@ for k in default:tendcf_interlocks.interlock_ids default:tendcf_services.interlo
 done
 check "scoped-key preset: refusal reported once" refusal_once "$out"
 check "scoped-key preset: the preset id lists did not actuate" no_actuation "$out"
+# The control that gives the case above its teeth: with no tendcf policy at all,
+# the loader really does preset the policy's own variable from such a key (so the
+# refusal had to overwrite it, not merely find it absent).
+printf 'bundle agent main\n{\n}\n' > "$work/inputs/empty.cf"
+"$cf_promises" --show-vars -f "$work/inputs/empty.cf" >"$work/xc-preset-vars.out" 2>&1 || true
+check "scoped-key preset (control): the loader installed default:tendcf_services.service_ids" \
+    bash -c "grep 'default:tendcf_services.service_ids' '$work/xc-preset-vars.out' | grep -q demo-runit"
+
+# A `vars` value that is not an object (the loader turns a string into a scalar
+# and a list of primitives into an slist) cannot be compared as JSON text with
+# the file's: not computable, so refused, and named.
+printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"scalar":"x","plain_list":["a","b"]}}' >"$work/data/host_specific.json"
+out="$work/xc-uncomparable.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "uncomparable vars values: refusal reported" refusal_reported "$out"
+for k in scalar plain_list; do
+    check "uncomparable vars value '$k': named as a content difference" \
+        grep -q "key '$k' content differs between" "$out"
+done
+check "uncomparable vars values: the object containers are not blamed" \
+    bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content differs\" '$out'"
 
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
@@ -683,7 +706,7 @@ check "data loaded with no file: nothing actuated" no_actuation "$out"
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
