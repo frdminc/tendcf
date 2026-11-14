@@ -6,7 +6,7 @@
 
   "$defs": {
     "contract_version": {
-      "description": "Bumped only when an EXISTING field is renamed, retyped, or removed. Adding a new optional field never needs a bump.",
+      "description": "Bumped when an EXISTING field is renamed, retyped or removed, or when the set of values it accepts is narrowed (ruling 2026-11-14, C-policy-01: the same number must mean the same acceptance set; before it, narrowing an enum was a no-bump precedent, as in the v4 and v5 writer-enum changes). Adding a new optional field never needs a bump. A schema that needs the guarantee states a floor with `minimum`, so a document still declaring an older number is refused instead of being judged under rules it never claimed (services.schema.json since 2).",
       "type": "integer",
       "minimum": 1
     },
