@@ -91,10 +91,10 @@
 #  11. the engine's evaluation of tendcf_cmdb, measured on a real
 #      cf-agent with -d: how often the checker's variables and classes are
 #      visited, with the file replaced (same keys and ids, another pre_action)
-#      by a common bundle resolved after tendcf_cmdb. The run must never act on
-#      the replaced file: either it is refused and nothing actuates, or the
-#      loaded pre_action runs and the replaced one does not. The counts are
-#      printed (`info:`) so a change in the engine's evaluation order is visible.
+#      by a common bundle resolved after tendcf_cmdb. The policy reads the file
+#      once, so the run is not refused, the loaded pre_action runs and the
+#      replaced one does not; a second run with the debug log counts the reads
+#      (the doc promise is evaluated once) and prints the other counts (`info:`).
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -772,10 +772,10 @@ echo "# 11. when does the engine evaluate tendcf_cmdb? (tests/policy/probe-mutat
 # The file is consistent with what the loader installed (A). A common bundle
 # resolved after tendcf_cmdb replaces it with B: same keys and ids, another
 # pre_action command. If the engine evaluated tendcf_cmdb's variables or classes
-# again and read the file, the policy would see B; it must then refuse
-# everything. The policy reads the file once (the `doc` promise is skipped once
-# `doc` exists), so the expected outcome is the second one: A was compared and
-# the loaded pre_action (A's) runs, never B's. Either way B is never acted on.
+# again and read the file, the policy would see B and, were the comparison
+# repeated, refuse. The policy reads the file once (the `doc` promise is skipped
+# once `doc` exists), so the one expected outcome is: A was compared, the loaded
+# pre_action (A's) runs, B's never does.
 # Measured on the pinned fork (2026-11-14, Linux CI): tendcf_cmdb is resolved
 # twice and its vars are visited on every pass, its classes once. The debug log
 # (-d) counts the visits, so a later engine change shows up as a changed count.
@@ -796,27 +796,36 @@ cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_speci
 probe_a="$(cat "$repo/tests/policy/fixtures/interlock-satisfied.json")"
 printf '%s\n' "${probe_a//\"\/usr\/bin\/true\"/\"\/usr\/bin\/false\"}" > "$work/probe-B.json"
 rm -f "$work/probe-count"
+# Outcome: a run without -d, so that the log holds only what the agent did. (A
+# debug log (-d) prints the policy's own report strings, so grepping it for a
+# refusal line finds the policy text, not a refusal: the first version of this
+# check read "refused" from exactly that.)
 out="$work/xc-probe.out"
-"$cf_agent" -K -I -d -f "$work/inputs/probe-entry.cf" >"$out" 2>&1 || true
-n_doc="$(grep -c 'Evaluating vars promise: doc$' "$out" || true)"
-n_json="$(grep -c 'Evaluating vars promise: file_json\[' "$out" || true)"
-n_cls="$(grep -c 'Evaluating classes promise: tendcf_cmdb_refused$' "$out" || true)"
-n_res="$(grep -c "Resolving classes and variables in 'bundle common tendcf_cmdb'" "$out" || true)"
+"$cf_agent" -K -I -f "$work/inputs/probe-entry.cf" >"$out" 2>&1 || true
+check "probe: the file was replaced during the run" \
+    bash -c "[ \"\$(cat '$work/data/host_specific.json')\" = \"\$(cat '$work/probe-B.json')\" ]"
+check "probe: not refused: the policy never saw the replacement (it reads the file once)" \
+    no_crosscheck "$out"
+check "probe: the loaded pre_action (true) ran" grep -q "info: Executing .*'/usr/bin/true'" "$out"
+check "probe: the replaced pre_action (false) did not" \
+    bash -c "! grep -q \"info: Executing .*'/usr/bin/false'\" '$out'"
+# Counts: a second run with the debug log, from the same starting file.
+cp "$repo/tests/policy/fixtures/interlock-satisfied.json" "$work/data/host_specific.json"
+rm -f "$work/probe-count"
+dbg="$work/xc-probe-debug.out"
+"$cf_agent" -K -I -d -f "$work/inputs/probe-entry.cf" >"$dbg" 2>&1 || true
+n_doc="$(grep -c 'Evaluating vars promise: doc$' "$dbg" || true)"
+n_json="$(grep -c 'Evaluating vars promise: file_json\[' "$dbg" || true)"
+n_cls="$(grep -c 'Evaluating classes promise: tendcf_cmdb_refused$' "$dbg" || true)"
+n_res="$(grep -c "Resolving classes and variables in 'bundle common tendcf_cmdb'" "$dbg" || true)"
 n_mut="$(wc -l < "$work/probe-count" 2>/dev/null || echo 0)"
 echo "info: tendcf_cmdb resolved $n_res times; vars 'doc' visited $n_doc times, 'file_json[..]' $n_json times; class 'tendcf_cmdb_refused' visited $n_cls times; mutation script ran $n_mut times"
-check "probe: the mutation script ran" [ "$n_mut" -ge 1 ]
-if refusal_reported "$out"; then
-    echo "info: the engine evaluated tendcf_cmdb again and the policy read the replaced file"
-    check "probe: refused after the replacement, nothing actuated" no_actuation "$out"
-else
-    echo "info: the policy did not read the replaced file (tendcf_cmdb is not evaluated again)"
-    check "probe: not refused, the loaded pre_action (true) ran and the replaced one (false) did not" \
-        bash -c "grep -q \"Executing .*'/usr/bin/true'\" '$out' && ! grep -q \"Executing .*'/usr/bin/false'\" '$out'"
-fi
+check "probe (debug run): the mutation script ran" [ "$n_mut" -ge 1 ]
+check "probe (debug run): the file is read once (doc promise evaluated once)" [ "$n_doc" = 1 ]
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do
         [ -f "$work/$f.out" ] || continue
