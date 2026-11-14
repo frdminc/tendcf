@@ -87,12 +87,25 @@
 #     same text, key order and number formatting included). A value that is not
 #     an object is refused when it reads back differently: the loader installs
 #     a scalar as a string (storejson() fails) and a list of primitives as an
-#     slist of strings (numbers read back as strings). Equal ids with changed
-#     values, as a `variables` entry or a
-#     replacement between the loader's read and ours would give, are caught;
-#     a comparison that cannot be computed counts as a difference;
+#     slist of strings (numbers read back as strings; a list of strings reads
+#     back equal and is accepted). Equal ids with changed values, as a
+#     `variables` entry would give, are caught. A comparison that cannot be
+#     computed is a problem of its own (`..._problem_uncomparable_<key>`), not
+#     the absence of a difference;
 #   - every `data:variables.*` the loader installed must be a key of `vars`
 #     in the file;
+#   - nothing the loader installed may lie outside `data:variables.<identifier>`:
+#     no CMDB-installed variable of any other name, and no CMDB-installed class.
+#     This is read from the loaded state (the variable table and the class
+#     table, by the tag the loader puts on everything it installs,
+#     `source=cmdb`), not from the file, in class expressions that call
+#     variablesmatching() and classmatch() inline, so it names no variable that
+#     a CMDB key could preset. It is what keeps the checker's own variables and
+#     the gates' id lists out of reach (see "Presets" below). It also covers the
+#     augments file (`def.json`, tag `source=augments_file`, loaded after the
+#     CMDB): tendcf ships none, and a variable or class from one is refused
+#     the same way (a host that needs a `def.json` must be given an exemption
+#     here, deliberately);
 #   - a file that exists but cannot be parsed (or exceeds the loader's own
 #     5 MiB cap), and loaded data with no file at all, are mismatches.
 # A missing file with nothing loaded is the normal empty case: no class, no
@@ -105,42 +118,71 @@
 # On any mismatch the single class `tendcf_cmdb_refused` is defined and
 # NOTHING is actuated: no interlock pre_action, no service, no tombstone. The
 # gate is one place per bundle: `interlock_ids` and `service_ids` are set to
-# empty lists under the refusal (explicitly, so a value a CMDB key preset in
-# the bundle's scope is overwritten: variable redefinition is allowed unless a
-# promise says `policy => "constant"`, verify_vars.c CollectConvergeVariable-
-# Options), and every promise that acts iterates one of them. The two
-# daemon-reload commands, which iterate no id, carry `!tendcf_cmdb_refused`
-# themselves (a `classes` section could otherwise define their trigger
-# classes; it is refused as well, but a refusal must not depend on that). A
-# new actuating promise MUST iterate those ids or carry `!tendcf_cmdb_refused`
-# itself. The mismatch is reported once, by tendcf_interlocks.
+# empty lists under the refusal, and every promise that acts iterates one of
+# them. The two daemon-reload commands, which iterate no id, carry
+# `!tendcf_cmdb_refused` themselves (a `classes` section could otherwise define
+# their trigger classes; it is refused as well, but a refusal must not depend on
+# that). A new actuating promise MUST iterate those ids or carry
+# `!tendcf_cmdb_refused` itself. The mismatch is reported once, by
+# tendcf_interlocks. Reports print file-derived text (keys, entry ids, section
+# names) only after replacing every character outside [A-Za-z0-9._:@/-] with `?`
+# and cutting it to a fixed length; the refusal summary and the foreign
+# variable and class reports are static text.
 #
-# Order is load-bearing, as in the paragraph above. The fork evaluates the
-# vars and the classes of every `bundle common` before the vars of any other
-# bundle, independently of `bundlesequence`: PolicyResolve resolves the common
-# bundles first and BundleResolve runs their vars, then classes, then vars
-# again (libpromises/expand.c:846-871 and 1145-1177 at the commit pinned in
-# overlay/fork.json, b8abf28408b1), so `tendcf_cmdb_refused` is final before
-# the `!tendcf_cmdb_refused` on the agent bundles' `*_ids` is first read. That
-# is a guarantee about vars and classes only, not that a common bundle's every
-# promise type runs to completion first. Within the common bundle the classes
+# Presets. The loader installs a `vars` key under any name, so a key such as
+# `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
+# that variable before any policy runs. Redefinition decides what a preset does,
+# and it differs by the kind of rvalue (verify_vars.c VerifyVarPromise and
+# CollectConvergeVariableOptions, commit b8abf28408b1 pinned in
+# overlay/fork.json). A promise with a LITERAL rvalue (`slist => { }`,
+# `string => "..."`) redefines an existing variable, so the preset is gone and
+# the policy's value stands. A promise whose rvalue is a FUNCTION CALL
+# (`readjson`, `getindices`, `difference`, `grep`, ... which is what every
+# variable the checker computes and the non-refused id lists are) is skipped
+# when the variable already exists ("Already did this"), so a preset keeps its
+# value and the policy's own promise never runs. Presetting the checker's `doc`,
+# `bad_keys` or `missing_keys`, or a gate's `interlock_ids`, would therefore
+# change what the check compares or which interlocks gate a service. The fix is
+# not to make each variable immune but to refuse the preset: a variable the
+# CMDB installed under any name but `data:variables.<identifier>` makes
+# `tendcf_cmdb_problem_foreign_var`, read from the variable table with the
+# `source=cmdb` tag, and a preset of a function-call variable keeps that tag.
+# (A preset of a literal-rvalue variable is overwritten with the policy's value
+# before it is read, and also refused when the tag is still there.) Under the
+# refusal the id lists are literal empty lists, which do redefine a preset.
+#
+# Order and evaluation. The fork evaluates the vars and the classes of every
+# `bundle common` before the vars of any other bundle, independently of
+# `bundlesequence`: PolicyResolve resolves the common bundles first and
+# BundleResolve runs their vars, then classes, then vars again
+# (libpromises/expand.c:846-871 and 1145-1177 at the pinned commit), so
+# `tendcf_cmdb_refused` is decided before the `!tendcf_cmdb_refused` on the agent
+# bundles' `*_ids` is first read. That is a statement about vars and classes
+# only, not that a common bundle's every promise type runs to completion first.
+# Whether and how often the engine evaluates `tendcf_cmdb` again after that is
+# measured, not assumed: tests/policy/run.sh check 11 counts the evaluations in
+# the debug log of a real cf-agent and replaces the file between them. The
+# check does not depend on the answer. Each problem class is defined from the
+# CURRENT comparison, in positive form (a difference, an uncomputable side, a
+# foreign variable), never as the negation of a class that was set once and
+# stays set: a class is never undefined, and a promise for an already-set class
+# is skipped (libpromises/promises.c), so "not equal" read from a sticky
+# "equal" class would stay false after a later mismatch. A problem class, once
+# set, stays set, which is the safe direction. The classes of the common bundle
 # run in one pass in written order: `tendcf_cmdb_refused` comes after every
-# `tendcf_cmdb_problem_*` class, and `tendcf_cmdb_problem_content_*` reads the
-# `tendcf_cmdb_json_equal_*` class defined just before it in the same section;
-# do not reorder them. A class read before its definition is false and, once
-# defined, never undone, so an agent bundle could not gate on a class it
-# defines itself, and the check defines `tendcf_cmdb_problem_*` classes only
-# from positive evidence (the content check reads its one negative form from
-# the class defined immediately above it). Proved on a real cf-agent by
-# tests/policy/run.sh checks 9-10 (a pre_action must not run, a service must
-# not be processed).
+# `tendcf_cmdb_problem_*` class; do not reorder them.
 #
-# What this is NOT: a sandbox. It is a consistency check between the file and
-# what the loader installed. A CMDB author (root) already chooses each
-# pre_action executable, `/bin/sh -c ...` included, and the unit commands, so
-# it does not stop a hostile but self-consistent file; it stops a file and a
-# loader that disagree, and (above) the sections and keys through which a file
-# could change what the policy reads without showing up as a `vars` difference.
+# What is NOT guaranteed: the check compares the file with the loader's state at
+# the evaluation. A file replaced after the last evaluation, or by a promise
+# that changes `data:variables.*` afterwards, is not seen; and nothing here makes
+# a publication atomic (`tendcf-install.sh data` installs by atomic rename, but
+# the agent can still start between the loader's read and ours). Not a sandbox
+# either: it is a consistency check between the file and what the loader
+# installed. A CMDB author (root) already chooses each pre_action executable,
+# `/bin/sh -c ...` included, and the unit commands, so it does not stop a hostile
+# but self-consistent file; it stops a file and a loader that disagree, and the
+# sections, keys, variables and classes through which a file could change what
+# the policy reads without showing up as a `vars` difference.
 
 bundle common tendcf_cmdb
 {
@@ -203,6 +245,40 @@ bundle common tendcf_cmdb
       "unlisted_keys"
         slist => difference("loaded_keys", "file_keys");
 
+      # Printable forms for the reports: every character outside the safe set
+      # becomes `?`, then each name is cut to 64 characters (two steps, each the
+      # same maplist idiom as loaded_keys). Keys, ids and section names come
+      # from the file and may hold newlines or escape sequences.
+      "missing_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "missing_keys");
+      "missing_clean"
+        slist => maplist(string_head("$(this)", 64), "missing_san");
+
+      "unlisted_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "unlisted_keys");
+      "unlisted_clean"
+        slist => maplist(string_head("$(this)", 64), "unlisted_san");
+
+      "bad_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "bad_keys");
+      "bad_clean"
+        slist => maplist(string_head("$(this)", 64), "bad_san");
+
+      "sections_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "extra_sections");
+      "sections_clean"
+        slist => maplist(string_head("$(this)", 64), "sections_san");
+
+      "loaded_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "loaded_keys");
+      "loaded_clean"
+        slist => maplist(string_head("$(this)", 64), "loaded_san");
+
       "key_canon[$(safe_keys)]"
         string => canonify("$(safe_keys)");
 
@@ -218,16 +294,36 @@ bundle common tendcf_cmdb
       "unfiled_ids[$(safe_keys)]"
         slist => difference("loaded_ids[$(safe_keys)]", "file_ids[$(safe_keys)]");
 
+      "unloaded_san[$(safe_keys)]"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "unloaded_ids[$(safe_keys)]");
+
+      "unloaded_clean[$(safe_keys)]"
+        slist => maplist(string_head("$(this)", 64), "unloaded_san[$(safe_keys)]");
+
+      "unloaded_joined[$(safe_keys)]"
+        string => join(", ", "unloaded_clean[$(safe_keys)]");
+
       "unloaded_text[$(safe_keys)]"
-        string => join(", ", "unloaded_ids[$(safe_keys)]");
+        string => string_head("$(unloaded_joined[$(safe_keys)])", 400);
+
+      "unfiled_san[$(safe_keys)]"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "unfiled_ids[$(safe_keys)]");
+
+      "unfiled_clean[$(safe_keys)]"
+        slist => maplist(string_head("$(this)", 64), "unfiled_san[$(safe_keys)]");
+
+      "unfiled_joined[$(safe_keys)]"
+        string => join(", ", "unfiled_clean[$(safe_keys)]");
 
       "unfiled_text[$(safe_keys)]"
-        string => join(", ", "unfiled_ids[$(safe_keys)]");
+        string => string_head("$(unfiled_joined[$(safe_keys)])", 400);
 
       # The whole container, as JSON text, from the file and as installed.
       # storejson() fails (the variable stays undefined) for anything that is
-      # not a container or list, and for a name that is not defined; the content
-      # class below treats an undefined side as a difference.
+      # not a container or list, and for a name that is not defined; the
+      # `uncomparable` class below makes an undefined side a problem.
       "file_json[$(safe_keys)]"
         string => storejson("doc[vars][$(safe_keys)]");
 
@@ -255,23 +351,40 @@ bundle common tendcf_cmdb
       "tendcf_cmdb_problem_badkey"
         expression => isgreaterthan(length("bad_keys"), 0);
 
+      # Read from the loaded state, with the calls inline: no variable here for
+      # a CMDB key to preset. Every variable tagged by the CMDB loader or by the
+      # augments loader is counted, and so is every one of them that is exactly
+      # data:variables.<identifier> AND tagged by the CMDB loader; any excess is
+      # a variable of another name (or from augments), which is a problem.
+      "tendcf_cmdb_problem_foreign_var"
+        expression => isgreaterthan(length(variablesmatching(".*", "source=cmdb", "source=augments_file")),
+                                    length(variablesmatching("data:variables\.[A-Za-z0-9_]+", "source=cmdb")));
+
+      "tendcf_cmdb_problem_foreign_class"
+        expression => classmatch(".*", "source=cmdb", "source=augments_file");
+
       "tendcf_cmdb_problem_partial_$(key_canon[$(safe_keys)])"
         expression => and(isvariable("data:variables.$(safe_keys)"),
                           or(isgreaterthan(length("unloaded_ids[$(safe_keys)]"), 0),
                              isgreaterthan(length("unfiled_ids[$(safe_keys)]"), 0)));
 
-      # Equal containers: defined only when both texts exist and are identical.
-      # The next promise reads this class negatively, which is sound only
-      # because it is evaluated after this one in the same pass (see the
-      # header): a loaded container that is not provably equal is a problem,
-      # whether the texts differ or one of them could not be computed.
-      "tendcf_cmdb_json_equal_$(key_canon[$(safe_keys)])"
-        expression => strcmp("$(file_json[$(safe_keys)])",
-                             "$(loaded_json[$(safe_keys)])");
-
-      "tendcf_cmdb_problem_content_$(key_canon[$(safe_keys)])"
+      # The two texts, computed now, differ. Defined only when both exist (an
+      # undefined side leaves the strcmp() argument unexpanded and the
+      # expression undefined; that case is the next class).
+      "tendcf_cmdb_problem_differs_$(key_canon[$(safe_keys)])"
         expression => and(isvariable("data:variables.$(safe_keys)"),
-                          not("tendcf_cmdb_json_equal_$(key_canon[$(safe_keys)])"));
+                          isvariable("file_json[$(safe_keys)]"),
+                          isvariable("loaded_json[$(safe_keys)]"),
+                          not(strcmp("$(file_json[$(safe_keys)])",
+                                     "$(loaded_json[$(safe_keys)])")));
+
+      # A loaded container for which one side could not be serialised. Needs only
+      # isvariable(), whose arguments are literal names, so it cannot be
+      # suppressed by an undefined variable.
+      "tendcf_cmdb_problem_uncomparable_$(key_canon[$(safe_keys)])"
+        expression => and(isvariable("data:variables.$(safe_keys)"),
+                          or(not(isvariable("file_json[$(safe_keys)]")),
+                             not(isvariable("loaded_json[$(safe_keys)]"))));
 
       "tendcf_cmdb_refused"
         expression => classmatch("tendcf_cmdb_problem_.*");
@@ -376,25 +489,36 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: $(tendcf_cmdb.file) exists but cannot be read as JSON (parse error or larger than 5242880 bytes)";
 
       "tendcf_cmdb_problem_nofile"::
-        "tendcf: CMDB cross-check: $(tendcf_cmdb.file) does not exist but CFEngine loaded data:variables.$(tendcf_cmdb.loaded_keys)";
+        "tendcf: CMDB cross-check: $(tendcf_cmdb.file) does not exist but CFEngine loaded data:variables.$(tendcf_cmdb.loaded_clean)";
 
       "tendcf_cmdb_problem_missing"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_keys)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_keys) (the loader skipped it)";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.missing_clean)' is under 'vars' in $(tendcf_cmdb.file) but CFEngine did not load data:variables.$(tendcf_cmdb.missing_clean) (the loader skipped it)";
 
       "tendcf_cmdb_problem_unlisted"::
-        "tendcf: CMDB cross-check: CFEngine loaded data:variables.$(tendcf_cmdb.unlisted_keys), which is not a key under 'vars' in $(tendcf_cmdb.file)";
+        "tendcf: CMDB cross-check: CFEngine loaded data:variables.$(tendcf_cmdb.unlisted_clean), which is not a key under 'vars' in $(tendcf_cmdb.file)";
 
       "tendcf_cmdb_problem_partial_$(tendcf_cmdb.key_canon[$(tendcf_cmdb.safe_keys)])"::
         "tendcf: CMDB cross-check: key '$(tendcf_cmdb.safe_keys)' loaded differently from $(tendcf_cmdb.file): in the file only: [$(tendcf_cmdb.unloaded_text[$(tendcf_cmdb.safe_keys)])]; loaded only: [$(tendcf_cmdb.unfiled_text[$(tendcf_cmdb.safe_keys)])]";
 
-      "tendcf_cmdb_problem_content_$(tendcf_cmdb.key_canon[$(tendcf_cmdb.safe_keys)])"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.safe_keys)' content differs between $(tendcf_cmdb.file) and the data CFEngine loaded (or the two could not be compared)";
+      "tendcf_cmdb_problem_differs_$(tendcf_cmdb.key_canon[$(tendcf_cmdb.safe_keys)])"::
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.safe_keys)' content differs between $(tendcf_cmdb.file) and the data CFEngine loaded";
+
+      "tendcf_cmdb_problem_uncomparable_$(tendcf_cmdb.key_canon[$(tendcf_cmdb.safe_keys)])"::
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.safe_keys)' content could not be compared between $(tendcf_cmdb.file) and the data CFEngine loaded (one side is not a container or list)";
 
       "tendcf_cmdb_problem_sections"::
-        "tendcf: CMDB cross-check: $(tendcf_cmdb.file) has top-level section '$(tendcf_cmdb.extra_sections)' besides 'vars'; only 'vars' is accepted (the loader would also apply 'variables' and 'classes')";
+        "tendcf: CMDB cross-check: $(tendcf_cmdb.file) has top-level section '$(tendcf_cmdb.sections_clean)' besides 'vars'; only 'vars' is accepted (the loader would also apply 'variables' and 'classes')";
+
+      # Static text on purpose: the names are in `cf-promises --show-vars`
+      # (tag source=cmdb or source=augments_file) and `--show-classes`.
+      "tendcf_cmdb_problem_foreign_var"::
+        "tendcf: CMDB cross-check: the CMDB or an augments file installed a variable outside data:variables.<identifier> (a preset of a variable of this policy or of another bundle); only data:variables.<identifier> is accepted";
+
+      "tendcf_cmdb_problem_foreign_class"::
+        "tendcf: CMDB cross-check: the CMDB or an augments file defined a class; no class from either is accepted";
 
       "tendcf_cmdb_problem_badkey"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_keys)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]+); the loader would read it as a variable reference";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]+); the loader would read it as a variable reference";
 }
 
 bundle agent tendcf_services

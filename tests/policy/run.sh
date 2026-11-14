@@ -62,8 +62,15 @@
 #      `classes` section, and a `vars` key that is not a plain identifier, which
 #      the loader would file under another scope (a preset of the policy's own
 #      id lists), and a `vars` value that is not an object (not comparable as
-#      JSON text with the file's). Every file of checks 2-8 and 6 is also a
-#      no-report control.
+#      JSON text with the file's). Also refused, each actuating nothing: a CMDB
+#      `vars` key that presets a variable of the checker itself (`doc`,
+#      `bad_keys`, `missing_keys`) or of a gate (`interlock_ids`), which the
+#      engine would otherwise keep because a vars promise with a function-call
+#      rvalue is skipped when the variable exists; a `classes` section that is
+#      hidden from the file-based checks by such a preset; and an augments file
+#      (`def.json` in inputs/) that defines a class and a variable. A `vars`
+#      container that is a list of strings is the positive control: accepted,
+#      actuates. Every file of checks 2-8 and 6 is also a no-report control.
 #      NB: the fork's loader skips a bad entry and installs the rest, but the
 #      Mac dev build rejects the whole `vars` instead (the same fixture refuses
 #      on both, as "nothing loaded"), so only the fork's CI legs see the
@@ -81,6 +88,13 @@
 #      interlock's pre_action) are refused as a content difference, which no
 #      key-and-id comparison could see. Under TENDCF_TEST_SYSTEMD=1 the same stand-in is run against
 #      the real manager (6b): no unit rendered, a tombstone leaves the unit alone.
+#  11. the engine's evaluation of tendcf_cmdb, measured on a real
+#      cf-agent with -d: how often the checker's variables and classes are
+#      visited, with the file replaced (same keys and ids, another pre_action)
+#      by a common bundle resolved after tendcf_cmdb. The run must never act on
+#      the replaced file: either it is refused and nothing actuates, or the
+#      loaded pre_action runs and the replaced one does not. The counts are
+#      printed (`info:`) so a change in the engine's evaluation order is visible.
 #
 # The pre_action commands are /usr/bin/true and /usr/bin/false, which exist
 # on Linux and macOS alike; /bin/true does not exist on macOS, and a missing
@@ -618,18 +632,18 @@ check "scoped-key preset (control): the loader installed default:tendcf_services
 # A `vars` value that is not an object is installed as a scalar (not
 # comparable: storejson() fails) or, for a list of primitives, as an slist of
 # strings, so numbers read back as "1","2" and differ from the file's [1,2]:
-# either way a difference, refused and named. (A list of strings would compare
-# equal and pass, which is correct.)
+# either way a problem (a difference, or one side that cannot be serialised),
+# refused and named. (A list of strings compares equal and passes, below.)
 printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"scalar":"x","plain_list":[1,2]}}' >"$work/data/host_specific.json"
 out="$work/xc-uncomparable.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
 check "uncomparable vars values: refusal reported" refusal_reported "$out"
 for k in scalar plain_list; do
-    check "uncomparable vars value '$k': named as a content difference" \
-        grep -q "key '$k' content differs between" "$out"
+    check "uncomparable vars value '$k': named (differs or could not be compared)" \
+        grep -Eq "key '$k' content (differs|could not be compared) between" "$out"
 done
 check "uncomparable vars values: the object containers are not blamed" \
-    bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content differs\" '$out'"
+    bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content (differs|could not be compared)\" '$out'"
 
 # A `vars` key can preset any variable of the policy, the checker's own included
 # (adversary M1): a vars promise whose rvalue is a function call is skipped when

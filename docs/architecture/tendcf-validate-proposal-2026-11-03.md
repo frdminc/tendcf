@@ -1135,13 +1135,14 @@ requires `data:variables.<key>` to exist, the key's entry ids to equal the
 loaded container's indices (a half-loaded container is caught), and the whole
 container to be identical: `storejson()` of the file's `vars[<key>]` against
 `storejson()` of `data:variables.<key>`, string-equal, with a comparison that
-cannot be computed counting as a difference. (Ids alone were the first
-version; same ids with another value, which a `variables` section or a file
-replaced between the loader's read and the policy's gives, passed it. Both
-texts come from the one parser, so key order and number formatting cannot
-differ on a consistent file; a `vars` value that is not an object is refused when it reads back
-differently: the loader installs a scalar as a string, which `storejson()`
-cannot read, and a list of numbers as an slist of strings.) It
+cannot be computed counted as a problem of its own (not as the absence of a
+difference). (Ids alone were the first
+version; same ids with another value, which a `variables` section gives, passed
+it. Both texts come from the one parser, so key order and number formatting
+cannot differ on a consistent file; a `vars` value that is not an object is
+refused when it reads back differently: the loader installs a scalar as a
+string, which `storejson()` cannot read, and a list of numbers as an slist of
+strings, while a list of strings reads back equal and is accepted.) It
 also refuses any top-level key of the file other than `vars` (the fork's
 loader also applies `variables`, loaded after `vars`, and `classes`, which can
 define `interlock_ok_*`; the projector emits neither, N-2), any `vars` key that
@@ -1150,18 +1151,47 @@ reference, `GetCMDBVariableRef`, so `default:tendcf_services.service_ids`
 presets a variable of the policy's own bundles), a loaded `data:variables.*`
 that is not a `vars` key of the file, a file that exists but cannot be
 parsed, and loaded data with no file. A missing file with nothing loaded is
-the normal empty case and says nothing. On any mismatch it defines the one
+the normal empty case and says nothing.
+
+Round 2 of the review (Astra A1, adversary M1) added the loaded-state check.
+A preset reaches the checker itself: a vars promise whose rvalue is a function
+call (`readjson`, `getindices`, `difference`, every variable the checker
+computes and the non-refused id lists) is skipped when the variable already
+exists (`verify_vars.c`, "Already did this"; only a promise with a literal
+rvalue redefines it). So `default:tendcf_cmdb.doc`,
+`default:tendcf_cmdb.bad_keys` or `default:tendcf_services.interlock_ids` in
+the file keeps its value, and the check passes while the loaded interlock is
+ignored. The policy therefore reads the loaded state directly, in class
+expressions that call the functions inline (no variable to preset): any
+variable tagged `source=cmdb` or `source=augments_file` outside
+`data:variables.<identifier>` (`variablesmatching`) and any class with either
+tag (`classmatch`) is refused. tendcf ships no `def.json`, so augments are
+refused too (a host that needs one must be exempted in the policy, on
+purpose). The content comparison no longer reads the negation of a class set
+once and never cleared (`tendcf_cmdb_json_equal_*`, which a later mismatch
+could not unset); `tendcf_cmdb_problem_differs_<key>` is defined from the
+current texts and `..._uncomparable_<key>` from a side that could not be
+serialised. Whether the engine evaluates `tendcf_cmdb` more than once is
+measured by `tests/policy/run.sh` check 11 (debug-log counts on a real
+cf-agent, with the file replaced between the evaluations); the check does not
+depend on the answer. Reports print file-derived text only with characters
+outside `[A-Za-z0-9._:@/-]` replaced by `?` and cut to a fixed length.
+`tendcf-install.sh data` installs by atomic rename. Not checked: a file replaced
+after the last evaluation (no check can see it).
+
+On any mismatch it defines the one
 class `tendcf_cmdb_refused`, and `tendcf_interlocks` reports what differs
 once. Both bundles then set `interlock_ids` and `service_ids` to explicitly
-empty lists (an undefined list would leave a preset one in place), and the two
+empty lists (an undefined list would leave a preset one in place; a literal
+rvalue does redefine a preset, a function call does not), and the two
 `daemon-reload` commands, which iterate no id, carry the refusal themselves:
 no pre_action, no service, no tombstone. The vars and classes of a
 `bundle common` are pre-evaluated before the vars of any non-common bundle,
 whatever `bundlesequence` says (`PolicyResolve` and `BundleResolve`,
 `libpromises/expand.c` lines 846-871 and 1145-1177 at the pinned fork commit
 `b8abf28408b1`, [expand.c](https://github.com/djbclark/core/blob/b8abf28408b1b54e285d372a9bc5f2d850c960ad/libpromises/expand.c#L846)),
-which is what makes the class final before any gate is read. That is a
-guarantee about vars and classes only, not that every promise type of a common
+so `tendcf_cmdb_refused` is decided before a gate is first read. That is a
+statement about vars and classes only, not that every promise type of a common
 bundle completes first, and the classes inside the check rely on their written
 order within the one pass. `bundlesequence` guard classes in `promises.cf` are
 not needed for this check. This is a consistency check, not a sandbox: a CMDB
