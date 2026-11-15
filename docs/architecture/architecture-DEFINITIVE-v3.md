@@ -22,8 +22,10 @@
   [`../review-2026-11-13/rulings-record-2026-11-14.md`](../review-2026-11-13/rulings-record-2026-11-14.md).
   Corrected the same day to the merged state (schema v6, PRs 52, 42 and
   41 merged); items not decided are marked "open: awaiting operator
-  ruling" (only the Fable G4 sentence, the reviewer-proposed map text and
-  the AI reviewer "up to 30" count still are; Q1-Q4 of PR 62 are ruled).
+  ruling" (only the AI reviewer "up to 30" count still is, Q7 of PR 62,
+  deferred by the operator to the schema design review; Q1-Q6 of PR 62 are
+  ruled, including the G4 sentence, Q5, and the reviewer-proposed map text,
+  Q6).
 - **Tracker:** frdminc/tendcf#1.
 
 This document describes the **current design and what is planned next**.
@@ -1689,7 +1691,8 @@ with full mesh) is **D38**.
   2026-11-14 rulings written into this file, and the checks;
   `../review-2026-11-13/rulings-record-2026-11-14.md` is the operator's
   rulings record (the L-numbers cited in `14-synthesis-and-rulings.md`),
-  and 14 lists the items still open: awaiting operator ruling.
+  and 14 lists the one item still open (awaiting operator ruling): the AI
+  reviewer "up to 30" count, Q7, deferred to the schema design review.
 - `tendcf-validate-proposal-2026-11-03.md` — a proposal, deciding
   nothing: options and a recommendation for each of §12's open D45
   items, a minimal first build, and an operator picklist.
