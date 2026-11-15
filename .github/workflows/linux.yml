@@ -72,6 +72,79 @@ jobs:
       - name: Root-owned install, cf-execd and canary (step 7)
         run: tests/deploy/linux-install.sh
 
+  # Upstream cfengine/core and libntech at the overlay bases plus the overlay
+  # (docs/architecture/upstream-overlay.md §4, §7), not the pinned fork. It is
+  # the proof that the overlay's all-or-nothing loader (overlay/core/0002) and
+  # the strict JSON parse (overlay/libntech/0005, 0006) build and behave like
+  # the fork's: the loader's unit and acceptance tests, then run.sh with
+  # TENDCF_REQUIRE_FORK_LOADER=1, whose check 4b probes the loader and fails
+  # on any build that kept a per-entry skip. One leg: the point is the
+  # overlay, not the platform matrix. `bin/overlay.py check` (weekly) only
+  # proves the patches apply to upstream master, not that they compile (R1).
+  overlay-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch core and libntech at the overlay bases
+        shell: bash
+        run: |
+          set -euo pipefail
+          m() { python3 -c "import json,sys;print(json.load(open('overlay/overlay.json'))['components'][sys.argv[1]][sys.argv[2]])" "$@"; }
+          core_base=$(m core base)
+          lib_base=$(m libntech base)
+          git init -q /tmp/core
+          git -C /tmp/core remote add origin "$(m core upstream)"
+          timeout 600 git -C /tmp/core fetch -q --depth 1 origin "$core_base"
+          git -C /tmp/core checkout -q FETCH_HEAD
+          # core's submodule pointer at its base is libntech's base (upstream-overlay.md §3)
+          pin=$(git -C /tmp/core rev-parse HEAD:libntech)
+          test "$pin" = "$lib_base" || { echo "libntech base $lib_base is not core's submodule pin $pin"; exit 1; }
+          git init -q /tmp/core/libntech
+          git -C /tmp/core/libntech remote add origin "$(m libntech upstream)"
+          timeout 600 git -C /tmp/core/libntech fetch -q --depth 1 origin "$lib_base"
+          git -C /tmp/core/libntech checkout -q FETCH_HEAD
+      - name: Apply the overlay (upstream-overlay.md §4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin/overlay.py apply core --checkout /tmp/core
+          bin/overlay.py apply libntech --checkout /tmp/core/libntech
+          git -C /tmp/core add libntech
+          {
+            echo "### CFEngine overlay build"
+            echo
+            echo "- core base \`$(git -C /tmp/core rev-parse HEAD~2)\` plus 2 patches, tree \`$(git -C /tmp/core rev-parse 'HEAD^{tree}')\`"
+            echo "- libntech base plus 6 patches, tree \`$(git -C /tmp/core/libntech rev-parse 'HEAD^{tree}')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build dependencies (core's own script; Debian/Ubuntu branch)
+        run: /tmp/core/ci/dependencies.sh
+      - name: Configure and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/core
+          ./autogen.sh --enable-debug --prefix=/tmp/overlay-cf --with-systemd-service=no
+          make -j"$(nproc)" CFLAGS="-Wall"
+          make install
+          /tmp/overlay-cf/bin/cf-agent --version
+      - name: Loader unit tests (cmdb_test) and libntech json and mustache tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C /tmp/core/tests/unit check TESTS=cmdb_test
+          make -C /tmp/core/libntech/tests/unit check TESTS="json_test mustache_test"
+      - name: Loader acceptance tests (06_host_specific_data)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/core/tests/acceptance
+          chmod -R go-w .
+          ./testall --printlog --tests=common,errorlog,errorexit,errorpass 00_basics/06_host_specific_data
+      - name: Generic-bundle tests (the loader capability probe must pass)
+        env:
+          TENDCF_REQUIRE_FORK_LOADER: "1"
+        run: tests/policy/run.sh --bindir /tmp/overlay-cf/bin
+
   debian-13:
     runs-on: ubuntu-24.04
     container: debian:13

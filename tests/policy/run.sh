@@ -26,7 +26,9 @@
 # 2026-11-14) each fork_only assertion prints `SKIP (loader not all-or-nothing):
 # <name>` and the run is expected to pass with those SKIP lines and a final
 # count, never a silent pass. The Linux CI legs set TENDCF_REQUIRE_FORK_LOADER=1,
-# which turns a non-fork loader (so, any skip) into a failure. The non-fork
+# which turns a non-fork loader (so, any skip) into a failure; so does the
+# overlay-build leg, which runs this script on upstream plus overlay/ (its
+# loader, overlay/core/0002, is the fork's, so check 4b passes unchanged). The non-fork
 # outcome has been derived from the parser behaviour, not yet run on the Mac.
 # Checks:
 #
@@ -287,7 +289,7 @@ no_render_start() { ! grep -Eq "Created file|launchctl|systemctl" "$1"; }
 # evaluation, and CI shows the policy's own refusal after the strict loader's
 # on the fork (Linux legs, run 43649349555). The separate probe policy
 # (probe()) runs a second process and proves only what the data loaded as.
-policy_completed() { grep -q "tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services" "$1"; }
+policy_completed() { grep -q "^R: tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services" "$1"; }
 # Lenient-path assertions apply only where the loader is NOT the fork's (a
 # repeated member, a repeated `vars` or trailing input is read leniently and
 # the data it keeps is acted on). Not a skip: on the fork the same file is
@@ -955,8 +957,8 @@ strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE PO
     cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
     "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
     # Same output file, any loader: this run evaluated both tendcf bundles (the
-    # test-only marker bundle runs after them). The negative greps below, which
-    # are the only assertions left on a non-fork run, mean nothing without it.
+    # test-only marker bundle runs after them). The marker ensures the negative
+    # greps below cannot pass on an invocation that never reached the policy.
     check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
     "$pcheck" "$name: the policy refuses and reports it" refusal_reported "$out"
     "$pcheck" "$name: the policy reports it once" refusal_once "$out"

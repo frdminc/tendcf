@@ -1097,7 +1097,8 @@ CFEngine.
    opposite of overlay patch `8f0076b81` (B-5b in
    [`upstream-register.md`](upstream-register.md)), which tendcf
    introduced to narrow the blast radius, and it diverges from what was
-   proposed upstream. Projector and policy stay unchanged.
+   proposed upstream. (Done: the overlay replaced that patch with this
+   loader on 2026-11-14, `overlay/core/0002`.) Projector and policy stay unchanged.
 
 **(c) Consequences.**
 
@@ -1257,6 +1258,10 @@ per-entry skip with the literal fixture
 that fixture, so check 9 sees both keys missing and the partial states stay
 tested only through the stand-in (check 10), which remains valid because the
 check compares the file with what was installed whatever the loader's policy.
+Since 2026-11-14 the overlay (`overlay/core/0002`, with libntech `0005`/`0006`)
+carries that same all-or-nothing loader in place of `8f0076b81`, so an
+upstream-plus-overlay build behaves like the pinned fork here; the
+`overlay-build` job runs `run.sh` on it with `TENDCF_REQUIRE_FORK_LOADER=1`.
 (2) The check
 needs `readjson` and `variablesmatching` to compose on the loader's
 installed variables; they do on the dev build (checks 9-10 of

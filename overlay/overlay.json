@@ -45,7 +45,7 @@
     "libntech": {
       "base": "0c0620d6c5f8f8d1cae212f084b021cff0b86ce6",
       "base_described": "upstream master as of 2026-08-15 (merge of #289); exactly the libntech submodule pin of core's base a0bca6aaf, so the two components are one coherent tree",
-      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 5cbd6f7425fa, identical to the local merge 45c816c)",
+      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 8d5fda1f9938 with all six patches; 0001-0004 alone give 5cbd6f7425fa, identical to the local merge 45c816c)",
       "fork": "https://github.com/djbclark/libntech",
       "patches": [
         {
