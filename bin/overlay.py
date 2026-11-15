@@ -50,7 +50,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -269,8 +268,8 @@ def check(overlay: Path, name: str, repo: Path, against: str | None) -> list[str
                     "\n".join(report + [
                         f"DRIFT: {name}/{path.name} does not apply to {rev} ({resolved[:12]}):",
                         *("    " + ln for ln in err.splitlines()),
-                        f"Rebase the fork branch onto {rev}, re-export with `bin/overlay.py export`, "
-                        f"and bump {name}.base in {MANIFEST_NAME} — or retire the patch if upstream carries it.",
+                        (f"Rebase the fork branch onto {rev}, re-export with `bin/overlay.py export`, "
+                         f"and bump {name}.base in {MANIFEST_NAME} — or retire the patch if upstream carries it."),
                     ]))
             report.append(f"  ok  {path.name}")
     return report
@@ -355,9 +354,9 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
         tree = git_out(checkout, "rev-parse", "HEAD^{tree}")
         if tree != expected:
             raise Finding("\n".join(report + [
-                f"TREE MISMATCH: the applied tree is {tree}, the manifest's applied_tree is {expected}. "
-                f"A patch file's body differs from what was recorded (lint checks only its From line and subject). "
-                f"The checkout at {checkout} is left with the patches applied.",
+                (f"TREE MISMATCH: the applied tree is {tree}, the manifest's applied_tree is {expected}. "
+                 f"A patch file's body differs from what was recorded (lint checks only its From line and subject). "
+                 f"The checkout at {checkout} is left with the patches applied."),
             ]))
         report.append(f"  applied tree {tree} matches the manifest")
     return report
