@@ -684,14 +684,16 @@ file stays rejected as circular.
   the owner answers) and a standing refusal. The record fields above
   describe the per-change shape, which stands until that bump lands. How
   the new shape sits with DC-2 is for the design review the schema bump
-  requires (two frontier reviews). **A reading of the ruling, not part of it; the
-  schema design review confirms:** a standing approval drops only the
-  per-change nonce. Every standing mode (hold window, standing approval,
+  requires (two frontier reviews). **A reading of the ruling (L5, B2), not
+  part of it (lead decision, PR 62 round-3 review):** a standing approval
+  drops only the per-change nonce; it is signed by an owner-held key, names
+  its signer and algorithm, and passes the other B1/DC-2 checks (trusted-key
+  signature, freshness, counter or high-water mark, names this device,
+  signer scope); every standing mode (hold window, standing approval,
   standing "wait for user", standing refusal) is owner-enrolled and
-  refusable. The ruling does not say the other DC-2 checks (counter or
-  high-water mark, freshness, names this device, signer scope) are
-  dropped; the design review of the new approval-record shape is where
-  that is confirmed (AGENTS.md, Android item 5).
+  refusable, and none is a default; dropping any other check needs an
+  operator ruling; the schema design review confirms the approval-record
+  shape (AGENTS.md, Android item 5).
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
   `--simulate-output=json` issue before Step 3 code.

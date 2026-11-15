@@ -94,22 +94,30 @@ path cannot preserve these checks, hold the review and report the missing check.
      **Lead notes in force until the operator rules otherwise.** The three
      notes below (the light-docs limits, the spike-workflow hardening worded
      under the spike lane, and the compiler, CI and tooling tier) are lead and
-     reviewer text that is not part of the O1, O2 or Q2 rulings. They are "in
-     force as lead practice until djbclark rules otherwise" (operator ruling,
+     reviewer text that is not part of the O1, O2 or Q2 rulings (except that
+     limit (a)'s widening below is L64's own wording). They are "in force as
+     lead practice until djbclark rules otherwise" (operator ruling,
      2026-11-14, PR 62 round-2 review, L64: "1. In force + widen"). Where this
      file says "not part of the ruling", that means the text is not the
-     operator's wording; it does not mean the text is not in force.
-     1. **Four limits on what counts as "light docs"** (lead practice, in
-        force per L64). (a) Not light: **every edit to this file, in any
-        section**, and every doc that defines or instructs privileged, trust,
-        consent, key, deploy or enforcement behaviour, including (an open list,
-        not a closed one) the architecture map's trust, consent and privilege
-        sections, `docs/architecture/change-process.md`,
+     operator's wording; it does not mean the text is not in force. That
+     sentence covers only these three notes and the readings this file labels
+     as readings (the Q2 family reading above, and Android item 5), all of
+     which only tighten. A reading that loosens a rule needs an operator
+     ruling; it is not in force on this file's say-so.
+     1. **Four limits on what counts as "light docs"** (limit (a)'s widening is
+        the operator's own L64 wording; limits (b) to (d) are lead practice, in
+        force per L64). (a) Not light (operator ruling, 2026-11-14, PR 62
+        round-2 review, L64): **every edit to this file, in any section**, and
+        every doc that defines or instructs privileged, trust, consent, key,
+        deploy or enforcement behaviour (an open "including ..." list, not a
+        closed one). Such an edit takes **at least one frontier review, and two
+        if the PR changes a design ruling** (the design-ruling tier below). L64
+        names no files; the lead's current examples are the architecture map's
+        trust, consent and privilege sections,
+        `docs/architecture/change-process.md`,
         `docs/architecture/linux-targets.md` section 3,
         `docs/architecture/nixos-passthrough-plan.md` and
-        `docs/architecture/tendcf-validate-proposal-2026-11-03.md`. Such an edit
-        takes **at least one frontier review, and two if the PR changes a design
-        ruling** (the design-ruling tier below). (b) A PR that carries a design
+        `docs/architecture/tendcf-validate-proposal-2026-11-03.md`. (b) A PR that carries a design
         ruling takes the design-ruling tier below. (c) A mixed PR takes its
         highest tier. (d) Policy run by a root `cf-execd` counts as root code.
      2. **Spike workflow hardening** (lead practice, in force per L64): see the
@@ -403,14 +411,16 @@ Maybe have a development mode and/or build?").
    shipping as the published build. A distinct `applicationId`, a distinct
    signing key, and a release pipeline that refuses the dev flavour are
    **recommended follow-ups, not ruled**.
-5. **Reading of L5 (the B2 ruling): a reading of the ruling, not part of it;
-   the schema design review confirms (adversary review of PR 62, finding 4):**
-   a standing approval drops only the per-change nonce. Every
-   standing mode (hold window, standing approval, standing "wait for user",
-   standing refusal) is owner-enrolled and refusable. The ruling does not say
-   the other DC-2 checks (counter or high-water mark, freshness, names this
-   device, signer scope) are dropped; the design review of the new
-   approval-record shape is where that is confirmed.
+5. **A reading of the ruling (L5, B2), not part of it (adversary review of PR
+   62, finding 4; wording: lead decision, PR 62 round-3 review):** a standing
+   approval drops only the per-change nonce; it is signed by an owner-held
+   key, names its signer and algorithm, and passes the other B1/DC-2 checks
+   (trusted-key signature, freshness, counter or high-water mark, names this
+   device, signer scope); every standing mode (hold window, standing approval,
+   standing "wait for user", standing refusal) is owner-enrolled and
+   refusable, and none is a default; dropping any other check needs an
+   operator ruling; the schema design review confirms the approval-record
+   shape.
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 

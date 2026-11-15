@@ -30,8 +30,8 @@
 > discovery (§1 item 3, §2's entry-point row, §3's table, §4's activation
 > steps 2 and 5 and the "Out of tree" item, §5 step 4, §7's #47 item) is
 > now **deferred design, kept as history** and marked "deferred" where it
-> stands; it takes effect only if both conditions are met and a later
-> ruling revives it.
+> stands; it takes effect only if both conditions are met (a user needs
+> one, and out-of-tree plugins can be pinned).
 
 ## 1. The decision
 
@@ -944,7 +944,7 @@ and the multi-version render returns with it.
 | 1 | This documentation: the guide, the paper, the map (D46), the change process, the Linux targets plan, the glossary, this file; and the rename of the illustrative `nix2cf_*` keys (§6). Moves no files and changes no code or schema. | this change |
 | 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | done: [#45](https://github.com/frdminc/tendcf/pull/45), merged 2026-11-13 (`ca4fa90`) |
 | 3 | Archive `frdminc/nix2cf`. | done 2026-11-13, right after #45 merged (README points here) |
-| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4), which is the deliverable (~~and the two public entry-point groups, which are not read until #47~~: the groups are deferred, not part of this step, until a user needs out-of-tree plugins and they can be pinned; operator ruling, 2026-11-14, Smaller 5); `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. Waits until open PRs #41 and #42 merge. | planned |
+| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4), which is the deliverable (~~and the two public entry-point groups, which are not read until #47~~: the groups are deferred, not part of this step, until a user needs out-of-tree plugins and they can be pinned; operator ruling, 2026-11-14, Smaller 5); `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. PRs #41 and #42 are merged. | planned |
 | 5 (map's Step 6) | The release pipeline (Step 6, [`change-process.md`](change-process.md) §10) and the §4 properties that depend on it: the plugin loader's activation steps; the two-job split and its signer backends; promotion of the pull request's artifacts and branch protection on site-private; the privileged-change checks of gate 5; the import step for external recipes with the Nix limits; the projection lint's cross-host check. None is built. The two numberings differ: this table's step 5 is the map's Step 6. | planned |
 
 Step 4 rewrites every path reference in every file, dated records
