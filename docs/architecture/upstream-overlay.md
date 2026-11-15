@@ -52,9 +52,10 @@ Load-bearing today, by that rule: libntech B-14 (backslash decoding of
 plist) and B-24 (the strict JSON parse); core B-5b, **replaced** on
 2026-11-14 by the all-or-nothing CMDB loader (operator ruling R13: one
 invalid entry in `host_specific.json` installs nothing, because a skipped
-interlock entry leaves the services it guards ungated), which carries B-20
-(its null validation relies on that crash fix) and B-7 (a warning that rides
-along). B-5a, B-13 and B-22 are carriers.
+interlock entry leaves the services it guards ungated), which carries B-20's
+null guards (the loader keeps them but refuses the whole file, where B-20
+skipped the entry; its null validation relies on them) and B-7 (a warning that
+rides along). B-5a, B-13 and B-22 are carriers.
 
 **Ruling, 2026-10-29 (operator):** the Linux CI and hosts ([`linux-targets.md`](linux-targets.md))
 run the full fork build, including the security fixes and `--simulate-json`,
@@ -70,9 +71,10 @@ writes core and libntech commits plus `cf-agent --version` to the job
 summary, and runs `tests/policy/run.sh` on the result. Moving the pin is a
 commit here, reviewed like any other. Since 2026-11-14 the `overlay-build`
 job in `.github/workflows/linux.yml` also builds upstream plus the overlay at
-the base (§4) and runs the loader's tests and `tests/policy/run.sh` with
-`TENDCF_REQUIRE_FORK_LOADER=1` on it, so the overlay's equality with the
-pinned fork's loader is a CI result, not a claim. `tendcf-integration` itself is
+the base (§4) and runs the loader's unit, acceptance and `tests/policy/run.sh`
+tests (`TENDCF_REQUIRE_FORK_LOADER=1`) on it. What that proves: the loader
+source is the fork's bar the R1 accessor, and the same tests pass on both
+builds. It does not prove the same behaviour for JSON numbers (§7). `tendcf-integration` itself is
 refreshed by merging fork `master` and every current fix branch
 ([`upstream-register.md`](upstream-register.md) "Branch layout"), never
 rebased.
@@ -142,8 +144,11 @@ patches and the per-entry-skip B-5b. It now applies six libntech patches
 (0005 and 0006 add `JsonParseStrict()`/`JsonParseFileStrict()`, B-24, which
 the core loader calls) and core's all-or-nothing loader; the commands are
 unchanged, and the `overlay-build` CI job runs them (`linux.yml`) and then
-`cmdb_test`, `json_test`, the `06_host_specific_data` acceptance directory
-and `tests/policy/run.sh`. `apply` refuses a checkout whose HEAD is not the
+`cmdb_test`, `json_test`, `mustache_test`, the `06_host_specific_data`
+acceptance directory and `tests/policy/run.sh` with
+`TENDCF_REQUIRE_FORK_LOADER=1`. The manifest's `applied_tree` per component is
+the expected tree after `apply`; `apply` fails on a mismatch, so an edited
+patch body cannot pass for the recorded one. `apply` refuses a checkout whose HEAD is not the
 pinned base and refuses a dirty tree, so the recipe cannot silently build
 something else.
 
@@ -273,20 +278,43 @@ as load-bearing, and `requires` libntech `0005`/`0006` (B-24). It no longer
 reproduces `8f0076b81`, and the `superseded_on_fork` note that said so is gone.
 Operator ruling, 2026-11-14, B11 round 2 item 1 (adversary D5, Astra C2):
 "1. Replace". Upstream plus this overlay now installs nothing from
-`host_specific.json` if any entry is invalid, as the pinned fork does.
+`host_specific.json` if any entry is invalid, as the pinned fork does (the
+JSON-number difference below aside).
 `8f0076b81` (fork PR 59) is retired and never offered upstream. Before this
 change (2026-11-02 to 2026-11-14) the manifest's B-5b reproduced the per-entry
 skip, which is history ([`upstream-register.md`](upstream-register.md), B-5b
 note and "Operator rulings of 2026-11-14 on the queue and the fork", item 2).
 
 **What is verified and what is not.** The tree equalities above and the
-`apply`/`check` runs are mechanical and were run. That the patched tree
-*builds and passes its tests* is the `overlay-build` job's result on the PR that
-made this change, not a hand run; on the Mac nothing was compiled. The libntech
-overlay result lacks the fork's other `json.c` changes (the fork's libntech pin,
-`cc892efae`, has a `json.c` that differs from overlay plus strict parse by 82
-lines), so a strict-parse test that needs them would fail only in the
-`overlay-build` job (R5 of the phase A design).
+`apply`/`check` runs are mechanical and were run. The patched tree builds and
+the loader's tests pass in the `overlay-build` job (`cmdb_test`, `json_test`,
+`mustache_test`, the `06_host_specific_data` acceptance directory,
+`tests/policy/run.sh` with `TENDCF_REQUIRE_FORK_LOADER=1`); on the Mac nothing
+was compiled. What CI proves is that the loader source is the fork's, bar the
+R1 accessor, and that its tests pass on both builds. It does not prove equal
+behaviour on every input: the fork's libntech pin (`cc892efae`) has a `json.c`
+that differs from overlay plus strict parse by 82 lines, and the fork's core
+carries a number fix in `rlist.c`.
+
+**Known difference from the pinned fork: JSON numbers.** The loader source is
+the fork's, but two things it calls are not. The fork's libntech
+(`cc892efae`) returns a number as it was parsed in `JsonPrimitiveToString()`
+and classifies exponent form as a real; the fork's core `rlist.c` does the
+same in `RlistAppendContainerPrimitive()`. Neither change is in the overlay
+(register B-4 and B-10, and the core `rlist.c` number fix; excluded by §2's
+rule). On upstream plus overlay a top-level `vars`/`variables` scalar, or a
+primitive array, holding an integer past `long` or exponent form without a dot
+(`1e5`, which the parser classifies as an integer) reaches
+`StringToLongExitOnError()` from `JsonPrimitiveGetAsInteger()` (libntech
+`json.c:850` after apply) and `cf-agent` exits in the install step, after
+validation passed: nothing is evaluated, so it is not a partial install, but the
+policy cannot refuse or report it. A real installs as `%.2f` (`string_lib.c`
+`StringFromDouble()`), so `0.00049` arrives as `0.00`; the fork installs
+`0.00049`. Reach: the projector refuses floats (`bin/projector.py:523`) and
+writes no exponents, and tendcf's variables are containers, so projected data
+does not reach it; a hand-edited file does. No test holds a bare number, so CI
+does not see it. Whether B-4, B-10 and the `rlist.c` fix join the overlay is
+open with djbclark (not decided here).
 
 ## 8. Rejected alternatives
 

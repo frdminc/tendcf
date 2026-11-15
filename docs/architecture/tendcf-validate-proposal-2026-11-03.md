@@ -1259,9 +1259,12 @@ that fixture, so check 9 sees both keys missing and the partial states stay
 tested only through the stand-in (check 10), which remains valid because the
 check compares the file with what was installed whatever the loader's policy.
 Since 2026-11-14 the overlay (`overlay/core/0002`, with libntech `0005`/`0006`)
-carries that same all-or-nothing loader in place of `8f0076b81`, so an
-upstream-plus-overlay build behaves like the pinned fork here; the
-`overlay-build` job runs `run.sh` on it with `TENDCF_REQUIRE_FORK_LOADER=1`.
+carries that same all-or-nothing loader source in place of `8f0076b81` (bar the
+R1 accessor), and the `overlay-build` job runs the loader's tests and `run.sh`
+on it with `TENDCF_REQUIRE_FORK_LOADER=1`; they pass on both builds. The two
+builds still differ for JSON numbers (B-4, B-10 and the `rlist.c` fix are not in
+the overlay; `upstream-overlay.md` §7), which this check's fixtures do not
+exercise.
 (2) The check
 needs `readjson` and `variablesmatching` to compose on the loader's
 installed variables; they do on the dev build (checks 9-10 of

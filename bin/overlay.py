@@ -194,6 +194,9 @@ def lint(overlay: Path) -> list[str]:
         base = comp.get("base", "")
         if not HEX40.match(base):
             findings.append(f"{name}: base {base!r} is not a 40-hex commit id")
+        tree = comp.get("applied_tree")
+        if tree is not None and not HEX40.match(tree):
+            findings.append(f"{name}: applied_tree {tree!r} is not a 40-hex tree id")
         cdir = overlay / name
         if not cdir.is_dir():
             findings.append(f"{name}: directory {cdir} missing")
@@ -347,6 +350,16 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
         ]))
     new_head = git_out(checkout, "rev-parse", "HEAD")
     report.append(f"  applied {len(paths)} patch(es); HEAD now {new_head[:12]}")
+    expected = comp.get("applied_tree")
+    if expected:
+        tree = git_out(checkout, "rev-parse", "HEAD^{tree}")
+        if tree != expected:
+            raise Finding("\n".join(report + [
+                f"TREE MISMATCH: the applied tree is {tree}, the manifest's applied_tree is {expected}. "
+                f"A patch file's body differs from what was recorded (lint checks only its From line and subject). "
+                f"The checkout at {checkout} is left with the patches applied.",
+            ]))
+        report.append(f"  applied tree {tree} matches the manifest")
     return report
 
 
@@ -511,6 +524,29 @@ def self_test() -> list[str]:
            subjects == ["Added a test for line five", "Fixed line five decoding twice"], str(subjects))
         ok("apply: the applied tree matches the fork tip's tree",
            git_out(clone, "rev-parse", "HEAD^{tree}") == git_out(upstream, "rev-parse", f"{c2}^{{tree}}"))
+
+        # 4b. The manifest's applied_tree is asserted after `git am`.
+        good_tree = git_out(clone, "rev-parse", "HEAD^{tree}")
+        for tree, label in ((good_tree, "matches"), ("0" * 40, "differs")):
+            data = load_manifest(overlay)
+            data["components"]["sample"]["applied_tree"] = tree
+            save_manifest(overlay, data)
+            git(clone, "reset", "-q", "--hard", base)
+            try:
+                rep = apply_series(overlay, "sample", clone, allow_mismatch=False)
+                ok(f"apply: applied_tree that {label} is "
+                   + ("accepted" if tree == good_tree else "refused"),
+                   tree == good_tree and any("matches the manifest" in ln for ln in rep))
+            except Finding as e:
+                ok("apply: applied_tree that differs is refused with TREE MISMATCH",
+                   tree != good_tree and "TREE MISMATCH" in str(e), str(e))
+        data = load_manifest(overlay)
+        data["components"]["sample"]["applied_tree"] = "xyz"
+        save_manifest(overlay, data)
+        ok("lint: a malformed applied_tree is a finding", any("applied_tree" in f for f in lint(overlay)))
+        del data["components"]["sample"]["applied_tree"]
+        save_manifest(overlay, data)
+        git(clone, "reset", "-q", "--hard", base)
 
         # 5. Retirement: upstream cherry-picks the first fix.
         git(upstream, "checkout", "-q", "-b", "caught-up", base)
