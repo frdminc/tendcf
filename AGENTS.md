@@ -67,20 +67,25 @@ path cannot preserve these checks, hold the review and report the missing check.
    slice, Fable or Argon count. Operator ruling, 2026-11-14, B10: "1. Spike
    lane, 2. Tiered review, 3. Docs freeze" (options O1, O2 and O4). **O6 was
    not chosen** and O5 (dogfood the gate) was not asked; neither is in force.
-   - **Tiered review (O2).** *Light* review for docs and spike notes. Read
-     conservatively, "light" changes the depth and scope of the review. It does
-     **not** waive model routing, quota readings, reservation or admission
-     rules, and the cross-model rule above still decides who may review.
-     Who may perform a light review (and whether it can be a non-frontier
-     model) is **open: awaiting operator ruling (which reviewers may perform a
-     light review?)**; until it is ruled, every reviewer launch follows the
-     routing, admission and independence rules in this file. Three limits on
-     what counts as "light docs" (a conservative reading, not a new ruling):
-     edits to this file's standing rules, or to normative trust, consent,
-     privilege or review text (the architecture map's trust, consent and
-     privilege sections; `docs/architecture/change-process.md`), are not
-     light; a PR that carries a design ruling takes the design-ruling tier
-     below; a mixed PR takes its highest tier; and policy run by a root
+   - **Tiered review (O2).** *Light* review for docs and spike notes. Lead
+     and reviewer reading, **not part of the ruling**: "light" changes the
+     depth and scope of the review. It does **not** waive model routing, quota
+     readings, reservation or admission rules.
+     Who may perform a light review: "2. Cheaper reviewer allowed" (operator
+     ruling, 2026-11-14, PR 62 review Q2; record line L58): any model outside
+     the author's family that is not on the weaker-tier ban list in rule 2
+     (GLM, Gemini Flash, Cursor Auto, `gpt-6-luna`) may perform a light
+     review; if the reviewer is a frontier model, the frontier checks (the
+     frontier allowance, fresh quota readings, estimate floors and caps,
+     reservation and admission) still apply to that launch. The cross-model
+     rule above still decides which families are "outside the author's family".
+     Lead and reviewer reading, **not part of the ruling** (kept from PR 62
+     round 1): three limits on what counts as "light docs": edits to this
+     file's standing rules, or to normative trust, consent, privilege or
+     review text (the architecture map's trust, consent and privilege
+     sections; `docs/architecture/change-process.md`), are not light; a PR
+     that carries a design ruling takes the design-ruling tier below; a mixed
+     PR takes its highest tier; and policy run by a root
      `cf-execd` counts as root code. **One frontier review** for device code.
      **Two frontier reviews** for root, trust-root, key and handshake code (the
      two are the independent astra-and-Fable pair described under design
@@ -116,7 +121,7 @@ path cannot preserve these checks, hold the review and report the missing check.
      Plan each review with
      `~/src/djbclark-ade/bin/route_agent.py plan --kinds frontier --repo tendcf --json`.
      Keep the reviewer order and model-family independence above; a non-frontier model
-     cannot satisfy this rule. Re-plan immediately before admission and launch.
+     cannot satisfy a frontier review (it may do a light one, above). Re-plan immediately before admission and launch.
      Record the reason `tendcf standing rule: cross-model review` in the brief
      and admission evidence.
 

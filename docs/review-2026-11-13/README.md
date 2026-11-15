@@ -10,16 +10,18 @@ Base commit for every anchor: `eefea3c` (master).
 
 Read `14-synthesis-and-rulings.md` first. Section B lists the rulings the
 operator had to make, and each is now ruled (2026-11-14); its opening index
-maps every line of the rulings record (L4 to L56) to its item and to the files
+maps every line of the rulings record (L4 to L60) to its item and to the files
 that carry it. Section C lists defects that need no ruling; section F is the
 merge map. The rulings record itself is `rulings-record-2026-11-14.md`, and
-`14-synthesis-and-rulings.md` lists the questions the record does not answer
-under "Open items awaiting operator ruling (2026-11-14)".
+`14-synthesis-and-rulings.md` lists the three questions the record still does
+not answer under "Open items awaiting operator ruling (2026-11-14)"; the four
+PR 62 review questions (Q1 to Q4) are ruled (record lines L57 to L60).
 
 ## Rulings of 2026-11-14
 
 The operator ruled B1 to B13, their riders and sub-rulings, the seven smaller
-items, the PR 52 follow-ups and the B11 round-2 items on 2026-11-14. Each
+items, the PR 52 follow-ups, the B11 round-2 items and the four PR 62 review
+questions on 2026-11-14. Each
 response item that the rulings decide carries a **Ruled** paragraph quoting
 the chosen option exactly and citing it as `operator ruling, 2026-11-14,
 <item>`; proposals that a ruling settled are rewritten and no longer read as
@@ -50,7 +52,7 @@ question)" and is never decided by this directory.
 | `12-fork-management.md` | Research: branch and fork management (G9) | new design material |
 | `13-premortem-and-ideas.md` | Pre-mortem, tensions, process, ideas | (reference) |
 | `14-synthesis-and-rulings.md` | Synthesis, rulings needed, defects, path to the first finish-line state | (reference) |
-| `rulings-record-2026-11-14.md` | The operator's rulings record, lines L4 to L56, verbatim except that absolute local paths are replaced by a neutral phrase | (reference; the L-numbers in 14 point here) |
+| `rulings-record-2026-11-14.md` | The operator's rulings record, lines L4 to L60, verbatim except that absolute local paths are replaced by a neutral phrase | (reference; the L-numbers in 14 point here) |
 | `checks/v1` to `v7` | The independent checkers' verdict tables and corrections; v7 is the source re-fetch | (evidence; cited as "vN Cn"; v7's corrections are "v7 R1" to "R21") |
 
 ## How it was produced
