@@ -85,6 +85,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # bin/overlay.py has a `uv run --script` shebang (as in check.yml)
+      - uses: astral-sh/setup-uv@v5
       - name: Fetch core and libntech at the overlay bases
         shell: bash
         run: |
