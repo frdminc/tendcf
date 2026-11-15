@@ -684,16 +684,21 @@ file stays rejected as circular.
   the owner answers) and a standing refusal. The record fields above
   describe the per-change shape, which stands until that bump lands. How
   the new shape sits with DC-2 is for the design review the schema bump
-  requires (two frontier reviews). **A reading of the ruling (L5, B2), not
-  part of it (lead decision, PR 62 round-3 review):** a standing approval
-  drops only the per-change nonce; it is signed by an owner-held key, names
-  its signer and algorithm, and passes the other B1/DC-2 checks (trusted-key
-  signature, freshness, counter or high-water mark, names this device,
-  signer scope); every standing mode (hold window, standing approval,
-  standing "wait for user", standing refusal) is owner-enrolled and
-  refusable, and none is a default; dropping any other check needs an
-  operator ruling; the schema design review confirms the approval-record
-  shape (AGENTS.md, Android item 5).
+  requires (two frontier reviews), within the reading below (dropping any
+  check other than the per-change nonce needs an operator ruling). **A reading of the ruling (L5, B2), not
+  part of it (lead decision, PR 62 round-3 review):** a standing approval drops
+  only the per-change nonce (DC-2's device nonce); it is signed by an
+  owner-held trusted key and keeps B1's other content checks (signed by trusted
+  keys, fresh, names this device) and the rest of DC-2 (per-target validity,
+  monotonic-counter single use or high-water mark, persisted rejects); its
+  ceremony class is still checked against the validator's derived requirement
+  (§9.8), and whether one standing approval may cover `privileged` or
+  `baseline` changes is for the schema design review; it names its signer and
+  algorithm only if X-trust-06 is adopted (proposed, not ruled); every standing
+  mode (hold window, standing approval, standing "wait for user", standing
+  refusal) is owner-enrolled and refusable, and none is a default; dropping any
+  other check needs an operator ruling; the schema design review confirms the
+  approval-record shape (AGENTS.md, Android item 5).
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
   `--simulate-output=json` issue before Step 3 code.

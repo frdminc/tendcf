@@ -102,8 +102,10 @@ path cannot preserve these checks, hold the review and report the missing check.
      operator's wording; it does not mean the text is not in force. That
      sentence covers only these three notes and the readings this file labels
      as readings (the Q2 family reading above, and Android item 5), all of
-     which only tighten. A reading that loosens a rule needs an operator
-     ruling; it is not in force on this file's say-so.
+     which only tighten. Those two readings are in force as lead practice, on
+     the lead's authority; L64 covers only the three notes. A reading that
+     loosens a rule needs an operator ruling; it is not in force on this
+     file's say-so.
      1. **Four limits on what counts as "light docs"** (limit (a)'s widening is
         the operator's own L64 wording; limits (b) to (d) are lead practice, in
         force per L64). (a) Not light (operator ruling, 2026-11-14, PR 62
@@ -413,14 +415,18 @@ Maybe have a development mode and/or build?").
    **recommended follow-ups, not ruled**.
 5. **A reading of the ruling (L5, B2), not part of it (adversary review of PR
    62, finding 4; wording: lead decision, PR 62 round-3 review):** a standing
-   approval drops only the per-change nonce; it is signed by an owner-held
-   key, names its signer and algorithm, and passes the other B1/DC-2 checks
-   (trusted-key signature, freshness, counter or high-water mark, names this
-   device, signer scope); every standing mode (hold window, standing approval,
-   standing "wait for user", standing refusal) is owner-enrolled and
-   refusable, and none is a default; dropping any other check needs an
-   operator ruling; the schema design review confirms the approval-record
-   shape.
+   approval drops only the per-change nonce (DC-2's device nonce); it is signed
+   by an owner-held trusted key and keeps B1's other content checks (signed by
+   trusted keys, fresh, names this device) and the rest of DC-2 (per-target
+   validity, monotonic-counter single use or high-water mark, persisted
+   rejects); its ceremony class is still checked against the validator's
+   derived requirement (§9.8), and whether one standing approval may cover
+   `privileged` or `baseline` changes is for the schema design review; it names
+   its signer and algorithm only if X-trust-06 is adopted (proposed, not
+   ruled); every standing mode (hold window, standing approval, standing "wait
+   for user", standing refusal) is owner-enrolled and refusable, and none is a
+   default; dropping any other check needs an operator ruling; the schema
+   design review confirms the approval-record shape.
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 
