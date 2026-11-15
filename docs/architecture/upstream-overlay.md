@@ -226,10 +226,15 @@ CMDB loader that replaces B-5b's per-entry skip (a skipped interlock leaves the
 services it guards unguarded). The manifest entry still reproduces `8f0076b81`
 and carries a `superseded_on_fork` note; the table above is the 2026-10-09
 state and is not updated. Upstream plus this overlay skips a bad entry; the
-pinned fork installs nothing from the file. The operator ruled on 2026-11-14
-to replace the patch: a later, separate PR makes the overlay carry the
-all-or-nothing loader in its place ([`upstream-register.md`](upstream-register.md)
-B-5b note).
+pinned fork installs nothing from the file. Operator ruling, 2026-11-14, B11
+round 2 item 1 (adversary D5, Astra C2): "1. Replace". The overlay carries the
+all-or-nothing CMDB loader (R13) instead of B-5b's per-entry skip, so
+upstream-plus-overlay builds match the pinned fork; if the overlay cannot patch
+libntech it carries the core part only (no strict parse). `8f0076b81` (fork PR
+59) is retired, never offered upstream. Status: ruled; implementation pending
+in a follow-up PR (overlay phase B), because it changes what the overlay
+reproduces ([`upstream-register.md`](upstream-register.md), "Operator rulings of
+2026-11-14 on the queue and the fork", item 2).
 
 So the overlay reproduces exactly the inputs whose build was verified on
 2026-08-19, from this repository alone, and would still apply to a build

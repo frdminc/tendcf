@@ -112,8 +112,12 @@ Rules for the file, each with the reason it is a rule:
    commit, reachable from what branch); `tree` is what the build verifies
    after fetching, because a rewritten branch can move `rev` out from under
    a `ref` while `tree` still proves the content. Both are plain git
-   objects: no Nix is needed to compute or check them, which R5 and D6
-   require (Nix is an optional builder, never a dependency of the path).
+   objects: no Nix is needed to compute or check them. Nix may be required
+   to build a release; devices never need Nix at run time (operator ruling,
+   2026-11-14, B4 rider "Nix on release path": "2. Allow on release path",
+   scope "1. Build-time only"). This amends the earlier reading of R5/D6
+   (Nix an optional builder, never a dependency of the release path); the
+   map's R5/D6 text is amended to match there.
 3. **A build never follows `ref`, but `ref` is verified.** The resolver
    updates `rev`/`tree` from `ref` on request, and a build never replaces
    the pinned `rev` with the tip of the moving `ref`. Gate 1 does fetch
@@ -127,7 +131,11 @@ Rules for the file, each with the reason it is a rule:
    is content inside the tendcf input; a built binary or the Android
    agent's APK enters a release only as a digest-bound fetched artifact
    (map §9.8, DC-11). The lockfile
-   pins sources, not binaries.
+   pins sources, not binaries. A person's own fork (G9, later) is not a
+   tool fork in this sense. Its build, like a tool fork's, reaches a device
+   only as a digest-bound artifact; its upstream pin is in site.lock, and
+   its patches are site content. (Operator ruling, 2026-11-14, Smaller 4,
+   X-forks-05: "1. Yes, a site.lock source input".)
 6. **A changed `url` is a privileged change** (decision D-d, issue #48;
    planned, Step 6). Gate 1 below verifies that `rev` belongs to `ref` at
    `url` and that `tree` matches, so a pull request that repoints a pin
@@ -199,7 +207,7 @@ Three properties follow:
    exists ([#47](https://github.com/frdminc/tendcf/issues/47)), a release
    build loads only in-tree plugins named by site-private, so the tendcf
    pin covers them, and plugins installed on the builder but not named
-   are not selected (map D46; installing one can still run code, plugin-layout §4). Reproducing the release byte for byte also
+   are not selected (map D46; installing one can still run code, plugin-layout §4). Out-of-tree discovery is itself deferred until a user needs it and out-of-tree plugins can be pinned (operator ruling, 2026-11-14, Smaller 5). Reproducing the release byte for byte also
    needs a fixed dependency and toolchain closure for the build and
    controlled or recorded external inputs (environment, network); those
    are not specified yet.
@@ -427,7 +435,7 @@ the review artifact; a diff computed in the compile job never is):
    verifies the pins itself; jobs B′ and B take nothing from job A but
    goal-file bytes and the digest manifest (plugin-layout §4).
 2. Compile every host, loading only the compiler plugins site-private
-   names (in-tree only until #47; map D46; the loader is planned,
+   names (in-tree only; out-of-tree discovery is deferred, with #47, until a user needs it and plugins can be pinned: operator ruling, 2026-11-14, Smaller 5; map D46; the loader is planned,
    [`plugin-layout.md`](plugin-layout.md) §4). Conflict-as-error (map §3):
    the same identity from two peer inputs without a private bind refuses
    the whole release, and so does a duplicate plugin name within a group.
@@ -711,8 +719,11 @@ moved on since.
    says), and makes the public engine's history irrelevant to its users.
 5. **Nix `flake.lock` as the mandatory lock.** The shape is right and the
    resolver is battle-tested, but it needs Nix to compute `narHash`, which
-   makes Nix a dependency of the release path on the builder; R5/D6 keep Nix
-   optional. `site.lock` keeps the two git hashes Nix does not need and can
+   makes Nix a dependency of the release path on the builder. The operator
+   has since allowed Nix on the release path, build-time only (§2 rule 2;
+   operator ruling, 2026-11-14, B4 rider "Nix on release path"), so Nix is
+   no longer excluded on principle; this choice stands on the other
+   grounds: `site.lock` keeps the two git hashes Nix does not need and can
    be converted into flake inputs when a Nix builder exists (Step 7/10+).
 6. **Devices reading git directly** (a device fetches the policy tree from
    a branch). This is what "git-synced policy" is sometimes taken to mean and

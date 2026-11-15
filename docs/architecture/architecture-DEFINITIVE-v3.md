@@ -11,7 +11,21 @@
   guide disagree on the current design, **the guide wins**. Numbered
   v1/v2 files, panel drafts, and the v2 trust spec are archival — see
   `deprecated/README.md`.
-- **Date:** 2026-08-15 (§9 rewritten for Model B; D43/D44 added)
+- **Date:** 2026-08-15 (§9 rewritten for Model B; D43/D44 added);
+  amended 2026-11-14 (operator rulings of the goal review written in:
+  D47–D50 added; §0, §1, §2 (R4, R5), §5, §6, §8, §9.1, §9.6, §9.11, §11,
+  §12, §13, §17, D6, D8, D12, D14, D16, D18, D22, D45 and D46 amended; new
+  §9.12, the safety score). Rulings are quoted as
+  `operator ruling, 2026-11-14, <item id>`; the full proposals are in
+  [`../review-2026-11-13/`](../review-2026-11-13/README.md) and the
+  rulings record is
+  [`../review-2026-11-13/rulings-record-2026-11-14.md`](../review-2026-11-13/rulings-record-2026-11-14.md).
+  Corrected the same day to the merged state (schema v6, PRs 52, 42 and
+  41 merged); items not decided are marked "open" (only the AI reviewer
+  "up to 30" count still is, marked "open: deferred to the schema design
+  review (operator ruling, 2026-11-14, PR 62 review Q7)"; Q1-Q6 of PR 62 are
+  ruled, including the G4 sentence, Q5, and the reviewer-proposed map text,
+  Q6).
 - **Tracker:** frdminc/tendcf#1.
 
 This document describes the **current design and what is planned next**.
@@ -25,18 +39,37 @@ cannot start its own privileged helper”).
 
 ## 0. Orientation for the AI that implements this
 
-1. **This is a freedom project.** Interesting and correct beats minimal
-   and safe when they conflict. Token spend is the cost that matters
-   (§13).
+1. **This is free software for people who want control of their own
+   devices.** Correct beats interesting; when correct and safe conflict,
+   stop and ask (item 5). Development cost is secondary to getting it
+   right (operator, 2026-10-31). A user's own AI token cost at run time
+   is a design constraint (R12). (Replaces "This is a freedom project.
+   Interesting and correct beats minimal and safe …"; operator ruling,
+   2026-11-14, Smaller 2 (M-§0-02), "1. Adopt the proposed text".)
 2. **The reference target is a stock Linux distro on bare metal**, not
    NixOS. Nix is used for builds, as one of two equal Site Model authoring
    languages, and verbatim on hosts that already run NixOS or nix-darwin
    (D12, [`linux-targets.md`](linux-targets.md) §5) — never as the
    installed OS a stranger must adopt. Ubuntu Server LTS is the working
-   default; the distro name is open until Step 4.
-3. **The trust/consent layer is the point.** A person should understand a
-   proposed change in ordinary language, refuse it, and keep a personal
-   branch — using **their** AI, not ours.
+   default; the distro name is open until Step 4. (Platform order is
+   D48, not this item: macOS first, Linux fourth and fifth; Nix is first
+   among authoring languages, D49. This item's Linux statement holds for
+   Linux hosts; operator ruling, 2026-11-14, B4, "1. Adopt D47-D50".)
+3. **The aim is an adoptable tool that gives people control of their own
+   devices** (goal G1,
+   [`00-goal-definition.md`](../review-2026-11-13/00-goal-definition.md)).
+   A person works through their own AI or directly in code, whichever
+   they prefer at the moment. The safety mechanism is see-and-refuse
+   (G4): nothing changes a device except as an exact, mechanically
+   checked difference that its owner can see and refuse. Measure every
+   step against the finish line (G8). State 1 comes first: one Mac and
+   one Android device converge from Nix-authored config, accept updates
+   only after the handshake, and archive logs on the Mac. (Replaces "The
+   trust/consent layer is the point."; D47 supersedes it and item 1's old
+   wording: operator ruling, 2026-11-14, Smaller 3 (M-§15-01), "1. Yes,
+   supersede D8's wording"; text from M-§0-01. The trust layer stays, as
+   G4's mechanism; a person still keeps a personal branch using **their**
+   AI, not ours, §11.)
 4. **Facts live in site data; behavior lives in tendcf.** Every tool
    (CFEngine, mise, Nix-for-builds, `tendcf-validate`, tendcf-agent) is a
    replaceable consumer.
@@ -91,8 +124,10 @@ cannot start its own privileged helper”).
 
           ▼
   JSONL log (capture)    append-only; the durable record
-  SQLite (index)         rebuildable from JSONL; tendcf-agent on
-                         Android, owner open elsewhere (§12)
+  SQLite (index)         rebuildable from JSONL; one per device,
+                         plus a fleet-wide one on the log archive
+                         (§8); owner: tendcf-agent on Android, open
+                         elsewhere (§12)
 ```
 
 Collision of the same identity from two peer inputs is a **compile
@@ -106,6 +141,8 @@ error**. Only site-private may bind a winner or a short name.
   Android (Termux + tendcf-agent + a Shizuku-class helper). Intel Mac
   mini out of scope. tendcf-agent is Android-only; Linux and macOS run
   CFEngine plus the `tendcf-validate` command, with no daemon (D45).
+  Platform order: D48 (macOS as server, Android as client, macOS as
+  client, Linux as server, Linux as client).
 - **R2** No permanent control node. Feature roles
   `{main, backups[], peers[]}` are data.
 - **R3** Resource efficiency; no fat containers; no VMs as the build
@@ -113,8 +150,17 @@ error**. Only site-private may bind a winner or a short name.
 - **R4** Android keeps Termux (+api, +x11), the built-in Terminal app, a
   Shizuku-class helper, tendcf-agent (Kotlin, D45), CFEngine. No
   nix-on-droid. Nix may build zero-on-device-footprint artifacts only.
+  tendcf never holds a DPC slot (profile owner or device owner) and never
+  requires MDM enrolment; it works with Island/Insular through shell
+  (`--user N`) and the owner app's API (operator ruling, 2026-11-14, B3
+  sub 3 (X-android-09), "1. Never").
 - **R5** No bare-metal Nix. A mainstream stock distro is the reference.
-  Ubuntu Server is the default answer, not the requirement.
+  Ubuntu Server is the default answer, not the requirement. **Amended
+  2026-11-14:** Nix may be required to build a release (operator ruling,
+  2026-11-14, B4 rider, Nix on release path, "2. Allow on release path"),
+  scope "1. Build-time only": devices never need Nix at run time. What
+  R5 forbids is Nix or NixOS as something a device or a stranger must
+  install; the change-process §2 amendment is in that file.
 - **R7 / R10** Push and pull. Pull becomes user sovereignty: the person’s
   own AI, suggested default prompt plus their extras, auto-review or a
   conversation. Generic layer publishable (GPL-3.0-or-later for code).
@@ -286,11 +332,15 @@ repository is archived), and in the restructure its command becomes
 `tendcf compile`, which replaces `nix2cf buildfile` with no
 alias. The name `nix2cf` moves to the Nix module frontend (D12).
 Frontends, supervisor renderers and importers are plugins, all compile
-time only. Third-party frontends and importers are to be found through
+time only. ~~Third-party frontends and importers are to be found through
 the public Python entry-point groups `tendcf.frontends` and
-`tendcf.importers`; plugins in this repository are to be found through a
-static import table, never through entry points (planned, restructure
-step 4; no loader exists today); supervisor renderers are in tree only. Plugins are trusted build-time code the
+`tendcf.importers`~~ (**amended 2026-11-14, D46:** all plugins live in
+tree and run only at compile time, never on a device; Python
+entry-point discovery of out-of-tree plugins is deferred until a user
+needs one and out-of-tree plugins can be pinned); plugins in this
+repository are to be found through a static import table, never through
+entry points (planned, restructure step 4; no loader exists today);
+supervisor renderers are in tree only. Plugins are trusted build-time code the
 operator explicitly allows, not sandboxed: a plugin cannot make a device
 accept anything that device's own diff does not show (on Linux and
 macOS that is `tendcf-validate`, planned, D45), and cannot emit a shape the schema forbids,
@@ -306,6 +356,13 @@ activation rules and the order of the move:
 CFEngine’s [Masterfiles Policy Framework](https://github.com/cfengine/masterfiles)
 already consumes that data layer. Common case: emit data, not `.cf`
 text. Merge once in the compiler; do not also use `mergedata()`.
+
+**Carry-over from other tools (B7).** Operator ruling, 2026-11-14, B7,
+"1. Importer + matching names": a one-shot importer for pure-data option
+families (it lists what it did not carry), plus tendcf option names that
+match nix-darwin and NixOS where the meaning is the same. Ruled;
+implementation pending (full text: X-nix-02 and X-nix-05 in
+[`08-nix-ecosystem.md`](../review-2026-11-13/08-nix-ecosystem.md)).
 
 Build **first** inside this pipeline: “exactly what device X would
 receive, without touching X” ([Bcfg2 `buildfile`](https://docs.bcfg2.org/)
@@ -366,9 +423,20 @@ model.
 - `provides` / `requires` inference and origin
 - Goal-file render, canonicalization, and the ChangePlan validator (§9)
 - Consent slot + default prompt (the advisor is theirs)
-- JSONL capture + SQLite index (§8; tendcf-agent's on Android)
+- JSONL capture + SQLite index (§8; tendcf-agent's on Android per D45, a support role; operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role")
 - Generic bundle that picks a supervisor
 - Peer actions as typed cross-machine help
+
+**Review TUI borrows (B12).** Borrow Toad and textual-diff-view
+(AGPL-3.0) as needed. The review TUI becomes AGPL-3.0-only and moves to
+Python >=3.14 (Toad's floor; Toad pins `textual==8.2.7`). The rest of the
+repository's licence is unchanged (R7 / R10). AGPL blocks GPL-2.0-only,
+CDDL, EPL-2.0 without a secondary designation and proprietary code in
+that module, so keep incompatible licences out of the TUI module; nothing
+tendcf uses today is affected. Follow-ups: Termux and Mac availability of
+Python >=3.14. Operator ruling, 2026-11-14, B12, "2. Borrow both freely;
+raise Python"; the licence question is X-safety-11 in
+[`09-safety-score-and-tui.md`](../review-2026-11-13/09-safety-score-and-tui.md).
 
 ncf/Rudder has no macOS or Android. CFEngine `services:` talks
 systemd/Windows/sysv, not launchd. Linux packages and systemd are mostly
@@ -432,12 +500,19 @@ is incomplete in exactly those windows.
    likewise logs results as JSON lines.
 2. **Index:** SQLite, for queries, extra-entry counts, “what release am
    I on.” Rebuildable from JSONL. If the DB is corrupt, history still
-   exists. On Android it lives inside **tendcf-agent**; on Linux and
-   macOS its owner is open (below).
+   exists. Every device keeps its own index over its own JSONL, and the
+   log archive keeps a fleet-wide one as well (ruled 2026-11-14, below).
+   On Android a device's index lives inside **tendcf-agent** per D45
+   (2026-11-02), and the B3 ruling ("trust and consent only", §12) does not
+   remove that role from the thin agent: "only" is about decisions, and the
+   thin Kotlin agent still writes the device JSONL and index as a support
+   role (operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role"). On Linux
+   and macOS its owning command is not yet named (below).
 
 CFEngine never opens SQLite. Single writer to JSONL (engine or its
 wrapper); single writer to SQLite (on Android the agent, which tails or
-receives the log).
+receives the log, as D45 stands; the B3 ruling does not change that: operator ruling,
+2026-11-14, PR 62 review Q3, "1. Agent keeps log role", see above).
 
 **Linux and macOS (D45, 2026-11-02).** No daemon runs beside CFEngine:
 `tendcf-validate` (§12) is a command that runs and exits, not a process
@@ -445,9 +520,11 @@ that tails the log. What holds there is the capture: JSONL, written by
 the engine or its wrapper. It is not built yet on any host — nothing
 writes report rows (`report-row.schema.json`), and the Linux writer is
 open in [`linux-targets.md`](linux-targets.md) §4. D45 gives the SQLite
-index no owner on these platforms; that is an operator question (§12),
-and nothing above depends on it, because the index is rebuildable and
-the JSONL is the record.
+index no owner on these platforms; the operator has ruled that every
+device keeps one (below, and §12 item 7), and nothing above depends on
+it, because the index is rebuildable and the JSONL is the record. Which
+command owns a device's index on Linux and macOS is implementation work
+and is not named yet.
 
 **Android UID isolation (looked up, 2026-08-14).** Termux (`com.termux`)
 and tendcf-agent are different UIDs. The APK **cannot** read
@@ -455,7 +532,11 @@ and tendcf-agent are different UIDs. The APK **cannot** read
 is a user-granted bridge with stdout via `PendingIntent`, not a log
 directory. Therefore:
 
-- tendcf-agent owns **both** JSONL and SQLite in **app-private storage**.
+- tendcf-agent owns **both** JSONL and SQLite in **app-private storage**
+  (D45, 2026-11-02, unchanged by any ruling; the B3 ruling "trust and
+  consent only" is about decisions, so the thin Kotlin agent still writes
+  the device JSONL and index as a support role: operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role"; map and D18
+  stand).
 - Either cf-agent runs as a native helper of the agent (same UID), or a
   Termux-side reporter **pushes** lines to the agent (localhost /
   ContentProvider). Never “agent opens Termux’s files.”
@@ -466,6 +547,25 @@ directory. Therefore:
 Optional best-effort push of a subset into Vector / OpenObserve /
 Grafana is never the record of truth. Fleet-wide yes/no questions query
 reachable devices and treat the rest as unknown.
+
+**Log archive (G8 state 1).** A device holding the `log-archive` role
+receives other devices' JSONL rows, authenticated by device public key,
+and appends them keyed by device public key and release stamp. Shipping
+is retried, idempotent by row identity, and never blocks convergence.
+The sending device's JSONL stays authoritative; the archive is an
+authenticated copy. **SQLite index (D45 item 7), ruled:** the log archive
+keeps a fleet-wide SQLite index over every device, **and** each device
+keeps its own index; device JSONL stays authoritative (operator ruling,
+2026-11-14, Smaller 6 REVISED, "make that both", option 3 "Both"; M-§8-01).
+The earlier answer the same day, "2. Per-device indexes" (every device
+its own index, the archive storing JSONL only), is superseded; it was
+also not the reviewers' recommendation. The JSONL writer on macOS and on
+Android is on the path to G8 state 1 (nothing writes report rows yet).
+In state 1 the archive server is the macOS VM on bigmac (§12); it is
+reachable only while bigmac is awake, so devices buffer JSONL until it is.
+The `monitor` role (monitoring of other machines) is G8 state 2: state 1
+needs only the log archive (operator ruling, 2026-11-14, B4 rider,
+monitor role, "1. State 2"; G8.1).
 
 Every row carries the release stamp. Each device records which release
 it is converged to.
@@ -575,6 +675,31 @@ file stays rejected as circular.
   The validator MUST recompute every hash. DC-2 applies in full:
   per-target validity, device nonce, monotonic-counter single use,
   persisted rejects.
+- **Standing modes (ruled; implementation pending; a schema bump).**
+  Operator ruling, 2026-11-14, B2, "3 but also the existance of standing
+  wait for user and standing refusal": option 3 (a hold window, or an
+  owner-enrolled standing approval, shown and refusable before apply; new
+  approval-record shape without a per-change nonce, i.e. a schema bump),
+  PLUS two further standing modes: a standing "wait for user" (hold until
+  the owner answers) and a standing refusal. The record fields above
+  describe the per-change shape, which stands until that bump lands. How
+  the new shape sits with DC-2 is for the design review the schema bump
+  requires (two frontier reviews), within the reading below (dropping any
+  check other than the per-change nonce needs an operator ruling). **A reading of the ruling (L5, B2), not
+  part of it (lead decision, PR 62 round-3 review):** a standing approval drops
+  only the per-change nonce (DC-2's device nonce); it is signed by an
+  owner-held trusted key and keeps B1's other content checks (signed by trusted
+  keys, fresh, names this device) and the rest of DC-2 (per-target validity,
+  monotonic-counter single use or high-water mark, persisted rejects); its
+  ceremony class is still checked against the validator's derived requirement
+  (§9.8); until the operator rules, a standing approval covers `ordinary`
+  changes only; whether one may cover `privileged` or `baseline` changes is for
+  the schema design review to propose and the operator to rule; it names its
+  signer and algorithm only if X-trust-06 is adopted (proposed, not ruled);
+  every standing mode (hold window, standing approval, standing "wait for
+  user", standing refusal) is owner-enrolled and refusable, and none is a
+  default; dropping any other check needs an operator ruling; the schema design
+  review confirms the approval-record shape (AGENTS.md, Android item 5).
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
   `--simulate-output=json` issue before Step 3 code.
@@ -730,6 +855,22 @@ field.
 Cost, accepted: the compiler carries multi-version render ability for a
 window and tracks per-host versions. The price is paid in one place
 rather than as device-side leniency on every device.
+
+**Ruled 2026-11-14 (schema).** (a) C-policy-01: "1. Bump to 6": a strict
+narrowing of `pre_action.command` still bumps `schema_version`; same
+version = same acceptance set (operator ruling, 2026-11-14,
+C-policy-01 schema version). (b) C-policy-01 `contract_version`:
+"1. Confirm `const: 2`": an exact pin, not a floor (operator ruling,
+2026-11-14, C-policy-01 contract_version form). (a) and (b) are
+**implemented**: the schema is at v6 (`"const": 6`, commit 83d7280) with
+`contract_version` const 2, merged by PR 52 (merge 2c78680, 2026-11-14).
+(c) The Android profile field (§12) rides the same bump as the `agent` id
+change (§12 item 4; M-§12-05 item 4); the standing-modes record (§9.1) is
+a schema bump too. Both are still pending and take **the next unused
+schema version (v7 or later)**, never v6, which has shipped. Ruled: "the next unused version (v7 or later); grouping not
+ruled; the schema design review (two frontier reviews) decides" (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"). Whether the profile/agent-id change and the
+standing-modes record are one version, and which number each takes, is
+that review's call.
 
 **Amended 2026-11-13 (D46).** There is no device outside the operator's
 own hosts to strand yet, so the
@@ -896,7 +1037,10 @@ when a genuinely offline root is lost and every `consented` device
 becomes unupdatable. DC-20 also asks for every root version to be
 retained and served, a written out-of-band runbook, and a
 machine-assisted fingerprint compare rather than an eyeball-hex one.
-None of those is built.
+None of those is built. **Ruled first build (operator ruling, 2026-11-14,
+B1, "1. Content checks; v0 first"):** SSH-signature v0, that is
+`ssh-keygen -Y` over the goal-file bytes plus a counter; the 2-of-3
+offline-root floor above may lag until TUF.
 
 **First-run root (D41).** The [TUF spec](https://theupdateframework.github.io/specification/latest/)
 assumes a good trusted `root.json` shipped with the updater, out of
@@ -924,6 +1068,53 @@ Push: any host holding `deploy-origin`, to **operator** (and
 operator-chosen `managed`) hosts. Push to a `consented` device still
 requires that device’s consent grant. Pull: each host’s own schedule,
 gated on timestamp role + quotas before it is autonomous.
+
+**The handshake is content checks (D50).** G3's "correct cryptographic
+handshake" means content checks: the goal file is signed by trusted keys,
+is fresh, names this device, and carries the owner's approval. Transport
+authentication decides only who may talk (operator ruling, 2026-11-14,
+B1, "1. Content checks; v0 first"; B13 item 1, "1. Keep text; B1 is the
+reading": goal text unchanged). Any device may relay a release; delivery
+never authorizes.
+
+### 9.12 The safety score (G4; operator rulings, 2026-11-14, B8)
+
+What G4 adds to Model B. The scan **advises**: it never authorizes (the
+device-computed diff, the approval record and the validator do). Ruled
+(implementation pending; the full text is in
+[`09-safety-score-and-tui.md`](../review-2026-11-13/09-safety-score-and-tui.md)
+and M-§9-03):
+
+- **A capped 0-100 score.** Operator ruling, 2026-11-14, B8, "1. Capped
+  0-100 score": "score from 0 to 100"; mechanical checks set a ceiling
+  that AI review can lower but never raise; an explanation of each part;
+  a measured hit rate once a corpus exists (B13 wording 3, X-pm-03).
+  This settles B13 items 2 and 3 (the G4 figure).
+- **Values.** B8 sub 1, "1. 09's table, top 95": base 95, never 100;
+  penalties, caps and bands are 09's table, fixed in the schema and
+  changed only by a ruling (later backed by a labelled corpus). The table
+  is in M-§9-03 and 09 (01 Idea 1, 09 Idea 1); it is not copied here.
+  **One part is undecided:** the table's AI-reviewer deduction ("up to
+  30") does not say whether 30 is the maximum per AI reviewer or the
+  maximum in total across reviewers; this aggregation is "open: deferred
+  to the schema design review (operator ruling, 2026-11-14, PR 62 review
+  Q7)". Nothing here chooses either reading.
+- **Owner-set auto-refuse floor.** B8 sub 2, "1. Allowed, off by
+  default": an owner may set a floor; a bundle below it is refused
+  automatically, logged, and the owner notified with the diff; no default
+  floor; tighten-only (no score ever auto-accepts); the owner can
+  re-request and accept a refused bundle (G-§7-01).
+- **Build order, not scope.** B8 sub 3, "1. Build order, not scope": G4
+  stays whole in state 1. The CLI diff and y/N is built first and used on
+  the VM and dev devices before any TUI or score work; state 1 is
+  declared only once score, explanation, highlighting and TUI land. No
+  "state 1.5".
+- **The authoring AI.** B8 sub 4, "2. Should not (as written)" (X-safety-06,
+  also placed in §11): the scanning AI SHOULD NOT be the authoring model;
+  it sees only the canonical diff as quoted data, never the author's
+  prose; the diff is hostile input; two model families where the owner
+  has them, and their disagreement caps the score (70). The same model is
+  allowed with no extra cap.
 
 ---
 
@@ -971,7 +1162,10 @@ offer a change and accept a signed yes/no. Same shape as a
   enrolled key, bound to the baseline and proposed goal-file hashes and
   the device nonce (§9.1). A reject MAY carry the hunks that drove it;
   accept is all-or-nothing (§9.3). Timeout is deny. Advisor down → fail
-  closed for *installs* (revocation still applies, §9).
+  closed for *installs* (revocation still applies, §9). The owner's own
+  enrolled alternatives to this default are the standing modes of §9.1
+  (hold window or standing approval, standing "wait for user", standing
+  refusal; operator ruling, 2026-11-14, B2).
 - Custom tools (OpenPGP WoT, a transparency log, a chain, gossip of
   signed apply-attestations) are theirs. Deadlock among “everyone
   waiting for everyone else” is a separate project that consumes
@@ -980,6 +1174,17 @@ offer a change and accept a signed yes/no. Same shape as a
 
 Proposing side and consenting side are different programs. The advisor
 never authorizes; the executor does, against the signed grant.
+
+**The scanning AI is not the authoring AI** (operator ruling, 2026-11-14,
+B8 sub 4, "2. Should not (as written)"; X-safety-06). The AI that scans a
+change SHOULD NOT be the model that authored it, and sees only the
+canonical diff as quoted data, never the author's prose. The diff is
+hostile input to it. Two model families, where the owner has them, are
+better than one; their disagreement caps the score (70). The same model is
+allowed with no extra cap. (Self-preference bias: [arXiv
+2404.13076](https://arxiv.org/abs/2404.13076), fetched and verified
+2026-11-14; cited for self-preference bias only, not for anything about
+code review.)
 
 Personal branch: theirs, applied under their consent; never auto-merges
 into anyone else’s trust domain. Upstream-heal is a suggestion their
@@ -996,13 +1201,87 @@ the primary workstation adopts nix-darwin is Step 7, gated on §14.1.
 Unit-writers lint is the safety rail on a live daily driver. Runtime:
 CFEngine + `tendcf-validate` (D45, below).
 
+*Ruled 2026-11-14: state 1's Mac.* macOS is platform 1, as a server (D48).
+
+- **Plain Mac, launchd by tendcf.** State 1's Mac has no nix-darwin;
+  tendcf renders launchd; Nix is for authoring and building only
+  (operator ruling, 2026-11-14, B6, "1. Plain Mac, launchd by tendcf").
+- **Which Mac.** An Apple Silicon macOS VM (tart / Virtualization.framework)
+  on bigmac (MacBookPro18,1): current macOS, snapshot/rollback, and CI can
+  run the same image; it is a client, not an always-on server (operator
+  ruling, 2026-11-14, B6 sub 1, "1. macOS VM on bigmac"; 13 E-2).
+- **Image size.** The state-1 macOS VM image is minimised: start from the
+  smallest base (vanilla, not a dev-tools image) and strip what tendcf's
+  state 1 does not need (operator ruling, 2026-11-14, B6 sub 1 rider,
+  "Try to cut down the MacOS VM image so be smaller, remove stuff we don't
+  need."). Queued as build work: research the floor (what macOS can drop
+  in a guest, e.g. tart vanilla vs base images).
+- **May the daily driver enforce.** "1. Dry-run only": bigmac may run
+  tendcf in dry-run (compute and report the diff, log drift, apply
+  nothing); the VM is the only enforcing Mac in state 1 (operator ruling,
+  2026-11-14, B6 sub 2, M-§12-01 / Q18). The VM is also the G8 log-archive
+  server, reachable only while bigmac is awake; devices buffer JSONL (§8).
+- **Root or user.** "1. Root in VM, user on bigmac": the enforcing VM runs
+  tendcf as a root LaunchDaemon; bigmac's dry-run runs as a user
+  LaunchAgent, no root (operator ruling, 2026-11-14, B6 sub 3, 13 E-2).
+  State 1 must verify the root launchd render path, which the WarpBuild
+  spike skipped.
+
 **Android (adapter #2).** Same Site Model vocabulary. Runtime: Termux +
 tendcf-agent (Kotlin, D45) + Shizuku-class helper + CFEngine. Agent owns
-logs (§8). Peer actions cover devices that need external ADB help.
+logs as a support role (§8, as D45 stands; operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", see below). Peer actions cover devices that need external ADB help.
+
+*Ruled 2026-11-14: Android (platform 2, client, D48).*
+
+- **State 1 on Android:** "3. Termux CFEngine + thin Kotlin": Termux
+  CFEngine fed tendcf projections; the Kotlin agent holds trust and
+  consent only (operator ruling, 2026-11-14, B3; 05 Idea 4). That ruling
+  decides the trust, consent and Termux split. It does not name who owns
+  the Android JSONL log and SQLite index (§8, D18); operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role":
+  "only" is about decisions; the thin Kotlin agent still writes the device
+  JSONL and index as a support role; map and D18 stand.
+- **Profile model.** "1. Field on entries": one host per phone (one key,
+  baseline, review); each Android promise names its target user (`owner`,
+  `work`, `private`) and the work profile's owner app (`island`,
+  `insular`, `none`), per X-android-05's text; an unreachable profile
+  reports `not_kept`. A `profile` field on entries is a schema bump, a
+  design ruling with two frontier reviews; it rides the same bump as the
+  `agent` id (§12 item 4; M-§12-05 item 4) (operator ruling, 2026-11-14,
+  B3 sub 1, M-§12-04).
+- **Validator on Android.** The single Python `tendcf-validate` runs in
+  Termux; the Kotlin agent independently re-checks signature and
+  high-water mark, keeps the trust anchor and the approval record in its
+  own app-private storage, and shows consent; no full Kotlin port
+  ("1. Termux + Kotlin trust check", B3 sub 2, M-§12-06; amends D45
+  (1)-(2)).
+- **Never a DPC slot.** tendcf never holds a DPC slot (profile owner or
+  device owner); it works with Island/Insular through shell (`--user N`)
+  and the owner app's API; an unreachable profile reports `not_kept`;
+  tendcf never requires MDM enrolment ("1. Never", B3 sub 3,
+  X-android-09).
+- **Phone review surface.** "1. Native screen + Termux": one review
+  document rendered three ways (CLI `--plain`/`--json`, Textual TUI
+  including Termux/SSH, native screen in tendcf-agent); goldens hold all
+  three; renderers compute nothing. The agent notification opens the
+  native screen with Accept/Refuse; the Termux CLI/TUI is the operator's
+  path. No answer = held; a refusal is logged ("1. Native screen +
+  Termux", B3 sub 4, X-safety-08 / X-android-14; replaces the former
+  Step 9 row, §13).
+- **The public claim (G5).** "1. Keep G5; word public claim": G5 is
+  unchanged; public docs use "we know of no other tool that converges an
+  owner's own unrooted phone, including its Island/Insular work profile,
+  from a signed goal file, without MDM enrollment or root" and state the
+  developer-verification terms (ADB exempt; advanced flow one-day wait;
+  limited distribution 20 vs 50 devices discrepancy) (operator ruling,
+  2026-11-14, B9).
 
 **Linux (adapter #3, adoptability keystone).** Stock distro; mise
 toolchains + CFEngine everything else, plus `tendcf-validate` (D45,
-below). Distro choice open until this step.
+below). Distro choice open until this step. *Ruled 2026-11-14:* under D48
+Linux is platforms 4 and 5 (server, then client): "1. Order language":
+Linux is later in the order, not paused (operator ruling, 2026-11-14, B4
+rider, Linux). The pastebin canary stays the standing end-to-end proof:
+"1. Keep it" (operator ruling, 2026-11-14, B4 rider, canary).
 
 **NixOS / nix-darwin (passthrough).** The host's existing Nix
 configuration, unchanged; tendcf supplies distribution, consent and
@@ -1036,13 +1315,22 @@ It is Python, `bin/projector.py` promoted, so the code CI's golden gate
 runs is the code the host runs: one implementation on these platforms,
 with nothing to drift. Each host needs `python3`; per the ruling, Debian
 has it, NixOS gets it through the derivation, and macOS from a bundled
-interpreter or the Command Line Tools. On Android the Kotlin agent runs
+interpreter or the Command Line Tools. ~~On Android the Kotlin agent runs
 the same validation and projection logic as a port, held byte-for-byte
 to the same checked-in goldens in CI (residue R22 of
-`projector-reconciliation-2026-08-16.md`, whose §9 placed the code); the
-Python implementation stays the one normative source. It is
-built after schema v5 lands and before any further host is enforced
-(§13). Nothing device-side runs today: pastebin's canary data is a
+`projector-reconciliation-2026-08-16.md`, whose §9 placed the code)~~.
+**Amended 2026-11-14 (D45 (1)-(2)):** on Android the single Python
+`tendcf-validate` runs in Termux, and the Kotlin agent independently
+re-checks signature and high-water mark, keeps the trust anchor and
+approval record in app-private storage and shows consent; there is no
+full Kotlin port of the validator (operator ruling, 2026-11-14, B3
+sub 2, "1. Termux + Kotlin trust check"). The Python implementation is
+the one normative source on every platform. It is
+built after schema v5 lands (it has; the schema is at v6) and before any
+further host is enforced (§13). Ruled exception (operator ruling, 2026-11-14, PR 62 review Q1, "2. Exception for the VM"): the §13 stage 1 macOS VM
+may enforce a root `cf-execd` early, before `tendcf-validate` exists at
+stage 4, as an explicit exception like pastebin's: canary only,
+operator-authored data. The stage order is not changed. Nothing device-side runs today: pastebin's canary data is a
 projection made in this repository by `bin/projector.py`, checked by
 `deploy/linux/canary/check.py` and installed by
 `tendcf-install.sh install --data`.
@@ -1107,9 +1395,12 @@ nothing:
    explicitly trusted host runtime outside that artifact. Pinning a
    version alone does not satisfy DC-11. R-S3-4's accidents-only model
    applies to the passthrough hard checks, not this consent gate. Timing:
-   the schema is at v4 and v5 is in flight; an id change decided before
-   v5 lands rides that bump, afterwards it costs v6 and a baseline
-   ceremony per device.
+   the schema is already at v6 (`"const": 6`, PR 52; v5 was the earlier
+   state), so an id change now costs the next unused schema version (v7
+   or later) and a baseline ceremony per device. Ruled 2026-11-14 (B3 sub
+   1, "1. Field on entries"): the schema bump for the Android `profile`
+   field rides this agent-id bump (M-§12-05 item 4). Ruled (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"): the next unused version (v7 or later); grouping not ruled (whether the standing-modes record, §9.1, shares that
+   version included); the schema design review (two frontier reviews) decides.
 5. **The `rfc8785` dependency.** `bin/projector.py` declares the PyPI
    package `rfc8785` and runs under `uv run --script`; D45 names only
    `python3`. Vendor it, package it, or implement JCS in the command.
@@ -1133,14 +1424,25 @@ nothing:
    compatibility; otherwise use a compatible bundled interpreter. Also
    open: the execution identity and privilege boundary for validation and
    projection publication on each platform.
-7. **The SQLite index on Linux and macOS (§8, D18).** No owner:
-   `tendcf-validate` is not a daemon and CFEngine never opens SQLite.
-   Deferred, owned by another command, or not built on these platforms.
+7. **The SQLite index on Linux and macOS (§8, D18).** **Ruled
+   2026-11-14** (Smaller 6 REVISED, "make that both", option 3 "Both";
+   it supersedes the same day's "2. Per-device indexes"): the log archive
+   keeps a fleet-wide SQLite index over every device, **and** each device
+   keeps its own; device JSONL stays authoritative. What stays open is
+   the owning command on a Linux or macOS device: `tendcf-validate` is
+   not a daemon and CFEngine never opens SQLite.
 8. **The v5 detector.** `schema-v5-dpkg-reconciliation-2026-11-02.md` R4
    left open whether tendcf-agent later takes over the Linux unit
    detector. D45 (1) closes that as posed: no tendcf-agent exists on
    Linux. Open is only whether any other component (`tendcf-validate` or
    a further command) ever takes it over from the policy bundle.
+
+**Engine pin (B5).** "1. Keep fork; spike stock" (operator ruling,
+2026-11-14, B5): the full fork pin on every platform, with the macOS fork
+build in CI; run report 11's 2-3 day stock/Termux spike before deciding
+the adopter path (options 2-4 of
+[`11-engine-alternatives.md`](../review-2026-11-13/11-engine-alternatives.md)).
+The spike is a spike-lane branch (never merged, §13).
 
 Future classes (extension points, no build-out): OpenWrt; consented
 iPhone/wearables that consume artifacts; firmware as Nix-built
@@ -1157,27 +1459,77 @@ before apply.
 
 ## 13. Build order
 
-Each step leaves a coherent system. Not a schedule.
+**Order, ruled 2026-11-14.** Operator ruling, 2026-11-14, B4, "1. Adopt
+D47-D50": the guide's build order
+([`02-response-guide.md`](../review-2026-11-13/02-response-guide.md)
+G-§18-02, "Build order from here") is the base, with this map's Step 0
+(M-§13-01: merge, the D46 restructure, the ruled schema changes) and an
+explicit macOS CI step folded in. Each stage leaves a coherent system and names
+the G8 state it serves ([`00-goal-definition.md`](../review-2026-11-13/00-goal-definition.md)
+G8). Not a schedule. Each state is reached in this order, but work toward
+state 3 may start once state 1 holds (operator ruling, 2026-11-14, B13
+item 4, "1. Adopt the clarification"). Linux is later in the order, not
+paused ("1. Order language", B4 rider); the pastebin canary stays the
+standing end-to-end proof ("1. Keep it", B4 rider); ordering inference
+(D16) is deferred explicitly ("1. Defer explicitly", B4 rider).
 
-| Step | What |
+| Stage | What | G8 |
+| --- | --- | --- |
+| 0 | Merge #42, then #41 (operator ruling, 2026-11-14, B11; historical: both merged 2026-11-14, #42 at acec5b5 and #41 at daa4530); the D46 restructure (`tendcf compile`, in-tree `plugins/`). The ruled schema changes: C-policy-01 (schema v6 with `contract_version` const 2) is done, merged by PR 52 (2c78680); the Android `profile` field with the `agent` id (§12 item 4) and the standing-modes approval record (§9.1) are still pending and take the next unused schema version (v7 or later); how they group is not ruled (§9.6; operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review": the next unused version (v7 or later), the schema design review of two frontier reviews decides). | 1 |
+| 1 | **The fork on the Mac.** Build the pinned fork for macOS arm64 into `/opt/tendcf` in the state-1 macOS VM on bigmac (§12; minimised image); root LaunchDaemon `cf-execd`; one canary launchd service enforced; bigmac itself dry-run only, as a user LaunchAgent. Verify the root launchd render path. Ruled exception (operator ruling, 2026-11-14, PR 62 review Q1, "2. Exception for the VM"): this stage enforces a root `cf-execd` in the VM before `tendcf-validate` exists at stage 4 and the handshake at stage 5; D45 says the validator is built "before any further host is enforced", and the VM is an explicit, ruled exception like pastebin's canary: it may enforce early, canary only, operator-authored data. The order is not changed. | 1 |
+| 2 | **macOS CI (explicit step).** A CI job builds the pinned fork on macOS and runs `tests/policy/run.sh`; the VM image is one CI can run. The WarpBuild spike (`spike/macos-check8-warp`, `warp-macos-26-arm64-12x`) is the first run. Historical: PR 52's merge waited on it (operator ruling, 2026-11-14, PR 52 gate 2); the run ("macOS check 8 spike (WarpBuild)", [run 43602684071](https://github.com/frdminc/tendcf/actions/runs/43602684071)) completed with conclusion success and PR 52 merged 2026-11-14 (2c78680). | 1 |
+| 3 | **Nix authoring, minimal.** A module system with tendcf options for services, interlocks and roles, named after nix-darwin and NixOS where the meaning is the same (B7), evaluating to today's Site Model JSON; YAML twins stay as fixtures. | 1 |
+| 4 | **`tendcf-validate`, first build, with the CLI review.** Stored, integrity-checked baseline; the device computes the diff; the CLI shows it and takes y/N; projection only after accept. Built first, and used on the VM and on dev devices before any TUI or score work (operator ruling, 2026-11-14, B8 sub 3, "1. Build order, not scope"). | 1 |
+| 5 | **Signed releases and the handshake.** Content checks (§9.11); SSH-signature v0 first (B1), TUF later; any device may relay. | 1 |
+| 6 | **Android client.** Termux CFEngine fed tendcf projections; the thin Kotlin agent (trust and consent only; it keeps the log and index as a support role: operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", §8); `tendcf-validate` in Termux; runit services via termux-services; the `profile` field on entries; ShizukuPlus helper; the native review screen (§12). | 1 |
+| 7 | **Peer actions and the archive.** The Mac starts ShizukuPlus over ADB when the phone cannot; JSONL capture on both devices (on Android the thin agent writes it as a support role: operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", §8); the `log-archive` role on the VM, fleet-wide index (§8); the phone buffers while the VM sleeps. The `monitor` role is not here: state 2. | 1 |
+| 8 | **Safety score, explanation, highlighting; then the TUI** (§9.12). State 1 is declared only once these land; G4 stays whole in state 1, and there is no "state 1.5". | 1 |
+| 9 | Pull: every device self-updates from any peer; roles move by editing data; the `monitor` role (operator ruling, 2026-11-14, B4 rider, "1. State 2"). | 2 |
+| 10 | macOS as client: the other Macs; nix-darwin passthrough (§14.1 for a workstation). | 2 |
+| 11 | Extra-entry reporting per domain, so the `not-yet-migrated` count measures what is left. | 2 |
+| 12 | Migrate the old stack's services one domain at a time, then retire it (`~/ops`). | 2 |
+| 13 | Linux as server: the existing Debian host, canary to full. | 2 |
+| 14 | Linux as client; NixOS and nix-darwin hosts as passthrough. | 2 |
+| 15-16 | State 3: the publishable layer, install and first-run root ceremony a person with no admin skill can complete, the default advisor prompt, public docs; then the `consented` tier. From state 1 on, a clean machine with a fresh AI session that has only the public docs rehearses this in CI (operator ruling, 2026-11-14, B13 item 5, "1. Add the rehearsal sentence"). | 3 |
+| later | Demand-driven: branch management (G9); ordering inference (D16, deferred explicitly); the builder/cache; APK provenance; web of trust as advisor tools; out-of-tree plugin discovery (D46, deferred). | later |
+
+State 1 is reached when the Mac and the phone each converge from a
+Nix-authored site, each refuses a release that fails the handshake and a
+diff its owner refused, and both devices' logs are in the Mac's archive,
+with stage 8 landed. Spike lane, tiered review and the docs freeze:
+`AGENTS.md` standing rule 3 (operator ruling, 2026-11-14, B10).
+
+**The earlier numbered steps** below are the names of pieces of work, kept
+for their status notes and for the references to them elsewhere (this map,
+`change-process.md`, `linux-targets.md`); the order is the stage table
+above. The guide's own Steps 0-15
+([`02-response-guide.md`](../review-2026-11-13/02-response-guide.md)
+G-§18-02) keep macOS CI inside their Step 1, so guide Step 0 = stage 0,
+guide Step 1 = stages 1-2, and guide Step n for n = 2 to 15 = stage n+1
+(stages 3 to 16). Rough correspondence of the former steps: Step 1 = stages 1-2, Step 2 = stage 6, Step 3
+(compiler) = built, stage 0, Steps 4-5 = stages 13-14, Step 6 = stages 4-5,
+Step 7 = stage 10, Step 8 = stage 9, Step 9 = stage 8.
+
+| Former step | What |
 | --- | --- |
 | 0 | Schemas in **tendcf** (`schema/`, `examples/`, `bin/schema_lint.py` — provides/requires, interlocks, comprehensive, report-row). Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
-| 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). 2026-10-29: the satisfied-interlock path had never opened (verdict class fixed in pass 1 before the check ran); the check moved to `tendcf_interlocks`, sequenced before `tendcf_services`, and `tests/policy/run.sh` proves both paths on Linux CI and the Mac. The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)); Linux CI builds the full fork ([`linux-targets.md`](linux-targets.md)). |
-| 2 | Android under the Site Model; Termux types; agent owns JSONL+SQLite. **Deferred** (operator, 2026-10-29): Linux comes first, see [`linux-targets.md`](linux-targets.md). Not started as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
+| 1 | macOS services adapter. Dry-run default. No nix-darwin. **Started** (`policy/tendcf_services.cf`, `222da45`: launchd present/absent and interlock refusal, verified against a real `cf-agent`; package/file promises, environment rendering, the unit-writer detector still open). 2026-10-29: the satisfied-interlock path had never opened (verdict class fixed in pass 1 before the check ran); the check moved to `tendcf_interlocks`, sequenced before `tendcf_services`, and `tests/policy/run.sh` proves both paths on Linux CI and the Mac. The CFEngine it was verified against is upstream plus the patch overlay (`overlay/`, [`upstream-overlay.md`](upstream-overlay.md)); Linux CI builds the full fork ([`linux-targets.md`](linux-targets.md)). **Ruled 2026-11-14:** the enforcing Mac in state 1 is the macOS VM on bigmac, not the daily driver (§12). |
+| 2 | Android under the Site Model; Termux types; agent writes JSONL+SQLite as a support role (operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", §8). ~~**Deferred** (operator, 2026-10-29): Linux comes first, see [`linux-targets.md`](linux-targets.md).~~ **Reversed 2026-11-13 (D48):** Android is platform 2; Linux is later in the order, not paused. Not started as code: the schema already carries a `termux` supervisor flavour (`services.schema.json`) and the `android-termux-services` domain fixture, but no adapter bundle, no agent, no JSONL/SQLite ownership. `frdminc/ShizukuTendCF` is the R4 helper (a tool fork), not this step. |
 | 3 | Compiler (`tendcf compile`; ~~nix2cf~~): `buildfile` first, conflict, extra-entry, then inference (needs step 1 and a Linux systemd adapter; Android is deferred). **Unblocked** on 2026-10-29 by the operator's decision recorded on [#4](https://github.com/frdminc/tendcf/issues/4); `frdminc/nix2cf` had one compilation command, `buildfile`, plus the `eval-nix` evaluation hook. **Amended 2026-11-13 (D46):** the compiler moved into tendcf under `compiler/` (#45; `frdminc/nix2cf` archived) and the restructure splits it into plugins ([`plugin-layout.md`](plugin-layout.md)); ~~its `tendcf.lock` is specified in [`change-process.md`](change-process.md) §2~~ with schema and compiler in one repository there is no `tendcf.lock` (it was specified, never built). |
-| 4 | Linux reference path on a stock distro. |
-| 5 | First real Linux host; prove roles are data. |
+| 4 | Linux reference path on a stock distro. (Later in the order, not paused: D48.) |
+| 5 | First real Linux host; prove roles are data. (Later in the order, not paused: D48.) |
 | 6 | Signed releases, push-only; goal-file render + diff + on-device validator (§9). Operator hosts. The lockfile, release, rollback and CI-gate design is [`change-process.md`](change-process.md) (#2); the code is not written. On Linux and macOS the on-device validator is `tendcf-validate`, built after schema v5 lands and before any further host is enforced; how much of this step's validator its first build carries is open (D45, §12). |
 | 7 | Mac substrate on the primary workstation (nix-darwin) if §14.1 says yes. The nix-darwin passthrough adapter itself is [`linux-targets.md`](linux-targets.md) Step 8 and does not wait on §14.1. |
 | 8 | Pull / self-update. |
-| 9 | Consent surface + default prompt + advisor slot. |
+| 9 | Consent surface + default prompt + advisor slot. One review document rendered three ways: command line (`--plain`, `--json`), TUI (Textual; also under Termux and SSH), and a native screen in tendcf-agent. Renderers compute nothing; golden fixtures hold all three (operator ruling, 2026-11-14, B3 sub 4, "1. Native screen + Termux"; X-safety-08, which replaces this row's former text). |
 | 10+ | Demand: builder/cache, APK provenance, WoT-as-advisor-tools, extracting the publishable layer when a second person runs it. |
 
-Dry-run is the standing posture on the first platform (the machine that
-cannot easily be reimaged). Reporting is an adoption requirement.
+Dry-run is the standing posture on the daily driver (the machine that
+cannot easily be reimaged), bigmac; the state-1 VM is the only enforcing
+Mac (§12). Reporting is an adoption requirement.
 
 The §9.9 schema family and the §14.2 review of it **MUST** land before the
-Step 6 validator is coded. Nothing else gates them — no fleet, no
+Step 6 validator (stage 4) is coded. Nothing else gates them — no fleet, no
 compiler — so they may be written as soon as someone is free to write
 them.
 
@@ -1211,20 +1563,20 @@ Older “superseded by” archaeology lives in
 | # | Decision | Resolution |
 | --- | --- | --- |
 | D2 | Site Model formality | Schemas at Step 0; writer-lint immediate. |
-| D6 | Nix on bare metal | No. Builds / dev shells / authoring language / passthrough where a host already runs NixOS or nix-darwin. Never the OS a stranger must install. |
-| D8 | Trust layer | Build it, gated. Sovereignty is the point. |
+| D6 | Nix on bare metal | No. Builds / dev shells / authoring language / passthrough where a host already runs NixOS or nix-darwin. Never the OS a stranger must install. **Amended 2026-11-14:** Nix may be required to build a release (operator ruling, 2026-11-14, B4 rider, Nix on release path, "2. Allow on release path"), scope "1. Build-time only": devices never need Nix at run time. |
+| D8 | Trust layer | Build it, gated. ~~Sovereignty is the point.~~ **Superseded in wording 2026-11-14 by D47:** adoption is the aim and see-and-refuse (G4) is its safety mechanism; the trust layer stays, as G4's mechanism (operator ruling, 2026-11-14, Smaller 3 (M-§15-01), "1. Yes, supersede D8's wording"). |
 | D10 | Task runner | `just` for humans; mise for toolchains. |
-| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. **Amended 2026-11-13 (D46):** the Nix frontend is the compiler plugin `plugins/frontends/nix/` and carries the name `nix2cf`; the YAML frontend is `plugins/frontends/yaml/` (built in); a Guix frontend may follow. Not built yet ([`plugin-layout.md`](plugin-layout.md)). **Amended 2026-11-13 (D46 (9), issue #48):** every Nix evaluation runs under restricted evaluation with no import-from-derivation, an empty `allowed-uris` and no network, and recipes from other sites are imported, pinned and scanned before compile; a Guix frontend waits for a sandbox design of its own (all planned). |
+| D12 | Authoring frontend | **Amended 2026-10-29.** Two equal frontends, Nix modules and YAML, rendering to byte-identical goal files; a Nix-authored site runs on hosts without Nix. Existing NixOS/nix-darwin configurations are used verbatim (passthrough). JSON remains the wire format. [`linux-targets.md`](linux-targets.md) §5. **Amended 2026-11-13 (D46):** the Nix frontend is the compiler plugin `plugins/frontends/nix/` and carries the name `nix2cf`; the YAML frontend is `plugins/frontends/yaml/` (built in); a Guix frontend may follow. Not built yet ([`plugin-layout.md`](plugin-layout.md)). **Amended 2026-11-13 (D46 (9), issue #48):** every Nix evaluation runs under restricted evaluation with no import-from-derivation, an empty `allowed-uris` and no network, and recipes from other sites are imported, pinned and scanned before compile; a Guix frontend waits for a sandbox design of its own (all planned). **Amended 2026-11-14 (D49):** Nix is first, not one of two equals: "Real Nix first, YAML beneath."; whether the byte-identical YAML twin stays as the frontend's test is open (D49). |
 | D13 | Service owner | CFEngine promises everywhere; mise toolchains only. |
-| D14 | Deployment shape | Git-synced policy; `cf-serverd` on every host; push and pull are one mechanism. |
+| D14 | Deployment shape | Git-synced policy; `cf-serverd` on every host; push and pull are one mechanism. **Amended 2026-11-14 (D50):** a device takes updates from any peer that completes the content-check handshake (§9.11); delivery never authorizes. |
 | D15 | Compile target | CFEngine Augments, not freehand `.cf`. (By way of the per-host goal file, which the device projects to Augments after approval: D43, D44, §5, §9.) |
-| D16 | Ordering | No Puppet catalog. Inference + fixpoint + authored `depends_on`. Interlocks. Default-on comprehensiveness. |
+| D16 | Ordering | No Puppet catalog. Inference + fixpoint + authored `depends_on`. Interlocks. Default-on comprehensiveness. **Ordering inference deferred explicitly, 2026-11-14:** operator ruling, 2026-11-14, B4 rider, D16, "1. Defer explicitly"; it is demand-driven (§13, "later"; G-§10-01), and the rest of D16 stands. |
 | D17 | ncf | Vendor generic methods as a reference corpus; strip Rudder reporting. |
-| D18 | Local record | ~~JSONL is the durable capture; SQLite in tendcf-agent is the index. On Android the agent owns both in app-private storage.~~ **Amended 2026-11-02 by D45:** JSONL is the durable capture; SQLite is the index, rebuildable from it. On Android tendcf-agent owns both in app-private storage. On Linux and macOS there is no agent, and the index's owner there is open (§8, §12). |
+| D18 | Local record | ~~JSONL is the durable capture; SQLite in tendcf-agent is the index. On Android the agent owns both in app-private storage.~~ **Amended 2026-11-02 by D45:** JSONL is the durable capture; SQLite is the index, rebuildable from it. On Android tendcf-agent owns both in app-private storage. On Linux and macOS there is no agent, and the index's owner there is open (§8, §12). **Amended 2026-11-14 (Smaller 6 REVISED, "make that both"):** every device keeps its own SQLite index over its own JSONL, **and** the log archive keeps a fleet-wide SQLite index over every device; device JSONL stays authoritative (§8, §12 item 7). The owning command on a Linux or macOS device is not yet named. **Android ownership of the log and index:** operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role": "only" is about decisions; the thin Kotlin agent still writes the device JSONL and index as a support role; map and D18 stand. The B3 ruling decides only trust, consent and Termux CFEngine (§12). |
 | D19 | Composition | Private-site lockfile pins inputs (DAG). Signed release is the deploy artifact. No sibling-repo tag lockstep. |
 | D20 | Nix store locality | Single writer per host. |
 | D21 | Schema home | **tendcf** owns schemas/types. ~~nix2cf is the compiler.~~ **Amended 2026-11-13 (D46):** the compiler also lives in tendcf (`compiler/`, command `tendcf compile`); schemas stay in `schema/`, outside the compiler's code, and the two live under one pin and change in separate commits whenever a change touches `tools/`, `schema/` or the projector (D46 (9d), operator rulings 20 and 21). `nix2cf` names the Nix frontend plugin. |
-| D22 | Platform sequence | macOS, Linux. Android deferred by the operator on 2026-10-29 ([`linux-targets.md`](linux-targets.md)). |
+| D22 | Platform sequence | ~~macOS, Linux. Android deferred by the operator on 2026-10-29 ([`linux-targets.md`](linux-targets.md)).~~ **Superseded 2026-11-13 by D48** (ruled 2026-11-14, B4, "1. Adopt D47-D50"). |
 | D23 | YAML canonicalize | Parse, re-serialize, diff on the YAML path. |
 | D24 / D40 | Lookup + auto-provide | Registry/token CLI; default `service:<name>`; compile errors teach names. |
 | D25 | Schema/example pairing | Lint fails if unpaired. |
@@ -1246,8 +1598,12 @@ Older “superseded by” archaeology lives in
 | D42 | Emergency | Restrictive metadata without consent; new installs still gated. |
 | D43 | ChangePlan model | ~~Model A: a closed `capability` vocabulary per operation, executor refuses effects outside the declared set.~~ **Superseded 2026-08-15 by Model B** (synthesis finding E1, adjudicated in `e1-adjudication-xhigh-2026-08-15.md`, which is final and supersedes `e1-adjudication-2026-08-15.md`): the wire artifact is the complete canonical per-host **goal file**; the ChangePlan is the **diff** against the device’s approved baseline; the executor is a **validator** over that diff, not an interpreter. Rationale: CFEngine has no runtime capability confinement, so Model A’s executor requires an interpreter plus a vocabulary-to-policy correspondence proof that does not exist and is not in budget; and coverage closes by construction when compiler and validator share one schema. The vocabulary, its versioning, and its skew policy are dropped. See §9. |
 | D44 | Goal-file schema family | The consent artifact is three paired schemas (goal file, goal diff, approval record) with canonical-byte fixtures. Binding sub-decisions, all from E1 §5 and normative in §9: diff computed **device-side**, full file on the wire, compiler diff is preview (§9.1 / E1 §5.1); RFC 8785 canonical JSON, no defaults, no empty collections, refuse-never-normalize, entry-granular structural hunks (§9.2 / E1 §5.2); accept is all-or-nothing, refusal annotated, no dependency groups (§9.3 / E1 §5.3); first adoption and schema migration are bounded **baseline ceremonies**, migration must diff to empty (§9.4 / E1 §5.4); hunk attribution is **excluded from the format** — impossible device-side — and replaced by an `explain-hunk` query (§9.5 / E1 §5.5); `schema_version` fails closed on unknown kinds, strandedness prevented at the compiler, two-phase bumps (§9.6 / E1 §5.6); per-domain coverage travels **in** the goal file (§9.7 / E1 §5.7). §14.2’s pre-build review applies to this family. |
-| D45 | Device-side component per platform | **Operator, 2026-11-02.** (1) tendcf-agent is **Android-only**, written in Kotlin. A Linux or macOS host runs CFEngine plus "a small validate-and-project command" (the ruling's words; the name **`tendcf-validate`** was chosen by the amending session on 2026-11-02 and may change without reopening the ruling), run before cf-agent reads `host_specific.json`; no daemon. (2) `tendcf-validate` is Python, the promotion of `bin/projector.py`: one implementation, so no byte-identity drift on those platforms. It needs `python3` on each host (Debian ships it, NixOS through the derivation, macOS bundled or the Command Line Tools). The Android agent's Kotlin projector is a port held to the same golden bytes in CI (residue R22), not a second normative source. (3) Built after schema v5 lands, before any further host is enforced. **Supersedes** every reading that ran the validator, the projector or the SQLite index inside tendcf-agent on every host: the §1 diagram's "CFEngine + tendcf-agent" per device, §8's index owner and D18 as written, §9's "run inside tendcf-agent" and "the agent binary" as the projector's call site, `goal-file-schema-reconciliation-2026-08-15.md` §0 item 7, §9 and §13 ("CI invokes the agent's own projector"), and `projector-reconciliation-2026-08-16.md` §9 and R22 ("tendcf-agent must reproduce" the reference). Not decided by it, and open for the operator: §12's list. |
-| D46 | Repository layout and compiler plugins | **Operator, 2026-11-13.** (1) `frdminc/nix2cf` folds into tendcf with full history, first under `compiler/` ([#45](https://github.com/frdminc/tendcf/pull/45)), and is archived as soon as that import merges. Both done 2026-11-13 (merge commit `ca4fa90`; the repository archived the same day). (2) The repository takes the plugin-type layout of [`plugin-layout.md`](plugin-layout.md): `schema/`, `examples/`, `policy/`, `overlay/`, `deploy/` unchanged; `tools/` (was `bin/`); `compiler/` (merge, conflict check, render); `plugins/frontends/` (`yaml`, `nix`, later `guix`, an authoring frontend), `plugins/supervisors/` (`launchd`, `systemd`, `runit`), `plugins/importers/` (`ansible`, `salt`); `contrib/` for in-tree third-party frontends and importers. It becomes one Python package, import name `tendcf`. (3) Third-party frontends and importers are found through the public entry-point groups `tendcf.frontends` and `tendcf.importers`, so they can live out of tree as a pip package; plugins in this repository are found through a static import table, never entry points (9a). Supervisor renderers are in tree only; there is no public `tendcf.supervisors` group, because the goal file's `unit` is a closed `oneOf` and an out-of-tree renderer could only shadow a built-in. (4) Plugins are compile-time only: none runs on a device. The device artifact (`tendcf-validate`, D45) is built from the validator's own source alone, never imports `compiler/`, `plugins/` or `contrib/` and never calls entry-point discovery; the schema lint and the projector never import the compiler; a CI import check is to enforce both (planned). Plugins are trusted build-time code that the operator explicitly allows, not sandboxed: a plugin cannot make a device accept anything that device's own diff does not show (on Linux and macOS that validation is `tendcf-validate`, planned, D45, and does not exist yet; the Android agent was not checked), and cannot emit a shape the schema forbids, but it can make the goal file say something other than what the Site Model says, and it sees the site's private data. Release gates (schema lint, projector, preview diff) and signing are to run in a separate environment with no plugin installed, and the compile step is to hold no signing key (planned, Step 6; nothing enforces this today, and amendment (9) says what the environment is). A compile-side preview diff or `explain-hunk` (D44) is compiler output and inherits the plugins' trust. `contrib/`'s lower bar waives support and maintenance promises, never the standing review rule. Out-of-tree trust establishment and plugin management: [#47](https://github.com/frdminc/tendcf/issues/47). (5) Activation (the loader is planned, restructure step 4): a plugin is selected only if site-private names it (name → distribution, version, hash); an installed but unnamed plugin is not selected (installing a package can still run code, amendment (9)); a duplicate name in a group is a compile error; built-in names are reserved; until out-of-tree pinning exists (#47) a release build loads in-tree plugins only; the release's `targets.json` `custom` records the plugin set. (6) No users and no backward compatibility yet, so no shims: the compiler's command becomes `tendcf compile`, which replaces `nix2cf buildfile` with no alias (it compiles every host; `--host` renders one); `eval-nix` moves to the Nix frontend; `bin/` → `tools/` leaves no symlink or wrapper and rewrites every path reference in every file, dated records included (djbclark, 2026-11-13, a one-time exception to their append-only convention; only paths change, and prose naming nix2cf as the old repository stays as history); `nix2cf` names the Nix frontend (D12). The compiler renders only the current `schema_version`; older-version rendering is removed in the restructure, and §9.6's ceiling design applies once the first device that is not an operator host enrolls. (7) The keys `nix2cf_services` and `nix2cf_edges` were only ever illustrative: they occurred in guide §16.A's preview-channel example and its copy in the paper, and no schema, fixture, projector or bundle carried them (the projection's keys are `tendcf_service` and `tendcf_interlock`). In the same change that recorded this decision they were renamed `preview_services` and `preview_edges` (illustrative only, chosen so they cannot be mistaken for the `tendcf_services` bundle or the real projected keys `tendcf_service`/`tendcf_interlock`). No schema change is involved ([`plugin-layout.md`](plugin-layout.md) §6). (8) Consequence for [`change-process.md`](change-process.md): the compiler is no longer a separately pinned input, the two-repository bump order and the compiler's `tendcf.lock` go away; `site.lock` loses only its `nix2cf` entry. One tendcf rev is the unit a site pins, so a compiler fix brings the `schema/` and `policy/` commits before it; accepted, with no maintenance-branch machinery, revisited when the first device that is not an operator host enrolls. Moving `bin/` to `tools/` and the plugin split wait until open PRs #41 and #42 merge. (9) **Amended 2026-11-13 ([issue #48](https://github.com/frdminc/tendcf/issues/48), the adversary review of this decision; operator decisions D-a to D-d recorded in [its comment](https://github.com/frdminc/tendcf/issues/48#issuecomment-6857866487); full text in [`plugin-layout.md`](plugin-layout.md) §4). Nothing below is built; each part is tagged with its step.** (a) **In-tree proof (D-a), planned with the loader:** a plugin is in-tree when its module's realpath sits under the gate-1-verified tendcf tree, checked before the module's code runs (a release build runs the compiler from that tree without installing it); every in-tree plugin (frontends, supervisors, importers) is found through a static import table, never through entry points, which are read only for third-party plugins after #47: list every one without deduplication by name, refuse duplicate names and every entry point that claims a reserved name, whatever its distribution name, load only the named ones; release builds never resolve `tendcf` from a package index; a release build pins or refuses `TENDCF_DIR`. This replaces the first sentence of (3) for in-tree plugins: only third-party plugins use the public groups. (b) **Frontend inputs are code (D-b), planned, Step 6:** external (site-shared or foreign) recipes are imported, never fetched at compile time; the import pins by content digest, runs a static scan and an AI review, and records the verdict with the pin; compile evaluates only pinned recipes with an accepting verdict bound to the digest and fails closed on a failed scan, a rejecting review or a missing or mismatched verdict (the no-AI setting never overrides a negative result; only the gate-5 ceremony marker does, recorded with the pin and shown in every later gate-5 review; the recorded verdict is advisory, because job B′ re-runs the static scan and the AI review on the pinned digest and fails on a negative result), and a site-shared or foreign `site.lock` input is not an import by being pinned; every Nix evaluation, the site's own included, runs under `restrict-eval` with import-from-derivation off, an empty `allowed-uris`, no unsafe native code and no network, with the whole directory tree that the import digested and scanned passed to `-I` and nothing wider (the import refuses a symlink that resolves outside it); `pure-eval` is not used because it cannot evaluate a file named on the command line (tested 2026-11-13 on Nix 2.35.6 in CI, [run 43483740436](https://github.com/frdminc/tendcf/actions/runs/43483740436): the positive recipe evaluates, and file reads outside the recipe (a symlink escape, `readDir` and `builtins.path` included), `fetchurl`, `fetchTarball`, a local `fetchGit`, a `<nixpkgs>` lookup and `builtins.exec` are each refused, each flag shown by relaxing it alone, while `getEnv` returns the empty string; the import-from-derivation flag is the layer that refuses it (on a fresh store the read-only `--eval` stops it first, with a store-state-specific message) and was proven with `--read-write-mode`; the exact command and what stays untested are in `plugin-layout.md` §4); no Guix frontend until it has a sandbox design of its own; with no AI reachable at import the static scan still runs and `external_import.without_ai` (`require-human-ack` by default, or `warn`, or `refuse`) decides, for the import step only (job B′ still requires an AI review, or the ceremony override, before anything is signed), set in the site-private file that names plugins. (c) **Separate environment (D-c), planned, Step 6:** interim, a separate Unix user on the builder holds the key and the gate tools; the default before the first real release is a two-job split (job A on a throwaway runner with no secrets compiles, runs gate 2 and uploads goal-file bytes plus a digest manifest; job B in a protected signing environment builds the gate tools from the previous release's tendcf pin, never the pin under test (the first release uses the tip of the protected branch the trust root declares, resolved once by job B′ and bound to the approval), with hash-locked dependencies, installs no `tendcf`, runs gates 3 to 5 and signs exactly the digests it checked; job B′ is job B without the key, runs gates 3 to 5 for pull requests so that the reviewed preview is computed outside the plugins); signers in the first real release are one of n (operator rulings, 2026-11-13): the CI key held as a GitHub environment secret, which alone suffices; hardware tokens, optional, at least two if any is enrolled; and the separate Unix user, opt-in and non-default, whose enrolment lowers every release to its level; each enrolled signer signs alone (`vps-hub` and the Hyades podman runner are not signers); both token paths normally sign only the approved pull request's job A digests (merged tree equal to the approved head), path 1 after verifying a passing job B′ run and path 2 after re-running gates 3 to 5 itself with the previous release's gate tools, hash-locked, and `targets.json` `custom` records which; a break-glass route with no merged pull request is allowed, privileged and recorded there too, and is one person's act, bounded only by the threshold-one trust in that signer (ruling 19); job A's egress is unrestricted for now, a stated exfiltration risk left open in `plugin-layout.md` §7. (d) **Signed is what was reviewed (D-d), planned, Step 6:** the pull request's own job A artifacts, previewed by job B′, are what reviewers approve (the approval is bound to head commit, job A run, manifest, preview and baseline release) and what merge signs when the merged tree equals the approved head tree and nothing bound changed (otherwise the gates run and are reviewed again); branch protection on site-private; a changed pin `url`, a pin that does not descend from the previous one and a changed plugin set (the operator's list), and a tendcf bump that changes `tools/`, `schema/` or the projector (issue #48's fixes; such a bump ships as its own release with unchanged data, because the gate tools come from the previous release's pin, ruling 18; a planned tendcf CI check fails a commit that changes `tools/`, `schema/` or the projector together with the compiler goldens or with `policy/`, rulings 20 and 21) need the gate-5 ceremony marker, and so do (operator rulings) a new `site.lock` input, the files the gate jobs run, CI workflow and signer configuration, a signer backend change and a lowered `external_import.without_ai`; the tendcf pin's `url` and `ref` must be what the site's trust root declares (default `frdminc/tendcf` and `master`, or a listed release-branch set, each with required review, no force-push, no deletion and no administrator bypass), any other ref is refused, and a site may declare its own tendcf repository and branch set in its trust root, a privileged change that no per-pull-request marker substitutes for, and gate 1 reads the trust root from the protected base, never from the pull request, so one pull request cannot both change it and move the pin; a backward pin move across a `schema_version` bump is forbidden (roll forward) and within one version is privileged; for a pull request that changes a pin `url` or the plugin set, adds a `site.lock` input or changes the trust-root declaration, job A does not run until the marker is present; the marker must be an attestation the author cannot produce, bound to one head and the named changes, and verified by jobs B′ and B from definitions outside the pull request, and the approval record is produced by job B′ and verified by job B (mechanisms open, `plugin-layout.md` §7); a break-glass route and a change of the trust-root declaration are also privileged; until built the preview diff is advisory. (e) **Statements corrected:** the claim that installing a package activates nothing was false (`.pth` files run when the interpreter starts and sdist build backends run at install time), so rule (5) says an unnamed plugin is "not selected"; hashes are to be checked at install time from a hash-locked, wheels-only resolution, plugin dependency closures pinned and the gate tools' dependencies locked; a plugin or recipe can copy one host's private data into another host's goal file and nothing in gates 3 to 5 checks that yet (planned: the projection lint checks for values from other hosts' slices; each host reads only its own goal files from the release store, by a per-host path and credential, while the operator and the signing job read all); folding the compiler in removed the producer/checker independence, listed as a cost in [`change-process.md`](change-process.md) §9; importers follow the naming and pinning rules of frontends, and gate 5 compares the plugin set with the previous release's. Amends D12, D15 (a pointer), D21, §1, §3, §5, §9.6 (when it applies) and Step 3. |
+| D45 | Device-side component per platform | **Operator, 2026-11-02.** (1) tendcf-agent is **Android-only**, written in Kotlin. A Linux or macOS host runs CFEngine plus "a small validate-and-project command" (the ruling's words; the name **`tendcf-validate`** was chosen by the amending session on 2026-11-02 and may change without reopening the ruling), run before cf-agent reads `host_specific.json`; no daemon. (2) `tendcf-validate` is Python, the promotion of `bin/projector.py`: one implementation, so no byte-identity drift on those platforms. It needs `python3` on each host (Debian ships it, NixOS through the derivation, macOS bundled or the Command Line Tools). ~~The Android agent's Kotlin projector is a port held to the same golden bytes in CI (residue R22), not a second normative source.~~ (3) Built after schema v5 lands, before any further host is enforced (exception: the stage 1 macOS VM may enforce early, canary only, operator-authored data, like pastebin's; operator ruling, 2026-11-14, PR 62 review Q1, "2. Exception for the VM"; §12, §13). **Supersedes** every reading that ran the validator, the projector or the SQLite index inside tendcf-agent on every host: the §1 diagram's "CFEngine + tendcf-agent" per device, §8's index owner and D18 as written, §9's "run inside tendcf-agent" and "the agent binary" as the projector's call site, `goal-file-schema-reconciliation-2026-08-15.md` §0 item 7, §9 and §13 ("CI invokes the agent's own projector"), and `projector-reconciliation-2026-08-16.md` §9 and R22 ("tendcf-agent must reproduce" the reference). Not decided by it, and open for the operator: §12's list. **Amended 2026-11-14 ((1)-(2) and item 7):** (1)-(2) on Android the single Python `tendcf-validate` runs in Termux; the Kotlin agent independently re-checks the signature and the high-water mark, keeps the trust anchor and the approval record in its own app-private storage, and shows consent; there is no full Kotlin port of the validator (operator ruling, 2026-11-14, B3 sub 2 (Q21 / M-§12-06), "1. Termux + Kotlin trust check"). Item 7 (the SQLite index): every device keeps its own index **and** the log archive keeps a fleet-wide one; device JSONL stays authoritative; this was revised the same day from "2. Per-device indexes" to option 3 "Both" ("make that both") (operator ruling, 2026-11-14, Smaller 6 / M-§8-01; §8, §12 item 7). |
+| D46 | Repository layout and compiler plugins | **Operator, 2026-11-13.** (1) `frdminc/nix2cf` folds into tendcf with full history, first under `compiler/` ([#45](https://github.com/frdminc/tendcf/pull/45)), and is archived as soon as that import merges. Both done 2026-11-13 (merge commit `ca4fa90`; the repository archived the same day). (2) The repository takes the plugin-type layout of [`plugin-layout.md`](plugin-layout.md): `schema/`, `examples/`, `policy/`, `overlay/`, `deploy/` unchanged; `tools/` (was `bin/`); `compiler/` (merge, conflict check, render); `plugins/frontends/` (`yaml`, `nix`, later `guix`, an authoring frontend), `plugins/supervisors/` (`launchd`, `systemd`, `runit`), `plugins/importers/` (`ansible`, `salt`); `contrib/` for in-tree third-party frontends and importers. It becomes one Python package, import name `tendcf`. (3) ~~Third-party frontends and importers are found through the public entry-point groups `tendcf.frontends` and `tendcf.importers`, so they can live out of tree as a pip package;~~ (deferred, see the amendment at the end of this row) plugins in this repository are found through a static import table, never entry points (9a). Supervisor renderers are in tree only; there is no public `tendcf.supervisors` group, because the goal file's `unit` is a closed `oneOf` and an out-of-tree renderer could only shadow a built-in. (4) Plugins are compile-time only: none runs on a device. The device artifact (`tendcf-validate`, D45) is built from the validator's own source alone, never imports `compiler/`, `plugins/` or `contrib/` and never calls entry-point discovery; the schema lint and the projector never import the compiler; a CI import check is to enforce both (planned). Plugins are trusted build-time code that the operator explicitly allows, not sandboxed: a plugin cannot make a device accept anything that device's own diff does not show (on Linux and macOS that validation is `tendcf-validate`, planned, D45, and does not exist yet; the Android agent was not checked), and cannot emit a shape the schema forbids, but it can make the goal file say something other than what the Site Model says, and it sees the site's private data. Release gates (schema lint, projector, preview diff) and signing are to run in a separate environment with no plugin installed, and the compile step is to hold no signing key (planned, Step 6; nothing enforces this today, and amendment (9) says what the environment is). A compile-side preview diff or `explain-hunk` (D44) is compiler output and inherits the plugins' trust. `contrib/`'s lower bar waives support and maintenance promises, never the standing review rule. Out-of-tree trust establishment and plugin management: [#47](https://github.com/frdminc/tendcf/issues/47). (5) Activation (the loader is planned, restructure step 4): a plugin is selected only if site-private names it (name → distribution, version, hash); an installed but unnamed plugin is not selected (installing a package can still run code, amendment (9)); a duplicate name in a group is a compile error; built-in names are reserved; until out-of-tree pinning exists (#47) a release build loads in-tree plugins only; the release's `targets.json` `custom` records the plugin set. (6) No users and no backward compatibility yet, so no shims: the compiler's command becomes `tendcf compile`, which replaces `nix2cf buildfile` with no alias (it compiles every host; `--host` renders one); `eval-nix` moves to the Nix frontend; `bin/` → `tools/` leaves no symlink or wrapper and rewrites every path reference in every file, dated records included (djbclark, 2026-11-13, a one-time exception to their append-only convention; only paths change, and prose naming nix2cf as the old repository stays as history); `nix2cf` names the Nix frontend (D12). The compiler renders only the current `schema_version`; older-version rendering is removed in the restructure, and §9.6's ceiling design applies once the first device that is not an operator host enrolls. (7) The keys `nix2cf_services` and `nix2cf_edges` were only ever illustrative: they occurred in guide §16.A's preview-channel example and its copy in the paper, and no schema, fixture, projector or bundle carried them (the projection's keys are `tendcf_service` and `tendcf_interlock`). In the same change that recorded this decision they were renamed `preview_services` and `preview_edges` (illustrative only, chosen so they cannot be mistaken for the `tendcf_services` bundle or the real projected keys `tendcf_service`/`tendcf_interlock`). No schema change is involved ([`plugin-layout.md`](plugin-layout.md) §6). (8) Consequence for [`change-process.md`](change-process.md): the compiler is no longer a separately pinned input, the two-repository bump order and the compiler's `tendcf.lock` go away; `site.lock` loses only its `nix2cf` entry. One tendcf rev is the unit a site pins, so a compiler fix brings the `schema/` and `policy/` commits before it; accepted, with no maintenance-branch machinery, revisited when the first device that is not an operator host enrolls. Moving `bin/` to `tools/` and the plugin split wait until open PRs #41 and #42 merge (historical: both merged 2026-11-14, #42 at acec5b5 and #41 at daa4530). (9) **Amended 2026-11-13 ([issue #48](https://github.com/frdminc/tendcf/issues/48), the adversary review of this decision; operator decisions D-a to D-d recorded in [its comment](https://github.com/frdminc/tendcf/issues/48#issuecomment-6857866487); full text in [`plugin-layout.md`](plugin-layout.md) §4). Nothing below is built; each part is tagged with its step.** (a) **In-tree proof (D-a), planned with the loader:** a plugin is in-tree when its module's realpath sits under the gate-1-verified tendcf tree, checked before the module's code runs (a release build runs the compiler from that tree without installing it); every in-tree plugin (frontends, supervisors, importers) is found through a static import table, never through entry points, which are read only for third-party plugins after #47: list every one without deduplication by name, refuse duplicate names and every entry point that claims a reserved name, whatever its distribution name, load only the named ones; release builds never resolve `tendcf` from a package index; a release build pins or refuses `TENDCF_DIR`. This replaces the first sentence of (3) for in-tree plugins: only third-party plugins use the public groups. (b) **Frontend inputs are code (D-b), planned, Step 6:** external (site-shared or foreign) recipes are imported, never fetched at compile time; the import pins by content digest, runs a static scan and an AI review, and records the verdict with the pin; compile evaluates only pinned recipes with an accepting verdict bound to the digest and fails closed on a failed scan, a rejecting review or a missing or mismatched verdict (the no-AI setting never overrides a negative result; only the gate-5 ceremony marker does, recorded with the pin and shown in every later gate-5 review; the recorded verdict is advisory, because job B′ re-runs the static scan and the AI review on the pinned digest and fails on a negative result), and a site-shared or foreign `site.lock` input is not an import by being pinned; every Nix evaluation, the site's own included, runs under `restrict-eval` with import-from-derivation off, an empty `allowed-uris`, no unsafe native code and no network, with the whole directory tree that the import digested and scanned passed to `-I` and nothing wider (the import refuses a symlink that resolves outside it); `pure-eval` is not used because it cannot evaluate a file named on the command line (tested 2026-11-13 on Nix 2.35.6 in CI, [run 43483740436](https://github.com/frdminc/tendcf/actions/runs/43483740436): the positive recipe evaluates, and file reads outside the recipe (a symlink escape, `readDir` and `builtins.path` included), `fetchurl`, `fetchTarball`, a local `fetchGit`, a `<nixpkgs>` lookup and `builtins.exec` are each refused, each flag shown by relaxing it alone, while `getEnv` returns the empty string; the import-from-derivation flag is the layer that refuses it (on a fresh store the read-only `--eval` stops it first, with a store-state-specific message) and was proven with `--read-write-mode`; the exact command and what stays untested are in `plugin-layout.md` §4); no Guix frontend until it has a sandbox design of its own; with no AI reachable at import the static scan still runs and `external_import.without_ai` (`require-human-ack` by default, or `warn`, or `refuse`) decides, for the import step only (job B′ still requires an AI review, or the ceremony override, before anything is signed), set in the site-private file that names plugins. (c) **Separate environment (D-c), planned, Step 6:** interim, a separate Unix user on the builder holds the key and the gate tools; the default before the first real release is a two-job split (job A on a throwaway runner with no secrets compiles, runs gate 2 and uploads goal-file bytes plus a digest manifest; job B in a protected signing environment builds the gate tools from the previous release's tendcf pin, never the pin under test (the first release uses the tip of the protected branch the trust root declares, resolved once by job B′ and bound to the approval), with hash-locked dependencies, installs no `tendcf`, runs gates 3 to 5 and signs exactly the digests it checked; job B′ is job B without the key, runs gates 3 to 5 for pull requests so that the reviewed preview is computed outside the plugins); signers in the first real release are one of n (operator rulings, 2026-11-13): the CI key held as a GitHub environment secret, which alone suffices; hardware tokens, optional, at least two if any is enrolled; and the separate Unix user, opt-in and non-default, whose enrolment lowers every release to its level; each enrolled signer signs alone (`vps-hub` and the Hyades podman runner are not signers); both token paths normally sign only the approved pull request's job A digests (merged tree equal to the approved head), path 1 after verifying a passing job B′ run and path 2 after re-running gates 3 to 5 itself with the previous release's gate tools, hash-locked, and `targets.json` `custom` records which; a break-glass route with no merged pull request is allowed, privileged and recorded there too, and is one person's act, bounded only by the threshold-one trust in that signer (ruling 19); job A's egress is unrestricted for now, a stated exfiltration risk left open in `plugin-layout.md` §7. (d) **Signed is what was reviewed (D-d), planned, Step 6:** the pull request's own job A artifacts, previewed by job B′, are what reviewers approve (the approval is bound to head commit, job A run, manifest, preview and baseline release) and what merge signs when the merged tree equals the approved head tree and nothing bound changed (otherwise the gates run and are reviewed again); branch protection on site-private; a changed pin `url`, a pin that does not descend from the previous one and a changed plugin set (the operator's list), and a tendcf bump that changes `tools/`, `schema/` or the projector (issue #48's fixes; such a bump ships as its own release with unchanged data, because the gate tools come from the previous release's pin, ruling 18; a planned tendcf CI check fails a commit that changes `tools/`, `schema/` or the projector together with the compiler goldens or with `policy/`, rulings 20 and 21) need the gate-5 ceremony marker, and so do (operator rulings) a new `site.lock` input, the files the gate jobs run, CI workflow and signer configuration, a signer backend change and a lowered `external_import.without_ai`; the tendcf pin's `url` and `ref` must be what the site's trust root declares (default `frdminc/tendcf` and `master`, or a listed release-branch set, each with required review, no force-push, no deletion and no administrator bypass), any other ref is refused, and a site may declare its own tendcf repository and branch set in its trust root, a privileged change that no per-pull-request marker substitutes for, and gate 1 reads the trust root from the protected base, never from the pull request, so one pull request cannot both change it and move the pin; a backward pin move across a `schema_version` bump is forbidden (roll forward) and within one version is privileged; for a pull request that changes a pin `url` or the plugin set, adds a `site.lock` input or changes the trust-root declaration, job A does not run until the marker is present; the marker must be an attestation the author cannot produce, bound to one head and the named changes, and verified by jobs B′ and B from definitions outside the pull request, and the approval record is produced by job B′ and verified by job B (mechanisms open, `plugin-layout.md` §7); a break-glass route and a change of the trust-root declaration are also privileged; until built the preview diff is advisory. (e) **Statements corrected:** the claim that installing a package activates nothing was false (`.pth` files run when the interpreter starts and sdist build backends run at install time), so rule (5) says an unnamed plugin is "not selected"; hashes are to be checked at install time from a hash-locked, wheels-only resolution, plugin dependency closures pinned and the gate tools' dependencies locked; a plugin or recipe can copy one host's private data into another host's goal file and nothing in gates 3 to 5 checks that yet (planned: the projection lint checks for values from other hosts' slices; each host reads only its own goal files from the release store, by a per-host path and credential, while the operator and the signing job read all); folding the compiler in removed the producer/checker independence, listed as a cost in [`change-process.md`](change-process.md) §9; importers follow the naming and pinning rules of frontends, and gate 5 compares the plugin set with the previous release's. Amends D12, D15 (a pointer), D21, §1, §3, §5, §9.6 (when it applies) and Step 3. **Amended 2026-11-14 (operator ruling, 2026-11-14, Smaller 5 (D46 out-of-tree plugin entry points, G-§4-01 / map Step 0, v2 C3), "1. Defer out-of-tree discovery"):** all plugins live in tree, compile-time only, never on a device; Python entry-point discovery of out-of-tree plugins is deferred until a user needs one and out-of-tree plugins can be pinned. The public entry-point groups of (3) are not built until then. |
+| D47 | Goal | **Operator, 2026-11-13.** The goal is G1–G9 of [`../review-2026-11-13/00-goal-definition.md`](../review-2026-11-13/00-goal-definition.md), as its rulings table records: primary aim "Adoptable tool" (row 1); first adopter "Nobody named yet." (row 2); finish line "The ladder of three states in G8" (row 7); wording "Agreed, with two changes to the draft", framing "focus on the user's freedom to control their own computing devices as they see fit", and "G9 added" (row 8). Adoption is the aim and see-and-refuse (G4) is its safety mechanism; this supersedes D8's "Sovereignty is the point" (the trust layer stays, as G4's mechanism) and §0 items 1 and 3. **Ruled 2026-11-14:** operator ruling, 2026-11-14, Smaller 3 (M-§15-01), "1. Yes, supersede D8's wording"; adopted with D48-D50, B4, "1. Adopt D47-D50". |
+| D48 | Platform sequence | **Operator, 2026-11-13** (rulings row 6): "The first platforms should be MacOS as server and Android as client, followed by MacOS as client, followed by linux server, followed by linux client. Android is one of the most important pieces as it will be the major marketplace differentiator". Goal G5 (wording agreed, row 8) adds that Android management "works with Island/Insular profiles and with user-space ShizukuPlus". This supersedes D22 and the 2026-10-29 Linux-first ruling and Android deferral ([`linux-targets.md`](linux-targets.md)). Linux work already done stays: pastebin's canary keeps running as the standing proof (operator, 2026-10-31; "1. Keep it", B4 rider, canary), and Linux is later in the order, not paused ("1. Order language", B4 rider, Linux). **Ruled 2026-11-14** (B4, "1. Adopt D47-D50"; M-§15-02). |
+| D49 | Authoring | **Operator, 2026-11-13** (rulings row 4): "Real Nix first, YAML beneath." Goal G2 (wording agreed, row 8): config is written in the real Nix language with NixOS-style options, so existing NixOS and nix-darwin configs carry over; plain YAML/JSON sits beneath it as the data form Nix evaluates to and can be written by hand; what a person is shown reads clearly without manuals. This amends D12 (Nix is first, not one of two equals). Carry-over: a one-shot importer for pure-data option families (it lists what it did not carry), plus tendcf option names matching nix-darwin and NixOS where the meaning is the same (operator ruling, 2026-11-14, B7, "1. Importer + matching names"). Nix may be required to build a release, build-time only (R5, D6). **Ruled 2026-11-14** (B4, "1. Adopt D47-D50"; M-§15-03). Still open, not decided by that ruling: whether `schema/` or the Nix module options is the schema authority (§4.1 says JSON Schema is generated from the module options), and whether a byte-identical YAML twin stays as the frontend's test. |
+| D50 | Device shape | **Operator, 2026-11-13** (rulings row 6b): "I am not trying to change the architecture; client and server are not entirely meaningful here as each device will be self-sufficient and able to take updates from any other device that uses the correct crytoographic handshake. So when I say server I am refering only to the machines that are a server for services like recieving and archiving logs and doing monitoring of other machines." Goal G3 (wording agreed, row 8): every device converges on its own and there is no control node. This confirms D33, amends D14's git-synced policy, and amends §9.11's push rule (peer delivery). The handshake: "the correct cryptographic handshake" means content checks (signed by trusted keys, fresh, names this device, owner approval); transport authentication decides only who may talk; first build SSH-signature v0; the 2-of-3 offline-root floor may lag until TUF (operator ruling, 2026-11-14, B1, "1. Content checks; v0 first"; B13 item 1, "1. Keep text; B1 is the reading"; §9.11). Owners may also enrol standing modes (§9.1, B2). **Ruled 2026-11-14** (B4, "1. Adopt D47-D50"; M-§15-04). |
 
 Silence = proceed from Step 0. Objections amend this register.
 
@@ -1345,6 +1701,14 @@ with full mesh) is **D38**.
 - `plugin-layout.md` — the repository's plugin-type layout, the plugin
   kinds and their two public entry-point groups, the plugin trust and
   activation rules, and the order of the move (D46).
+- `../review-2026-11-13/` — the 2026-11-13 goal review: the goal
+  (`00-goal-definition.md`, G1-G9), the proposals behind D47-D50 and the
+  2026-11-14 rulings written into this file, and the checks;
+  `../review-2026-11-13/rulings-record-2026-11-14.md` is the operator's
+  rulings record (the L-numbers cited in `14-synthesis-and-rulings.md`),
+  and 14 lists the one item still open: the AI reviewer "up to 30" count
+  (per reviewer or total), "open: deferred to the schema design review
+  (operator ruling, 2026-11-14, PR 62 review Q7)".
 - `tendcf-validate-proposal-2026-11-03.md` — a proposal, deciding
   nothing: options and a recommendation for each of §12's open D45
   items, a minimal first build, and an operator picklist.

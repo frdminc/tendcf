@@ -15,6 +15,23 @@
 > code enforces yet is tagged "planned", with its step.** Today there is
 > no plugin loader, no release pipeline, no gate separation, no import
 > step and no device-side validation command.
+>
+> **Amended 2026-11-14 (operator ruling, 2026-11-14, Smaller 5 (D46
+> out-of-tree plugin entry points, G-§4-01 / map Step 0, v2 C3), "1. Defer
+> out-of-tree discovery"; map D46, amendment at the end of the row).** All
+> plugins live in tree, run at compile time only and never on a device.
+> Python entry-point discovery of out-of-tree plugins is **deferred until a
+> user needs one and out-of-tree plugins can be pinned** (both, not either;
+> pinning is [#47](https://github.com/frdminc/tendcf/issues/47)). The
+> deliverable of restructure step 4 (§5) is the **static in-tree import
+> table**; the public entry-point groups `tendcf.frontends` and
+> `tendcf.importers` are not built, and no release build reads an entry
+> point. Every passage below that describes third-party entry-point
+> discovery (§1 item 3, §2's entry-point row, §3's table, §4's activation
+> steps 2 and 5 and the "Out of tree" item, §5 step 4, §7's #47 item) is
+> now **deferred design, kept as history** and marked "deferred" where it
+> stands; it takes effect only if both conditions are met (a user needs
+> one, and out-of-tree plugins can be pinned).
 
 ## 1. The decision
 
@@ -26,14 +43,19 @@
 2. The repository takes the plugin-type layout of §2. It becomes one
    Python package, import name `tendcf` (today's `nix2cf` package is
    renamed; how the directories map onto it is open, §7).
-3. A third-party frontend or importer can live outside this repository as
+3. ~~A third-party frontend or importer can live outside this repository as
    an ordinary pip package, found through the public Python entry-point
-   groups `tendcf.frontends` and `tendcf.importers` (§3). Every plugin in
-   this repository (frontends, supervisor renderers and importers) is
-   found through a static import table, never through entry points (§4,
-   activation; planned, restructure step 4: no table exists today).
-   Supervisor renderers are in tree only; there is no public
-   `tendcf.supervisors` group (§3).
+   groups `tendcf.frontends` and `tendcf.importers` (§3).~~ **Amended
+   2026-11-14 (Smaller 5, "1. Defer out-of-tree discovery"):** all plugins
+   live in tree and run only at compile time; entry-point discovery of
+   out-of-tree plugins is deferred until a user needs one and out-of-tree
+   plugins can be pinned, and the public groups are not built until then
+   (the deferred design stays in §3 and §4). Every plugin in this
+   repository (frontends, supervisor renderers and importers) is found
+   through a static import table, never through entry points (§4,
+   activation; planned, restructure step 4: no table exists today; this
+   table is the deliverable). Supervisor renderers are in tree only; there
+   is no public `tendcf.supervisors` group (§3).
 4. Plugins run at compile time only, and they are trusted build-time code
    that the operator explicitly allows, not sandboxed code (§4).
 5. A plugin is selected only if site-private names it (§4, activation;
@@ -102,7 +124,7 @@ tendcf/
 | `plugins/supervisors/systemd/`, `runit/` | nothing: a service selected for a systemd or runit host is a compile error (`RENDERED_SUPERVISORS` in `compile.py`) | written in tree ([`linux-targets.md`](linux-targets.md) §3, step 6) |
 | `plugins/importers/` | nothing | optional |
 | `contrib/` | nothing | as third parties contribute |
-| entry-point groups | none; nix2cf's `pyproject.toml` declares only the `nix2cf` script | the two public groups of §3, read for third-party plugins only; in-tree plugins are found through a static import table (§4) |
+| entry-point groups | none; nix2cf's `pyproject.toml` declares only the `nix2cf` script | none for now: the two public groups of §3 are deferred (Smaller 5, 2026-11-14); in-tree plugins are found through a static import table (§4) |
 
 A supervisor plugin renders a service record into the goal file's `unit`
 entry for that supervisor and resolves that supervisor's defaults (for
@@ -115,10 +137,19 @@ Wherever it lands, the device boundary rules of §4 apply to it.
 
 ## 3. Plugin kinds and entry-point groups
 
+> **Amended 2026-11-14 (operator ruling, 2026-11-14, Smaller 5, "1. Defer
+> out-of-tree discovery"):** the two public groups in this table are the
+> **deferred design**, not a deliverable. All plugins live in tree and are
+> found through a static import table; discovery of out-of-tree plugins by
+> Python entry points waits until a user needs one **and** out-of-tree
+> plugins can be pinned ([#47](https://github.com/frdminc/tendcf/issues/47)).
+> The table below keeps the old design as history, so a later ruling can
+> revive it without rewriting it.
+
 | Kind | Entry-point group | What it is |
 | --- | --- | --- |
-| Frontend | `tendcf.frontends` (public; third-party plugins only, §4) | A language a site keeps authoring in. It turns its source into the Site Model's JSON, which the compiler then merges, checks and renders like any other. YAML and Nix are the two equal frontends of map D12; Guix may follow as an authoring frontend (Guile records → Site Model JSON) once it has a sandbox design of its own (§4). |
-| Importer | `tendcf.importers` (public; third-party plugins only, §4) | An optional one-shot migration from another tool's configuration (Ansible, Salt) into Site Model files, which the site then keeps and edits as its own. Not run on every compile. |
+| Frontend | `tendcf.frontends` (deferred: public group for third-party plugins only, §4) | A language a site keeps authoring in. It turns its source into the Site Model's JSON, which the compiler then merges, checks and renders like any other. YAML and Nix are the two equal frontends of map D12; Guix may follow as an authoring frontend (Guile records → Site Model JSON) once it has a sandbox design of its own (§4). |
+| Importer | `tendcf.importers` (deferred: public group for third-party plugins only, §4) | An optional one-shot migration from another tool's configuration (Ansible, Salt) into Site Model files, which the site then keeps and edits as its own. Not run on every compile. |
 | Supervisor renderer | none: in tree only | A unit renderer for one supervisor (launchd, systemd, runit): service record in, goal-file `unit` entry out (§2). |
 
 The difference between a frontend and an importer is what happens next. A
@@ -147,7 +178,7 @@ decided (§7).
 Built-in frontends, supervisor renderers and importers are in tree, are
 to be found through a static import table and never through entry points
 (planned, §4: no table exists today), and their names are reserved
-against third-party entry points (§4). The
+against third-party entry points should those be built (deferred, §4). The
 Python interface a plugin implements, and the table's format, are not
 specified yet; they are to be settled when the split is done (§5, step 4).
 
@@ -787,7 +818,13 @@ the preview diff is **advisory**. The rule:
 
 **Activation: a plugin is selected only if site-private names it** (the
 loader is **planned**, restructure step 4, and Step 6 for the release
-checks; no loader exists today). The steps run in this order:
+checks; no loader exists today). The steps run in this order.
+**Deferral (operator ruling, 2026-11-14, Smaller 5, "1. Defer out-of-tree
+discovery"):** the deliverable is steps 1, 3 (for in-tree plugins), 4, 6, 7
+and 8 over the static import table. Step 2 and the third-party parts of
+steps 3 and 5 describe out-of-tree discovery, which is deferred until a
+user needs it and out-of-tree plugins can be pinned (#47); they are kept
+as the deferred design.
 
 1. **In-tree plugins come from a static import table.** A plugin is
    in-tree when its module's realpath, with symlinks resolved, sits under
@@ -807,8 +844,10 @@ checks; no loader exists today). The steps run in this order:
    resolves each table entry to a file, checks that file's realpath, and
    only then executes it by file location, the way `load_projector` in
    `compiler/nix2cf/cli.py` already loads the projector.
-2. **Entry points are read only for third-party plugins**, and only after
-   [#47](https://github.com/frdminc/tendcf/issues/47) exists. The loader
+2. **Deferred: entry points are read only for third-party plugins**, and
+   only after [#47](https://github.com/frdminc/tendcf/issues/47) exists
+   (until then they are not read at all, so there is no loader code for
+   this step). The loader
    lists every entry point, with no deduplication by distribution name
    (`importlib.metadata.entry_points()` drops a second distribution with
    the same name, so "a duplicate name is a compile error" could never
@@ -835,9 +874,9 @@ checks; no loader exists today). The steps run in this order:
 4. **Importers follow the same rules as frontends**: an importer runs
    only if it is named and pinned. Which importers an operator may run is
    exactly the set site-private names.
-5. **Until out-of-tree pinning exists**
-   ([#47](https://github.com/frdminc/tendcf/issues/47)), a release build
-   loads in-tree plugins only (`plugins/` and `contrib/`, at the pinned
+5. **Until out-of-tree pinning exists** (and entry-point discovery, which
+   is deferred with it; [#47](https://github.com/frdminc/tendcf/issues/47)),
+   a release build loads in-tree plugins only (`plugins/` and `contrib/`, at the pinned
    tendcf rev). That way the tendcf pin identifies the source of the
    compiler and of every plugin a release loads. Reproducing a release
    byte for byte also needs a fixed dependency and toolchain closure and
@@ -865,7 +904,8 @@ checks; no loader exists today). The steps run in this order:
 
 How an out-of-tree plugin earns trust (an OpenPGP web of trust) and how a
 site manages its plugins (a `tendcf plugin` command) is
-[#47](https://github.com/frdminc/tendcf/issues/47).
+[#47](https://github.com/frdminc/tendcf/issues/47); it is deferred with
+out-of-tree discovery (Smaller 5, 2026-11-14).
 
 **Current schema version only.** The compiler renders only the current
 `schema_version`. Its ability to render older versions (today nix2cf's
@@ -884,12 +924,13 @@ and the multi-version render returns with it.
    into the repository with a lower bar. The lower bar waives support and
    maintenance promises only: the project does not promise to fix, keep
    or port a contrib plugin. It never waives the standing review rule
-   (root `AGENTS.md`: every pull request gets a cross-model frontier
-   review), because contrib code runs in the release pipeline with the
+   (root `AGENTS.md` rule 3: contrib code is neither docs, a spike note nor
+   device code, so it keeps at least one cross-model frontier review), because contrib code runs in the release pipeline with the
    same privilege as everything else. A contrib plugin is off unless
    site-private names it, like any other.
-3. **Out of tree.** A pip package that registers under `tendcf.frontends`
-   or `tendcf.importers`, the way Salt extensions and Ansible collections
+3. **Out of tree (deferred, Smaller 5, 2026-11-14: not built until a user
+   needs it and out-of-tree plugins can be pinned).** A pip package that
+   registers under `tendcf.frontends` or `tendcf.importers`, the way Salt extensions and Ansible collections
    are shipped apart from Salt and Ansible. tendcf does not review it.
    Its output passes the same release gates as any plugin's, which bound
    its shape, not its faithfulness (above). A release build does not load
@@ -903,7 +944,7 @@ and the multi-version render returns with it.
 | 1 | This documentation: the guide, the paper, the map (D46), the change process, the Linux targets plan, the glossary, this file; and the rename of the illustrative `nix2cf_*` keys (§6). Moves no files and changes no code or schema. | this change |
 | 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | done: [#45](https://github.com/frdminc/tendcf/pull/45), merged 2026-11-13 (`ca4fa90`) |
 | 3 | Archive `frdminc/nix2cf`. | done 2026-11-13, right after #45 merged (README points here) |
-| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4) and the two public entry-point groups, which are not read until #47; `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. Waits until open PRs #41 and #42 merge. | planned |
+| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4), which is the deliverable (~~and the two public entry-point groups, which are not read until #47~~: the groups are deferred, not part of this step, until a user needs out-of-tree plugins and they can be pinned; operator ruling, 2026-11-14, Smaller 5); `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. PRs #41 and #42 are merged. | planned |
 | 5 (map's Step 6) | The release pipeline (Step 6, [`change-process.md`](change-process.md) §10) and the §4 properties that depend on it: the plugin loader's activation steps; the two-job split and its signer backends; promotion of the pull request's artifacts and branch protection on site-private; the privileged-change checks of gate 5; the import step for external recipes with the Nix limits; the projection lint's cross-host check. None is built. The two numberings differ: this table's step 5 is the map's Step 6. | planned |
 
 Step 4 rewrites every path reference in every file, dated records
@@ -998,8 +1039,9 @@ change, because the list moves:
   `external_import.without_ai` (§4, frontend inputs) lives in this file,
   so the file's format decides how that setting is written; TOML unless
   decided otherwise.
-- Out-of-tree pinning and trust establishment, after which a release
-  build may load an out-of-tree plugin
+- Out-of-tree pinning and trust establishment, after which (and only when
+  a user needs one: Smaller 5, 2026-11-14) entry-point discovery of an
+  out-of-tree plugin may be built and a release build may load one
   ([#47](https://github.com/frdminc/tendcf/issues/47)).
 - Compile-step network access: job A's egress is unrestricted for now
   (operator ruling, §4), and a future restriction stays open below. Still

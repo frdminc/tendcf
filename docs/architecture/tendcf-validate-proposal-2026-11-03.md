@@ -1225,7 +1225,8 @@ The fork-side all-or-nothing loader (PR #41) and this check hold each without
 the other: with the loader failing closed, the file's keys are not loaded and
 the check refuses and reports it, which is correct and louder. The independence
 is limited, not complete: the loader's strict parse (a repeated member or
-trailing input refuses the file; fork `4443504`) belongs to the CMDB loader
+trailing input refuses the file; fork `4443504`, the pin moved by PR #61, merged
+2026-11-15T00:12:15Z, `401e0f6`) belongs to the CMDB loader
 only, while this check's `readjson` stays lenient and sees the last of a
 repeated member or `vars` section, so an earlier container the loader refused
 is not named by the check. The check reports a refusal when that lenient view

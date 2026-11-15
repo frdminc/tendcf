@@ -350,7 +350,8 @@ tendcf that is fail-open: an interlock entry dropped at load leaves the
 services it guards actuated unguarded. `tendcf-integration` now carries
 `cmdb-fail-closed` (`a750b1dfe`, `dbf9dede6`, `61065e551`, `736becc07`, merged
 `d32cade13`; hardened by djbclark/core PR #98 and a strict libntech JSON parse,
-fork PR 99 moved the CMDB test seam under `TEST_UNIT_TEST`; the pin now `4443504`): `LoadCMDBData()` validates every entry of
+fork PR 99 moved the CMDB test seam under `TEST_UNIT_TEST`; the pin now `4443504`,
+moved by PR #61, merged 2026-11-15T00:12:15Z, `401e0f6`): `LoadCMDBData()` validates every entry of
 `vars`/`variables`/`classes` first and installs nothing from
 `host_specific.json` if any one is invalid (also an unknown top-level key, a
 null section, a key with index brackets, a frame-dependent special scope, two
@@ -369,7 +370,67 @@ a `superseded_on_fork` note saying so, and
 overlay keeps, retires or replaces that patch was ruled on 2026-11-14 (Replace:
 the overlay will carry the all-or-nothing loader instead of the per-entry skip),
 and is done in a later, separate PR because it changes what the overlay
-reproduces.
+reproduces. The ruling is recorded in full under "Operator rulings of
+2026-11-14 on the queue and the fork" below.
+
+### Operator rulings of 2026-11-14 on the queue and the fork
+
+Ruled, one item per line. Quotes are the operator's chosen options, exactly.
+
+1. **PR queue (B11).** Operator ruling, 2026-11-14, B11: "1. Review+merge #42,
+   then #41; park s5". Frontier plus adversary review of #42, then merge it;
+   rebase #41, fix its two stale statements and its stale pin hash, review it,
+   merge it. The two 2026-11-02 rulings are recorded with #41 (the fork's
+   all-or-nothing loader, R13, in the B-5b note above), without duplicating
+   #42's own paragraph, which records the other (Q10, "Implemented
+   2026-11-06"; V-§13-11, C9). `s5-design` (the report-only systemd/dpkg
+   detector, 54 commits behind) is parked and the branch kept. Queued by the
+   lead; at the time of the ruling the reviews and merges were not yet done
+   (historical). Outcome, 2026-11-14: #42 merged (`acec5b5`), then #41
+   (`daa4530`), in the ruled order; `s5-design` stays parked.
+2. **B-5b: overlay carries the all-or-nothing loader.** Operator ruling,
+   2026-11-14, B11 round 2 item 1 (adversary D5, Astra C2, upstream queue C2):
+   "1. Replace". The overlay carries the all-or-nothing CMDB loader (R13)
+   instead of B-5b's per-entry skip, so upstream-plus-overlay builds match
+   the pinned fork. If the overlay cannot patch libntech, it carries the core
+   part only (no strict parse). Upstream is later offered the core
+   all-or-nothing series (queue item 7 of e0d15d93's upstream queue, still
+   gated on D1/D2 and on libntech item 6). `8f0076b81` (fork PR 59) is
+   retired and never offered upstream. Status: ruled; implementation pending
+   in a follow-up PR (overlay phase B); queued as build work. The overlay
+   side is in [`upstream-overlay.md`](upstream-overlay.md) section 7.
+3. **Fork-only assertions in `tests/policy/run.sh`.** Operator ruling,
+   2026-11-14, B11 round 2 item 2 (adversary D1, Astra r2 B3): "1. Keep Mac,
+   SKIPs". The Mac dev build stays a `run.sh` target and prints an explicit
+   SKIP for each fork-only assertion; Linux CI sets
+   `TENDCF_REQUIRE_FORK_LOADER=1` and fails on any SKIP. Follow-up (Astra r2
+   B3): assertions that hold only with the strict loader (the `strict_case`
+   policy refusals) are gated the same way, so a non-fork run passes with
+   SKIPs rather than failing (done in the base: the `strict_case` calls with
+   POLICY `fork` go through `fork_only` in `tests/policy/run.sh`; not yet run
+   on the Mac). How the script behaves is in `AGENTS.md`
+   ("Verifying policy and the CFEngine build").
+4. **Upstream queue order.** Operator ruling, 2026-11-14, B11 round 2 item 3:
+   "1. Leave order as is". The libntech strict parse stays queue item 6,
+   after the four `--simulate-json` PRs.
+5. **`.gitmodules` in the fork's core.** Operator ruling, 2026-11-14, B11
+   round 2 item 4 (adversary r2 I3): "1. Bundle with next pin move". A
+   one-line `.gitmodules` change pointing libntech at
+   `https://github.com/djbclark/libntech` lands on `djbclark/core`
+   `tendcf-integration` together with the next real engine change (for
+   example the `CMDBTestFailInsertion` test-hook removal). PR #41 merges at
+   `6505f48` without it. Upstream PRs keep upstream's URL. Status: the
+   `.gitmodules` change is in place at the pin `4443504` (checked in
+   `djbclark/core`: `libntech` points at `https://github.com/djbclark/libntech`);
+   that pin move is PR #61, merged 2026-11-15T00:12:15Z, `401e0f6`.
+6. **`--simulate-json` upstream (Smaller 7).** Operator ruling, 2026-11-14,
+   Smaller 7: "Talk to 2d776056-3ea2-4fe5-a8d6-b59574dc427f about this and
+   let it lead and ask me any questions; you monitor and get the final
+   decision/state." Outcome, via 2d776056 (2026-11-14): the operator chose
+   "Prepare the PR". It is **not sent**: the cfengine worker 7d55e815 is
+   preparing it, and the operator's review gates sending. Nothing is posted
+   upstream until that review (the standing rule that nothing is re-sent
+   without the operator stands).
 
 B-2 through B-7 are described, measured and sourced in
 [`cfengine-upstream-candidates-2026-08-16.md`](cfengine-upstream-candidates-2026-08-16.md);
