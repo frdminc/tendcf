@@ -65,7 +65,7 @@ FROM_LINE = re.compile(r"^From ([0-9a-f]{40}) ")
 SUBJECT_PREFIX = re.compile(r"^\[PATCH[^\]]*\]\s*")
 
 REQUIRED_PATCH_KEYS = ("commit", "file", "subject")
-REQUIRED_COMPONENT_KEYS = ("base", "patches", "upstream")
+REQUIRED_COMPONENT_KEYS = ("base", "patches", "upstream", "applied_tree")
 
 
 class Finding(Exception):
@@ -75,14 +75,20 @@ class Finding(Exception):
 # ---------------------------------------------------------------- git helpers
 
 
-def git(repo: Path | str, *args: str, env: dict | None = None,
-        check: bool = True, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+def git(
+    repo: Path | str,
+    *args: str,
+    env: dict | None = None,
+    check: bool = True,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess:
     cmd = ["git", "-C", str(repo), *args]
     merged = dict(os.environ)
     if env:
         merged.update(env)
-    return subprocess.run(cmd, env=merged, check=check, capture_output=True,
-                          input=input_bytes)
+    return subprocess.run(
+        cmd, env=merged, check=check, capture_output=True, input=input_bytes
+    )
 
 
 def git_out(repo: Path | str, *args: str, **kw) -> str:
@@ -120,15 +126,18 @@ def load_manifest(overlay: Path) -> dict:
         raise Finding(f"{path}: not JSON: {e}") from None
     canonical = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     if canonical != text:
-        raise Finding(f"{path}: not in canonical form (2-space indent, sorted keys, "
-                      f"trailing newline). Rewrite with: bin/overlay.py lint --fix")
+        raise Finding(
+            f"{path}: not in canonical form (2-space indent, sorted keys, "
+            f"trailing newline). Rewrite with: bin/overlay.py lint --fix"
+        )
     return data
 
 
 def save_manifest(overlay: Path, data: dict) -> None:
     (overlay / MANIFEST_NAME).write_text(
         json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
 
 
 def component(data: dict, name: str) -> dict:
@@ -162,7 +171,7 @@ def parse_patch_header(path: Path) -> tuple[str, str]:
                     continue
                 break
             if line.startswith("Subject: "):
-                subject_lines.append(line[len("Subject: "):])
+                subject_lines.append(line[len("Subject: ") :])
                 in_subject = True
             elif line == "":
                 break
@@ -203,14 +212,20 @@ def lint(overlay: Path) -> list[str]:
         on_disk = sorted(p.name for p in cdir.iterdir() if p.suffix == ".patch")
         listed = [p.get("file", "") for p in comp.get("patches", [])]
         if listed != sorted(listed):
-            findings.append(f"{name}: manifest patch order is not the NNNN order: {listed}")
+            findings.append(
+                f"{name}: manifest patch order is not the NNNN order: {listed}"
+            )
         if sorted(listed) != on_disk:
-            findings.append(f"{name}: manifest lists {sorted(listed)} but disk has {on_disk}")
+            findings.append(
+                f"{name}: manifest lists {sorted(listed)} but disk has {on_disk}"
+            )
         seen_numbers: set[str] = set()
         for entry in comp.get("patches", []):
             for key in REQUIRED_PATCH_KEYS:
                 if key not in entry:
-                    findings.append(f"{name}: patch entry {entry.get('file', '?')} missing {key!r}")
+                    findings.append(
+                        f"{name}: patch entry {entry.get('file', '?')} missing {key!r}"
+                    )
             fname = entry.get("file", "")
             m = PATCH_NAME.match(fname)
             if not m:
@@ -230,9 +245,13 @@ def lint(overlay: Path) -> list[str]:
                 findings.append(str(e))
                 continue
             if commit != entry.get("commit"):
-                findings.append(f"{name}/{fname}: From line {commit} != manifest commit {entry.get('commit')}")
+                findings.append(
+                    f"{name}/{fname}: From line {commit} != manifest commit {entry.get('commit')}"
+                )
             if subject != entry.get("subject"):
-                findings.append(f"{name}/{fname}: subject {subject!r} != manifest {entry.get('subject')!r}")
+                findings.append(
+                    f"{name}/{fname}: subject {subject!r} != manifest {entry.get('subject')!r}"
+                )
     for d in overlay.iterdir():
         if d.is_dir() and d.name not in listed_dirs:
             findings.append(f"{d}: directory not listed in the manifest")
@@ -252,25 +271,42 @@ def check(overlay: Path, name: str, repo: Path, against: str | None) -> list[str
         tree = git_out(repo, "rev-parse", "--verify", f"{rev}^{{tree}}")
         resolved = git_out(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
     except subprocess.CalledProcessError as e:
-        raise Finding(f"{name}: cannot resolve {rev!r} in {repo}: {e.stderr.decode().strip()}") from None
-    report = [f"{name}: base {comp['base'][:12]}; checking against {rev} = {resolved[:12]}"
-              + ("" if resolved == comp["base"] else "  (NOT the pinned base: drift check)")]
+        raise Finding(
+            f"{name}: cannot resolve {rev!r} in {repo}: {e.stderr.decode().strip()}"
+        ) from None
+    report = [
+        f"{name}: base {comp['base'][:12]}; checking against {rev} = {resolved[:12]}"
+        + ("" if resolved == comp["base"] else "  (NOT the pinned base: drift check)")
+    ]
     with tempfile.TemporaryDirectory(prefix="tendcf-overlay-") as tmp:
         index = str(Path(tmp) / "index")
         env = {"GIT_INDEX_FILE": index}
         git(repo, "read-tree", tree, env=env)
         for path in patch_paths(overlay, name, comp):
-            r = git(repo, "apply", "--cached", "--whitespace=nowarn", str(path),
-                    env=env, check=False)
+            r = git(
+                repo,
+                "apply",
+                "--cached",
+                "--whitespace=nowarn",
+                str(path),
+                env=env,
+                check=False,
+            )
             if r.returncode != 0:
                 err = r.stderr.decode().strip()
                 raise Finding(
-                    "\n".join(report + [
-                        f"DRIFT: {name}/{path.name} does not apply to {rev} ({resolved[:12]}):",
-                        *("    " + ln for ln in err.splitlines()),
-                        (f"Rebase the fork branch onto {rev}, re-export with `bin/overlay.py export`, "
-                         f"and bump {name}.base in {MANIFEST_NAME} — or retire the patch if upstream carries it."),
-                    ]))
+                    "\n".join(
+                        report
+                        + [
+                            f"DRIFT: {name}/{path.name} does not apply to {rev} ({resolved[:12]}):",
+                            *("    " + ln for ln in err.splitlines()),
+                            (
+                                f"Rebase the fork branch onto {rev}, re-export with `bin/overlay.py export`, "
+                                f"and bump {name}.base in {MANIFEST_NAME} — or retire the patch if upstream carries it."
+                            ),
+                        ]
+                    )
+                )
             report.append(f"  ok  {path.name}")
     return report
 
@@ -284,15 +320,25 @@ def patch_id(repo: Path, patch_bytes: bytes) -> str | None:
     return out[0] if out else None
 
 
-def retired(overlay: Path, name: str, repo: Path, against: str) -> tuple[list[str], bool]:
+def retired(
+    overlay: Path, name: str, repo: Path, against: str
+) -> tuple[list[str], bool]:
     data = load_manifest(overlay)
     comp = component(data, name)
     base = comp["base"]
     # Every upstream commit between the pinned base and `against`, by patch-id.
-    log = git(repo, "log", "-p", "--no-merges", "--format=commit %H%n%s", f"{base}..{against}").stdout
-    ids_out = git(repo, "patch-id", "--stable", input_bytes=log, check=False).stdout.decode()
-    upstream_ids = {ln.split()[0]: ln.split()[1] for ln in ids_out.splitlines() if ln.strip()}
-    subjects = git_out(repo, "log", "--no-merges", "--format=%s", f"{base}..{against}").splitlines()
+    log = git(
+        repo, "log", "-p", "--no-merges", "--format=commit %H%n%s", f"{base}..{against}"
+    ).stdout
+    ids_out = git(
+        repo, "patch-id", "--stable", input_bytes=log, check=False
+    ).stdout.decode()
+    upstream_ids = {
+        ln.split()[0]: ln.split()[1] for ln in ids_out.splitlines() if ln.strip()
+    }
+    subjects = git_out(
+        repo, "log", "--no-merges", "--format=%s", f"{base}..{against}"
+    ).splitlines()
     count = len(subjects)
     report = [f"{name}: {count} upstream commit(s) in {base[:12]}..{against}"]
     any_retire = False
@@ -300,11 +346,15 @@ def retired(overlay: Path, name: str, repo: Path, against: str) -> tuple[list[st
         pid = patch_id(repo, path.read_bytes())
         if pid and pid in upstream_ids:
             any_retire = True
-            report.append(f"  RETIRE  {path.name}: identical change is upstream as {upstream_ids[pid][:12]}")
+            report.append(
+                f"  RETIRE  {path.name}: identical change is upstream as {upstream_ids[pid][:12]}"
+            )
         elif entry["subject"] in subjects:
             any_retire = True
-            report.append(f"  VERIFY  {path.name}: an upstream commit has the same subject but a different "
-                          f"patch-id; check whether it supersedes this patch")
+            report.append(
+                f"  VERIFY  {path.name}: an upstream commit has the same subject but a different "
+                f"patch-id; check whether it supersedes this patch"
+            )
         else:
             report.append(f"  keep    {path.name}")
     return report, any_retire
@@ -313,23 +363,38 @@ def retired(overlay: Path, name: str, repo: Path, against: str) -> tuple[list[st
 # ------------------------------------------------------------------ apply
 
 
-def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool) -> list[str]:
+def apply_series(
+    overlay: Path, name: str, checkout: Path, allow_mismatch: bool
+) -> list[str]:
     data = load_manifest(overlay)
     comp = component(data, name)
     head = git_out(checkout, "rev-parse", "HEAD")
     report = [f"{name}: HEAD {head[:12]}, pinned base {comp['base'][:12]}"]
     if head != comp["base"] and not allow_mismatch:
-        raise Finding(f"{name}: {checkout} is at {head[:12]}, not the pinned base {comp['base'][:12]}. "
-                      f"Check out the base, or pass --allow-base-mismatch after `check --against` is green.")
+        raise Finding(
+            f"{name}: {checkout} is at {head[:12]}, not the pinned base {comp['base'][:12]}. "
+            f"Check out the base, or pass --allow-base-mismatch after `check --against` is green."
+        )
     dirty = git_out(checkout, "status", "--porcelain", "--untracked-files=no")
     if dirty:
-        raise Finding(f"{name}: {checkout} has uncommitted changes; refusing to `git am` onto them")
+        raise Finding(
+            f"{name}: {checkout} has uncommitted changes; refusing to `git am` onto them"
+        )
     rebase_apply = git_path(checkout, "rebase-apply")
     for busy in (rebase_apply, git_path(checkout, "rebase-merge")):
         if busy.exists():
-            raise Finding(f"{name}: {checkout} has a `git am` or rebase in progress ({busy}); resolve or abort it first")
+            raise Finding(
+                f"{name}: {checkout} has a `git am` or rebase in progress ({busy}); resolve or abort it first"
+            )
     paths = patch_paths(overlay, name, comp)
-    r = git(checkout, *identity_args(checkout), "am", "--whitespace=nowarn", *map(str, paths), check=False)
+    r = git(
+        checkout,
+        *identity_args(checkout),
+        "am",
+        "--whitespace=nowarn",
+        *map(str, paths),
+        check=False,
+    )
     if r.returncode != 0:
         err = r.stderr.decode().strip() + "\n" + r.stdout.decode().strip()
         # Abort only the am session this invocation started: rebase-apply was
@@ -341,23 +406,52 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
             abort_note = f"another `git am` or rebase session ({rebase_apply}) appeared meanwhile; left it alone"
         else:
             ab = git(checkout, *identity_args(checkout), "am", "--abort", check=False)
-            abort_note = (f"aborted, checkout restored to {head[:12]}" if ab.returncode == 0 else
-                          f"and `git am --abort` ALSO failed ({ab.returncode}): {ab.stderr.decode().strip()} {ab.stdout.decode().strip()}")
-        raise Finding("\n".join(report + [
-            f"DRIFT: `git am` failed in {checkout}; {abort_note}:",
-            *("    " + ln for ln in err.splitlines() if ln.strip()),
-        ]))
+            abort_note = (
+                f"aborted, checkout restored to {head[:12]}"
+                if ab.returncode == 0
+                else f"and `git am --abort` ALSO failed ({ab.returncode}): {ab.stderr.decode().strip()} {ab.stdout.decode().strip()}"
+            )
+        raise Finding(
+            "\n".join(
+                report
+                + [
+                    f"DRIFT: `git am` failed in {checkout}; {abort_note}:",
+                    *("    " + ln for ln in err.splitlines() if ln.strip()),
+                ]
+            )
+        )
     new_head = git_out(checkout, "rev-parse", "HEAD")
     report.append(f"  applied {len(paths)} patch(es); HEAD now {new_head[:12]}")
     expected = comp.get("applied_tree")
-    if expected:
-        tree = git_out(checkout, "rev-parse", "HEAD^{tree}")
+    tree = git_out(checkout, "rev-parse", "HEAD^{tree}")
+    if head != comp["base"]:
+        # applied_tree is the tree after applying onto the pinned base only.
+        report.append(
+            f"  applied tree {tree} not compared (HEAD is not the pinned base)"
+        )
+    else:
+        if not expected:
+            raise Finding(
+                "\n".join(
+                    report
+                    + [
+                        f"{name}: the manifest has no applied_tree to assert after `git am`."
+                    ]
+                )
+            )
         if tree != expected:
-            raise Finding("\n".join(report + [
-                (f"TREE MISMATCH: the applied tree is {tree}, the manifest's applied_tree is {expected}. "
-                 f"A patch file's body differs from what was recorded (lint checks only its From line and subject). "
-                 f"The checkout at {checkout} is left with the patches applied."),
-            ]))
+            raise Finding(
+                "\n".join(
+                    report
+                    + [
+                        (
+                            f"TREE MISMATCH: the applied tree is {tree}, the manifest's applied_tree is {expected}. "
+                            f"A patch file's body differs from what was recorded (lint checks only its From line and subject). "
+                            f"The checkout at {checkout} is left with the patches applied."
+                        ),
+                    ]
+                )
+            )
         report.append(f"  applied tree {tree} matches the manifest")
     return report
 
@@ -365,17 +459,30 @@ def apply_series(overlay: Path, name: str, checkout: Path, allow_mismatch: bool)
 # ----------------------------------------------------------------- export
 
 
-def export(overlay: Path, name: str, repo: Path, base: str, tips: list[str]) -> list[str]:
+def export(
+    overlay: Path, name: str, repo: Path, base: str, tips: list[str]
+) -> list[str]:
     """One or more series, each `base..tip`, numbered consecutively. Several
     tips are for independent fork branches with no file overlap (issue #3's
     libntech case); `check` proves the combined order still applies."""
-    data = load_manifest(overlay) if (overlay / MANIFEST_NAME).is_file() else {"schema_version": 1, "components": {}}
+    data = (
+        load_manifest(overlay)
+        if (overlay / MANIFEST_NAME).is_file()
+        else {"schema_version": 1, "components": {}}
+    )
     comps = data.setdefault("components", {})
     comp = comps.setdefault(name, {"upstream": "", "base": base, "patches": []})
     base_full = git_out(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
-    tips_full = [git_out(repo, "rev-parse", "--verify", f"{t}^{{commit}}") for t in tips]
+    tips_full = [
+        git_out(repo, "rev-parse", "--verify", f"{t}^{{commit}}") for t in tips
+    ]
     for tip, tip_full in zip(tips, tips_full):
-        if git(repo, "merge-base", "--is-ancestor", base_full, tip_full, check=False).returncode != 0:
+        if (
+            git(
+                repo, "merge-base", "--is-ancestor", base_full, tip_full, check=False
+            ).returncode
+            != 0
+        ):
             raise Finding(f"{name}: {base} is not an ancestor of {tip}")
     old_by_commit = {p["commit"]: p for p in comp.get("patches", [])}
     cdir = overlay / name
@@ -386,9 +493,18 @@ def export(overlay: Path, name: str, repo: Path, base: str, tips: list[str]) -> 
     cdir.mkdir(parents=True, exist_ok=True)
     files: list[str] = []
     for tip_full in tips_full:
-        out = git_out(repo, "format-patch", "--no-signature", "--no-renames", "--full-index",
-                      "--no-stat", f"--start-number={len(files) + 1}", "-o", str(cdir),
-                      f"{base_full}..{tip_full}")
+        out = git_out(
+            repo,
+            "format-patch",
+            "--no-signature",
+            "--no-renames",
+            "--full-index",
+            "--no-stat",
+            f"--start-number={len(files) + 1}",
+            "-o",
+            str(cdir),
+            f"{base_full}..{tip_full}",
+        )
         files.extend(Path(ln).name for ln in out.splitlines() if ln.strip())
     patches = []
     for fname in files:
@@ -399,8 +515,10 @@ def export(overlay: Path, name: str, repo: Path, base: str, tips: list[str]) -> 
     comp["base"] = base_full
     comp["patches"] = patches
     save_manifest(overlay, data)
-    return [f"{name}: exported {len(files)} patch(es) from {base_full[:12]}..{{{', '.join(t[:12] for t in tips_full)}}} into {cdir}",
-            *(f"  {f}" for f in files)]
+    return [
+        f"{name}: exported {len(files)} patch(es) from {base_full[:12]}..{{{', '.join(t[:12] for t in tips_full)}}} into {cdir}",
+        *(f"  {f}" for f in files),
+    ]
 
 
 # -------------------------------------------------------------- self-test
@@ -413,10 +531,17 @@ def self_test() -> list[str]:
 
     def ok(label: str, cond: bool, detail: str = "") -> None:
         if not cond:
-            raise Finding(f"self-test FAILED: {label}" + (f"\n{detail}" if detail else ""))
+            raise Finding(
+                f"self-test FAILED: {label}" + (f"\n{detail}" if detail else "")
+            )
         report.append(f"  pass  {label}")
 
-    ident = ["-c", "user.name=tendcf overlay self-test", "-c", "user.email=overlay@tendcf.invalid"]
+    ident = [
+        "-c",
+        "user.name=tendcf overlay self-test",
+        "-c",
+        "user.email=overlay@tendcf.invalid",
+    ]
 
     def commit_file(repo: Path, rel: str, text: str, msg: str) -> str:
         (repo / rel).write_text(text, encoding="utf-8")
@@ -436,8 +561,15 @@ def self_test() -> list[str]:
         git(upstream, "checkout", "-q", "-b", "fix/sample")
         fixed = list(lines)
         fixed[4] = "line 5 fixed\n"
-        c1 = commit_file(upstream, "json.c", "".join(fixed), "Fixed line five decoding twice")
-        c2 = commit_file(upstream, "json_test.c", "test for line five\n", "Added a test for line five")
+        c1 = commit_file(
+            upstream, "json.c", "".join(fixed), "Fixed line five decoding twice"
+        )
+        c2 = commit_file(
+            upstream,
+            "json_test.c",
+            "test for line five\n",
+            "Added a test for line five",
+        )
         git(upstream, "checkout", "-q", "master")
 
         overlay = tmp_path / "overlay"
@@ -446,8 +578,15 @@ def self_test() -> list[str]:
         export(overlay, "sample", upstream, base, [c2])
         data = load_manifest(overlay)
         data["components"]["sample"]["upstream"] = "file://" + str(upstream)
+        data["components"]["sample"]["applied_tree"] = git_out(
+            upstream, "rev-parse", f"{c2}^{{tree}}"
+        )
         save_manifest(overlay, data)
-        ok("export produced two numbered patches", [p["file"][:5] for p in data["components"]["sample"]["patches"]] == ["0001-", "0002-"])
+        ok(
+            "export produced two numbered patches",
+            [p["file"][:5] for p in data["components"]["sample"]["patches"]]
+            == ["0001-", "0002-"],
+        )
         ok("lint is clean on the exported overlay", lint(overlay) == [])
 
         # 1. The series applies to the pinned base.
@@ -456,7 +595,9 @@ def self_test() -> list[str]:
 
         # 2. An unrelated upstream change does not count as drift.
         git(upstream, "checkout", "-q", "-b", "unrelated", base)
-        unrelated = commit_file(upstream, "README", "unrelated\n", "Unrelated upstream change")
+        unrelated = commit_file(
+            upstream, "README", "unrelated\n", "Unrelated upstream change"
+        )
         check(overlay, "sample", upstream, unrelated)
         ok("check --against: unrelated upstream change still applies", True)
 
@@ -464,11 +605,17 @@ def self_test() -> list[str]:
         git(upstream, "checkout", "-q", "-b", "drifted", base)
         drifted_lines = list(lines)
         drifted_lines[4] = "line 5 rewritten upstream\n"
-        drifted = commit_file(upstream, "json.c", "".join(drifted_lines), "Rewrote line five differently")
+        drifted = commit_file(
+            upstream, "json.c", "".join(drifted_lines), "Rewrote line five differently"
+        )
         try:
             check(overlay, "sample", upstream, drifted)
         except Finding as e:
-            ok("check --against: conflicting upstream change reports DRIFT", "DRIFT" in str(e) and "0001-" in str(e), str(e))
+            ok(
+                "check --against: conflicting upstream change reports DRIFT",
+                "DRIFT" in str(e) and "0001-" in str(e),
+                str(e),
+            )
         else:
             ok("check --against: conflicting upstream change reports DRIFT", False)
 
@@ -478,7 +625,11 @@ def self_test() -> list[str]:
         try:
             apply_series(overlay, "sample", clone, allow_mismatch=False)
         except Finding as e:
-            ok("apply: refuses a checkout whose HEAD is not the pinned base", "not the pinned base" in str(e), str(e))
+            ok(
+                "apply: refuses a checkout whose HEAD is not the pinned base",
+                "not the pinned base" in str(e),
+                str(e),
+            )
         else:
             ok("apply: refuses a checkout whose HEAD is not the pinned base", False)
         try:
@@ -487,9 +638,14 @@ def self_test() -> list[str]:
             status = git_out(clone, "status", "--porcelain")
             in_progress = git_path(clone, "rebase-apply").exists()
             head_now = git_out(clone, "rev-parse", "HEAD")
-            ok("apply --allow-base-mismatch: `git am` conflict fails loudly and leaves the checkout clean",
-               "DRIFT" in str(e) and status == "" and not in_progress and head_now == drifted,
-               f"status={status!r} rebase-apply={in_progress} HEAD={head_now[:12]} expected={drifted[:12]}\n{e}")
+            ok(
+                "apply --allow-base-mismatch: `git am` conflict fails loudly and leaves the checkout clean",
+                "DRIFT" in str(e)
+                and status == ""
+                and not in_progress
+                and head_now == drifted,
+                f"status={status!r} rebase-apply={in_progress} HEAD={head_now[:12]} expected={drifted[:12]}\n{e}",
+            )
         else:
             ok("apply --allow-base-mismatch: `git am` conflict fails loudly", False)
 
@@ -497,19 +653,29 @@ def self_test() -> list[str]:
         # is a file), is refused and left alone, never aborted by us.
         wt = tmp_path / "linked-worktree"
         git(clone, "worktree", "add", "-q", "--detach", str(wt), drifted)
-        first_patch = overlay / "sample" / data["components"]["sample"]["patches"][0]["file"]
+        first_patch = (
+            overlay / "sample" / data["components"]["sample"]["patches"][0]["file"]
+        )
         user_am = git(wt, *ident, "am", str(first_patch), check=False)
         user_session = git_path(wt, "rebase-apply")
-        ok("linked worktree: the user's own `git am` stopped, its session outside <worktree>/.git/",
-           user_am.returncode != 0 and user_session.exists() and (wt / ".git").is_file()
-           and not (wt / ".git" / "rebase-apply").exists(),
-           f"am rc={user_am.returncode} session={user_session} exists={user_session.exists()}")
+        ok(
+            "linked worktree: the user's own `git am` stopped, its session outside <worktree>/.git/",
+            user_am.returncode != 0
+            and user_session.exists()
+            and (wt / ".git").is_file()
+            and not (wt / ".git" / "rebase-apply").exists(),
+            f"am rc={user_am.returncode} session={user_session} exists={user_session.exists()}",
+        )
         try:
             apply_series(overlay, "sample", wt, allow_mismatch=True)
         except Finding as e:
-            ok("apply: refuses a linked worktree with a `git am` in progress and leaves that session intact",
-               "in progress" in str(e) and user_session.exists() and git_out(wt, "rev-parse", "HEAD") == drifted,
-               f"session exists={user_session.exists()}\n{e}")
+            ok(
+                "apply: refuses a linked worktree with a `git am` in progress and leaves that session intact",
+                "in progress" in str(e)
+                and user_session.exists()
+                and git_out(wt, "rev-parse", "HEAD") == drifted,
+                f"session exists={user_session.exists()}\n{e}",
+            )
         else:
             ok("apply: refuses a linked worktree with a `git am` in progress", False)
         git(wt, *ident, "am", "--abort")
@@ -519,10 +685,17 @@ def self_test() -> list[str]:
         git(clone, "checkout", "-q", base)
         apply_series(overlay, "sample", clone, allow_mismatch=False)
         subjects = git_out(clone, "log", "--format=%s", f"{base}..HEAD").splitlines()
-        ok("apply: `git am` lands both commits in order",
-           subjects == ["Added a test for line five", "Fixed line five decoding twice"], str(subjects))
-        ok("apply: the applied tree matches the fork tip's tree",
-           git_out(clone, "rev-parse", "HEAD^{tree}") == git_out(upstream, "rev-parse", f"{c2}^{{tree}}"))
+        ok(
+            "apply: `git am` lands both commits in order",
+            subjects
+            == ["Added a test for line five", "Fixed line five decoding twice"],
+            str(subjects),
+        )
+        ok(
+            "apply: the applied tree matches the fork tip's tree",
+            git_out(clone, "rev-parse", "HEAD^{tree}")
+            == git_out(upstream, "rev-parse", f"{c2}^{{tree}}"),
+        )
 
         # 4b. The manifest's applied_tree is asserted after `git am`.
         good_tree = git_out(clone, "rev-parse", "HEAD^{tree}")
@@ -533,41 +706,99 @@ def self_test() -> list[str]:
             git(clone, "reset", "-q", "--hard", base)
             try:
                 rep = apply_series(overlay, "sample", clone, allow_mismatch=False)
-                ok(f"apply: applied_tree that {label} is "
-                   + ("accepted" if tree == good_tree else "refused"),
-                   tree == good_tree and any("matches the manifest" in ln for ln in rep))
+                ok(
+                    f"apply: applied_tree that {label} is "
+                    + ("accepted" if tree == good_tree else "refused"),
+                    tree == good_tree
+                    and any("matches the manifest" in ln for ln in rep),
+                )
             except Finding as e:
-                ok("apply: applied_tree that differs is refused with TREE MISMATCH",
-                   tree != good_tree and "TREE MISMATCH" in str(e), str(e))
+                ok(
+                    "apply: applied_tree that differs is refused with TREE MISMATCH",
+                    tree != good_tree and "TREE MISMATCH" in str(e),
+                    str(e),
+                )
         data = load_manifest(overlay)
         data["components"]["sample"]["applied_tree"] = "xyz"
         save_manifest(overlay, data)
-        ok("lint: a malformed applied_tree is a finding", any("applied_tree" in f for f in lint(overlay)))
+        ok(
+            "lint: a malformed applied_tree is a finding",
+            any("applied_tree" in f for f in lint(overlay)),
+        )
         del data["components"]["sample"]["applied_tree"]
         save_manifest(overlay, data)
+        ok(
+            "lint: a component without applied_tree is a finding",
+            any("missing 'applied_tree'" in f for f in lint(overlay)),
+        )
         git(clone, "reset", "-q", "--hard", base)
+        try:
+            apply_series(overlay, "sample", clone, allow_mismatch=False)
+        except Finding as e:
+            ok(
+                "apply: on the pinned base a manifest without applied_tree is refused",
+                "no applied_tree" in str(e),
+                str(e),
+            )
+        else:
+            ok(
+                "apply: on the pinned base a manifest without applied_tree is refused",
+                False,
+            )
+        git(clone, "reset", "-q", "--hard", base)
+
+        # 4c. Off the pinned base the tree is reported, not compared.
+        data = load_manifest(overlay)
+        data["components"]["sample"]["applied_tree"] = good_tree
+        save_manifest(overlay, data)
+        git(clone, "checkout", "-q", unrelated)
+        rep = apply_series(overlay, "sample", clone, allow_mismatch=True)
+        ok(
+            "apply --allow-base-mismatch: off the pinned base the applied tree is reported as not compared",
+            any("not compared" in ln for ln in rep)
+            and not any("TREE MISMATCH" in ln for ln in rep),
+            "\n".join(rep),
+        )
+        git(clone, "checkout", "-q", base)
 
         # 5. Retirement: upstream cherry-picks the first fix.
         git(upstream, "checkout", "-q", "-b", "caught-up", base)
         git(upstream, *ident, "cherry-pick", c1)
         caught_up = git_out(upstream, "rev-parse", "HEAD")
         rep, any_retire = retired(overlay, "sample", upstream, caught_up)
-        ok("retired: a cherry-picked patch is reported RETIRE, the other kept",
-           any_retire and any("RETIRE" in ln and "0001-" in ln for ln in rep) and any("keep" in ln and "0002-" in ln for ln in rep),
-           "\n".join(rep))
+        ok(
+            "retired: a cherry-picked patch is reported RETIRE, the other kept",
+            any_retire
+            and any("RETIRE" in ln and "0001-" in ln for ln in rep)
+            and any("keep" in ln and "0002-" in ln for ln in rep),
+            "\n".join(rep),
+        )
         rep, any_retire = retired(overlay, "sample", upstream, unrelated)
-        ok("retired: nothing to retire against an unrelated change", not any_retire, "\n".join(rep))
+        ok(
+            "retired: nothing to retire against an unrelated change",
+            not any_retire,
+            "\n".join(rep),
+        )
 
         # 6. Lint catches a manifest that disagrees with the files.
         data = load_manifest(overlay)
         data["components"]["sample"]["patches"][0]["commit"] = "0" * 40
         save_manifest(overlay, data)
-        ok("lint: a manifest commit that disagrees with the patch's From line is a finding",
-           any("From line" in f for f in lint(overlay)))
+        ok(
+            "lint: a manifest commit that disagrees with the patch's From line is a finding",
+            any("From line" in f for f in lint(overlay)),
+        )
         stray = overlay / "sample" / "0003-stray.patch"
-        stray.write_text("From " + "1" * 40 + " Mon Sep 17 00:00:00 2001\nSubject: [PATCH] stray\n\n", encoding="utf-8")
-        ok("lint: a patch file the manifest does not list is a finding",
-           any("disk has" in f for f in lint(overlay)))
+        stray.write_text(
+            "From "
+            + "1" * 40
+            + " Mon Sep 17 00:00:00 2001\nSubject: [PATCH] stray\n\n",
+            encoding="utf-8",
+        )
+        ok(
+            "lint: a patch file the manifest does not list is a finding",
+            any("disk has" in f for f in lint(overlay)),
+        )
     return report
 
 
@@ -575,37 +806,65 @@ def self_test() -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--overlay", type=Path, default=DEFAULT_OVERLAY,
-                        help=f"overlay directory (default {DEFAULT_OVERLAY})")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--overlay",
+        type=Path,
+        default=DEFAULT_OVERLAY,
+        help=f"overlay directory (default {DEFAULT_OVERLAY})",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("lint", help="manifest and patch files agree").add_argument(
-        "--fix", action="store_true", help="rewrite the manifest in canonical form")
+        "--fix", action="store_true", help="rewrite the manifest in canonical form"
+    )
     sub.add_parser("status", help="print the overlay")
 
-    p = sub.add_parser("check", help="patches apply to a tree (temporary index; repo untouched)")
+    p = sub.add_parser(
+        "check", help="patches apply to a tree (temporary index; repo untouched)"
+    )
     p.add_argument("component")
-    p.add_argument("--repo", type=Path, required=True, help="any git repository holding the upstream objects")
+    p.add_argument(
+        "--repo",
+        type=Path,
+        required=True,
+        help="any git repository holding the upstream objects",
+    )
     p.add_argument("--against", help="rev to apply onto (default: the pinned base)")
 
     p = sub.add_parser("retired", help="patches upstream already carries")
     p.add_argument("component")
     p.add_argument("--repo", type=Path, required=True)
-    p.add_argument("--against", required=True, help="upstream rev to compare with, e.g. upstream/master")
-    p.add_argument("--strict", action="store_true", help="exit 1 if any patch should be retired")
+    p.add_argument(
+        "--against",
+        required=True,
+        help="upstream rev to compare with, e.g. upstream/master",
+    )
+    p.add_argument(
+        "--strict", action="store_true", help="exit 1 if any patch should be retired"
+    )
 
-    p = sub.add_parser("apply", help="`git am` the series onto a checkout at the pinned base")
+    p = sub.add_parser(
+        "apply", help="`git am` the series onto a checkout at the pinned base"
+    )
     p.add_argument("component")
     p.add_argument("--checkout", type=Path, required=True)
     p.add_argument("--allow-base-mismatch", action="store_true")
 
-    p = sub.add_parser("export", help="regenerate a component's patches from a fork branch")
+    p = sub.add_parser(
+        "export", help="regenerate a component's patches from a fork branch"
+    )
     p.add_argument("component")
     p.add_argument("--repo", type=Path, required=True)
     p.add_argument("--base", required=True, help="upstream commit the series sits on")
-    p.add_argument("--tip", required=True, action="append",
-                   help="fork branch tip; repeat for independent series on the same base")
+    p.add_argument(
+        "--tip",
+        required=True,
+        action="append",
+        help="fork branch tip; repeat for independent series on the same base",
+    )
 
     sub.add_parser("self-test", help="prove the mechanism on a synthetic repository")
 
@@ -624,24 +883,58 @@ def main() -> int:
         if args.cmd == "status":
             data = load_manifest(overlay)
             for name, comp in sorted(data["components"].items()):
-                print(f"{name}: upstream {comp.get('upstream', '?')} base {comp['base'][:12]}"
-                      f"{'  ' + comp['base_described'] if comp.get('base_described') else ''}")
+                print(
+                    f"{name}: upstream {comp.get('upstream', '?')} base {comp['base'][:12]}"
+                    f"{'  ' + comp['base_described'] if comp.get('base_described') else ''}"
+                )
                 for e in comp["patches"]:
-                    extra = ", ".join(f"{k}={e[k]}" for k in ("register", "role", "upstream_pr_state") if k in e)
-                    print(f"  {e['file']}  {e['commit'][:12]}  {e['subject']}" + (f"  [{extra}]" if extra else ""))
+                    extra = ", ".join(
+                        f"{k}={e[k]}"
+                        for k in ("register", "role", "upstream_pr_state")
+                        if k in e
+                    )
+                    print(
+                        f"  {e['file']}  {e['commit'][:12]}  {e['subject']}"
+                        + (f"  [{extra}]" if extra else "")
+                    )
             return 0
         if args.cmd == "check":
-            print("\n".join(check(overlay, args.component, args.repo.resolve(), args.against)))
+            print(
+                "\n".join(
+                    check(overlay, args.component, args.repo.resolve(), args.against)
+                )
+            )
             return 0
         if args.cmd == "retired":
-            rep, any_retire = retired(overlay, args.component, args.repo.resolve(), args.against)
+            rep, any_retire = retired(
+                overlay, args.component, args.repo.resolve(), args.against
+            )
             print("\n".join(rep))
             return 1 if (args.strict and any_retire) else 0
         if args.cmd == "apply":
-            print("\n".join(apply_series(overlay, args.component, args.checkout.resolve(), args.allow_base_mismatch)))
+            print(
+                "\n".join(
+                    apply_series(
+                        overlay,
+                        args.component,
+                        args.checkout.resolve(),
+                        args.allow_base_mismatch,
+                    )
+                )
+            )
             return 0
         if args.cmd == "export":
-            print("\n".join(export(overlay, args.component, args.repo.resolve(), args.base, args.tip)))
+            print(
+                "\n".join(
+                    export(
+                        overlay,
+                        args.component,
+                        args.repo.resolve(),
+                        args.base,
+                        args.tip,
+                    )
+                )
+            )
             return 0
         if args.cmd == "self-test":
             rep = self_test()
@@ -652,7 +945,10 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as e:
-        print(f"{' '.join(e.cmd)} failed ({e.returncode}):\n{e.stderr.decode(errors='replace')}", file=sys.stderr)
+        print(
+            f"{' '.join(e.cmd)} failed ({e.returncode}):\n{e.stderr.decode(errors='replace')}",
+            file=sys.stderr,
+        )
         return 1
     return 2
 

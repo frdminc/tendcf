@@ -143,12 +143,18 @@ That is the recipe the #3 comment executed by hand on 2026-08-19 (full
 patches and the per-entry-skip B-5b. It now applies six libntech patches
 (0005 and 0006 add `JsonParseStrict()`/`JsonParseFileStrict()`, B-24, which
 the core loader calls) and core's all-or-nothing loader; the commands are
-unchanged, and the `overlay-build` CI job runs them (`linux.yml`) and then
-`cmdb_test`, `json_test`, `mustache_test`, the `06_host_specific_data`
+unchanged. The `overlay-build` CI job (`linux.yml`) applies the overlay with
+`bin/overlay.py apply`, then runs the same dependency, configure, build and
+install steps as the `build-fork` action (`.github/actions/build-fork`:
+`ci/dependencies.sh`, `./autogen.sh --enable-debug --prefix=... --with-systemd-service=no`,
+`make -j"$(nproc)" CFLAGS="-Wall"`, `make install`), not the hand recipe above,
+and then `cmdb_test`, `json_test`, `mustache_test`, the `06_host_specific_data`
 acceptance directory and `tests/policy/run.sh` with
 `TENDCF_REQUIRE_FORK_LOADER=1`. The manifest's `applied_tree` per component is
-the expected tree after `apply`; `apply` fails on a mismatch, so an edited
-patch body cannot pass for the recorded one. `apply` refuses a checkout whose HEAD is not the
+the expected tree after `apply` onto the pinned base, and `lint` requires it;
+`apply` fails on a mismatch, so an edited patch body cannot pass for the recorded
+one (with `--allow-base-mismatch` on another HEAD it reports the tree as not
+compared). `apply` refuses a checkout whose HEAD is not the
 pinned base and refuses a dirty tree, so the recipe cannot silently build
 something else.
 
@@ -258,7 +264,7 @@ drops it.
 | `check --against` upstream master (2026-11-14) | ok at `3c21479` (6/6) | ok at `a8ac0dc7e` (2/2), **textual only: see R1 in §5** |
 | `apply` into a clean clone at base | tree `8d5fda1f9938` (2026-10-09, four patches: `5cbd6f7…`, identical to the local merge `45c816c`) | tree `5c9f3ce18a6b`, **identical to the tree of `4158906f2`**, the head of `overlay/cmdb-all-or-nothing` (2026-10-09: `c66a60d…` = `8f0076b81`) |
 | `retired --strict` against upstream master (2026-11-14) | nothing to retire | nothing to retire |
-| `self-test` | 15 assertions pass | |
+| `self-test` | 21 assertions pass | |
 
 The core patch is a squash. The fork's loader work sits on `tendcf-integration`
 (`4443504`, the pin in `overlay/fork.json`), stacked on B-20, B-7, formatting
