@@ -350,7 +350,7 @@ tendcf that is fail-open: an interlock entry dropped at load leaves the
 services it guards actuated unguarded. `tendcf-integration` now carries
 `cmdb-fail-closed` (`a750b1dfe`, `dbf9dede6`, `61065e551`, `736becc07`, merged
 `d32cade13`; hardened by djbclark/core PR #98 and a strict libntech JSON parse,
-the pin now `6505f488a`): `LoadCMDBData()` validates every entry of
+fork PR 99 moved the CMDB test seam under `TEST_UNIT_TEST`; the pin now `4443504`): `LoadCMDBData()` validates every entry of
 `vars`/`variables`/`classes` first and installs nothing from
 `host_specific.json` if any one is invalid (also an unknown top-level key, a
 null section, a key with index brackets, a frame-dependent special scope, two

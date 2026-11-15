@@ -10,7 +10,15 @@
 #     absence of actuation for a repeated member, a repeated `vars` and trailing
 #     input (9b dup-member, dup-vars, trailing). A lenient loader and the lenient
 #     readjson see the same surviving data, so the cross-check has no difference
-#     to refuse and the interlock or service guard acts instead.
+#     to refuse and the interlock or service guard acts instead. For these
+#     cases two plain `check`s hold on any loader: the test-only completion
+#     marker (policy_completed: entry.cf runs tests/policy/fixtures/test-done.cf
+#     after the two tendcf bundles, so the SAME output shows that invocation
+#     evaluated the policy to the end) and no_render_start (no `Created file`,
+#     no launchctl, no systemctl). The marker is what makes the negative grep
+#     mean something; a separate probe process proves only what the data loaded
+#     as. On a non-fork run lenient_only also asserts the line a lenient loader's
+#     data makes the policy print (derived from policy source, never run there).
 # Everything else is policy-layer and holds on any cf-agent (the Linux CI
 # legs, the Mac dev build). A one-time capability probe in check 4b (a file with
 # a repeated member of `vars`) decides whether the loader is the fork's; on a
@@ -104,7 +112,7 @@
 #      container that is a list of strings is the positive control: accepted,
 #      actuates. A plain-identifier key longer than 64 characters is refused and
 #      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
-#      NB: the fork at the pin (overlay/fork.json, core 6505f488a) loads
+#      NB: the fork at the pin (overlay/fork.json, core 4443504) loads
 #      all-or-nothing (PR #41, operator ruling R13): a file in which an entry is
 #      invalid, a class cannot be inserted, a `vars` member or section is
 #      repeated, or non-whitespace follows the document, installs none of its
@@ -210,11 +218,14 @@ echo
 export CFENGINE_TEST_OVERRIDE_WORKDIR="$work"
 "$bindir${bindir:+/}cf-key" >/dev/null 2>&1 || true
 
+# The test-only marker bundle (tests/policy/fixtures/test-done.cf) runs last, so
+# a negative-only case can require it in the same output as the run it asserts
+# about (policy_completed below).
 cat > "$work/inputs/entry.cf" <<EOF
 body common control
 {
-      inputs => { "$repo/policy/tendcf_services.cf" };
-      bundlesequence => { "tendcf_interlocks", "tendcf_services" };
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_services", "tendcf_test_done" };
 }
 EOF
 # Same two bundles, with the stand-in loader first (see tests/policy/sim-loader.cf).
@@ -259,6 +270,33 @@ refusal_reported() { grep -q "tendcf: CMDB cross-check failed: refusing to actua
 refusal_once() { [ "$(grep -c "CMDB cross-check failed" "$1")" = 1 ]; }
 no_crosscheck() { ! grep -q "CMDB cross-check" "$1"; }
 no_actuation() { ! grep -Eq "Executing|Created file|launchctl|systemctl|tendcf: (service|interlock) '" "$1"; }
+# Narrower than no_actuation: nothing rendered and nothing started. It holds on a
+# lenient loader too for the strict-parse fixtures (the interlock's pre_action
+# fails and blocks the bundle, or only the runit service is left and its flavour
+# is refused by name on every host), where no_actuation does not, because it also
+# matches the interlock's own `Executing` and the `tendcf: service|interlock '`
+# report lines a lenient run legitimately prints. (Adversary r4 I4.)
+no_render_start() { ! grep -Eq "Created file|launchctl|systemctl" "$1"; }
+# Positive evidence about the SAME cf-agent invocation whose output is asserted:
+# the test-only bundle that entry.cf runs after tendcf_interlocks and
+# tendcf_services reported. A run that failed validation or died before its
+# policy, or whose loader refusal ended it, has no such line, so a negative
+# grep over its output cannot pass for the wrong reason. cf-agent does go on to
+# evaluate policy after the CMDB loader refuses a file: generic_agent.c:1234
+# (4443504) only logs "Failed to load CMDB data" at ERR and returns to
+# evaluation, and CI shows the policy's own refusal after the strict loader's
+# on the fork (Linux legs, run 43649349555). The separate probe policy
+# (probe()) runs a second process and proves only what the data loaded as.
+policy_completed() { grep -q "tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services" "$1"; }
+# Lenient-path assertions apply only where the loader is NOT the fork's (a
+# repeated member, a repeated `vars` or trailing input is read leniently and
+# the data it keeps is acted on). Not a skip: on the fork the same file is
+# refused, which the fork_only assertions cover. Derived from the policy source
+# and the fixtures, never run on a lenient build.
+lenient_only() {  # lenient_only NAME COND...
+    [ "$fork_loader" = 0 ] && check "$@"
+    return 0
+}
 foreign_var_reported() { grep -q "tendcf: CMDB cross-check: the CMDB or an augments file installed a variable outside" "$1"; }
 foreign_class_reported() { grep -q "tendcf: CMDB cross-check: the CMDB or an augments file defined a class" "$1"; }
 key_not_loaded() { grep -q "key '$2' is under 'vars' in .* but CFEngine did not load data:variables.$2" "$1"; }
@@ -334,7 +372,7 @@ check "probe control: a file that loads has tendcf_service" \
 
 # Loader capability, once: a repeated object member in `vars` must install
 # nothing (the fork's strict parse, LoadCMDBData reading with JsonParseFileStrict,
-# cmdb.c:1171 at 6505f488a), where a lenient loader keeps the last member and
+# cmdb.c:1187 at 4443504), where a lenient loader keeps the last member and
 # installs both containers. Positive evidence only: both "absent" lines.
 probe loader-dup-member.json "$work/probe-capability.out"
 if grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-capability.out" &&
@@ -883,9 +921,9 @@ check "list of strings in vars: no cross-check report" no_crosscheck "$out"
 check "list of strings in vars: actuates normally (the pre_action ran)" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
 
-echo "# 9b. the real loader's strict parse and class handling (fork 6505f488a), policy level"
+echo "# 9b. the real loader's strict parse and class handling (fork 4443504), policy level"
 # What the pinned loader does with each file is read from libpromises/cmdb.c at
-# 6505f488a (line numbers there), and each case asserts it. The cross-check's
+# 4443504 (line numbers there), and each case asserts it. The cross-check's
 # refusal and the absence of actuation are asserted unconditionally only where
 # the policy refuses on its own (class-space, class-exists: a `classes` section)
 # or where nothing can actuate (the empty-view controls). For a repeated member,
@@ -905,13 +943,21 @@ echo "# 9b. the real loader's strict parse and class handling (fork 6505f488a), 
 # cross-check sees no difference, and the interlock (whose pre_action fails) or
 # the service's own guard actuates or reports. Those are loader+policy
 # integration assertions and SKIP on a non-fork loader.
-strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE POLICY KEY...
-    local name="$1" fixture="$2" pattern="$3" none="$4" policy="$5"; shift 5
+strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE POLICY LENIENT-LINE KEY...
+    local name="$1" fixture="$2" pattern="$3" none="$4" policy="$5" lenient="$6"; shift 6
+    case "$policy" in
+        any|fork) ;;
+        *) echo "strict_case $name: bad POLICY '$policy' (any|fork)" >&2; exit 2 ;;
+    esac
     local pcheck=check
     [ "$policy" = fork ] && pcheck=fork_only
     out="$work/strict-$name.out"
     cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
     "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    # Same output file, any loader: this run evaluated both tendcf bundles (the
+    # test-only marker bundle runs after them). The negative greps below, which
+    # are the only assertions left on a non-fork run, mean nothing without it.
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
     "$pcheck" "$name: the policy refuses and reports it" refusal_reported "$out"
     "$pcheck" "$name: the policy reports it once" refusal_once "$out"
     fork_only "$name: the loader refuses the file" grep -q "$pattern" "$out"
@@ -924,36 +970,54 @@ strict_case() {  # strict_case NAME FIXTURE LOADER-ERROR-PATTERN INSTALL-NONE PO
         fork_only "$name: $k reported not installed" key_not_loaded "$out" "$k"
     done
     "$pcheck" "$name: nothing actuated (no service, no interlock, no render)" no_actuation "$out"
+    # On any loader: nothing rendered and nothing started (a plain `check`, so a
+    # non-fork run still asserts a safety property for the fork-only cases)
+    check "$name: nothing rendered, nothing started" no_render_start "$out"
+    # A lenient loader (not the fork's) keeps the last member / the last `vars` /
+    # the document before the trailing input and the policy acts on it: the
+    # expected line is the one a run on that data prints (LENIENT-LINE, a grep
+    # pattern; `-` for none, where the policy refuses on any loader).
+    if [ "$lenient" != - ]; then
+        lenient_only "$name: the lenient loader's data reaches the policy: $lenient" \
+            grep -q "$lenient" "$out"
+    fi
     probe "$fixture" "$work/probe-strict-$name.out"
     fork_only "$name: no tendcf_interlock variable" \
         grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-strict-$name.out"
     fork_only "$name: no tendcf_service variable" \
         grep -q "cmdb-probe: tendcf_service absent" "$work/probe-strict-$name.out"
 }
+# What a LENIENT loader's data makes the policy print (derived from the fixtures
+# and policy/tendcf_services.cf reports, not run on a lenient build): a repeated
+# member and trailing input leave the valid interlock whose pre_action fails (the
+# line check 2 asserts for the same entry); a repeated `vars` leaves only the
+# runit service, refused by name on every host (check 4).
+interlock_line="tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused"
+runit_line="tendcf: service 'demo-runit' refused: unit flavour 'runit' is not implemented on this host"
 dup_member="Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with a duplicate object member"
 # (a) a repeated member: an invalid earlier value (null), then a valid interlock.
 # The lenient parser keeps the last (valid) one; the strict parse the loader reads
-# with (cmdb.c:59-84 ReadJsonFileMode, :1171-1177) refuses the file before any
+# with (cmdb.c:73-96 ReadJsonFileMode, :1185-1191) refuses the file before any
 # validation, so the first value is no longer discarded unseen.
-strict_case dup-member loader-dup-member.json "$dup_member" no fork tendcf_interlock tendcf_service
+strict_case dup-member loader-dup-member.json "$dup_member" no fork "$interlock_line" tendcf_interlock tendcf_service
 # (b) `vars` twice at the top level, the later one without the interlock
-strict_case dup-vars loader-dup-vars.json "$dup_member" no fork tendcf_service
+strict_case dup-vars loader-dup-vars.json "$dup_member" no fork "$runit_line" tendcf_service
 # (c) a complete valid document, then more input (the lenient parser stops after
 # the first document and ignores the rest)
 strict_case trailing loader-trailing.json \
     "Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with trailing non-whitespace characters" \
-    no fork tendcf_interlock tendcf_service
+    no fork "$interlock_line" tendcf_interlock tendcf_service
 # (d) a default-namespace class whose name is whitespace only: refused in
-# validation (CheckCMDBClassName, cmdb.c:776-), so nothing is installed, where it
+# validation (CheckCMDBClassName, cmdb.c:790-), so nothing is installed, where it
 # used to reach insertion, fail, and be taken for "a class that exists already"
 strict_case class-space loader-class-space.json \
-    "Invalid CMDB class 'default: ': the class name starts or ends with whitespace" yes any \
+    "Invalid CMDB class 'default: ': the class name starts or ends with whitespace" yes any - \
     tendcf_interlock tendcf_service
 check "class-space: the classes section is named by the policy" \
     grep -q "has top-level section 'classes' besides 'vars'" "$out"
 
 # (e) a class that exists already, beside good vars. The loader leaves it as it
-# is and goes on (InstallCMDBPending, cmdb.c:1095-1102: CMDBClassExists by
+# is and goes on (InstallCMDBPending, cmdb.c:1109-1116: CMDBClassExists by
 # canonical identity, logged at VERBOSE only), so both containers are installed;
 # the policy refuses all the same, for the `classes` section. `linux` is a hard
 # class on the Linux legs (`darwin` on a Mac), set before the loader runs
@@ -993,8 +1057,24 @@ for spec in "empty-dup-vars:loader-empty-dup-vars.json:Unwilling to parse json d
     out="$work/strict-$name.out"
     cp "$repo/tests/policy/fixtures/$fixture" "$work/data/host_specific.json"
     "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    # Positive control, same output file as the two negative greps below: the
+    # test-only marker bundle that entry.cf runs after tendcf_interlocks and
+    # tendcf_services reported, so THIS invocation evaluated the policy to the
+    # end (on the fork too: the loader's refusal only logs ERR, generic_agent.c:1234
+    # at 4443504, and evaluation goes on). Without it a run that died before its
+    # policy would pass both negatives. (Astra r1 / adversary r1 on PR 61.)
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
     check "$name: the lenient view is empty, so no cross-check report" no_crosscheck "$out"
     check "$name: nothing actuated" no_actuation "$out"
+    # The probe is a SECOND cf-agent process running cmdb-probe.cf only, not the
+    # tendcf bundles. It proves what the data loaded as (neither container is
+    # installed, on any loader: an empty view, or a refused file) and nothing
+    # about the entry.cf run above; the marker line covers that.
+    probe "$fixture" "$work/probe-strict-$name.out"
+    check "$name: the probe process loaded no tendcf_interlock" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$work/probe-strict-$name.out"
+    check "$name: the probe process loaded no tendcf_service" \
+        grep -q "cmdb-probe: tendcf_service absent" "$work/probe-strict-$name.out"
     fork_only "$name: the loader refuses the file" \
         grep -q "Could not parse JSON file .*host_specific\\.json: $pattern" "$out"
 done
@@ -1169,7 +1249,7 @@ if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
-             strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing \
+             strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              sysd-sim-present sysd-sim-tomb; do

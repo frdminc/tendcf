@@ -71,16 +71,22 @@
 # loads all-or-nothing instead: an invalid entry, a repeated object member
 # anywhere, non-whitespace after the document, a class name with whitespace at
 # either end, a variable that exists already, and it installs none of the file,
-# so this check then sees every `vars` key missing and refuses. That strict parse
+# so this check, if its lenient view lists any `vars` key, sees every one of
+# them missing and refuses. That strict parse
 # is the CMDB loader's only: `readjson`, which this check reads the file with,
 # and def.json stay lenient, so after a repeated member or a repeated `vars`
 # section the check sees the LAST one only (an earlier container is not named).
 # It reports a refusal when that lenient view still lists variables the loader
 # did not install (or another feature it refuses on its own). When the lenient
-# view is EMPTY (`{"vars":{},"vars":{}}`, or `{"vars":{}}` plus non-whitespace
-# after it) nothing is installed and nothing actuates, but the check has nothing
-# to report: no actuation is not a refusal report, and the loader's own error is
-# then the only trace (tests/policy/run.sh 9b, empty-view controls). The two are
+# view is EMPTY nothing is installed and nothing actuates, but the check has
+# nothing to report: no actuation is not a refusal report, and the loader's own
+# error is then the only trace (tests/policy/run.sh 9b, empty-view controls,
+# which pin two examples, `{"vars":{},"vars":{}}` and `{"vars":{}}` plus
+# non-whitespace after it). The examples are not the whole class. The one that
+# matters operationally is `{"vars":{<the real configuration>},"vars":{}}`: the
+# lenient parser keeps the last, empty `vars`, the strict loader refuses the
+# file, and the whole intended configuration is silently not applied, with the
+# loader's error as the only trace. The two are
 # not fully independent for that reason, and each holds for a loader that fails
 # closed, for one that does not, and for a gap in either, to the extent the
 # other does not share the gap. The check does not model WHY an entry was
@@ -153,8 +159,8 @@
 # `default:tendcf_cmdb.doc` or `default:tendcf_services.interlock_ids` presets
 # that variable before any policy runs. What a preset does then depends on the
 # promise (verify_vars.c VerifyVarPromise, read at commit b8abf28408b1; the
-# pin in overlay/fork.json is now 6505f488a, which differs from it only in
-# libpromises/cmdb.c, cmdb.h, tests and the libntech submodule pointer): a promise with a LITERAL rvalue (`slist => { }`) always
+# pin in overlay/fork.json is now 4443504, which differs from it only in
+# libpromises/cmdb.c, cmdb.h, tests, .gitmodules and the libntech submodule pointer): a promise with a LITERAL rvalue (`slist => { }`) always
 # redefines it, so the policy's value stands. A promise whose rvalue is a
 # FUNCTION CALL is skipped when the variable exists ("Already did this") if the
 # call was not already evaluated to a value when the promise runs, and
