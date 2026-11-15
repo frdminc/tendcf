@@ -47,6 +47,16 @@ Not in the overlay, by that rule:
 
 The overlay is therefore small by construction, and it shrinks: §6.
 
+Load-bearing today, by that rule: libntech B-14 (backslash decoding of
+`host_specific.json` strings), B-23 (mustache rendering of every launchd
+plist) and B-24 (the strict JSON parse); core B-5b, **replaced** on
+2026-11-14 by the all-or-nothing CMDB loader (operator ruling R13: one
+invalid entry in `host_specific.json` installs nothing, because a skipped
+interlock entry leaves the services it guards ungated), which carries B-20's
+null guards (the loader keeps them but refuses the whole file, where B-20
+skipped the entry; its null validation relies on them) and B-7 (a warning that
+rides along). B-5a, B-13 and B-22 are carriers.
+
 **Ruling, 2026-10-29 (operator):** the Linux CI and hosts ([`linux-targets.md`](linux-targets.md))
 run the full fork build, including the security fixes and `--simulate-json`,
 not upstream plus the overlay. The manifest above still lists what shipped
@@ -59,7 +69,12 @@ pointer, fetched from the libntech fork). `.github/workflows/linux.yml`
 builds it on every Linux CI target through `.github/actions/build-fork`,
 writes core and libntech commits plus `cf-agent --version` to the job
 summary, and runs `tests/policy/run.sh` on the result. Moving the pin is a
-commit here, reviewed like any other. `tendcf-integration` itself is
+commit here, reviewed like any other. Since 2026-11-14 the `overlay-build`
+job in `.github/workflows/linux.yml` also builds upstream plus the overlay at
+the base (§4) and runs the loader's unit, acceptance and `tests/policy/run.sh`
+tests (`TENDCF_REQUIRE_FORK_LOADER=1`) on it. What that proves: the loader
+source is the fork's bar the R1 accessor, and the same tests pass on both
+builds. It does not prove the same behaviour for JSON numbers (§7). `tendcf-integration` itself is
 refreshed by merging fork `master` and every current fix branch
 ([`upstream-register.md`](upstream-register.md) "Branch layout"), never
 rebased.
@@ -124,9 +139,24 @@ cd ~/src/core-overlay && NO_CONFIGURE=1 ./autogen.sh && ./configure --enable-deb
 
 That is the recipe the #3 comment executed by hand on 2026-08-19 (full
 `make -j4` clean; `json_test` 74/74, `mustache_test` 17/17,
-`06_host_specific_data` 14/14 under fakeroot). `apply` refuses a checkout
-whose HEAD is not the pinned base and refuses a dirty tree, so the recipe
-cannot silently build something else.
+`06_host_specific_data` 14/14 under fakeroot), then with four libntech
+patches and the per-entry-skip B-5b. It now applies six libntech patches
+(0005 and 0006 add `JsonParseStrict()`/`JsonParseFileStrict()`, B-24, which
+the core loader calls) and core's all-or-nothing loader; the commands are
+unchanged. The `overlay-build` CI job (`linux.yml`) applies the overlay with
+`bin/overlay.py apply`, then runs the same dependency, configure, build and
+install steps as the `build-fork` action (`.github/actions/build-fork`:
+`ci/dependencies.sh`, `./autogen.sh --enable-debug --prefix=... --with-systemd-service=no`,
+`make -j"$(nproc)" CFLAGS="-Wall"`, `make install`), not the hand recipe above,
+and then `cmdb_test`, `json_test`, `mustache_test`, the `06_host_specific_data`
+acceptance directory and `tests/policy/run.sh` with
+`TENDCF_REQUIRE_FORK_LOADER=1`. The manifest's `applied_tree` per component is
+the expected tree after `apply` onto the pinned base, and `lint` requires it;
+`apply` fails on a mismatch, so an edited patch body cannot pass for the recorded
+one (with `--allow-base-mismatch` on another HEAD it reports the tree as not
+compared). `apply` refuses a checkout whose HEAD is not the
+pinned base and refuses a dirty tree, so the recipe cannot silently build
+something else.
 
 **Later**, when device binaries have a build pipeline (map §13 Step 10+,
 "builder/cache"; this was first written for tendcf-agent, which map D45
@@ -169,6 +199,21 @@ Where it runs:
   not on every push. A red run is the overlay asking for §5's rebase or
   §6's retirement, nothing else.
 
+**Caveat (R1): `check` is textual only.** It proves the series *applies*,
+not that it *compiles*. The core loader at the overlay base calls
+`EvalContextVariableGet(ctx, ref, &type)` (three arguments). Upstream master
+since `671d53ff0` (2026-08-21, secrets tracking) has a four-argument
+`EvalContextVariableGet(…, get_secret)` and a separate
+`EvalContextVariableGetPlaintext()`; the fork's loader uses the latter, and
+the overlay's spelling of it is the base's. So at upstream master
+(`a8ac0dc7e`, 2026-11-13) `check core` is green (`git apply --cached` of both
+patches succeeds) while a build would stop on that call (a signature comparison, not a build: nothing was compiled at that commit). The weekly
+`overlay-drift` job cannot see this. The `overlay-build` job builds at the
+pinned base only, so a bump of the base must re-run it before the base moves:
+bumping to a commit at or after `671d53ff0` means spelling the call
+`EvalContextVariableGetPlaintext()` again and re-checking B-5a and the four
+older libntech patches against the newer base.
+
 **Rebasing the overlay** when it drifts: in the fork, rebase the branch
 onto the new upstream commit and push it; then
 
@@ -207,38 +252,75 @@ A patch can also retire because the code it protects stops shipping
 (`retire_when` says so). That is a judgment, recorded in the commit that
 drops it.
 
-## 7. State verified on 2026-10-09
+## 7. State verified on 2026-10-09, updated 2026-11-14 (overlay phase B)
 
 | | libntech | core |
 | --- | --- | --- |
 | base | `0c0620d` (upstream master 2026-08-15) | `a0bca6aaf` (upstream master 2026-08-15; pins libntech `0c0620d`) |
-| patches | 4: B-13 (carrier), **B-14**, B-22 (carrier), **B-23** | 2: B-5a (carrier), **B-5b** |
-| upstream PRs | #293, #297, #296, #298 — all closed unmerged 2026-08-19 | #6315, #6320 — closed unmerged 2026-08-19 |
-| `check` at base | 4/4 ok | 2/2 ok |
-| `check --against` upstream master | ok at `3c21479` (master moved 2 commits, neither in `json.c`/`mustache.c`) | ok at `4b67bb7` (master moved 98 commits, none in `cmdb.c`) and at tag `3.27.1-build7` |
-| `apply` into a clean clone at base | tree `5cbd6f7…`, **byte-identical to the local merge `45c816c`** the #3 comment built and tested | tree `c66a60d…`, **byte-identical to fork tip `8f0076b81`** |
-| `retired --strict` against upstream master | nothing to retire | nothing to retire |
-| `self-test` | 13/13 | |
+| patches | 6: B-13 (carrier), **B-14**, B-22 (carrier), **B-23**, **B-24** ×2 (`0005`, `0006`: `JsonParseFileStrict()`) | 2: B-5a (carrier), **B-5b replaced** (`0002`, the all-or-nothing loader, with B-20 and B-7 inside) |
+| fork refs | the four 2026-08 branches; `fix/json-strict-parse` (fork PR 11: `dc3fba2`, `8a57e55`) | `fix/cmdb-name-offending-key`; `overlay/cmdb-all-or-nothing` (`4158906f2`, tag `tendcf-pin-4158906`) |
+| upstream PRs | #293, #297, #296, #298 — closed unmerged 2026-08-19; B-24 has none (fork PR only) | #6315 — closed unmerged 2026-08-19; the loader has none (#6320, the per-entry skip it replaces, closed the same day) |
+| `check` at base (2026-11-14) | 6/6 ok | 2/2 ok |
+| `check --against` upstream master (2026-11-14) | ok at `3c21479` (6/6) | ok at `a8ac0dc7e` (2/2), **textual only: see R1 in §5** |
+| `apply` into a clean clone at base | tree `8d5fda1f9938` (2026-10-09, four patches: `5cbd6f7…`, identical to the local merge `45c816c`) | tree `5c9f3ce18a6b`, **identical to the tree of `4158906f2`**, the head of `overlay/cmdb-all-or-nothing` (2026-10-09: `c66a60d…` = `8f0076b81`) |
+| `retired --strict` against upstream master (2026-11-14) | nothing to retire | nothing to retire |
+| `self-test` | 21 assertions pass | |
 
-**Since 2026-11-02 (R13, PR #41) the core column's B-5b is not what the fork
-the tests run does.** The pin in `overlay/fork.json` carries an all-or-nothing
-CMDB loader that replaces B-5b's per-entry skip (a skipped interlock leaves the
-services it guards unguarded). The manifest entry still reproduces `8f0076b81`
-and carries a `superseded_on_fork` note; the table above is the 2026-10-09
-state and is not updated. Upstream plus this overlay skips a bad entry; the
-pinned fork installs nothing from the file. Operator ruling, 2026-11-14, B11
-round 2 item 1 (adversary D5, Astra C2): "1. Replace". The overlay carries the
-all-or-nothing CMDB loader (R13) instead of B-5b's per-entry skip, so
-upstream-plus-overlay builds match the pinned fork; if the overlay cannot patch
-libntech it carries the core part only (no strict parse). `8f0076b81` (fork PR
-59) is retired, never offered upstream. Status: ruled; implementation pending
-in a follow-up PR (overlay phase B), because it changes what the overlay
-reproduces ([`upstream-register.md`](upstream-register.md), "Operator rulings of
-2026-11-14 on the queue and the fork", item 2).
+The core patch is a squash. The fork's loader work sits on `tendcf-integration`
+(`4443504`, the pin in `overlay/fork.json`), stacked on B-20, B-7, formatting
+commits and an upstream merge that the overlay base does not have, so a
+replay does not apply. `libpromises/cmdb.c`, `libpromises/cmdb.h`,
+`tests/unit/cmdb_test.c` and `tests/acceptance/00_basics/06_host_specific_data`
+are taken from `4443504` byte for byte, plus the one `cmdb_test` line in
+`tests/unit/Makefile.am`. **The only difference from `4443504`** in those files is one
+secrets-tracking accessor at three call sites: the base has no
+`EvalContextVariableGetPlaintext()`, so the call in `cmdb.c` (one) and in
+`cmdb_test.c` (two) is spelled `EvalContextVariableGet(ctx, ref, &type)`.
+That is the R1 risk in §5.
 
-So the overlay reproduces exactly the inputs whose build was verified on
-2026-08-19, from this repository alone, and would still apply to a build
-cut from today's upstream.
+**What the manifest says since 2026-11-14.** The `core` `0002` entry has role
+`load-bearing`, register `B-5b` (replaced) with `B-7` as a passenger and `B-20`
+as load-bearing, and `requires` libntech `0005`/`0006` (B-24). It no longer
+reproduces `8f0076b81`, and the `superseded_on_fork` note that said so is gone.
+Operator ruling, 2026-11-14, B11 round 2 item 1 (adversary D5, Astra C2):
+"1. Replace". Upstream plus this overlay now installs nothing from
+`host_specific.json` if any entry is invalid, as the pinned fork does (the
+JSON-number difference below aside).
+`8f0076b81` (fork PR 59) is retired and never offered upstream. Before this
+change (2026-11-02 to 2026-11-14) the manifest's B-5b reproduced the per-entry
+skip, which is history ([`upstream-register.md`](upstream-register.md), B-5b
+note and "Operator rulings of 2026-11-14 on the queue and the fork", item 2).
+
+**What is verified and what is not.** The tree equalities above and the
+`apply`/`check` runs are mechanical and were run. The patched tree builds and
+the loader's tests pass in the `overlay-build` job (`cmdb_test`, `json_test`,
+`mustache_test`, the `06_host_specific_data` acceptance directory,
+`tests/policy/run.sh` with `TENDCF_REQUIRE_FORK_LOADER=1`); on the Mac nothing
+was compiled. What CI proves is that the loader source is the fork's, bar the
+R1 accessor, and that its tests pass on both builds. It does not prove equal
+behaviour on every input: the fork's libntech pin (`cc892efae`) has a `json.c`
+that differs from overlay plus strict parse by 82 lines, and the fork's core
+carries a number fix in `rlist.c`.
+
+**Known difference from the pinned fork: JSON numbers.** The loader source is
+the fork's, but two things it calls are not. The fork's libntech
+(`cc892efae`) returns a number as it was parsed in `JsonPrimitiveToString()`
+and classifies exponent form as a real; the fork's core `rlist.c` does the
+same in `RlistAppendContainerPrimitive()`. Neither change is in the overlay
+(register B-4 and B-10, and the core `rlist.c` number fix; excluded by §2's
+rule). On upstream plus overlay a top-level `vars`/`variables` scalar, or a
+primitive array, holding an integer past `long` or exponent form without a dot
+(`1e5`, which the parser classifies as an integer) reaches
+`StringToLongExitOnError()` from `JsonPrimitiveGetAsInteger()` (libntech
+`json.c:850` after apply) and `cf-agent` exits in the install step, after
+validation passed: nothing is evaluated, so it is not a partial install, but the
+policy cannot refuse or report it. A real installs as `%.2f` (`string_lib.c`
+`StringFromDouble()`), so `0.00049` arrives as `0.00`; the fork installs
+`0.00049`. Reach: the projector refuses floats (`bin/projector.py:523`) and
+writes no exponents, and tendcf's variables are containers, so projected data
+does not reach it; a hand-edited file does. No test holds a bare number, so CI
+does not see it. Whether B-4, B-10 and the `rlist.c` fix join the overlay is
+open with djbclark (not decided here).
 
 ## 8. Rejected alternatives
 

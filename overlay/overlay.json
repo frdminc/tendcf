@@ -1,6 +1,7 @@
 {
   "components": {
     "core": {
+      "applied_tree": "5c9f3ce18a6b290903b6610b58cb535638453822",
       "base": "a0bca6aaf310515f69fef60e6c56b3e60bd337ac",
       "base_described": "upstream master as of 2026-08-15 (merge of #6276)",
       "fork": "https://github.com/djbclark/core",
@@ -19,30 +20,42 @@
           "why": "B-5b is stacked on it; it names the offending CMDB entry and file in the rejection message"
         },
         {
-          "acceptance_test": "tests/acceptance/00_basics/06_host_specific_data/16-variable-references-good-entry-survives.cf",
-          "commit": "8f0076b814e8a0d69e48baeab8e637926e4d111a",
-          "file": "0002-Fixed-one-bad-CMDB-entry-discarding-every-entry-in-i.patch",
-          "fork_issue": "https://github.com/djbclark/core/issues/9",
-          "fork_ref": "fix/cmdb-one-bad-entry-skips-only-that-entry",
-          "jira": "CFE-4720",
+          "commit": "4158906f2a5b3f202af1615fb80357a9a85987cc",
+          "file": "0002-Made-CMDB-loading-all-or-nothing-one-bad-entry-insta.patch",
+          "fork_ref": "overlay/cmdb-all-or-nothing",
           "load_bearing_for": [
-            "host_specific.json is loaded by core's CMDB loader; one malformed entry used to drop its whole section"
+            "host_specific.json is loaded by core's CMDB loader, which now validates every entry first and installs nothing if any one is invalid (operator ruling R13): a skipped entry would leave the interlock it names, and the services it guards, ungated",
+            "the loader's null validation relies on B-20's null guards (87490bb8f), which here refuse the whole file instead of skipping the entry"
           ],
           "register": "B-5b",
+          "registers": [
+            "B-5b (replaced: this is the all-or-nothing loader, not 8f0076b81's per-entry skip)",
+            "B-7 (passenger: dotted-key warning, ee1f9d60c)",
+            "B-20 (load-bearing: its null guards, as a refusal of the file; 87490bb8f)"
+          ],
+          "requires": "libntech patches 0005 and 0006 (B-24): the loader parses host_specific.json with JsonParseFileStrict(). Known difference from the pinned fork (open with djbclark): libntech B-4/B-10 and core's rlist.c number fix are not in the overlay, so a top-level CMDB scalar or primitive array holding 1e5 or an integer past long makes cf-agent exit in the install step (StringToLongExitOnError), and a real installs as %.2f; the projector refuses floats and writes no exponents, so only a hand-edited file reaches it (upstream-overlay.md section 7)",
           "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
-          "subject": "Fixed one bad CMDB entry discarding every entry in its section",
-          "superseded_on_fork": "2026-11-02, operator ruling R13 (PR #41): the fork's tendcf-integration branch, which overlay/fork.json pins, replaces this patch's per-entry skip with an all-or-nothing loader (branch cmdb-fail-closed: a750b1dfe, dbf9dede6, 61065e551, 736becc07; merged d32cade13, hardened by djbclark/core PR #98 and a strict libntech parse; test seam under TEST_UNIT_TEST by fork PR 99, pin 4443504). A skipped interlock entry leaves the services it guards unguarded. This entry still describes, and apply reproduces, commit 8f0076b81 exactly, so upstream plus the overlay skips a bad entry and does NOT behave like the pinned fork. Operator ruling 2026-11-14: Replace. A later, separate PR makes the overlay carry the all-or-nothing loader instead of this per-entry skip, because that changes what the overlay reproduces (upstream-overlay.md section 7); this PR leaves the patch and its manifest entry as they are.",
-          "upstream_pr": "https://github.com/cfengine/core/pull/6320",
-          "upstream_pr_state": "closed unmerged 2026-08-19"
+          "subject": "Made CMDB loading all-or-nothing: one bad entry installs nothing",
+          "tests": [
+            "tests/unit/cmdb_test.c",
+            "tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf",
+            "tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf",
+            "tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf",
+            "tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf",
+            "tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf"
+          ],
+          "upstream_pr": "none: B-5b's per-entry skip was cfengine/core#6320 (closed unmerged 2026-08-19); the all-or-nothing loader has no upstream PR yet",
+          "why": "replaces 8f0076b81 (B-5b's per-entry skip) per the 2026-11-14 operator ruling Replace; a squash of the fork's tendcf-integration loader (djbclark/core 4443504) onto the overlay base plus B-5a, with EvalContextVariableGetPlaintext() spelled EvalContextVariableGet() because the base has no secrets tracking (upstream-overlay.md section 7, risk R1)"
         }
       ],
       "upstream": "https://github.com/cfengine/core"
     },
     "libntech": {
+      "applied_tree": "8d5fda1f9938c6b69bb9bb4d8a6e3be6c174f9e0",
       "base": "0c0620d6c5f8f8d1cae212f084b021cff0b86ce6",
       "base_described": "upstream master as of 2026-08-15 (merge of #289); exactly the libntech submodule pin of core's base a0bca6aaf, so the two components are one coherent tree",
-      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 5cbd6f7425fa, identical to the local merge 45c816c)",
+      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 8d5fda1f9938 with all six patches; 0001-0004 alone give 5cbd6f7425fa, identical to the local merge 45c816c)",
       "fork": "https://github.com/djbclark/libntech",
       "patches": [
         {
@@ -101,6 +114,32 @@
           "subject": "Fixed a log-truncation format bug and an OOB pointer construction",
           "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/298",
           "upstream_pr_state": "closed unmerged 2026-08-19"
+        },
+        {
+          "commit": "dc3fba212bd323358c4de951acdaae3b182a4ef8",
+          "file": "0005-Added-JsonParseStrict-and-JsonParseFileStrict.patch",
+          "fork_ref": "fix/json-strict-parse",
+          "load_bearing_for": [
+            "core's CMDB loader (overlay/core 0002, B-5b replaced) reads host_specific.json through JsonParseFileStrict(): a repeated object member or non-whitespace after the document refuses the whole file"
+          ],
+          "register": "B-24",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Added JsonParseStrict() and JsonParseFileStrict()",
+          "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/11 only"
+        },
+        {
+          "commit": "8a57e5558ef126ccd2f2edf5dd650418fef38724",
+          "file": "0006-Fixed-JsonParseFileStrict-missing-a-null-byte-in-the.patch",
+          "fork_ref": "fix/json-strict-parse",
+          "load_bearing_for": [
+            "fixes JsonParseFileStrict() (0005), which the CMDB loader calls: a file with an embedded null byte, such as {\"vars\": {}}<NUL>not-json, parsed as the valid object; it is refused now"
+          ],
+          "register": "B-24",
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Fixed JsonParseFileStrict() missing a null byte in the file",
+          "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/11 only"
         }
       ],
       "upstream": "https://github.com/NorthernTechHQ/libntech"

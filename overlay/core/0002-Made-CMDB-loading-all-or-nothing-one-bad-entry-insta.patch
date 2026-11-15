@@ -1,0 +1,2692 @@
+From 4158906f2a5b3f202af1615fb80357a9a85987cc Mon Sep 17 00:00:00 2001
+From: Daniel JB Clark <djbclark@gmail.com>
+Date: Sat, 14 Nov 2026 22:00:37 -0500
+Subject: [PATCH] Made CMDB loading all-or-nothing: one bad entry installs
+ nothing
+
+Replaces the per-entry skip of "Fixed one bad CMDB entry discarding
+every entry in its section" (8f0076b81). A bad entry in host_specific.json
+now rejects the whole file: the loader validates every section first
+and installs nothing unless all of it is valid. A skipped entry used to
+leave whatever it guarded (an interlock, for example) unguarded.
+
+The loader keeps the pending classes and variables, installs them only
+after every check has passed, and rolls back on a failed insertion. It
+parses with JsonParseFileStrict() (libntech), which refuses a repeated
+object member and any non-whitespace after the document. Null values
+no longer crash it, and a dotted variable key gets a warning.
+
+This is a squash of the fork's tendcf-integration cmdb loader work
+(djbclark/core 4443504) onto the overlay base: libpromises/cmdb.c,
+tests/unit/cmdb_test.c and tests/acceptance/00_basics/06_host_specific_data
+are taken from that commit, plus the cmdb_test line in
+tests/unit/Makefile.am. The one difference is the secrets-tracking
+accessor: the base has EvalContextVariableGet(ctx, ref, type_out), so
+EvalContextVariableGetPlaintext() is spelled that way here (three call
+sites: one in cmdb.c, two in cmdb_test.c).
+
+It includes the null-value crash fix (B-20, 87490bb8f) and the
+dotted-key warning (B-7, ee1f9d60c) because the final cmdb.c contains
+them. Requires libntech with JsonParseFileStrict() (fork PR
+djbclark/libntech#11).
+---
+ libpromises/cmdb.c                            | 910 +++++++++++++++---
+ .../06_host_specific_data/07-invalid-data.cf  |  10 +-
+ .../08-class-expression.cf                    |   9 +-
+ .../09-class-reg-expression.cf                |   9 +-
+ .../06_host_specific_data/13-null-values.cf   |  60 ++
+ .../13-null-values.cf.json                    |  13 +
+ .../06_host_specific_data/14-dotted-keys.cf   |  52 +
+ .../14-dotted-keys.cf.json                    |   4 +
+ ...ariable-references-metadata-format.cf.json |   4 +-
+ ...e-references-bad-entry-installs-nothing.cf |  87 ++
+ ...erences-bad-entry-installs-nothing.cf.json |   6 +
+ .../17-duplicate-member-installs-nothing.cf   |  93 ++
+ ...-duplicate-member-installs-nothing.cf.json |  10 +
+ .../18-trailing-input-installs-nothing.cf     |  93 ++
+ ...18-trailing-input-installs-nothing.cf.json |   9 +
+ tests/unit/Makefile.am                        |   1 +
+ tests/unit/cmdb_test.c                        | 779 +++++++++++++++
+ 17 files changed, 1983 insertions(+), 166 deletions(-)
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf.json
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf.json
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf.json
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf.json
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf
+ create mode 100644 tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf.json
+ create mode 100644 tests/unit/cmdb_test.c
+
+diff --git a/libpromises/cmdb.c b/libpromises/cmdb.c
+index a874071ab..0644e6c26 100644
+--- a/libpromises/cmdb.c
++++ b/libpromises/cmdb.c
+@@ -23,13 +23,17 @@
+ */
+ 
+ #include <platform.h>
++#include <ctype.h>             /* isspace() */
+ #include <unistd.h>
+ #include <json.h>
+ #include <set.h>                /* StringSet */
++#include <sequence.h>           /* Seq */
++#include <cf3.defs.h>           /* CF_MAXVARSIZE */
+ #include <string_lib.h>
+ #include <known_dirs.h>         /* GetDataDir() */
+ #include <var_expressions.h>    /* VarRef, StringContainsUnresolved() */
+ #include <eval_context.h>       /* EvalContext*() */
++#include <class.h>              /* Class */
+ #include <files_names.h>        /* JoinPaths() */
+ 
+ #include <cmdb.h>
+@@ -45,12 +49,36 @@
+ #define CMDB_CLASSES_REGULAR_EXPRESSIONS "regular_expressions"
+ #define CMDB_COMMENT_KEY "comment"
+ 
+-JsonElement *ReadJsonFile(const char *filename, LogLevel log_level, size_t size_max)
++#ifdef TEST_UNIT_TEST
++/**
++ * Only in the unit test build (cmdb_test.c includes this file with
++ * TEST_UNIT_TEST defined, as split_process_line_test.c does for
++ * processes_select.c): a variable or class whose CMDB key makes the hook
++ * return true is treated as one that cannot be inserted into the EvalContext,
++ * which validation cannot otherwise produce. It lets a test exercise the
++ * rollback of LoadCMDBData(). Production has no such pointer.
++ */
++static bool (*CMDBTestFailInsertion)(const char *key) = NULL;
++#define CMDBInsertionForcedToFail(key) \
++    (CMDBTestFailInsertion != NULL && CMDBTestFailInsertion(key))
++#else
++#define CMDBInsertionForcedToFail(key) false
++#endif
++
++/**
++ * @param strict refuse what JsonParseFile() would repair or ignore: a repeated
++ *        object member (it replaces the earlier one) and anything but
++ *        whitespace after the document (it is not looked at)
++ */
++static JsonElement *ReadJsonFileMode(const char *filename, LogLevel log_level,
++                                     size_t size_max, bool strict)
+ {
+     assert(filename != NULL);
+ 
+     JsonElement *doc = NULL;
+-    JsonParseError err = JsonParseFile(filename, size_max, &doc);
++    JsonParseError err = strict ?
++        JsonParseFileStrict(filename, size_max, &doc) :
++        JsonParseFile(filename, size_max, &doc);
+ 
+     if (err == JSON_PARSE_ERROR_NO_SUCH_FILE)
+     {
+@@ -67,6 +95,11 @@ JsonElement *ReadJsonFile(const char *filename, LogLevel log_level, size_t size_
+     return doc;
+ }
+ 
++JsonElement *ReadJsonFile(const char *filename, LogLevel log_level, size_t size_max)
++{
++    return ReadJsonFileMode(filename, log_level, size_max, false);
++}
++
+ /* What made the unexpanded-variable walk below stop: exactly one of these is
+  * set, depending on which visitor stopped it. Both point into the JSON
+  * document being walked and must not be freed. */
+@@ -116,77 +149,129 @@ static bool CheckObjectForUnexpandedVars(JsonElement *object, void *data)
+ }
+ 
+ /**
+- * Reject CMDB data containing unresolved variable references, naming the entry
+- * that was rejected.
++ * Report that the dots in a CMDB key were taken as a scope separator.
+  *
+- * Each top-level entry is walked separately so that the entry can be named,
+- * which is what an operator needs to find the offending line. A single walk of
+- * the whole section could only report the immediate property name, and in the
+- * 'variables' format (CFE-3633) that is the metadata key 'value' rather than
+- * the name of the variable holding it.
++ * VarRefParse() splits a key at its first dot, so the flat-looking key
++ * "com.dotted.key" does not become a variable of that name, it becomes the
++ * variable "dotted.key" in the scope "com". Naming a scope like this is a
++ * supported feature, so a key of the documented "[namespace:]bundle.variable"
++ * form is only reported at the verbose level; warning on every agent run
++ * about a working policy would just be noise.
+  *
+- * @param data      the CMDB section to check, which must be a JSON object
++ * The remaining keys cannot be of that form: it has room for exactly one dot,
++ * and neither the bundle name nor the variable name can be empty. A variable
++ * name that still contains a dot is a particularly good hint, since a vars
++ * promise cannot create one (the same splitting happens there), so nothing
++ * but CMDB data can address it. Those keys are much more likely to be flat
++ * keys meant literally, and get a warning.
++ */
++static void LogCMDBVariableScope(const char *key, const VarRef *ref)
++{
++    assert(key != NULL);
++    assert(ref != NULL);
++
++    char *address = VarRefToString(ref, true);
++    if (!StringEqual(ref->scope, "") && !StringEqual(ref->lval, "") &&
++        (strchr(ref->lval, '.') == NULL))
++    {
++        Log(LOG_LEVEL_VERBOSE, "The CMDB key '%s' names the '%s' scope,"
++            " the variable is addressed as '%s'",
++            key, ref->scope, address);
++    }
++    else
++    {
++        Log(LOG_LEVEL_WARNING, "The '.' in the CMDB key '%s' was taken as a"
++            " scope separator: the variable is named '%s' in the '%s' scope,"
++            " addressed as '%s'", key, ref->lval, ref->scope, address);
++    }
++    free(address);
++}
++
++/**
++ * Reject a single CMDB entry containing unresolved variable references,
++ * naming the entry that was rejected.
++ *
++ * Checked per entry, rather than once for the whole section, so that the
++ * log names every offending entry, not only the first one in the section
++ * (any one of them makes LoadCMDBData() install nothing from the file).
++ *
++ * @param entry     the entry's value, as found under key in its section
++ * @param key       the entry's key, as it appears in the CMDB file
+  * @param section   the section's key, as it appears in the CMDB file
+  * @param file_path the CMDB file the data came from
+- * @return          whether the data is free of variable references
++ * @return          whether the entry is free of variable references
+  */
+-static bool CheckCMDBDataForUnexpandedVars(JsonElement *data,
+-                                           const char *section,
+-                                           const char *file_path)
++static bool CheckCMDBEntryForUnexpandedVars(JsonElement *entry,
++                                            const char *key,
++                                            const char *section,
++                                            const char *file_path)
+ {
+-    assert(data != NULL);
+-    assert(JsonGetType(data) == JSON_TYPE_OBJECT);
++    assert(entry != NULL);
++    assert(key != NULL);
+     assert(section != NULL);
+     assert(file_path != NULL);
+ 
+-    JsonIterator iter = JsonIteratorInit(data);
+-    while (JsonIteratorHasMore(&iter))
++    if (StringContainsUnresolved(key))
+     {
+-        JsonElement *child = JsonIteratorNextValue(&iter);
+-        const char *entry = JsonGetPropertyAsString(child);
+-
+-        if (StringContainsUnresolved(entry))
+-        {
+-            Log(LOG_LEVEL_ERR,
+-                "Invalid '%s' CMDB data in '%s', cannot contain variable"
+-                " references (offending key: '%s')",
+-                section, file_path, entry);
+-            return false;
+-        }
++        Log(LOG_LEVEL_ERR,
++            "Invalid '%s' CMDB data in '%s', cannot contain variable"
++            " references (offending key: '%s')",
++            section, file_path, key);
++        return false;
++    }
+ 
+-        CMDBUnexpandedVar offender = {NULL, NULL};
+-        if (JsonWalk(child, CheckObjectForUnexpandedVars,
+-                     NULL, CheckPrimitiveForUnexpandedVars, &offender))
+-        {
+-            continue;
+-        }
++    CMDBUnexpandedVar offender = {NULL, NULL};
++    if (JsonWalk(entry, CheckObjectForUnexpandedVars,
++                 NULL, CheckPrimitiveForUnexpandedVars, &offender))
++    {
++        return true;
++    }
+ 
+-        /* The walk stops only when one of the two visitors above stops it,
+-         * and each records what it found before doing so. */
+-        assert((offender.value != NULL) || (offender.key != NULL));
++    /* The walk stops only when one of the two visitors above stops it, and
++     * each records what it found before doing so. */
++    assert((offender.value != NULL) || (offender.key != NULL));
+ 
+-        if (offender.value != NULL)
+-        {
+-            Log(LOG_LEVEL_ERR,
+-                "Invalid '%s' CMDB data in '%s', cannot contain variable"
+-                " references (offending value in entry '%s': '%s')",
+-                section, file_path, entry, offender.value);
+-        }
+-        else
+-        {
+-            Log(LOG_LEVEL_ERR,
+-                "Invalid '%s' CMDB data in '%s', cannot contain variable"
+-                " references (offending key in entry '%s': '%s')",
+-                section, file_path, entry, offender.key);
+-        }
+-        return false;
++    if (offender.value != NULL)
++    {
++        Log(LOG_LEVEL_ERR,
++            "Invalid '%s' CMDB data in '%s', cannot contain variable"
++            " references (offending value in entry '%s': '%s')",
++            section, file_path, key, offender.value);
+     }
+-
+-    return true;
++    else
++    {
++        Log(LOG_LEVEL_ERR,
++            "Invalid '%s' CMDB data in '%s', cannot contain variable"
++            " references (offending key in entry '%s': '%s')",
++            section, file_path, key, offender.key);
++    }
++    return false;
+ }
+ 
++/**
++ * Turn a CMDB key into the variable it installs, or NULL (logged) if the key
++ * is not a variable this loader can install.
++ *
++ * The key's syntax is checked here, before VarRefParse(): that function
++ * answers a malformed key with a log message and a usable reference to
++ * something else ('tendcf_interlock[' becomes 'tendcf_interlock'), which
++ * would let an entry silently replace another one. A CMDB key is a variable
++ * name, so it holds no index brackets at all.
++ *
++ * Special scopes are refused too, except 'def': 'this', 'body' and 'edit' name
++ * tables that exist only while a promise, body or bundle is being evaluated,
++ * and 'sys', 'const', 'mon' and 'match' take no namespace, but every CMDB
++ * variable is given one.
++ */
+ static VarRef *GetCMDBVariableRef(const char *key)
+ {
++    if (strpbrk(key, "[]") != NULL)
++    {
++        Log(LOG_LEVEL_ERR, "Invalid variable specification in CMDB data: '%s'"
++            " (a variable name cannot contain '[' or ']')", key);
++        return NULL;
++    }
++
+     VarRef *ref = VarRefParse(key);
+     if (ref->ns == NULL)
+     {
+@@ -207,9 +292,88 @@ static VarRef *GetCMDBVariableRef(const char *key)
+     {
+         ref->scope = xstrdup("variables");
+     }
++    else
++    {
++        const SpecialScope special = SpecialScopeFromString(ref->scope);
++        if (special != SPECIAL_SCOPE_NONE && special != SPECIAL_SCOPE_DEF)
++        {
++            Log(LOG_LEVEL_ERR, "Invalid variable specification in CMDB data: '%s'"
++                " (the '%s' scope cannot be set from CMDB data)", key, ref->scope);
++            VarRefDestroy(ref);
++            return NULL;
++        }
++
++        /* The key contained a dot, so the variable did not land in the
++         * default scope. Tell the operator where it went instead. */
++        LogCMDBVariableScope(key, ref);
++    }
+     return ref;
+ }
+ 
++/** Does the given JSON array have a JSON null among its direct children? */
++static bool JsonArrayContainsNull(const JsonElement *array)
++{
++    assert(JsonGetType(array) == JSON_TYPE_ARRAY);
++
++    const size_t length = JsonLength(array);
++    for (size_t i = 0; i < length; i++)
++    {
++        if (JsonGetType(JsonArrayGet(array, i)) == JSON_TYPE_NULL)
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
++/**
++ * Why a variable cannot be installed, as far as that can be known before
++ * touching the EvalContext: everything AddCMDBVariable() or
++ * EvalContextVariablePutTagsSetWithComment() would reject.
++ *
++ * @return whether the entry's value can be installed (details are logged
++ *         otherwise)
++ */
++static bool CheckCMDBVariableValue(const char *key, const VarRef *ref,
++                                   const JsonElement *data)
++{
++    assert(key != NULL);
++    assert(ref != NULL);
++    assert(data != NULL);
++
++    if (strlen(ref->lval) > CF_MAXVARSIZE)
++    {
++        Log(LOG_LEVEL_ERR, "Invalid variable specification in CMDB data: '%s'"
++            " (the variable name exceeds the maximum length allowed, %d characters)",
++            key, CF_MAXVARSIZE);
++        return false;
++    }
++
++    if (JsonGetElementType(data) == JSON_ELEMENT_TYPE_PRIMITIVE)
++    {
++        if (JsonGetPrimitiveType(data) == JSON_PRIMITIVE_TYPE_NULL)
++        {
++            /* JsonPrimitiveToString() returns NULL for JSON null and there is
++             * no scalar to install in its place. */
++            Log(LOG_LEVEL_ERR, "Invalid value in '%s' variable specification in CMDB data"
++                " (null is not a supported value)", key);
++            return false;
++        }
++    }
++    else if ((JsonGetType(data) == JSON_TYPE_ARRAY) &&
++             JsonArrayContainsOnlyPrimitives((JsonElement *) data) &&
++             JsonArrayContainsNull(data))
++    {
++        /* RlistFromContainer() skips JSON nulls, so the resulting slist
++         * would silently be shorter than the data it came from. */
++        Log(LOG_LEVEL_ERR, "Invalid value in '%s' variable specification in CMDB data"
++            " (a list must not contain null)", key);
++        return false;
++    }
++    return true;
++}
++
++/** Install a variable that CheckCMDBVariableValue() accepted. */
+ static bool AddCMDBVariable(EvalContext *ctx, const char *key, const VarRef *ref,
+                             JsonElement *data, StringSet *tags, const char *comment)
+ {
+@@ -219,12 +383,23 @@ static bool AddCMDBVariable(EvalContext *ctx, const char *key, const VarRef *ref
+     assert(data != NULL);
+     assert(tags != NULL);
+ 
++    if (CMDBInsertionForcedToFail(key))
++    {
++        Log(LOG_LEVEL_ERR, "Variable '%s' cannot be added (insertion failure forced by a test)", key);
++        StringSetDestroy(tags);
++        return false;
++    }
++
+     bool ret;
++    /* Not '%s:%s.%s' of ref->ns, ref->scope and key: a key that names a scope
++     * already contains that scope, which would then be printed twice. */
++    char *address = VarRefToString(ref, true);
+     if (JsonGetElementType(data) == JSON_ELEMENT_TYPE_PRIMITIVE)
+     {
++        assert(JsonGetPrimitiveType(data) != JSON_PRIMITIVE_TYPE_NULL);
+         char *value = JsonPrimitiveToString(data);
+-        Log(LOG_LEVEL_VERBOSE, "Installing CMDB variable '%s:%s.%s=%s'",
+-            ref->ns, ref->scope, key, value);
++        Log(LOG_LEVEL_VERBOSE, "Installing CMDB variable '%s=%s'",
++            address, value);
+         ret = EvalContextVariablePutTagsSetWithComment(ctx, ref, value, CF_DATA_TYPE_STRING,
+                                                        tags, comment);
+         free(value);
+@@ -232,9 +407,9 @@ static bool AddCMDBVariable(EvalContext *ctx, const char *key, const VarRef *ref
+     else if ((JsonGetType(data) == JSON_TYPE_ARRAY) &&
+              JsonArrayContainsOnlyPrimitives(data))
+     {
++        assert(!JsonArrayContainsNull(data));
+         // map to slist if the data only has primitives
+-        Log(LOG_LEVEL_VERBOSE, "Installing CMDB slist variable '%s:%s.%s'",
+-            ref->ns, ref->scope, key);
++        Log(LOG_LEVEL_VERBOSE, "Installing CMDB slist variable '%s'", address);
+         Rlist *data_rlist = RlistFromContainer(data);
+         ret = EvalContextVariablePutTagsSetWithComment(ctx, ref,
+                                                        data_rlist, CF_DATA_TYPE_STRING_LIST,
+@@ -244,12 +419,13 @@ static bool AddCMDBVariable(EvalContext *ctx, const char *key, const VarRef *ref
+     else
+     {
+         // install as a data container
+-        Log(LOG_LEVEL_VERBOSE, "Installing CMDB data container variable '%s:%s.%s'",
+-            ref->ns, ref->scope, key);
++        Log(LOG_LEVEL_VERBOSE, "Installing CMDB data container variable '%s'",
++            address);
+         ret = EvalContextVariablePutTagsSetWithComment(ctx, ref,
+                                                        data, CF_DATA_TYPE_CONTAINER,
+                                                        tags, comment);
+     }
++    free(address);
+     if (!ret)
+     {
+         /* On success, EvalContextVariablePutTagsSet() consumes the tags set,
+@@ -259,8 +435,147 @@ static bool AddCMDBVariable(EvalContext *ctx, const char *key, const VarRef *ref
+     return ret;
+ }
+ 
+-static bool ReadCMDBVars(EvalContext *ctx, JsonElement *vars,
+-                         const char *file_path)
++/*
++ * The CMDB file is loaded in two steps. First every entry of every section is
++ * validated and prepared, without touching the EvalContext; only if all of
++ * them are fine is anything installed. A host-specific file is one document
++ * written by one author, so a single bad entry means the file as a whole
++ * cannot be trusted, and installing only the entries around it could leave
++ * policy running without data it expects to guard it (see LoadCMDBData()).
++ */
++typedef struct
++{
++    const char *key;            /* borrowed from the JSON document */
++    VarRef *ref;                /* owned */
++    JsonElement *data;          /* borrowed from the JSON document */
++    StringSet *tags;            /* owned until installed */
++    const char *comment;        /* borrowed from the JSON document, or NULL */
++} CMDBPendingVariable;
++
++typedef struct
++{
++    const char *key;            /* borrowed from the JSON document */
++    StringSet *tags;            /* owned until installed */
++    const char *comment;        /* borrowed from the JSON document, or NULL */
++    bool installed;             /* set by InstallCMDBPending() */
++} CMDBPendingClass;
++
++typedef struct
++{
++    Seq *variables;             /* CMDBPendingVariable *, in install order */
++    Seq *classes;               /* CMDBPendingClass *, in install order */
++} CMDBPending;
++
++static void CMDBPendingVariableDestroy(void *item)
++{
++    CMDBPendingVariable *var = item;
++    VarRefDestroy(var->ref);
++    StringSetDestroy(var->tags);
++    free(var);
++}
++
++static void CMDBPendingClassDestroy(void *item)
++{
++    CMDBPendingClass *cls = item;
++    StringSetDestroy(cls->tags);
++    free(cls);
++}
++
++static CMDBPending CMDBPendingNew(void)
++{
++    return (CMDBPending) {
++        .variables = SeqNew(16, CMDBPendingVariableDestroy),
++        .classes = SeqNew(16, CMDBPendingClassDestroy),
++    };
++}
++
++static void CMDBPendingDestroy(CMDBPending *pending)
++{
++    SeqDestroy(pending->variables);
++    SeqDestroy(pending->classes);
++}
++
++/**
++ * Refuse two entries that name the same variable (also across sections and
++ * spellings: 'x', 'data:variables.x' and 'variables.x' are one variable): the
++ * later would replace the earlier one, so an entry could silently take the
++ * place of the one a policy relies on.
++ *
++ * @return false (logged) if any variable is named more than once
++ */
++static bool CMDBPendingCheckNoDuplicates(const CMDBPending *pending)
++{
++    bool valid = true;
++    StringSet *seen = StringSetNew();
++    for (size_t i = 0; i < SeqLength(pending->variables); i++)
++    {
++        const CMDBPendingVariable *var = SeqAt(pending->variables, i);
++        char *address = VarRefToString(var->ref, true);
++        if (StringSetContains(seen, address))
++        {
++            Log(LOG_LEVEL_ERR,
++                "Invalid variable specification in CMDB data: '%s' names the variable '%s'"
++                " that another entry names too", var->key, address);
++            valid = false;
++            free(address);
++        }
++        else
++        {
++            StringSetAdd(seen, address); /* takes ownership */
++        }
++    }
++    StringSetDestroy(seen);
++    return valid;
++}
++
++/**
++ * Is rules an array that is empty or holds just the string 'allowed'? The
++ * element's type is checked before its value is read.
++ */
++static bool CheckCMDBRuleArray(const JsonElement *rules, const char *allowed)
++{
++    if (JsonGetType(rules) != JSON_TYPE_ARRAY || JsonLength(rules) > 1)
++    {
++        return false;
++    }
++    if (JsonLength(rules) == 0)
++    {
++        return true;
++    }
++    const JsonElement *rule = JsonArrayGet(rules, 0);
++    return (JsonGetType(rule) == JSON_TYPE_STRING &&
++            StringEqual(JsonPrimitiveGetAsString(rule), allowed));
++}
++
++/** Takes ownership of ref and tags. */
++static void CMDBPendingAddVariable(CMDBPending *pending, const char *key,
++                                   VarRef *ref, JsonElement *data,
++                                   StringSet *tags, const char *comment)
++{
++    CMDBPendingVariable *var = xmalloc(sizeof(*var));
++    *var = (CMDBPendingVariable) {
++        .key = key, .ref = ref, .data = data, .tags = tags, .comment = comment,
++    };
++    SeqAppend(pending->variables, var);
++}
++
++/** Takes ownership of tags. */
++static void CMDBPendingAddClass(CMDBPending *pending, const char *key,
++                                StringSet *tags, const char *comment)
++{
++    CMDBPendingClass *cls = xmalloc(sizeof(*cls));
++    *cls = (CMDBPendingClass) { .key = key, .tags = tags, .comment = comment };
++    SeqAppend(pending->classes, cls);
++}
++
++/**
++ * Validate the 'vars' section.
++ *
++ * @return false if the section or any entry in it is invalid. Every entry is
++ *         looked at regardless, so that all problems are logged in one go.
++ */
++static bool PrepareCMDBVars(JsonElement *vars, const char *file_path,
++                            CMDBPending *pending)
+ {
+     assert(vars != NULL);
+ 
+@@ -272,40 +587,49 @@ static bool ReadCMDBVars(EvalContext *ctx, JsonElement *vars,
+         return false;
+     }
+ 
+-    if (!CheckCMDBDataForUnexpandedVars(vars, "vars", file_path))
+-    {
+-        return false;
+-    }
+-
++    bool all_valid = true;
+     JsonIterator iter = JsonIteratorInit(vars);
+     while (JsonIteratorHasMore(&iter))
+     {
+         const char *key = JsonIteratorNextKey(&iter);
+         JsonElement *data = JsonObjectGet(vars, key);
+ 
++        if (!CheckCMDBEntryForUnexpandedVars(data, key, "vars", file_path))
++        {
++            all_valid = false;
++            continue;
++        }
++
+         VarRef *ref = GetCMDBVariableRef(key);
+         if (ref == NULL)
+         {
++            all_valid = false;
+             continue;
+         }
+ 
+-        StringSet *tags = StringSetNew();
+-        StringSetAdd(tags, xstrdup(CMDB_SOURCE_TAG));
+-        bool ret = AddCMDBVariable(ctx, key, ref, data, tags, NULL);
+-        VarRefDestroy(ref);
+-        if (!ret)
++        if (!CheckCMDBVariableValue(key, ref, data))
+         {
+-            /* Details should have been logged already. */
+-            Log(LOG_LEVEL_ERR, "Failed to add CMDB variable '%s'", key);
++            VarRefDestroy(ref);
++            all_valid = false;
++            continue;
+         }
++
++        StringSet *tags = StringSetNew();
++        StringSetAdd(tags, xstrdup(CMDB_SOURCE_TAG));
++        CMDBPendingAddVariable(pending, key, ref, data, tags, NULL);
+     }
+-    return true;
++    return all_valid;
+ }
+ 
++/**
++ * Read the tags of an entry; *valid is cleared if they are malformed. The
++ * returned set is never NULL and always has default_tag in it.
++ */
+ static StringSet *GetTagsFromJsonTags(const char *item_type,
+                                       const char *key,
+                                       const JsonElement *json_tags,
+-                                      const char *default_tag)
++                                      const char *default_tag,
++                                      bool *valid)
+ {
+     StringSet *tags = NULL;
+     if (JSON_NOT_NULL(json_tags))
+@@ -317,6 +641,7 @@ static StringSet *GetTagsFromJsonTags(const char *item_type,
+                 "Invalid json_tags information for %s '%s' in CMDB data:"
+                 " must be a JSON array of strings",
+                 item_type, key);
++            *valid = false;
+         }
+         else
+         {
+@@ -327,6 +652,7 @@ static StringSet *GetTagsFromJsonTags(const char *item_type,
+                     "Invalid json_tags information %s '%s' in CMDB data:"
+                     " must be a JSON array of strings",
+                     item_type, key);
++                *valid = false;
+             }
+         }
+     }
+@@ -339,8 +665,10 @@ static StringSet *GetTagsFromJsonTags(const char *item_type,
+     return tags;
+ }
+ 
++/** Read the comment of an entry; *valid is cleared if it is not a string. */
+ static inline const char *GetCMDBComment(const char *item_type, const char *identifier,
+-                                         const JsonElement *json_object)
++                                         const JsonElement *json_object,
++                                         bool *valid)
+ {
+     assert(JsonGetType(json_object) == JSON_TYPE_OBJECT);
+ 
+@@ -355,15 +683,19 @@ static inline const char *GetCMDBComment(const char *item_type, const char *iden
+         Log(LOG_LEVEL_ERR,
+             "Invalid type of the 'comment' field for the '%s' %s in CMDB data, must be a string",
+             identifier, item_type);
++        *valid = false;
+         return NULL;
+     }
+ 
+     return JsonPrimitiveGetAsString(json_comment);
+ }
+ 
+-/** Uses the new format allowing metadata (CFE-3633) */
+-static bool ReadCMDBVariables(EvalContext *ctx, JsonElement *variables,
+-                              const char *file_path)
++/**
++ * Validate the 'variables' section, which uses the new format allowing
++ * metadata (CFE-3633). Same contract as PrepareCMDBVars().
++ */
++static bool PrepareCMDBVariables(JsonElement *variables, const char *file_path,
++                                 CMDBPending *pending)
+ {
+     assert(variables != NULL);
+ 
+@@ -375,27 +707,30 @@ static bool ReadCMDBVariables(EvalContext *ctx, JsonElement *variables,
+         return false;
+     }
+ 
+-    if (!CheckCMDBDataForUnexpandedVars(variables, "variables", file_path))
+-    {
+-        return false;
+-    }
+-
++    bool all_valid = true;
+     JsonIterator iter = JsonIteratorInit(variables);
+     while (JsonIteratorHasMore(&iter))
+     {
+         const char *key = JsonIteratorNextKey(&iter);
++        JsonElement *const var_info = JsonObjectGet(variables, key);
++
++        if (!CheckCMDBEntryForUnexpandedVars(var_info, key, "variables", file_path))
++        {
++            all_valid = false;
++            continue;
++        }
+ 
+         VarRef *ref = GetCMDBVariableRef(key);
+         if (ref == NULL)
+         {
++            all_valid = false;
+             continue;
+         }
+ 
+-        JsonElement *const var_info = JsonObjectGet(variables, key);
+-
+         JsonElement *data;
+         StringSet *tags;
+         const char *comment = NULL;
++        bool entry_valid = true;
+ 
+         if (JsonGetType(var_info) == JSON_TYPE_OBJECT)
+         {
+@@ -405,30 +740,75 @@ static bool ReadCMDBVariables(EvalContext *ctx, JsonElement *variables,
+             {
+                 Log(LOG_LEVEL_ERR, "Missing value in '%s' variable specification in CMDB data (value field is required)", key);
+                 VarRefDestroy(ref);
++                all_valid = false;
+                 continue;
+             }
+ 
+             JsonElement *json_tags = JsonObjectGet(var_info, CMDB_VARIABLES_TAGS);
+-            tags = GetTagsFromJsonTags("variable", key, json_tags, CMDB_SOURCE_TAG);
+-            comment = GetCMDBComment("variable", key, var_info);
++            tags = GetTagsFromJsonTags("variable", key, json_tags, CMDB_SOURCE_TAG, &entry_valid);
++            comment = GetCMDBComment("variable", key, var_info, &entry_valid);
+         }
+         else
+         {
+             // Just a bare value, like in "vars", no metadata
+             data = var_info;
+-            tags = GetTagsFromJsonTags("variable", key, NULL, CMDB_SOURCE_TAG);
++            tags = GetTagsFromJsonTags("variable", key, NULL, CMDB_SOURCE_TAG, &entry_valid);
+         }
+ 
+         assert(tags != NULL);
+         assert(data != NULL);
+ 
+-        bool ret = AddCMDBVariable(ctx, key, ref, data, tags, comment);
+-        VarRefDestroy(ref);
+-        if (!ret)
++        if (!entry_valid || !CheckCMDBVariableValue(key, ref, data))
+         {
+-            /* Details should have been logged already. */
+-            Log(LOG_LEVEL_ERR, "Failed to add CMDB variable '%s'", key);
++            StringSetDestroy(tags);
++            VarRefDestroy(ref);
++            all_valid = false;
++            continue;
+         }
++
++        CMDBPendingAddVariable(pending, key, ref, data, tags, comment);
++    }
++    return all_valid;
++}
++
++/** Split a class key the way AddCMDBClass() does: "ns:name" or "name". */
++static const char *CMDBClassNameOfKey(const char *key)
++{
++    const char *sep = strchr(key, ':');
++    return (sep == NULL) ? key : (sep + 1);
++}
++
++/**
++ * Does EvalContextClassPutTagsSet() have a name it can work with?
++ *
++ * That function chops trailing whitespace off a copy of the name and refuses
++ * the class if nothing is left (in the default namespace), yet files the class
++ * under the name as given, whitespace canonified to '_'. A name with
++ * whitespace at either end is thus either refused there or filed under a name
++ * its author did not write, so it is refused here.
++ */
++static bool CheckCMDBClassName(const char *key)
++{
++    const char *name = CMDBClassNameOfKey(key);
++    if (name[0] == '\0')
++    {
++        Log(LOG_LEVEL_ERR, "Invalid CMDB class '%s': the class name is empty", key);
++        return false;
++    }
++    if (isspace((unsigned char) name[0]) ||
++        isspace((unsigned char) name[strlen(name) - 1]))
++    {
++        Log(LOG_LEVEL_ERR,
++            "Invalid CMDB class '%s': the class name starts or ends with whitespace",
++            key);
++        return false;
++    }
++    if (strlen(name) >= CF_MAXVARSIZE)
++    {
++        Log(LOG_LEVEL_ERR,
++            "Invalid CMDB class '%s': the class name is equal or longer than %d characters",
++            key, CF_MAXVARSIZE);
++        return false;
+     }
+     return true;
+ }
+@@ -439,6 +819,13 @@ static bool AddCMDBClass(EvalContext *ctx, const char *key, StringSet *tags, con
+     assert(key != NULL);
+     assert(tags != NULL);
+ 
++    if (CMDBInsertionForcedToFail(key))
++    {
++        Log(LOG_LEVEL_ERR, "Class '%s' cannot be added (insertion failure forced by a test)", key);
++        StringSetDestroy(tags);
++        return false;
++    }
++
+     bool ret;
+     Log(LOG_LEVEL_VERBOSE, "Installing CMDB class '%s'", key);
+ 
+@@ -467,8 +854,11 @@ static bool AddCMDBClass(EvalContext *ctx, const char *key, StringSet *tags, con
+     return ret;
+ }
+ 
+-static bool ReadCMDBClasses(EvalContext *ctx, JsonElement *classes,
+-                            const char *file_path)
++/**
++ * Validate the 'classes' section. Same contract as PrepareCMDBVars().
++ */
++static bool PrepareCMDBClasses(JsonElement *classes, const char *file_path,
++                               CMDBPending *pending)
+ {
+     assert(classes != NULL);
+ 
+@@ -480,16 +870,23 @@ static bool ReadCMDBClasses(EvalContext *ctx, JsonElement *classes,
+         return false;
+     }
+ 
+-    if (!CheckCMDBDataForUnexpandedVars(classes, "classes", file_path))
+-    {
+-        return false;
+-    }
+-
++    bool all_valid = true;
+     JsonIterator iter = JsonIteratorInit(classes);
+     while (JsonIteratorHasMore(&iter))
+     {
+         const char *key = JsonIteratorNextKey(&iter);
+         JsonElement *data = JsonObjectGet(classes, key);
++
++        if (!CheckCMDBEntryForUnexpandedVars(data, key, "classes", file_path) ||
++            !CheckCMDBClassName(key))
++        {
++            all_valid = false;
++            continue;
++        }
++
++        StringSet *tags = NULL;
++        const char *comment = NULL;
++
+         if (JsonGetElementType(data) == JSON_ELEMENT_TYPE_PRIMITIVE)
+         {
+             const char *expr = JsonPrimitiveGetAsString(data);
+@@ -497,38 +894,33 @@ static bool ReadCMDBClasses(EvalContext *ctx, JsonElement *classes,
+             {
+                 Log(LOG_LEVEL_ERR,
+                     "Invalid class specification '%s' in CMDB data, only \"any::\" allowed", expr);
++                all_valid = false;
+                 continue;
+             }
+ 
+-            StringSet *default_tags = StringSetNew();
+-            StringSetAdd(default_tags, xstrdup(CMDB_SOURCE_TAG));
+-            bool ret = AddCMDBClass(ctx, key, default_tags, NULL);
+-            if (!ret)
+-            {
+-                /* It does not have to be and error, it could be a result of
+-                 * the class already existing. Anyways, details about
+-                 * potential errors should have been logged already. */
+-                Log(LOG_LEVEL_DEBUG, "Did not add CMDB class '%s'", key);
+-            }
++            tags = StringSetNew();
++            StringSetAdd(tags, xstrdup(CMDB_SOURCE_TAG));
+         }
+         else if (JsonGetContainerType(data) == JSON_CONTAINER_TYPE_ARRAY &&
+                  JsonArrayContainsOnlyPrimitives(data))
+         {
++            bool array_valid = true;
+             switch (JsonLength(data))
+             {
+             case 0:
+                 Log(LOG_LEVEL_ERR,
+                     "Empty class specification '[]' in CMDB data not allowed, only '[\"any::\"]'");
+-                continue;;
++                array_valid = false;
++                break;
+             case 1:
+                 if (!StringEqual(JsonPrimitiveGetAsString(JsonArrayGet(data, 0)), "any::"))
+                 {
+                     Log(LOG_LEVEL_ERR,
+                         "Invalid class specification '[\"%s\"]' in CMDB data, only '[\"any::\"]' allowed",
+                         JsonPrimitiveGetAsString(JsonArrayGet(data, 0)));
+-                    continue;
++                    array_valid = false;
+                 }
+-                // All good :)
++                // else all good :)
+                 break;
+             default:
+                 {
+@@ -539,18 +931,17 @@ static bool ReadCMDBClasses(EvalContext *ctx, JsonElement *classes,
+                         StringWriterData(str));
+                     WriterClose(str);
+                 }
+-                continue;
++                array_valid = false;
++                break;
+             }
+-            StringSet *default_tags = StringSetNew();
+-            StringSetAdd(default_tags, xstrdup(CMDB_SOURCE_TAG));
+-            bool ret = AddCMDBClass(ctx, key, default_tags, NULL);
+-            if (!ret)
++            if (!array_valid)
+             {
+-                /* It does not have to be and error, it could be a result of
+-                 * the class already existing. Anyways, details about
+-                 * potential errors should have been logged already. */
+-                Log(LOG_LEVEL_DEBUG, "Did not add CMDB class '%s'", key);
++                all_valid = false;
++                continue;
+             }
++
++            tags = StringSetNew();
++            StringSetAdd(tags, xstrdup(CMDB_SOURCE_TAG));
+         }
+         else if (JsonGetContainerType(data) == JSON_CONTAINER_TYPE_OBJECT)
+         {
+@@ -559,47 +950,221 @@ static bool ReadCMDBClasses(EvalContext *ctx, JsonElement *classes,
+             const JsonElement *json_tags = JsonObjectGet(data, CMDB_CLASSES_TAGS);
+ 
+             if (JSON_NOT_NULL(class_exprs) &&
+-                (JsonGetType(class_exprs) != JSON_TYPE_ARRAY ||
+-                 JsonLength(class_exprs) > 1 ||
+-                 (JsonLength(class_exprs) == 1 &&
+-                  !StringEqual(JsonPrimitiveGetAsString(JsonArrayGet(class_exprs, 0)), "any::"))))
++                !CheckCMDBRuleArray(class_exprs, "any::"))
+             {
+                 Log(LOG_LEVEL_ERR,
+                     "Invalid class expression rules for class '%s' in CMDB data,"
+                     " only '[]' or '[\"any::\"]' allowed", key);
++                all_valid = false;
+                 continue;
+             }
+             if (JSON_NOT_NULL(reg_exprs) &&
+-                (JsonGetType(reg_exprs) != JSON_TYPE_ARRAY ||
+-                 JsonLength(reg_exprs) > 1 ||
+-                 (JsonLength(reg_exprs) == 1 &&
+-                  !StringEqual(JsonPrimitiveGetAsString(JsonArrayGet(reg_exprs, 0)), "any"))))
++                !CheckCMDBRuleArray(reg_exprs, "any"))
+             {
+                 Log(LOG_LEVEL_ERR,
+                     "Invalid regular expression rules for class '%s' in CMDB data,"
+                     " only '[]' or '[\"any\"]' allowed", key);
++                all_valid = false;
+                 continue;
+             }
+ 
+-            StringSet *tags = GetTagsFromJsonTags("class", key, json_tags, CMDB_SOURCE_TAG);
+-            const char *comment = GetCMDBComment("class", key, data);
+-            bool ret = AddCMDBClass(ctx, key, tags, comment);
+-            if (!ret)
++            bool entry_valid = true;
++            tags = GetTagsFromJsonTags("class", key, json_tags, CMDB_SOURCE_TAG, &entry_valid);
++            comment = GetCMDBComment("class", key, data, &entry_valid);
++            if (!entry_valid)
+             {
+-                /* It does not have to be and error, it could be a result of
+-                 * the class already existing. Anyways, details about
+-                 * potential errors should have been logged already. */
+-                Log(LOG_LEVEL_DEBUG, "Did not add CMDB class '%s'", key);
++                StringSetDestroy(tags);
++                all_valid = false;
++                continue;
+             }
+         }
+         else
+         {
+             Log(LOG_LEVEL_ERR, "Invalid CMDB class data for class '%s'", key);
++            all_valid = false;
++            continue;
++        }
++
++        CMDBPendingAddClass(pending, key, tags, comment);
++    }
++    return all_valid;
++}
++
++/**
++ * The namespace and name EvalContextClassPutTagsSet() files a CMDB class
++ * under: the key split the way AddCMDBClass() splits it, the name canonified
++ * the way ClassInit() does. Both results are owned by the caller.
++ */
++static void CMDBClassIdentity(const char *key, char **ns, char **name)
++{
++    const char *sep = strchr(key, ':');
++    *ns = (sep != NULL) ? xstrndup(key, sep - key) : xstrdup(CMDB_NAMESPACE);
++    /* Not CanonifyName(): it returns a static buffer */
++    *name = xstrdup(CMDBClassNameOfKey(key));
++    CanonifyNameInPlace(*name);
++}
++
++/**
++ * Is the class there already? EvalContextClassPutTagsSet() decides that by the
++ * name as given, so 'pre-class' is not found where 'pre_class' is, and the
++ * existing class would be replaced; ask by the canonical identity instead.
++ */
++static bool CMDBClassExists(const EvalContext *ctx, const char *key)
++{
++    char *ns;
++    char *name;
++    CMDBClassIdentity(key, &ns, &name);
++    const Class *existing = EvalContextClassGet(ctx, ns, name);
++    free(ns);
++    free(name);
++    return (existing != NULL && existing->scope == CONTEXT_SCOPE_NAMESPACE);
++}
++
++/**
++ * Refuse a variable that exists already: installing it would replace the
++ * existing one, and RollbackCMDBPending() could not put that one back.
++ * Nothing is there to be replaced in practice, as the loader runs on a
++ * cleared context, before augments.
++ *
++ * @return false (logged) if any variable exists already
++ */
++static bool CMDBPendingCheckNoExistingVariables(const EvalContext *ctx,
++                                                const CMDBPending *pending)
++{
++    bool valid = true;
++    for (size_t i = 0; i < SeqLength(pending->variables); i++)
++    {
++        const CMDBPendingVariable *var = SeqAt(pending->variables, i);
++        /* The value of an empty list is NULL, so go by the type */
++        DataType type = CF_DATA_TYPE_NONE;
++        EvalContextVariableGet(ctx, var->ref, &type);
++        if (type != CF_DATA_TYPE_NONE)
++        {
++            char *address = VarRefToString(var->ref, true);
++            Log(LOG_LEVEL_ERR,
++                "Invalid variable specification in CMDB data: '%s' names the"
++                " variable '%s' that exists already", var->key, address);
++            free(address);
++            valid = false;
++        }
++    }
++    return valid;
++}
++
++/**
++ * Take back what InstallCMDBPending() installed so far: the first
++ * variables_installed variables and every class marked installed. A class
++ * that was already there was not installed by this load and is left alone.
++ *
++ * Removing is restoring only because nothing it removes was there before:
++ * LoadCMDBData() refuses a variable that exists already, and
++ * InstallCMDBPending() does not touch a class that does (by its canonical
++ * identity, so an alias of one is left alone too).
++ */
++static void RollbackCMDBPending(EvalContext *ctx, CMDBPending *pending,
++                                size_t variables_installed)
++{
++    for (size_t i = 0; i < variables_installed; i++)
++    {
++        const CMDBPendingVariable *var = SeqAt(pending->variables, i);
++        EvalContextVariableRemove(ctx, var->ref);
++    }
++
++    for (size_t i = 0; i < SeqLength(pending->classes); i++)
++    {
++        const CMDBPendingClass *cls = SeqAt(pending->classes, i);
++        if (!cls->installed)
++        {
++            continue;
++        }
++
++        char *ns;
++        char *name;
++        CMDBClassIdentity(cls->key, &ns, &name);
++        EvalContextClassRemove(ctx, ns, name);
++        free(ns);
++        free(name);
++    }
++}
++
++/**
++ * Install what PrepareCMDB*() accepted. Everything that can make an
++ * installation fail has been checked by then, except for one case: a class
++ * that already exists is not an error and is left as it is.
++ *
++ * All or nothing in its own right, should the validation have a gap: at the
++ * first class or variable that cannot be installed, everything this call
++ * installed is removed again and false is returned.
++ *
++ * @return false if a class or variable could not be installed after all
++ *         (details are logged); nothing is left installed then
++ */
++static bool InstallCMDBPending(EvalContext *ctx, CMDBPending *pending)
++{
++    /* Classes first: installing them before the variables lets a failing
++     * variable exercise the rollback of both. */
++    for (size_t i = 0; i < SeqLength(pending->classes); i++)
++    {
++        CMDBPendingClass *cls = SeqAt(pending->classes, i);
++        if (CMDBClassExists(ctx, cls->key))
++        {
++            /* Not an error, and not ours to replace or to take back */
++            Log(LOG_LEVEL_VERBOSE,
++                "Not adding CMDB class '%s', it exists already", cls->key);
++            continue;
++        }
++
++        cls->installed = AddCMDBClass(ctx, cls->key, cls->tags, cls->comment);
++        cls->tags = NULL;       /* consumed or destroyed by AddCMDBClass() */
++        if (!cls->installed)
++        {
++            /* Details should have been logged already. */
++            Log(LOG_LEVEL_ERR,
++                "Failed to add CMDB class '%s', removing what was installed from the file",
++                cls->key);
++            RollbackCMDBPending(ctx, pending, 0);
++            return false;
++        }
++    }
++
++    for (size_t i = 0; i < SeqLength(pending->variables); i++)
++    {
++        CMDBPendingVariable *var = SeqAt(pending->variables, i);
++        bool ret = AddCMDBVariable(ctx, var->key, var->ref, var->data,
++                                   var->tags, var->comment);
++        var->tags = NULL;       /* consumed or destroyed by AddCMDBVariable() */
++        if (!ret)
++        {
++            /* Details should have been logged already. */
++            Log(LOG_LEVEL_ERR,
++                "Failed to add CMDB variable '%s', removing what was installed from the file",
++                var->key);
++            RollbackCMDBPending(ctx, pending, i);
++            return false;
+         }
+     }
+     return true;
+ }
+ 
++/**
++ * Load host_specific.json into the EvalContext, all or nothing.
++ *
++ * If the file is there but anything in it is unusable (unreadable, not
++ * valid JSON, a repeated member in any object, anything but whitespace after
++ * the document, not an object, a section of the wrong type, or any single
++ * entry of 'vars', 'variables' or 'classes' that cannot be validated or
++ * installed), nothing at all is installed from it, every problem found is
++ * logged, and false is returned. A policy that guards an action by data it
++ * reads from this file (an interlock that blocks a service, say) must not
++ * see the file half-loaded: the guard's entry could be exactly the one
++ * dropped, and the action would then run unguarded.
++ *
++ * An absent file is not an error. A top-level key other than 'vars',
++ * 'variables' and 'classes' makes the file invalid, as does a section whose
++ * value is not a JSON object (JSON null included), and two entries that
++ * name the same variable (one would silently replace the other), or a
++ * variable that exists already. A class that exists already is left as it is.
++ */
+ bool LoadCMDBData(EvalContext *ctx)
+ {
+     char file_path[PATH_MAX] = {0};
+@@ -617,10 +1182,13 @@ bool LoadCMDBData(EvalContext *ctx)
+         return false;
+     }
+ 
+-    JsonElement *data = ReadJsonFile(file_path, LOG_LEVEL_ERR, HOST_SPECIFIC_DATA_MAX_SIZE);
++    /* Strict: a repeated member would have replaced the earlier one, and
++     * trailing input would have been ignored, before any validation saw it. */
++    JsonElement *data = ReadJsonFileMode(file_path, LOG_LEVEL_ERR,
++                                         HOST_SPECIFIC_DATA_MAX_SIZE, true);
+     if (data == NULL)
+     {
+-        /* Details are logged by ReadJsonFile() */
++        /* Details are logged by ReadJsonFileMode() */
+         return false;
+     }
+     if (JsonGetType(data) != JSON_TYPE_OBJECT)
+@@ -630,39 +1198,73 @@ bool LoadCMDBData(EvalContext *ctx)
+         return false;
+     }
+ 
+-    Log(LOG_LEVEL_VERBOSE, "Loaded CMDB data file '%s', installing contents", file_path);
++    Log(LOG_LEVEL_VERBOSE, "Loaded CMDB data file '%s', validating contents", file_path);
+ 
++    bool unknown_key_found = false;
+     JsonIterator iter = JsonIteratorInit(data);
+     while (JsonIteratorHasMore(&iter))
+     {
+         const char *key = JsonIteratorNextKey(&iter);
+-        /* Only vars and classes allowed in CMDB data */
++        /* Only vars, variables and classes allowed in CMDB data. A section
++         * this loader does not know is data it cannot install, which may be
++         * the very data a policy relies on (a misspelled 'variables' would
++         * drop an interlock and keep its services), so the file is refused. */
+         if (!IsStrIn(key, (const char*[4]){"vars", "classes", "variables", NULL}))
+         {
+-            Log(LOG_LEVEL_WARNING, "Invalid key '%s' in the CMDB data file '%s', skipping it",
++            Log(LOG_LEVEL_ERR, "Invalid key '%s' in the CMDB data file '%s'"
++                " (only 'vars', 'variables' and 'classes' are allowed)",
+                 key, file_path);
++            unknown_key_found = true;
+         }
+     }
+ 
+-    bool success = true;
++    /* Step 1: validate everything, install nothing. Every section is
++     * looked at even after a failure, so the log names every bad entry.
++     * A section is there if its key is, whatever it holds: a JSON null is
++     * not "absent" and PrepareCMDB*() refuse it as not being an object. */
++    CMDBPending pending = CMDBPendingNew();
++    bool valid = unknown_key_found ? false : true;
+     JsonElement *vars = JsonObjectGet(data, "vars");
+-    if (JSON_NOT_NULL(vars) && !ReadCMDBVars(ctx, vars, file_path))
++    if (vars != NULL && !PrepareCMDBVars(vars, file_path, &pending))
+     {
+-        success = false;
++        valid = false;
+     }
+     /* Uses the new format allowing metadata (CFE-3633) */
+     JsonElement *variables = JsonObjectGet(data, "variables");
+-    if (JSON_NOT_NULL(variables) &&
+-        !ReadCMDBVariables(ctx, variables, file_path))
++    if (variables != NULL &&
++        !PrepareCMDBVariables(variables, file_path, &pending))
+     {
+-        success = false;
++        valid = false;
+     }
+     JsonElement *classes = JsonObjectGet(data, "classes");
+-    if (JSON_NOT_NULL(classes) && !ReadCMDBClasses(ctx, classes, file_path))
++    if (classes != NULL && !PrepareCMDBClasses(classes, file_path, &pending))
++    {
++        valid = false;
++    }
++    if (!CMDBPendingCheckNoDuplicates(&pending))
+     {
+-        success = false;
++        valid = false;
++    }
++    if (!CMDBPendingCheckNoExistingVariables(ctx, &pending))
++    {
++        valid = false;
++    }
++
++    /* Step 2: install, but only if the whole file is good. */
++    bool success = false;
++    if (valid)
++    {
++        Log(LOG_LEVEL_VERBOSE, "Installing contents of CMDB data file '%s'", file_path);
++        success = InstallCMDBPending(ctx, &pending);
++    }
++    else
++    {
++        Log(LOG_LEVEL_ERR,
++            "CMDB data file '%s' has invalid entries (see above), installing none of its contents",
++            file_path);
+     }
+ 
++    CMDBPendingDestroy(&pending);
+     JsonDestroy(data);
+     return success;
+ }
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/07-invalid-data.cf b/tests/acceptance/00_basics/06_host_specific_data/07-invalid-data.cf
+index c7ef877b7..f0b55ed48 100644
+--- a/tests/acceptance/00_basics/06_host_specific_data/07-invalid-data.cf
++++ b/tests/acceptance/00_basics/06_host_specific_data/07-invalid-data.cf
+@@ -1,4 +1,6 @@
+-# basic test of the host_specific.json functionality: 'classes' object with a tag and a comment
++# test of the host_specific.json functionality: an unknown top-level key is an
++# error and the whole file is rejected, so the valid 'classes' next to it is not
++# installed either
+ body common control
+ {
+   inputs => { "../../default.sub.cf" };
+@@ -38,8 +40,10 @@ bundle agent check
+   methods:
+     ""
+       usebundle => dcs_passif_output(
+-        "\s*warning: Invalid key 'clses'.*\s+ns1:test_class\s+.*",
+-        "",
++        "\s*error: Invalid key 'clses' in the CMDB data file.*installing none of its contents.*",
++        # the unknown key makes the loader install nothing, so the valid
++        # class next to it is not defined
++        ".*\s+ns1:test_class\s+.*",
+         $(command),
+         $(this.promise_filename)
+       );
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/08-class-expression.cf b/tests/acceptance/00_basics/06_host_specific_data/08-class-expression.cf
+index afe07efbb..837d14dbf 100644
+--- a/tests/acceptance/00_basics/06_host_specific_data/08-class-expression.cf
++++ b/tests/acceptance/00_basics/06_host_specific_data/08-class-expression.cf
+@@ -1,4 +1,5 @@
+-# basic test of the host_specific.json functionality: 'classes' object with a tag and a comment
++# test of the host_specific.json functionality: an invalid 'class_expressions'
++# rule is reported and the whole file is rejected (all or nothing)
+ body common control
+ {
+   inputs => { "../../default.sub.cf" };
+@@ -38,8 +39,10 @@ bundle agent check
+   methods:
+     ""
+       usebundle => dcs_passif_output(
+-        "\s*error: Invalid class expression rules for class 'ns1:test_class1'.*\s+ns2:test_class2\s+.*",
+-        "",
++        "\s*error: Invalid class expression rules for class 'ns1:test_class1'.*",
++        # the invalid entry makes the loader install nothing, so the valid
++        # class next to it is not defined either
++        ".*\s+ns2:test_class2\s+.*",
+         $(command),
+         $(this.promise_filename)
+       );
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/09-class-reg-expression.cf b/tests/acceptance/00_basics/06_host_specific_data/09-class-reg-expression.cf
+index 8d056ca50..ebf7d7bfa 100644
+--- a/tests/acceptance/00_basics/06_host_specific_data/09-class-reg-expression.cf
++++ b/tests/acceptance/00_basics/06_host_specific_data/09-class-reg-expression.cf
+@@ -1,4 +1,5 @@
+-# basic test of the host_specific.json functionality: 'classes' object with a tag and a comment
++# test of the host_specific.json functionality: an invalid 'regular_expressions'
++# rule is reported and the whole file is rejected (all or nothing)
+ body common control
+ {
+   inputs => { "../../default.sub.cf" };
+@@ -38,8 +39,10 @@ bundle agent check
+   methods:
+     ""
+       usebundle => dcs_passif_output(
+-        "\s*error: Invalid regular expression rules for class 'ns1:test_class1'.*\s+ns2:test_class2\s+.*",
+-        "",
++        "\s*error: Invalid regular expression rules for class 'ns1:test_class1'.*",
++        # the invalid entry makes the loader install nothing, so the valid
++        # class next to it is not defined either
++        ".*\s+ns2:test_class2\s+.*",
+         $(command),
+         $(this.promise_filename)
+       );
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf b/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf
+new file mode 100644
+index 000000000..6e92059e7
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf
+@@ -0,0 +1,60 @@
++# test of the host_specific.json functionality: JSON null values are rejected
++# (used to crash), every one is reported, and since one invalid entry makes
++# the loader install nothing, the good entries are not installed either
++body common control
++{
++  inputs => { "../../default.sub.cf" };
++  bundlesequence => { default("$(this.promise_filename)") };
++  version => "1.0";
++}
++
++#######################################################
++bundle agent init
++{
++  files:
++    "$(sys.workdir)$(const.dirsep)data$(const.dirsep)."
++      create => "true",
++      perms => mog(
++        "0700", "$(sys.user_data[username])", "$(sys.user_data[username])"
++      );
++
++  methods:
++    "prepare_host_specific_data"
++      usebundle => file_copy(
++        "$(this.promise_filename).json",
++        "$(sys.workdir)$(const.dirsep)data$(const.dirsep)host_specific.json"
++      ),
++      handle => "prepare_host_specific_data";
++
++    "empty_promises_cf"
++      usebundle => file_make("$(sys.inputdir)/promises.cf", '');
++}
++
++#######################################################
++bundle agent check
++{
++  vars:
++    "command"
++      string => "$(sys.cf_promises) --show-vars -f $(sys.inputdir)/promises.cf | $(G.grep) -E 'CMDB data|value_from_'";
++
++    # The offending entries are reported in the order they appear in the CMDB
++    # data, 'vars' first, then 'variables', and the file is rejected as a
++    # whole.
++    "expected"
++      string => concat(
++        "\s*error: Invalid value in 'null_scalar'.*null is not a supported value.*",
++        "\s+error: Invalid value in 'null_list'.*a list must not contain null.*",
++        "\s+error: Invalid value in 'null_value'.*null is not a supported value.*",
++        "\s+error: Invalid value in 'null_bare'.*null is not a supported value.*",
++        "\s+error: Invalid value in 'null_value_list'.*a list must not contain null.*",
++        "\s+error: CMDB data file '.*host_specific\.json' has invalid entries.*installing none of its contents.*"
++      );
++
++  methods:
++    # value_from_vars and value_from_variables are the good entries' values:
++    # none of them may be installed.
++    ""
++      usebundle => dcs_passif_output(
++        $(expected), ".*value_from_.*", $(command), $(this.promise_filename)
++      );
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf.json b/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf.json
+new file mode 100644
+index 000000000..f8632e347
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/13-null-values.cf.json
+@@ -0,0 +1,13 @@
++{
++  "vars": {
++    "null_scalar": null,
++    "null_list": ["a", null],
++    "good_vars": "value_from_vars"
++  },
++  "variables": {
++    "null_value": { "value": null },
++    "null_bare": null,
++    "null_value_list": { "value": ["a", null] },
++    "good_variables": { "value": "value_from_variables" }
++  }
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf b/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf
+new file mode 100644
+index 000000000..f1e88bd45
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf
+@@ -0,0 +1,52 @@
++# test of the host_specific.json functionality: keys with more dots than the
++# "[namespace:]bundle.variable" form allows are warned about, plain scope
++# qualification is not
++body common control
++{
++  inputs => { "../../default.sub.cf" };
++  bundlesequence => { default("$(this.promise_filename)") };
++  version => "1.0";
++}
++
++#######################################################
++bundle agent init
++{
++  files:
++    "$(sys.workdir)$(const.dirsep)data$(const.dirsep)."
++      create => "true",
++      perms => mog(
++        "0700", "$(sys.user_data[username])", "$(sys.user_data[username])"
++      );
++
++  methods:
++    "prepare_host_specific_data"
++      usebundle => file_copy(
++        "$(this.promise_filename).json",
++        "$(sys.workdir)$(const.dirsep)data$(const.dirsep)host_specific.json"
++      ),
++      handle => "prepare_host_specific_data";
++
++    "empty_promises_cf"
++      usebundle => file_make("$(sys.inputdir)/promises.cf", '');
++}
++
++#######################################################
++bundle agent check
++{
++  vars:
++    "command"
++      string => "$(sys.cf_promises) --show-vars -f $(sys.inputdir)/promises.cf";
++
++  methods:
++    ""
++      usebundle => dcs_passif_output(
++        # both dotted keys are warned about, and both variables are still
++        # installed at the address the dots ask for
++        ".*warning: The '.' in the CMDB key 'com\.dotted\.key' was taken as a scope separator: the variable is named 'dotted\.key' in the 'com' scope, addressed as 'data:com\.dotted\.key'.*warning: The '.' in the CMDB key 'vcom\.vdotted\.vkey' was taken as a scope separator.*data:com\.dotted\.key\s+dotted_value\s.*data:myscope\.myvar\s+scoped_value\s.*data:vcom\.vdotted\.vkey\s+dotted_value2\s.*",
++        # a plain "bundle.variable" key is a supported way to pick a scope,
++        # it must not be warned about
++        ".*warning:[^\n]*'myscope\.myvar'.*",
++        $(command),
++        $(this.promise_filename)
++      );
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf.json b/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf.json
+new file mode 100644
+index 000000000..b61b5e31d
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/14-dotted-keys.cf.json
+@@ -0,0 +1,4 @@
++{
++  "vars": { "com.dotted.key": "dotted_value", "myscope.myvar": "scoped_value" },
++  "variables": { "vcom.vdotted.vkey": { "value": "dotted_value2" } }
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/15-variable-references-metadata-format.cf.json b/tests/acceptance/00_basics/06_host_specific_data/15-variable-references-metadata-format.cf.json
+index 1c3f1a47a..a3fe6a85b 100644
+--- a/tests/acceptance/00_basics/06_host_specific_data/15-variable-references-metadata-format.cf.json
++++ b/tests/acceptance/00_basics/06_host_specific_data/15-variable-references-metadata-format.cf.json
+@@ -1,8 +1,6 @@
+ {
+   "variables": {
+-    "good_key": {
+-      "value": "a literal value"
+-    },
++    "good_key": { "value": "a literal value" },
+     "key_with_unresolved_value": {
+       "value": "$(sys.workdir)",
+       "comment": "the offending entry must be named by this key, not by 'value'",
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf b/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf
+new file mode 100644
+index 000000000..46b16d910
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf
+@@ -0,0 +1,87 @@
++# test that one entry with an unresolved variable reference makes the CMDB
++# loader install nothing from host_specific.json: the file is all or nothing,
++# so no entry can be left behind without the entry that was meant to guard it
++body common control
++{
++  inputs => { "../../default.sub.cf" };
++  bundlesequence => { default("$(this.promise_filename)") };
++  version => "1.0";
++}
++
++#######################################################
++bundle agent init
++{
++  files:
++    "$(sys.workdir)$(const.dirsep)data$(const.dirsep)."
++      create => "true",
++      perms => mog(
++        "0700", "$(sys.user_data[username])", "$(sys.user_data[username])"
++      );
++
++  methods:
++    "prepare_host_specific_data"
++      usebundle => file_copy(
++        "$(this.promise_filename).json",
++        "$(sys.workdir)$(const.dirsep)data$(const.dirsep)host_specific.json"
++      ),
++      handle => "prepare_host_specific_data";
++
++    "empty_promises_cf"
++      usebundle => file_make("$(sys.inputdir)/promises.cf", '');
++}
++
++#######################################################
++bundle agent check
++{
++  vars:
++    "error_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-classes -f $(sys.inputdir)/promises.cf",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++    "vars_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-vars -f $(sys.inputdir)/promises.cf | $(G.grep) good_key",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++  classes:
++    # The offending entry is rejected and named.
++    "offender_named"
++      expression => regcmp(
++        ".*error: Invalid 'vars' CMDB data in '.*host_specific\.json', cannot contain variable references \(offending value in entry 'key_with_unresolved_value': .*",
++        "$(error_output)"
++      );
++
++    # The loader says that it installed none of the file.
++    "nothing_installed_reported"
++      expression => regcmp(
++        ".*error: CMDB data file '.*host_specific\.json' has invalid entries \(see above\), installing none of its contents.*",
++        "$(error_output)"
++      );
++
++    # Its sibling entry in the same section is NOT installed: a single bad
++    # entry takes the whole file down, so that policy never runs with only
++    # part of the data it was written against.
++    "good_entry_absent"
++      not => regcmp(
++        ".*good_key.*",
++        "$(vars_output)"
++      );
++
++    "ok" and => { "offender_named", "nothing_installed_reported", "good_entry_absent" };
++
++  reports:
++    ok::
++      "$(this.promise_filename) Pass";
++
++    !ok::
++      "$(this.promise_filename) FAIL";
++
++    !ok.DEBUG::
++      "error_output was: '$(error_output)'";
++      "vars_output was: '$(vars_output)'";
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf.json b/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf.json
+new file mode 100644
+index 000000000..5f225ddcc
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/16-variable-references-bad-entry-installs-nothing.cf.json
+@@ -0,0 +1,6 @@
++{
++  "vars": {
++    "good_key": "a literal value",
++    "key_with_unresolved_value": "$(sys.workdir)"
++  }
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf b/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf
+new file mode 100644
+index 000000000..824c7b05f
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf
+@@ -0,0 +1,93 @@
++# test that a repeated object member makes the CMDB loader install nothing from
++# host_specific.json: the parser used to keep only the last of the two, so the
++# file looked valid and the discarded entry was never checked
++body common control
++{
++  inputs => { "../../default.sub.cf" };
++  bundlesequence => { default("$(this.promise_filename)") };
++  version => "1.0";
++}
++
++#######################################################
++bundle agent init
++{
++  files:
++    "$(sys.workdir)$(const.dirsep)data$(const.dirsep)."
++      create => "true",
++      perms => mog(
++        "0700", "$(sys.user_data[username])", "$(sys.user_data[username])"
++      );
++
++  methods:
++    "prepare_host_specific_data"
++      usebundle => file_copy(
++        "$(this.promise_filename).json",
++        "$(sys.workdir)$(const.dirsep)data$(const.dirsep)host_specific.json"
++      ),
++      handle => "prepare_host_specific_data";
++
++    "empty_promises_cf"
++      usebundle => file_make("$(sys.inputdir)/promises.cf", '');
++}
++
++#######################################################
++bundle agent check
++{
++  vars:
++    "error_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-classes -f $(sys.inputdir)/promises.cf",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++    "vars_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-vars -f $(sys.inputdir)/promises.cf | $(G.grep) good_key",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++    "classes_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-classes -f $(sys.inputdir)/promises.cf | $(G.grep) cmdb_good_class",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++  classes:
++    # The file is refused by the parser, and the loader says so.
++    "refusal_reported"
++      expression => regcmp(
++        ".*error: Could not parse JSON file .*host_specific\.json: Unwilling to parse json data with a duplicate object member.*",
++        "$(error_output)"
++      );
++
++    # Nothing is installed from it: neither the variable nor the class next
++    # to the offending text.
++    "good_entry_absent"
++      not => regcmp(
++        ".*good_key.*",
++        "$(vars_output)"
++      );
++
++    "good_class_absent"
++      not => regcmp(
++        ".*cmdb_good_class.*",
++        "$(classes_output)"
++      );
++
++    "ok" and => { "refusal_reported", "good_entry_absent", "good_class_absent" };
++
++  reports:
++    ok::
++      "$(this.promise_filename) Pass";
++
++    !ok::
++      "$(this.promise_filename) FAIL";
++
++    !ok.DEBUG::
++      "error_output was: '$(error_output)'";
++      "vars_output was: '$(vars_output)'";
++      "classes_output was: '$(classes_output)'";
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf.json b/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf.json
+new file mode 100644
+index 000000000..93c902882
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/17-duplicate-member-installs-nothing.cf.json
+@@ -0,0 +1,10 @@
++{
++  "vars": {
++    "good_key": "a literal value",
++    "repeated_key": "first",
++    "repeated_key": "second"
++  },
++  "classes": {
++    "ns1:cmdb_good_class": "any::"
++  }
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf b/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf
+new file mode 100644
+index 000000000..4f1c2d670
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf
+@@ -0,0 +1,93 @@
++# test that input after the document makes the CMDB loader install nothing from
++# host_specific.json: the parser used to stop after the first complete object
++# and never look at what followed
++body common control
++{
++  inputs => { "../../default.sub.cf" };
++  bundlesequence => { default("$(this.promise_filename)") };
++  version => "1.0";
++}
++
++#######################################################
++bundle agent init
++{
++  files:
++    "$(sys.workdir)$(const.dirsep)data$(const.dirsep)."
++      create => "true",
++      perms => mog(
++        "0700", "$(sys.user_data[username])", "$(sys.user_data[username])"
++      );
++
++  methods:
++    "prepare_host_specific_data"
++      usebundle => file_copy(
++        "$(this.promise_filename).json",
++        "$(sys.workdir)$(const.dirsep)data$(const.dirsep)host_specific.json"
++      ),
++      handle => "prepare_host_specific_data";
++
++    "empty_promises_cf"
++      usebundle => file_make("$(sys.inputdir)/promises.cf", '');
++}
++
++#######################################################
++bundle agent check
++{
++  vars:
++    "error_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-classes -f $(sys.inputdir)/promises.cf",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++    "vars_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-vars -f $(sys.inputdir)/promises.cf | $(G.grep) good_key",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++    "classes_output"
++      string => execresult(
++        "$(sys.cf_promises) --show-classes -f $(sys.inputdir)/promises.cf | $(G.grep) cmdb_good_class",
++        "useshell"
++      ),
++      depends_on => { "prepare_host_specific_data" };
++
++  classes:
++    # The file is refused by the parser, and the loader says so.
++    "refusal_reported"
++      expression => regcmp(
++        ".*error: Could not parse JSON file .*host_specific\.json: Unwilling to parse json data with trailing non-whitespace characters.*",
++        "$(error_output)"
++      );
++
++    # Nothing is installed from it: neither the variable nor the class next
++    # to the offending text.
++    "good_entry_absent"
++      not => regcmp(
++        ".*good_key.*",
++        "$(vars_output)"
++      );
++
++    "good_class_absent"
++      not => regcmp(
++        ".*cmdb_good_class.*",
++        "$(classes_output)"
++      );
++
++    "ok" and => { "refusal_reported", "good_entry_absent", "good_class_absent" };
++
++  reports:
++    ok::
++      "$(this.promise_filename) Pass";
++
++    !ok::
++      "$(this.promise_filename) FAIL";
++
++    !ok.DEBUG::
++      "error_output was: '$(error_output)'";
++      "vars_output was: '$(vars_output)'";
++      "classes_output was: '$(classes_output)'";
++}
+diff --git a/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf.json b/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf.json
+new file mode 100644
+index 000000000..550169977
+--- /dev/null
++++ b/tests/acceptance/00_basics/06_host_specific_data/18-trailing-input-installs-nothing.cf.json
+@@ -0,0 +1,9 @@
++{
++  "vars": {
++    "good_key": "a literal value"
++  },
++  "classes": {
++    "ns1:cmdb_good_class": "any::"
++  }
++}
++{ "vars": { "other_key": "never looked at" } }
+diff --git a/tests/unit/Makefile.am b/tests/unit/Makefile.am
+index 024e25f78..784872a19 100644
+--- a/tests/unit/Makefile.am
++++ b/tests/unit/Makefile.am
+@@ -99,6 +99,7 @@ check_PROGRAMS = \
+ 	set_domainname_test \
+ 	evalfunction_test \
+ 	eval_context_test \
++	cmdb_test \
+ 	regex_test \
+ 	lastseen_test \
+ 	lastseen_migration_test \
+diff --git a/tests/unit/cmdb_test.c b/tests/unit/cmdb_test.c
+new file mode 100644
+index 000000000..2b9984f44
+--- /dev/null
++++ b/tests/unit/cmdb_test.c
+@@ -0,0 +1,779 @@
++#include <test.h>
++
++/* Includes cmdb.c itself, with its test hook (not in the production library) */
++#define TEST_UNIT_TEST
++#include <cmdb.c>
++
++#include <eval_context.h>
++#include <class.h>                                         /* Class */
++#include <set.h>                                           /* StringSetContains */
++#include <string_lib.h>                                    /* StringEqual */
++#include <var_expressions.h>                               /* VarRefParse */
++#include <known_dirs.h>
++#include <misc_lib.h>                                          /* xsnprintf */
++
++/* LoadCMDBData() is all-or-nothing: if any entry of host_specific.json cannot
++ * be validated or installed, none of the file is installed. */
++
++char CFWORKDIR[CF_BUFSIZE];
++
++void tests_setup(void)
++{
++    static char env[] = /* Needs to be static for putenv() */
++        "CFENGINE_TEST_OVERRIDE_WORKDIR=/tmp/CFENGINE_cmdb_test.XXXXXX";
++    char *workdir = strchr(env, '=');
++    assert(workdir && workdir[1] == '/');
++    workdir++;
++
++    mkdtemp(workdir);
++    strlcpy(CFWORKDIR, workdir, CF_BUFSIZE);
++    putenv(env);
++
++    mkdir(GetDataDir(), 0700);
++}
++
++void tests_teardown(void)
++{
++    char cmd[CF_BUFSIZE];
++    xsnprintf(cmd, CF_BUFSIZE, "rm -rf '%s'", CFWORKDIR);
++    system(cmd);
++}
++
++static void CMDBFilePath(char *path, size_t size)
++{
++    xsnprintf(path, size, "%s/host_specific.json", GetDataDir());
++}
++
++static void WriteCMDBFile(const char *json)
++{
++    char path[CF_BUFSIZE];
++    CMDBFilePath(path, sizeof(path));
++
++    FILE *f = fopen(path, "w");
++    assert_true(f != NULL);
++    assert_true(fputs(json, f) >= 0);
++    assert_int_equal(fclose(f), 0);
++}
++
++static void RemoveCMDBFile(void)
++{
++    char path[CF_BUFSIZE];
++    CMDBFilePath(path, sizeof(path));
++    unlink(path);
++}
++
++/* The variable's scalar value, or NULL if it is not installed. */
++static const char *InstalledScalar(const EvalContext *ctx, const char *ref_str)
++{
++    VarRef *ref = VarRefParse(ref_str);
++    DataType type;
++    const void *value = EvalContextVariableGet(ctx, ref, &type);
++    VarRefDestroy(ref);
++    if (value == NULL)
++    {
++        return NULL;
++    }
++    assert_int_equal(type, CF_DATA_TYPE_STRING);
++    return value;
++}
++
++static bool VariableIsInstalled(const EvalContext *ctx, const char *ref_str)
++{
++    VarRef *ref = VarRefParse(ref_str);
++    DataType type;
++    const bool found =
++        (EvalContextVariableGet(ctx, ref, &type) != NULL);
++    VarRefDestroy(ref);
++    return found;
++}
++
++static bool ClassIsInstalled(const EvalContext *ctx, const char *name)
++{
++    return (EvalContextClassGet(ctx, "data", name) != NULL);
++}
++
++static void test_missing_file_is_not_an_error(void)
++{
++    RemoveCMDBFile();
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(LoadCMDBData(ctx));
++    EvalContextDestroy(ctx);
++}
++
++static void test_all_good_file_installs_everything(void)
++{
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": {\n"
++        "    \"good_var\": \"from_vars\",\n"
++        "    \"good_list\": [\"a\", \"b\"],\n"
++        "    \"good_data\": { \"k\": \"v\" }\n"
++        "  },\n"
++        "  \"variables\": {\n"
++        "    \"good_variable\": { \"value\": \"from_variables\",\n"
++        "                         \"tags\": [\"t1\"], \"comment\": \"c\" },\n"
++        "    \"good_bare\": \"bare\"\n"
++        "  },\n"
++        "  \"classes\": {\n"
++        "    \"good_class\": \"any::\",\n"
++        "    \"ns1:good_ns_class\": { \"class_expressions\": [] }\n"
++        "  }\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(LoadCMDBData(ctx));
++
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_var"),
++                        "from_vars");
++    assert_true(VariableIsInstalled(ctx, "data:variables.good_list"));
++    assert_true(VariableIsInstalled(ctx, "data:variables.good_data"));
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_variable"),
++                        "from_variables");
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_bare"),
++                        "bare");
++    assert_true(ClassIsInstalled(ctx, "good_class"));
++    assert_true(EvalContextClassGet(ctx, "ns1", "good_ns_class") != NULL);
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_bad_var_entry_installs_nothing(void)
++{
++    /* A JSON null has no value to install; the good entries on both sides of
++     * it, and the ones in the other sections, must not be installed either. */
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": {\n"
++        "    \"first_good_var\": \"x\",\n"
++        "    \"bad_var\": null,\n"
++        "    \"last_good_var\": \"y\"\n"
++        "  },\n"
++        "  \"variables\": { \"good_variable\": { \"value\": \"z\" } },\n"
++        "  \"classes\": { \"good_class\": \"any::\" }\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.first_good_var"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.bad_var"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.last_good_var"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_variable"));
++    assert_false(ClassIsInstalled(ctx, "good_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_bad_variables_entry_installs_nothing(void)
++{
++    /* An entry with an unresolved variable reference, in the 'variables'
++     * section, next to good entries in 'vars' and 'variables'. */
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": {\n"
++        "    \"good_variable\": { \"value\": \"y\" },\n"
++        "    \"unresolved\": { \"value\": \"$(sys.workdir)\" }\n"
++        "  }\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_variable"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.unresolved"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_bad_class_entry_installs_nothing(void)
++{
++    /* Only "any::" is a valid class specification. */
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": {\n"
++        "    \"first_good_class\": \"any::\",\n"
++        "    \"bad_class\": [\"linux::\"],\n"
++        "    \"last_good_class\": [\"any::\"]\n"
++        "  }\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    assert_false(ClassIsInstalled(ctx, "first_good_class"));
++    assert_false(ClassIsInstalled(ctx, "bad_class"));
++    assert_false(ClassIsInstalled(ctx, "last_good_class"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_bad_metadata_installs_nothing(void)
++{
++    /* Malformed tags make the entry invalid, not just tag-less. */
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": {\n"
++        "    \"bad_tags\": { \"value\": \"y\", \"tags\": \"not_an_array\" }\n"
++        "  }\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.bad_tags"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_section_of_wrong_type_installs_nothing(void)
++{
++    WriteCMDBFile(
++        "{\n"
++        "  \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": [ \"any::\" ]\n"
++        "}\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_reload_does_not_keep_earlier_data(void)
++{
++    /* What cf-execd, cf-serverd and cf-reactor do on a policy reload: clear
++     * the context, then load again. A file that has turned bad since must
++     * leave no variables behind, neither old nor new. */
++    WriteCMDBFile("{ \"vars\": { \"good_var\": \"old\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(LoadCMDBData(ctx));
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_var"), "old");
++
++    WriteCMDBFile("{ \"vars\": { \"good_var\": \"new\", \"bad\": null } }\n");
++    EvalContextClear(ctx);
++    assert_false(LoadCMDBData(ctx));
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++/* Load json, expect failure, and expect none of the named variables (full
++ * references) and classes (in the 'data' namespace) to be installed. */
++static void assert_rejected_and_nothing_installed(const char *json,
++                                                  const char *const *variables,
++                                                  const char *const *classes)
++{
++    WriteCMDBFile(json);
++
++    EvalContext *ctx = EvalContextNew();
++    assert_false(LoadCMDBData(ctx));
++
++    for (size_t i = 0; variables != NULL && variables[i] != NULL; i++)
++    {
++        if (VariableIsInstalled(ctx, variables[i]))
++        {
++            print_error("variable '%s' is installed by a rejected file\n",
++                        variables[i]);
++        }
++        assert_false(VariableIsInstalled(ctx, variables[i]));
++    }
++    for (size_t i = 0; classes != NULL && classes[i] != NULL; i++)
++    {
++        if (ClassIsInstalled(ctx, classes[i]))
++        {
++            print_error("class '%s' is installed by a rejected file\n",
++                        classes[i]);
++        }
++        assert_false(ClassIsInstalled(ctx, classes[i]));
++    }
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_unbalanced_index_key_installs_nothing(void)
++{
++    /* VarRefParse() answers 'tendcf_interlock[' with a reference to
++     * 'tendcf_interlock', which would replace the valid interlock container
++     * and leave the service container installed. */
++    const char *const absent[] = {
++        "data:variables.tendcf_interlock",
++        "data:variables.tendcf_service",
++        NULL
++    };
++
++    /* in 'vars' */
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": {\n"
++        "    \"tendcf_interlock\": { \"demo\": { \"bundle\": \"demo\" } },\n"
++        "    \"tendcf_interlock[\": [],\n"
++        "    \"tendcf_service\": { \"svc\": { \"bundle\": \"demo\" } } } }\n",
++        absent, NULL);
++
++    /* in 'variables' */
++    assert_rejected_and_nothing_installed(
++        "{ \"variables\": {\n"
++        "    \"tendcf_interlock\": { \"value\": { \"demo\": { \"bundle\": \"demo\" } } },\n"
++        "    \"tendcf_interlock[\": { \"value\": [] },\n"
++        "    \"tendcf_service\": { \"value\": { \"svc\": { \"bundle\": \"demo\" } } } } }\n",
++        absent, NULL);
++
++    /* the interlock in 'variables', the service in 'vars' */
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": {\n"
++        "    \"tendcf_service\": { \"svc\": { \"bundle\": \"demo\" } } },\n"
++        "  \"variables\": {\n"
++        "    \"tendcf_interlock\": { \"value\": { \"demo\": { \"bundle\": \"demo\" } } },\n"
++        "    \"tendcf_interlock[\": { \"value\": [] } } }\n",
++        absent, NULL);
++
++    /* a stray closing bracket */
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good\": \"x\", \"bad]\": \"y\" } }\n",
++        (const char *const[]) { "data:variables.good", NULL }, NULL);
++}
++
++static void test_balanced_index_key_installs_nothing(void)
++{
++    /* An index would make the entry an element of some other variable. */
++    const char *const absent[] = { "data:variables.good", NULL };
++
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good\": \"x\", \"array[key]\": \"y\" } }\n",
++        absent, NULL);
++    assert_rejected_and_nothing_installed(
++        "{ \"variables\": { \"good\": \"x\", \"array[key]\": { \"value\": \"y\" } } }\n",
++        absent, NULL);
++}
++
++static void test_frame_dependent_scopes_install_nothing(void)
++{
++    /* These scopes name tables that exist only while a bundle, body or
++     * promise is evaluated (or take no namespace); installing into them
++     * during discovery crashes the agent, after earlier entries went in. */
++    const char *const keys[] = {
++        "default:body.bad", "body.bad", "edit.bad", "default:edit.bad",
++        "this.v", "default:this.v", "sys.bad", "default:sys.bad", "const.bad",
++        "mon.bad", "match.bad", NULL
++    };
++    const char *const absent[] = { "data:variables.good", NULL };
++    const char *const absent_class[] = { "good_class", NULL };
++
++    for (size_t i = 0; keys[i] != NULL; i++)
++    {
++        char json[CF_BUFSIZE];
++
++        xsnprintf(json, sizeof(json),
++                  "{ \"vars\": { \"good\": \"x\", \"%s\": \"y\" },"
++                  "  \"classes\": { \"good_class\": \"any::\" } }\n", keys[i]);
++        assert_rejected_and_nothing_installed(json, absent, absent_class);
++
++        xsnprintf(json, sizeof(json),
++                  "{ \"variables\": { \"good\": \"x\", \"%s\": { \"value\": \"y\" } },"
++                  "  \"classes\": { \"good_class\": \"any::\" } }\n", keys[i]);
++        assert_rejected_and_nothing_installed(json, absent, absent_class);
++    }
++}
++
++static void test_def_scope_is_installed(void)
++{
++    /* 'def' is no more special than a bundle name (CFE-3668) and works. */
++    WriteCMDBFile("{ \"vars\": { \"def.mine\": \"x\", \"mybundle.mine\": \"y\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(LoadCMDBData(ctx));
++    assert_string_equal(InstalledScalar(ctx, "data:def.mine"), "x");
++    assert_string_equal(InstalledScalar(ctx, "data:mybundle.mine"), "y");
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_null_section_installs_nothing(void)
++{
++    /* A section that is present as JSON null is not an absent section. */
++    const char *const absent[] = {
++        "data:variables.good_var", "data:variables.good_variable", NULL
++    };
++    const char *const absent_class[] = { "good_class", NULL };
++
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": null,\n"
++        "  \"variables\": { \"good_variable\": { \"value\": \"y\" } },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        absent, absent_class);
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": null,\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        absent, absent_class);
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": { \"good_variable\": { \"value\": \"y\" } },\n"
++        "  \"classes\": null }\n",
++        absent, absent_class);
++}
++
++static void test_rule_array_of_wrong_type_installs_nothing(void)
++{
++    /* The sole element must be a string; an object or array there used to
++     * reach an assertion that aborts the agent. */
++    const char *const absent[] = { "data:variables.good_var", NULL };
++    const char *const absent_class[] = { "good_class", "bad_class", NULL };
++    const char *const specs[] = {
++        "{ \"class_expressions\": [ {} ] }",
++        "{ \"class_expressions\": [ [] ] }",
++        "{ \"class_expressions\": [ 1 ] }",
++        "{ \"class_expressions\": [ null ] }",
++        "{ \"regular_expressions\": [ {} ] }",
++        "{ \"regular_expressions\": [ [] ] }",
++        "{ \"regular_expressions\": [ true ] }",
++        NULL
++    };
++
++    for (size_t i = 0; specs[i] != NULL; i++)
++    {
++        char json[CF_BUFSIZE];
++        xsnprintf(json, sizeof(json),
++                  "{ \"vars\": { \"good_var\": \"x\" },\n"
++                  "  \"classes\": { \"good_class\": \"any::\", \"bad_class\": %s } }\n",
++                  specs[i]);
++        assert_rejected_and_nothing_installed(json, absent, absent_class);
++    }
++}
++
++static void test_unknown_top_level_key_installs_nothing(void)
++{
++    /* A misspelled section would otherwise drop its data and keep the rest. */
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"varables\": { \"tendcf_interlock\": { \"value\": \"y\" } },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        (const char *const[]) { "data:variables.good_var", NULL },
++        (const char *const[]) { "good_class", NULL });
++}
++
++static void test_duplicate_variable_installs_nothing(void)
++{
++    /* One spelling replacing another could swap out a valid entry. */
++    const char *const absent[] = { "data:variables.dup", "data:variables.good", NULL };
++
++    assert_rejected_and_nothing_installed(
++        "{ \"vars\": { \"good\": \"x\", \"dup\": \"first\" },\n"
++        "  \"variables\": { \"data:variables.dup\": { \"value\": \"second\" } } }\n",
++        absent, NULL);
++}
++
++static bool FailInsertionOfFailMe(const char *key)
++{
++    return StringEqual(key, "fail_me");
++}
++
++static void test_failed_insertion_rolls_back_everything(void)
++{
++    /* Validation accepts the file, then one variable cannot be inserted
++     * after the others went in (forced through the test seam, as no real
++     * input gets there). Whatever this load installed must be taken back,
++     * and a class that was there before it must be left alone. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"first\": \"1\", \"fail_me\": \"2\", \"last\": \"3\" },\n"
++        "  \"variables\": { \"in_variables\": { \"value\": \"4\" } },\n"
++        "  \"classes\": { \"new_class\": \"any::\", \"ns1:new_ns_class\": \"any::\","
++        "                 \"pre_class\": \"any::\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_class",
++                                          CONTEXT_SCOPE_NAMESPACE, ""));
++
++    CMDBTestFailInsertion = FailInsertionOfFailMe;
++    const bool loaded = LoadCMDBData(ctx);
++    CMDBTestFailInsertion = NULL;
++    assert_false(loaded);
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.first"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.fail_me"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.last"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.in_variables"));
++    assert_false(ClassIsInstalled(ctx, "new_class"));
++    assert_true(EvalContextClassGet(ctx, "ns1", "new_ns_class") == NULL);
++    assert_true(ClassIsInstalled(ctx, "pre_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++/* Is there a class of that name in the 'data' namespace, put there by
++ * something else than the CMDB (it has pre_tag, not the CMDB's tag)? */
++static bool ClassIsUntouched(const EvalContext *ctx, const char *name)
++{
++    const Class *cls = EvalContextClassGet(ctx, "data", name);
++    return (cls != NULL &&
++            StringSetContains(cls->tags, "pre_tag") &&
++            !StringSetContains(cls->tags, CMDB_SOURCE_TAG));
++}
++
++static void test_whitespace_class_name_installs_nothing(void)
++{
++    /* EvalContextClassPutTagsSet() refuses a default-namespace class whose
++     * name is only whitespace, and files "x " as "x_". The good variable and
++     * class beside it must not be installed either. */
++    const char *const names[] = {
++        " ", "\\t", "default: ", "ns1: ", "trailing ", " leading", "tab\\t",
++        NULL
++    };
++    const char *const absent[] = { "data:variables.good_var", NULL };
++    const char *const absent_class[] = {
++        "good_class", "trailing_", "_leading", "tab_", NULL
++    };
++
++    for (size_t i = 0; names[i] != NULL; i++)
++    {
++        char json[CF_BUFSIZE];
++        xsnprintf(json, sizeof(json),
++                  "{ \"vars\": { \"good_var\": \"x\" },\n"
++                  "  \"classes\": { \"good_class\": \"any::\", \"%s\": \"any::\" } }\n",
++                  names[i]);
++        assert_rejected_and_nothing_installed(json, absent, absent_class);
++    }
++}
++
++static void test_existing_class_is_not_an_error(void)
++{
++    /* A class that is there already stays as it is, and the rest of the file
++     * is installed; so does one that differs only in how it is spelled. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"pre_class\": \"any::\", \"pre-aliased\": \"any::\","
++        "                 \"new_class\": \"any::\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_class",
++                                          CONTEXT_SCOPE_NAMESPACE, "pre_tag"));
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_aliased",
++                                          CONTEXT_SCOPE_NAMESPACE, "pre_tag"));
++    assert_true(LoadCMDBData(ctx));
++
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_var"), "x");
++    assert_true(ClassIsInstalled(ctx, "new_class"));
++    assert_false(ClassIsUntouched(ctx, "new_class"));
++    assert_true(ClassIsUntouched(ctx, "pre_class"));
++    assert_true(ClassIsUntouched(ctx, "pre_aliased"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_existing_variable_is_refused_and_left_alone(void)
++{
++    /* Installing it would replace it, and a rollback could only remove it:
++     * the file is refused as a whole and the variable keeps its value. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"first\": \"new\", \"other\": \"2\" },\n"
++        "  \"classes\": { \"new_class\": \"any::\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    VarRef *ref = VarRefParse("data:variables.first");
++    assert_true(EvalContextVariablePut(ctx, ref, "old", CF_DATA_TYPE_STRING,
++                                       "pre_tag"));
++    VarRefDestroy(ref);
++
++    assert_false(LoadCMDBData(ctx));
++
++    assert_string_equal(InstalledScalar(ctx, "data:variables.first"), "old");
++    assert_false(VariableIsInstalled(ctx, "data:variables.other"));
++    assert_false(ClassIsInstalled(ctx, "new_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_rollback_removes_non_canonical_and_keeps_aliased(void)
++{
++    /* 'dash-class' is filed as 'dash_class' and rolled back by that name;
++     * 'pre-class' is the existing 'pre_class' by another spelling, so neither
++     * installing nor rolling back touches it. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"first\": \"1\", \"fail_me\": \"2\" },\n"
++        "  \"classes\": { \"dash-class\": \"any::\", \"pre-class\": \"any::\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_class",
++                                          CONTEXT_SCOPE_NAMESPACE, "pre_tag"));
++
++    /* Without the failure the class is there under the canonical name */
++    CMDBTestFailInsertion = NULL;
++    assert_true(LoadCMDBData(ctx));
++    assert_true(ClassIsInstalled(ctx, "dash_class"));
++    assert_true(ClassIsUntouched(ctx, "pre_class"));
++    EvalContextClear(ctx);
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_class",
++                                          CONTEXT_SCOPE_NAMESPACE, "pre_tag"));
++
++    CMDBTestFailInsertion = FailInsertionOfFailMe;
++    const bool loaded = LoadCMDBData(ctx);
++    CMDBTestFailInsertion = NULL;
++    assert_false(loaded);
++
++    assert_false(ClassIsInstalled(ctx, "dash_class"));
++    assert_false(VariableIsInstalled(ctx, "data:variables.first"));
++    assert_true(ClassIsUntouched(ctx, "pre_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static bool FailInsertionOfFailClass(const char *key)
++{
++    return StringEqual(key, "fail_class");
++}
++
++static void test_failed_class_insertion_rolls_back_everything(void)
++{
++    /* A class that cannot be inserted is not "one that exists": the classes
++     * before it are taken back, the ones after it and the variables are not
++     * installed, and a class that was there before is left alone. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"pre_class\": \"any::\", \"new-class\": \"any::\","
++        "                 \"ns1:new_ns_class\": \"any::\","
++        "                 \"fail_class\": \"any::\", \"late_class\": \"any::\" } }\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(EvalContextClassPutSoftNS(ctx, "data", "pre_class",
++                                          CONTEXT_SCOPE_NAMESPACE, "pre_tag"));
++
++    CMDBTestFailInsertion = FailInsertionOfFailClass;
++    const bool loaded = LoadCMDBData(ctx);
++    CMDBTestFailInsertion = NULL;
++    assert_false(loaded);
++
++    assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++    assert_false(ClassIsInstalled(ctx, "new_class"));
++    assert_true(EvalContextClassGet(ctx, "ns1", "new_ns_class") == NULL);
++    assert_false(ClassIsInstalled(ctx, "fail_class"));
++    assert_false(ClassIsInstalled(ctx, "late_class"));
++    assert_true(ClassIsUntouched(ctx, "pre_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++static void test_repeated_member_or_trailing_input_installs_nothing(void)
++{
++    /* What the lenient parser repaired or ignored before validation saw it:
++     * a repeated member replaced the earlier one (an invalid earlier value
++     * vanished, or a whole section did), and anything after the document was
++     * not looked at. Each file has a good variable and class next to it. */
++    const char *const absent[] = {
++        "data:variables.good_var", "data:variables.v", "data:variables.good",
++        NULL
++    };
++    const char *const absent_class[] = { "good_class", "c", NULL };
++    const char *const files[] = {
++        /* repeated member at the top level (section replaced) */
++        "{ \"vars\": { \"good_var\": \"x\" }, \"vars\": { \"good\": \"y\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        /* repeated member, the earlier one invalid */
++        "{ \"vars\": { \"good_var\": \"x\", \"good\": null, \"good\": \"ok\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        /* repeated member in 'classes' */
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\", \"c\": \"any::\","
++        " \"c\": \"any::\" } }\n",
++        /* repeated member in 'variables', and in a nested object */
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": { \"v\": { \"value\": \"1\" }, \"v\": { \"value\": \"2\" } },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": { \"v\": { \"value\": \"1\", \"value\": \"2\" } },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n",
++        /* trailing input */
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } } {}\n",
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }x\n",
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"variables\": {},\n"
++        "  \"classes\": { \"good_class\": \"any::\" } } ]\n",
++        NULL
++    };
++
++    for (size_t i = 0; files[i] != NULL; i++)
++    {
++        assert_rejected_and_nothing_installed(files[i], absent, absent_class);
++    }
++}
++
++static void test_whitespace_after_document_is_fine(void)
++{
++    /* The control for the above: the same kind of file, nothing repeated and
++     * nothing after the document but whitespace, loads. */
++    WriteCMDBFile(
++        "{ \"vars\": { \"good_var\": \"x\" },\n"
++        "  \"classes\": { \"good_class\": \"any::\" } }  \n\t\n\n");
++
++    EvalContext *ctx = EvalContextNew();
++    assert_true(LoadCMDBData(ctx));
++    assert_string_equal(InstalledScalar(ctx, "data:variables.good_var"), "x");
++    assert_true(ClassIsInstalled(ctx, "good_class"));
++
++    EvalContextDestroy(ctx);
++    RemoveCMDBFile();
++}
++
++int main()
++{
++    PRINT_TEST_BANNER();
++    tests_setup();
++
++    const UnitTest tests[] =
++    {
++        unit_test(test_missing_file_is_not_an_error),
++        unit_test(test_all_good_file_installs_everything),
++        unit_test(test_bad_var_entry_installs_nothing),
++        unit_test(test_bad_variables_entry_installs_nothing),
++        unit_test(test_bad_class_entry_installs_nothing),
++        unit_test(test_bad_metadata_installs_nothing),
++        unit_test(test_section_of_wrong_type_installs_nothing),
++        unit_test(test_reload_does_not_keep_earlier_data),
++        unit_test(test_unbalanced_index_key_installs_nothing),
++        unit_test(test_balanced_index_key_installs_nothing),
++        unit_test(test_frame_dependent_scopes_install_nothing),
++        unit_test(test_def_scope_is_installed),
++        unit_test(test_null_section_installs_nothing),
++        unit_test(test_rule_array_of_wrong_type_installs_nothing),
++        unit_test(test_unknown_top_level_key_installs_nothing),
++        unit_test(test_duplicate_variable_installs_nothing),
++        unit_test(test_failed_insertion_rolls_back_everything),
++        unit_test(test_whitespace_class_name_installs_nothing),
++        unit_test(test_existing_class_is_not_an_error),
++        unit_test(test_existing_variable_is_refused_and_left_alone),
++        unit_test(test_rollback_removes_non_canonical_and_keeps_aliased),
++        unit_test(test_failed_class_insertion_rolls_back_everything),
++        unit_test(test_repeated_member_or_trailing_input_installs_nothing),
++        unit_test(test_whitespace_after_document_is_fine),
++    };
++
++    int ret = run_tests(tests);
++
++    tests_teardown();
++
++    return ret;
++}
+-- 
+2.56.0
+

@@ -359,8 +359,12 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
 - Linux CI (`.github/workflows/linux.yml`) builds the fork at the commit in
   `overlay/fork.json` (`--prefix=/opt/tendcf`) and runs the fork's
   unit/acceptance subsets plus the scripts above on ubuntu-24.04/26.04/24.04-arm
-  and a `debian:13` container, which also uploads the pastebin artifact. Moving
-  the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
+  and a `debian:13` container, which also uploads the pastebin artifact. The
+  `overlay-build` job builds upstream at the overlay bases plus `overlay/`
+  (the all-or-nothing loader and the strict parse; `upstream-overlay.md` §4,
+  §7) and runs `cmdb_test`, libntech's `json_test`/`mustache_test`, the
+  `06_host_specific_data` acceptance directory and `run.sh` with
+  `TENDCF_REQUIRE_FORK_LOADER=1` on it. Moving the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
   `bin/xref_lint.py`, `bin/overlay.py lint`, the canary check and `shellcheck`.
 - Plan and status: `docs/architecture/linux-targets.md` §3; the NixOS side in
   `docs/architecture/nixos-passthrough-plan.md`. Live hosts: pastebin (root
