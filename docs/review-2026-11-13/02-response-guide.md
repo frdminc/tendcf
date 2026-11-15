@@ -472,7 +472,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 
 Ruled; the schema bump is pending (SCHEMA-TOUCHING: an approval record without a per-change nonce). Q19 in the map is answered (`03-response-map.md` M-§10-01). The new shape takes the next unused schema version (v7 or later; shipped v6 is C-policy-01, PR 52, 83d7280), ruled this way (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"): the next unused version (v7 or later); grouping not ruled; the schema design review (two frontier reviews) decides.
 
-A reading of this ruling, not new policy: "without a per-change nonce" drops only the nonce. The other content checks of B1 still apply to a standing approval, and every standing mode (hold window, standing approval, standing "wait for user", standing refusal) is enrolled by the owner and refusable by the owner; none is a default.
+A reading of the ruling, not part of it; the schema design review confirms: a standing approval drops only the per-change nonce. Every standing mode (hold window, standing approval, standing "wait for user", standing refusal) is owner-enrolled and refusable. The ruling does not say the other DC-2 checks (counter or high-water mark, freshness, names this device, signer scope) are dropped; the schema design review of the new approval-record shape is where that is confirmed.
 
 **Merge:** replace the §7 clause, the §4 parenthesis, and the §14 "Consent" row, using the ruled sentence above. Ruled (operator ruling, 2026-11-14, B2).
 **Checked:** verified (read the three places); independently checked 2026-11-13: confirmed

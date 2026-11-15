@@ -231,7 +231,9 @@ base     = 95                      # ruled: never 100 (B8 sub 1)
 penalty  = sum over findings of weight[severity_if_wrong]
            lockout 60, privilege 50, management 45, data-loss 40,
            reversible 10, notice 3
-ai_sub   = per AI reviewer, up to 30, only for findings citing a key path
+ai_sub   = up to 30, only for findings citing a key path
+           # open: deferred to the schema design review (operator ruling, 2026-11-14, PR 62 review Q7):
+           # whether the 30 is per AI reviewer or a total across reviewers is undecided
 score    = base - penalty - ai_sub, floored at 0
 caps     = min of the caps that apply:
            any lockout/privilege/management finding    -> 40
@@ -244,6 +246,9 @@ caps     = min of the caps that apply:
 score    = min(score, caps)
 band     = 0-39 danger, 40-69 caution, 70-89 notice, 90-95 plain
 ```
+
+One part of the formula is not ruled: whether the "up to 30" for the AI reviewer is a limit per AI reviewer or a total across
+all AI reviewers (open: deferred to the schema design review (operator ruling, 2026-11-14, PR 62 review Q7); Q7: "1. Defer to design review", stays open). Nothing here chooses either reading.
 
 The weights are starting values, not measured, and the bands and caps are the
 load-bearing part. As ruled (B8 sub 1), the values are fixed in the schema and

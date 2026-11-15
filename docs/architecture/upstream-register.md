@@ -351,7 +351,7 @@ services it guards actuated unguarded. `tendcf-integration` now carries
 `cmdb-fail-closed` (`a750b1dfe`, `dbf9dede6`, `61065e551`, `736becc07`, merged
 `d32cade13`; hardened by djbclark/core PR #98 and a strict libntech JSON parse,
 fork PR 99 moved the CMDB test seam under `TEST_UNIT_TEST`; the pin now `4443504`,
-moved by PR #61, merged 2026-11-15, `401e0f6`): `LoadCMDBData()` validates every entry of
+moved by PR #61, merged 2026-11-15T00:12:15Z, `401e0f6`): `LoadCMDBData()` validates every entry of
 `vars`/`variables`/`classes` first and installs nothing from
 `host_specific.json` if any one is invalid (also an unknown top-level key, a
 null section, a key with index brackets, a frame-dependent special scope, two
@@ -422,7 +422,7 @@ Ruled, one item per line. Quotes are the operator's chosen options, exactly.
    `6505f48` without it. Upstream PRs keep upstream's URL. Status: the
    `.gitmodules` change is in place at the pin `4443504` (checked in
    `djbclark/core`: `libntech` points at `https://github.com/djbclark/libntech`);
-   that pin move is PR #61, merged 2026-11-15, `401e0f6`.
+   that pin move is PR #61, merged 2026-11-15T00:12:15Z, `401e0f6`.
 6. **`--simulate-json` upstream (Smaller 7).** Operator ruling, 2026-11-14,
    Smaller 7: "Talk to 2d776056-3ea2-4fe5-a8d6-b59574dc427f about this and
    let it lead and ask me any questions; you monitor and get the final

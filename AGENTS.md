@@ -67,33 +67,58 @@ path cannot preserve these checks, hold the review and report the missing check.
    slice, Fable or Argon count. Operator ruling, 2026-11-14, B10: "1. Spike
    lane, 2. Tiered review, 3. Docs freeze" (options O1, O2 and O4). **O6 was
    not chosen** and O5 (dogfood the gate) was not asked; neither is in force.
-   - **Tiered review (O2).** *Light* review for docs and spike notes. Lead
-     and reviewer reading, **not part of the ruling**: "light" changes the
-     depth and scope of the review. It does **not** waive model routing, quota
-     readings, reservation or admission rules.
+   - **Tiered review (O2).** Operator ruling, 2026-11-14, B10 (record line
+     L22): O2 is "tiered review (light for docs and spike notes, one frontier
+     review for device code, two for root/trust-root/key/handshake code)".
+     **Light** review for docs and spike notes; **one frontier review** for
+     device code; **two frontier reviews** for root, trust-root, key and
+     handshake code (the two are the independent astra-and-Fable pair
+     described under design rulings below). This supersedes the earlier text
+     "Every PR, docs-only included, gets one frontier review before merge"
+     (this rule's own first PR was reviewed that way).
      Who may perform a light review: "2. Cheaper reviewer allowed" (operator
      ruling, 2026-11-14, PR 62 review Q2; record line L58): any model outside
      the author's family that is not on the weaker-tier ban list in rule 2
      (GLM, Gemini Flash, Cursor Auto, `gpt-6-luna`) may perform a light
      review; if the reviewer is a frontier model, the frontier checks (the
      frontier allowance, fresh quota readings, estimate floors and caps,
-     reservation and admission) still apply to that launch. The cross-model
-     rule above still decides which families are "outside the author's family".
-     Lead and reviewer reading, **not part of the ruling** (kept from PR 62
-     round 1): three limits on what counts as "light docs": edits to this
-     file's standing rules, or to normative trust, consent, privilege or
-     review text (the architecture map's trust, consent and privilege
-     sections; `docs/architecture/change-process.md`), are not light; a PR
-     that carries a design ruling takes the design-ruling tier below; a mixed
-     PR takes its highest tier; and policy run by a root
-     `cf-execd` counts as root code. **One frontier review** for device code.
-     **Two frontier reviews** for root, trust-root, key and handshake code (the
-     two are the independent astra-and-Fable pair described under design
-     rulings below). A PR that is neither docs, a spike note nor device code
-     (compiler, CI or tooling, say) keeps the one frontier review this rule
-     required of every PR before 2026-11-14. This supersedes the earlier text
-     "Every PR, docs-only included, gets one frontier review before merge"
-     (this rule's own first PR was reviewed that way).
+     reservation and admission) still apply to that launch.
+     Lead and reviewer reading of Q2, **not part of the ruling**: the
+     cross-model rule above is what says which families are "outside the
+     author's family", and it implies that Opus and Sonnet are one family
+     (an Opus review of Sonnet work, or the reverse, is not outside it),
+     while Fable, astra and Argon count as outside it for Opus- or
+     Sonnet-authored work. "Light" changes the depth and scope of the review.
+     It does **not** waive model routing, quota readings, reservation or
+     admission rules.
+     **Lead notes in force until the operator rules otherwise.** The three
+     notes below (the light-docs limits, the spike-workflow hardening worded
+     under the spike lane, and the compiler, CI and tooling tier) are lead and
+     reviewer text that is not part of the O1, O2 or Q2 rulings. They are "in
+     force as lead practice until djbclark rules otherwise" (operator ruling,
+     2026-11-14, PR 62 round-2 review, L64: "1. In force + widen"). Where this
+     file says "not part of the ruling", that means the text is not the
+     operator's wording; it does not mean the text is not in force.
+     1. **Four limits on what counts as "light docs"** (lead practice, in
+        force per L64). (a) Not light: **every edit to this file, in any
+        section**, and every doc that defines or instructs privileged, trust,
+        consent, key, deploy or enforcement behaviour, including (an open list,
+        not a closed one) the architecture map's trust, consent and privilege
+        sections, `docs/architecture/change-process.md`,
+        `docs/architecture/linux-targets.md` section 3,
+        `docs/architecture/nixos-passthrough-plan.md` and
+        `docs/architecture/tendcf-validate-proposal-2026-11-03.md`. Such an edit
+        takes **at least one frontier review, and two if the PR changes a design
+        ruling** (the design-ruling tier below). (b) A PR that carries a design
+        ruling takes the design-ruling tier below. (c) A mixed PR takes its
+        highest tier. (d) Policy run by a root `cf-execd` counts as root code.
+     2. **Spike workflow hardening** (lead practice, in force per L64): see the
+        spike lane below.
+     3. **Compiler, CI or tooling PRs keep one frontier review** (lead practice,
+        in force per L64; the operator was not asked this sub-question when
+        ruling O2). A PR that is neither docs, a spike note nor device code
+        (compiler, CI or tooling, say) keeps the one frontier review this rule
+        required of every PR before 2026-11-14.
    - **Spike lane (O1).** A `spike/*` branch is never merged, so it gets no
      frontier review. Each spike runs on a real, non-production device and
      leaves a one-page note, which is reviewed under the light tier. What a
@@ -104,8 +129,9 @@ path cannot preserve these checks, hold the review and report the missing check.
      only on a test phone, a spare Mac or VM, or as an unprivileged user. It
      touches no real secrets and no keys used elsewhere."
      Hardening added by the lead and reviewers on PR 62, **not part of the
-     operator's ruling**: a spike workflow runs with `permissions: contents:
-     read` and no secrets.
+     operator's ruling O1**, and "in force as lead practice until djbclark
+     rules otherwise" (operator ruling, 2026-11-14, PR 62 round-2 review, L64):
+     a spike workflow runs with `permissions: contents: read` and no secrets.
    - **Docs freeze (O4).** No new design doc is written for a state-1 piece
      until a spike for that piece has run.
    - A PR that needs a frontier review gets it before merge. `docs/handoffs/`
@@ -335,7 +361,7 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
   to WarpBuild runner group 1 (the app already sees all repos); the spike
   branch `spike/macos-check8-warp` builds the fork pin on
   `warp-macos-26-arm64-12x` and runs `tests/policy/run.sh` (worker 68cf038a).
-  The ruling's original gate text was: "The merge of PR 52 waits on that run."
+  The ruling's original gate text was: "Merge of PR 52 waits on that run."
   Outcome, 2026-11-14: the run ("macOS check 8 spike (WarpBuild)", branch
   `spike/macos-check8-warp` at 299f219, [run
   43602684071](https://github.com/frdminc/tendcf/actions/runs/43602684071))
@@ -377,8 +403,9 @@ Maybe have a development mode and/or build?").
    shipping as the published build. A distinct `applicationId`, a distinct
    signing key, and a release pipeline that refuses the dev flavour are
    **recommended follow-ups, not ruled**.
-5. **Reading of L5 (the B2 ruling), not new policy (adversary review of PR 62,
-   finding 4):** a standing approval drops only the per-change nonce. Every
+5. **Reading of L5 (the B2 ruling): a reading of the ruling, not part of it;
+   the schema design review confirms (adversary review of PR 62, finding 4):**
+   a standing approval drops only the per-change nonce. Every
    standing mode (hold window, standing approval, standing "wait for user",
    standing refusal) is owner-enrolled and refusable. The ruling does not say
    the other DC-2 checks (counter or high-water mark, freshness, names this

@@ -207,7 +207,7 @@ Three properties follow:
    exists ([#47](https://github.com/frdminc/tendcf/issues/47)), a release
    build loads only in-tree plugins named by site-private, so the tendcf
    pin covers them, and plugins installed on the builder but not named
-   are not selected (map D46; installing one can still run code, plugin-layout §4). Reproducing the release byte for byte also
+   are not selected (map D46; installing one can still run code, plugin-layout §4). Out-of-tree discovery is itself deferred until a user needs it and out-of-tree plugins can be pinned (operator ruling, 2026-11-14, Smaller 5). Reproducing the release byte for byte also
    needs a fixed dependency and toolchain closure for the build and
    controlled or recorded external inputs (environment, network); those
    are not specified yet.
@@ -435,7 +435,7 @@ the review artifact; a diff computed in the compile job never is):
    verifies the pins itself; jobs B′ and B take nothing from job A but
    goal-file bytes and the digest manifest (plugin-layout §4).
 2. Compile every host, loading only the compiler plugins site-private
-   names (in-tree only until #47; map D46; the loader is planned,
+   names (in-tree only; out-of-tree discovery is deferred, with #47, until a user needs it and plugins can be pinned: operator ruling, 2026-11-14, Smaller 5; map D46; the loader is planned,
    [`plugin-layout.md`](plugin-layout.md) §4). Conflict-as-error (map §3):
    the same identity from two peer inputs without a private bind refuses
    the whole release, and so does a duplicate plugin name within a group.

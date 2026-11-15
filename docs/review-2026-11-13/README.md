@@ -10,19 +10,22 @@ Base commit for every anchor: `eefea3c` (master).
 
 Read `14-synthesis-and-rulings.md` first. Section B lists the rulings the
 operator had to make, and each is now ruled (2026-11-14); its opening index
-maps every line of the rulings record (L4 to L63) to its item and to the files
+maps every line of the rulings record (L4 to L64) to its item and to the files
 that carry it. Section C lists defects that need no ruling; section F is the
 merge map. The rulings record itself is `rulings-record-2026-11-14.md`, and
 `14-synthesis-and-rulings.md` lists the one question the record leaves open
 (Q7, "AI reviewer subtracts up to 30"; the operator deferred it to the schema
-design review, L63) under "Open items awaiting operator ruling (2026-11-14)";
-six PR 62 review questions (Q1 to Q6) are ruled (record lines L57 to L62).
+design review, L63) under "Open items (2026-11-14)";
+six PR 62 review questions (Q1 to Q6) are ruled (record lines L57 to L62), and
+the PR 62 round-2 review ruling is L64.
 
 ## Rulings of 2026-11-14
 
 The operator ruled B1 to B13, their riders and sub-rulings, the seven smaller
 items, the PR 52 follow-ups, the B11 round-2 items and six PR 62 review
-questions (Q1 to Q6; Q7 was deferred to the schema design review) on 2026-11-14. Each
+questions (Q1 to Q6; Q7 was deferred to the schema design review) on 2026-11-14,
+and on the PR 62 round-2 review (L64) ruled that the AGENTS.md lead notes are in force and widened what is
+not light docs. Each
 response item that the rulings decide carries a **Ruled** paragraph quoting
 the chosen option exactly and citing it as `operator ruling, 2026-11-14,
 <item>`; proposals that a ruling settled are rewritten and no longer read as
@@ -32,7 +35,9 @@ ruled item that is not yet built says "ruled; implementation pending" (or the
 exact status). A ruled item that is built says so with its dated outcome (for
 example C-policy-01, implemented by PR 52, merged 2026-11-14 as `2c78680`).
 An item the record leaves undecided says "open: awaiting operator ruling (the
-question)" and is never decided by this directory.
+question)" and is never decided by this directory. The one item deferred to a
+later design review (Q7) says "open: deferred to the schema design review
+(operator ruling, 2026-11-14, PR 62 review Q7)".
 
 ## Files
 
@@ -53,7 +58,7 @@ question)" and is never decided by this directory.
 | `12-fork-management.md` | Research: branch and fork management (G9) | new design material |
 | `13-premortem-and-ideas.md` | Pre-mortem, tensions, process, ideas | (reference) |
 | `14-synthesis-and-rulings.md` | Synthesis, rulings needed, defects, path to the first finish-line state | (reference) |
-| `rulings-record-2026-11-14.md` | The operator's rulings record, lines L4 to L63, verbatim except that absolute local paths are replaced by a neutral phrase | (reference; the L-numbers in 14 point here) |
+| `rulings-record-2026-11-14.md` | The operator's rulings record, lines L4 to L64, verbatim except that absolute local paths are replaced by a neutral phrase | (reference; the L-numbers in 14 point here) |
 | `checks/v1` to `v7` | The independent checkers' verdict tables and corrections; v7 is the source re-fetch | (evidence; cited as "vN Cn"; v7's corrections are "v7 R1" to "R21") |
 
 ## How it was produced

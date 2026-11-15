@@ -21,9 +21,9 @@
   rulings record is
   [`../review-2026-11-13/rulings-record-2026-11-14.md`](../review-2026-11-13/rulings-record-2026-11-14.md).
   Corrected the same day to the merged state (schema v6, PRs 52, 42 and
-  41 merged); items not decided are marked "open: awaiting operator
-  ruling" (only the AI reviewer "up to 30" count still is, Q7 of PR 62,
-  deferred by the operator to the schema design review; Q1-Q6 of PR 62 are
+  41 merged); items not decided are marked "open" (only the AI reviewer
+  "up to 30" count still is, marked "open: deferred to the schema design
+  review (operator ruling, 2026-11-14, PR 62 review Q7)"; Q1-Q6 of PR 62 are
   ruled, including the G4 sentence, Q5, and the reviewer-proposed map text,
   Q6).
 - **Tracker:** frdminc/tendcf#1.
@@ -511,8 +511,8 @@ is incomplete in exactly those windows.
 
 CFEngine never opens SQLite. Single writer to JSONL (engine or its
 wrapper); single writer to SQLite (on Android the agent, which tails or
-receives the log, as D45 stands; whether B3 changes that is open, see
-below).
+receives the log, as D45 stands; the B3 ruling does not change that: operator ruling,
+2026-11-14, PR 62 review Q3, "1. Agent keeps log role", see above).
 
 **Linux and macOS (D45, 2026-11-02).** No daemon runs beside CFEngine:
 `tendcf-validate` (§12) is a command that runs and exits, not a process
@@ -684,12 +684,14 @@ file stays rejected as circular.
   the owner answers) and a standing refusal. The record fields above
   describe the per-change shape, which stands until that bump lands. How
   the new shape sits with DC-2 is for the design review the schema bump
-  requires (two frontier reviews). **A reading of the ruling (L5), not new
-  policy:** the ruling drops only the per-change nonce; it does not name
-  any other check (counter and high-water mark, freshness, names this
-  device, signer scope) as waived, so none is waived by it. Every standing
-  mode is enrolled by the owner and refusable by the owner; none is a
-  default, and the hold window is whatever the owner enrols (§10).
+  requires (two frontier reviews). **A reading of the ruling, not part of it; the
+  schema design review confirms:** a standing approval drops only the
+  per-change nonce. Every standing mode (hold window, standing approval,
+  standing "wait for user", standing refusal) is owner-enrolled and
+  refusable. The ruling does not say the other DC-2 checks (counter or
+  high-water mark, freshness, names this device, signer scope) are
+  dropped; the design review of the new approval-record shape is where
+  that is confirmed (AGENTS.md, Android item 5).
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
   `--simulate-output=json` issue before Step 3 code.
@@ -1084,6 +1086,11 @@ and M-§9-03):
   penalties, caps and bands are 09's table, fixed in the schema and
   changed only by a ruling (later backed by a labelled corpus). The table
   is in M-§9-03 and 09 (01 Idea 1, 09 Idea 1); it is not copied here.
+  **One part is undecided:** the table's AI-reviewer deduction ("up to
+  30") does not say whether 30 is the maximum per AI reviewer or the
+  maximum in total across reviewers; this aggregation is "open: deferred
+  to the schema design review (operator ruling, 2026-11-14, PR 62 review
+  Q7)". Nothing here chooses either reading.
 - **Owner-set auto-refuse floor.** B8 sub 2, "1. Allowed, off by
   default": an owner may set a floor; a bundle below it is refused
   automatically, logged, and the owner notified with the diff; no default
@@ -1466,8 +1473,8 @@ standing end-to-end proof ("1. Keep it", B4 rider); ordering inference
 | 3 | **Nix authoring, minimal.** A module system with tendcf options for services, interlocks and roles, named after nix-darwin and NixOS where the meaning is the same (B7), evaluating to today's Site Model JSON; YAML twins stay as fixtures. | 1 |
 | 4 | **`tendcf-validate`, first build, with the CLI review.** Stored, integrity-checked baseline; the device computes the diff; the CLI shows it and takes y/N; projection only after accept. Built first, and used on the VM and on dev devices before any TUI or score work (operator ruling, 2026-11-14, B8 sub 3, "1. Build order, not scope"). | 1 |
 | 5 | **Signed releases and the handshake.** Content checks (§9.11); SSH-signature v0 first (B1), TUF later; any device may relay. | 1 |
-| 6 | **Android client.** Termux CFEngine fed tendcf projections; the thin Kotlin agent (trust and consent only; who owns the Android log and index is open, §8); `tendcf-validate` in Termux; runit services via termux-services; the `profile` field on entries; ShizukuPlus helper; the native review screen (§12). | 1 |
-| 7 | **Peer actions and the archive.** The Mac starts ShizukuPlus over ADB when the phone cannot; JSONL capture on both devices (the Android writer is open, §8); the `log-archive` role on the VM, fleet-wide index (§8); the phone buffers while the VM sleeps. The `monitor` role is not here: state 2. | 1 |
+| 6 | **Android client.** Termux CFEngine fed tendcf projections; the thin Kotlin agent (trust and consent only; it keeps the log and index as a support role: operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", §8); `tendcf-validate` in Termux; runit services via termux-services; the `profile` field on entries; ShizukuPlus helper; the native review screen (§12). | 1 |
+| 7 | **Peer actions and the archive.** The Mac starts ShizukuPlus over ADB when the phone cannot; JSONL capture on both devices (on Android the thin agent writes it as a support role: operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role", §8); the `log-archive` role on the VM, fleet-wide index (§8); the phone buffers while the VM sleeps. The `monitor` role is not here: state 2. | 1 |
 | 8 | **Safety score, explanation, highlighting; then the TUI** (§9.12). State 1 is declared only once these land; G4 stays whole in state 1, and there is no "state 1.5". | 1 |
 | 9 | Pull: every device self-updates from any peer; roles move by editing data; the `monitor` role (operator ruling, 2026-11-14, B4 rider, "1. State 2"). | 2 |
 | 10 | macOS as client: the other Macs; nix-darwin passthrough (§14.1 for a workstation). | 2 |
@@ -1691,8 +1698,9 @@ with full mesh) is **D38**.
   2026-11-14 rulings written into this file, and the checks;
   `../review-2026-11-13/rulings-record-2026-11-14.md` is the operator's
   rulings record (the L-numbers cited in `14-synthesis-and-rulings.md`),
-  and 14 lists the one item still open (awaiting operator ruling): the AI
-  reviewer "up to 30" count, Q7, deferred to the schema design review.
+  and 14 lists the one item still open: the AI reviewer "up to 30" count
+  (per reviewer or total), "open: deferred to the schema design review
+  (operator ruling, 2026-11-14, PR 62 review Q7)".
 - `tendcf-validate-proposal-2026-11-03.md` — a proposal, deciding
   nothing: options and a recommendation for each of §12's open D45
   items, a minimal first build, and an operator picklist.
