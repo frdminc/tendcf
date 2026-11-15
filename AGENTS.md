@@ -420,13 +420,14 @@ Maybe have a development mode and/or build?").
    trusted keys, fresh, names this device) and the rest of DC-2 (per-target
    validity, monotonic-counter single use or high-water mark, persisted
    rejects); its ceremony class is still checked against the validator's
-   derived requirement (§9.8), and whether one standing approval may cover
-   `privileged` or `baseline` changes is for the schema design review; it names
-   its signer and algorithm only if X-trust-06 is adopted (proposed, not
-   ruled); every standing mode (hold window, standing approval, standing "wait
-   for user", standing refusal) is owner-enrolled and refusable, and none is a
-   default; dropping any other check needs an operator ruling; the schema
-   design review confirms the approval-record shape.
+   derived requirement (§9.8); until the operator rules, a standing approval
+   covers `ordinary` changes only; whether one may cover `privileged` or
+   `baseline` changes is for the schema design review to propose and the
+   operator to rule; it names its signer and algorithm only if X-trust-06 is
+   adopted (proposed, not ruled); every standing mode (hold window, standing
+   approval, standing "wait for user", standing refusal) is owner-enrolled and
+   refusable, and none is a default; dropping any other check needs an operator
+   ruling; the schema design review confirms the approval-record shape.
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 
