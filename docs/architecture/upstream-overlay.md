@@ -319,8 +319,10 @@ policy cannot refuse or report it. A real installs as `%.2f` (`string_lib.c`
 `0.00049`. Reach: the projector refuses floats (`bin/projector.py:523`) and
 writes no exponents, and tendcf's variables are containers, so projected data
 does not reach it; a hand-edited file does. No test holds a bare number, so CI
-does not see it. Whether B-4, B-10 and the `rlist.c` fix join the overlay is
-open with djbclark (not decided here).
+does not see it. Decided 2026-11-17: B-4, B-10 and the `rlist.c` fix do not
+join the overlay; the difference stays documented as above. The case for a
+later patch series, and what would trigger it, is
+[#71](https://github.com/frdminc/tendcf/issues/71).
 
 ## 8. Rejected alternatives
 
