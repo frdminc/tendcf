@@ -33,7 +33,7 @@
             "B-7 (passenger: dotted-key warning, ee1f9d60c)",
             "B-20 (load-bearing: its null guards, as a refusal of the file; 87490bb8f)"
           ],
-          "requires": "libntech patches 0005 and 0006 (B-24): the loader parses host_specific.json with JsonParseFileStrict(). Known difference from the pinned fork (open with djbclark): libntech B-4/B-10 and core's rlist.c number fix are not in the overlay, so a top-level CMDB scalar or primitive array holding 1e5 or an integer past long makes cf-agent exit in the install step (StringToLongExitOnError), and a real installs as %.2f; the projector refuses floats and writes no exponents, so only a hand-edited file reaches it (upstream-overlay.md section 7)",
+          "requires": "libntech patches 0005 and 0006 (B-24): the loader parses host_specific.json with JsonParseFileStrict(). Known difference from the pinned fork (decided 2026-11-17 to keep; issue 71): libntech B-4/B-10 and core's rlist.c number fix are not in the overlay, so a top-level CMDB scalar or primitive array holding 1e5 or an integer past long makes cf-agent exit in the install step (StringToLongExitOnError), and a real installs as %.2f; the projector refuses floats and writes no exponents, so only a hand-edited file reaches it (upstream-overlay.md section 7; issue 71)",
           "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Made CMDB loading all-or-nothing: one bad entry installs nothing",
