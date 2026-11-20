@@ -144,18 +144,35 @@ path cannot preserve these checks, hold the review and report the missing check.
      a spike workflow runs with `permissions: contents: read` and no secrets.
    - **Docs freeze (O4).** No new design doc is written for a state-1 piece
      until a spike for that piece has run.
-     Clarified and given a sunset: "1. Clarify + sunset (Recommended)"
-     (operator ruling, 2026-11-20, O4 docs-freeze chooser; the operator first
-     said "Lets discuss the docs-freeze rule in general. It still being in
-     place may be a bug."):
-     1. **Not frozen:** schema files, fixtures and examples, errata items in
-        existing docs, and a design review the operator orders for a piece
-        (for example the schema design review of PR 62 review Q4).
+     Clarified and given a sunset: "1. Clarify + sunset" (operator ruling,
+     2026-11-20, O4 docs-freeze chooser; the operator first said "Lets
+     discuss the docs-freeze rule in general. It still being in place may be
+     a bug."). The chosen option's text, word for word: "Keep O4, but schema
+     files, fixtures, errata and operator-ordered design reviews (like Q4)
+     are not frozen. The freeze lifts per piece once a spike has run or you
+     order a design review. Issue 64 then proceeds as a schema PR plus
+     errata." Items 1 to 3 are the lead's wording of that option, not the
+     operator's words:
+     1. **Not frozen** (none of these is a design doc): files under `schema/`
+        and `examples/` (fixtures included), errata items in existing docs,
+        and the design doc that a design review ordered by the operator
+        reviews (for example the schema design review of PR 62 review Q4,
+        record line L60).
      2. **Sunset, per piece:** the freeze on a piece lifts once a spike for
         it has run or the operator orders a design review for it.
-     3. Unchanged: the review tier for whatever is written (O2 and the
-        design-ruling rule below), and the anti-drift intent (13 failure
-        modes 1 and 8): prefer errata and schema over new prose.
+     3. **Unchanged:** the review tier for whatever is written (O2 with its
+        limits (a) to (d), and the design-ruling tier below), and the intent
+        of O4 (`docs/review-2026-11-13/13-premortem-and-ideas.md` A(i) items
+        1 and 8).
+     Lead reading, not part of the ruling (it only tightens): "orders" means
+     an operator ruling that names the review, quoted and dated; the standing
+     design-ruling tier below is not an order, and neither is a request from
+     a lead, a reviewer or an issue. A lift by order covers what that review
+     is ordered to decide, no wider. A spike "has run" when it ran under the
+     spike lane above and its one-page note is merged. A new design section
+     in an existing doc counts as a new design doc. The PR that relies on a
+     lift cites the note or the ruling. Prefer errata and schema over new
+     prose.
    - A PR that needs a frontier review gets it before merge. `docs/handoffs/`
      commits are not PRs and keep the push-in-place exception above. Try the
      reviewers in this order:
