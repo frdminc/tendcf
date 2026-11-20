@@ -153,11 +153,11 @@ path cannot preserve these checks, hold the review and report the missing check.
      order a design review. Issue 64 then proceeds as a schema PR plus
      errata." Items 1 to 3 are the lead's wording of that option, not the
      operator's words:
-     1. **Not frozen** (none of these is a design doc): files under `schema/`
-        and `examples/` (fixtures included), errata items in existing docs,
-        and the design doc that a design review ordered by the operator
-        reviews (for example the schema design review of PR 62 review Q4,
-        record line L60).
+     1. **Not frozen:** files under `schema/`, `examples/` and test fixture
+        directories, and errata items in existing docs, none of which is a
+        design doc; and a design review the operator orders, with what it
+        reviews (like Q4, record line L60: issue 64 proceeds as a schema
+        PR plus errata, the option's words).
      2. **Sunset, per piece:** the freeze on a piece lifts once a spike for
         it has run or the operator orders a design review for it.
      3. **Unchanged:** the review tier for whatever is written (O2 with its
