@@ -1034,7 +1034,9 @@ class Golden(Base):
         self.assertIn("removing the old", st["g10"]["evidence"])
         self.assertNotIn("cleanup", st)  # the finished build is not deleted
         self.assertEqual(sorted(self.world.vms), sorted([GOLDEN, f"{GOLDEN}-build"]))
-        self.assertEqual(self.world.tart_calls("rename"), [])
+        self.assertEqual(
+            len(self.world.tart_calls("rename")), 1
+        )  # only the first run's
         # the old golden still matches its own record: check's pin and record are unchanged
         self.assertEqual((self.ctx.state_dir / "known_hosts").read_text(), old_kh)
         self.assertEqual((self.ctx.state_dir / "golden.json").read_text(), old_rec)
@@ -1061,7 +1063,11 @@ class Golden(Base):
         # the new record is parked beside them, so finishing by hand does not need a rebuild
         self.assertTrue((self.ctx.state_dir / "known_hosts.pending").exists())
         rec = json.loads((self.ctx.state_dir / "golden.json.pending").read_text())
-        self.assertEqual(rec["host_key"], f"ssh-ed25519 {NEW_BLOB}")
+        self.assertEqual(rec["image"], REF)
+        self.assertEqual(
+            (self.ctx.state_dir / "known_hosts.pending").read_text(),
+            f"{vmssh.HOST_ALIAS} ssh-ed25519 {NEW_BLOB}\n",
+        )
 
     def test_failure_cleans_up_and_leaves_no_golden(self):
         self.world.fail_prep = True
