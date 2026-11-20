@@ -486,8 +486,14 @@ Maybe have a development mode and/or build?").
    owner or covered-signer, on the goal file's device-trust key entries, in
    the v7 bump); R6 "1. Ordinary only (Recommended)" (developer mode only on
    an ordinary grant, enrolled through at least the privileged ceremony, with
-   `not_after` required). The 2026-11-19 rulings and R1-R6 are the only
-   rulings here; everything else the schema states (terminal revocation,
+   `not_after` required); R7 (operator ruling, 2026-11-20, PR 75 review)
+   `policy-tree` joins the R1 carve-out (a standing application never covers a
+   policy-tree change; it needs a per-change owner record; the carve-out
+   covers goal-diff hunks, which no approval-record schema rule or fixture can
+   express, so it stays an enforcement-PR negative-list item); R8 (operator
+   ruling, 2026-11-20, PR 75 review) the issue 55 goal-file pattern fixes are
+   out of PR 75, a separate PR later. The 2026-11-19 rulings and R1-R8 are the
+   only rulings here; everything else the schema states (terminal revocation,
    most-restrictive-wins and its tie rules, hold-window timing, persist at
    intake, an owner's per-change accept over a standing refusal, the Ed25519
    profile, the approval-record downgrade floor, and the reading of "trust
