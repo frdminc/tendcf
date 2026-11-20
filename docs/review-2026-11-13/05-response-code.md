@@ -706,6 +706,8 @@ Rider: "We don't have to always do both builds when in development, just the mod
 
 Ruled; implementation pending.
 
+**Erratum (2026-11-20, PR 75):** "revoke and deny always honoured" above is read as of the schema v7 standing-approval record (`schema/approval-record.schema.json`, `AGENTS.md` Android items 1 and 5). A deny stops the change it names. A revocation or expiry is honoured as a record: it stops later applications and a pending hold, never code or state an earlier application already installed (operator ruling R9, 2026-11-20, PR 75 review, "1. Accept, disclose (Recommended)"). Because that authority is root-equivalent, a covered signer can also, through the code it installs, alter the trust root, the replay store, the validator and the clock, so the carve-out and revocation bind the approval path and not such code; a grant should be given only to a signer the owner would trust with root. The public build's developer mode is ordinary-only (R6). Enforcement list: [frdminc/tendcf#76](https://github.com/frdminc/tendcf/issues/76).
+
 Recommended follow-up from the PR 62 adversary review, not ruled: the developer build should have a distinct `applicationId` and a distinct signing key, and the release pipeline should refuse to publish the developer flavour, so that "never the published public build" is enforced by the build and not only by this sentence. The operator has not ruled on this; it is recorded here as a recommendation only.
 
 **Merge:** ruled

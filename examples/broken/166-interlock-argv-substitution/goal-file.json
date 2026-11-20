@@ -5,6 +5,7 @@
       "entries": {
         "advisor-key": {
           "ed25519:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2": {
+            "role": "owner",
             "state": "present"
           }
         },
@@ -93,5 +94,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 6
+  "schema_version": 7
 }

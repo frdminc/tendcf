@@ -431,8 +431,11 @@ Maybe have a development mode and/or build?").
 
 1. **Every build has a developer mode, open to any owner:** an owner-enrolled
    standing approval for a signer of the owner's choice (the B2 mechanism);
-   revoke and deny are always honoured; a persistent indicator shows the mode
-   is on.
+   a deny stops the change it names; a revocation or expiry stops later
+   applications and a pending hold, never code or state an earlier
+   application already installed, and that installed root code can itself
+   alter the trust root, the replay store, the validator and the clock (R9,
+   item 5); a persistent indicator shows the mode is on.
 2. **A separate developer build** exists for tendcf contributors' test
    devices. It keeps the ignore-revoke override. It is never the published
    public build.
@@ -447,20 +450,96 @@ Maybe have a development mode and/or build?").
    signing key, and a release pipeline that refuses the dev flavour are
    **recommended follow-ups, not ruled**.
 5. **A reading of the ruling (L5, B2), not part of it (adversary review of PR
-   62, finding 4; wording: lead decision, PR 62 round-3 review):** a standing
-   approval drops only the per-change nonce (DC-2's device nonce); it is signed
-   by an owner-held trusted key and keeps B1's other content checks (signed by
+   62, finding 4; wording: lead decision, PR 62 review), updated for the
+   operator rulings of 2026-11-19 below (issue 64):** every standing mode that
+   applies a change without a per-change yes (hold window, standing approval)
+   drops only the per-change nonce (DC-2's device nonce); its enrollment is
+   signed by an owner-role trusted key, and each change it covers is signed by
+   a signer the enrollment names; it keeps B1's other content checks (signed by
    trusted keys, fresh, names this device) and the rest of DC-2 (per-target
    validity, monotonic-counter single use or high-water mark, persisted
-   rejects); its ceremony class is still checked against the validator's
-   derived requirement (§9.8); until the operator rules, a standing approval
-   covers `ordinary` changes only; whether one may cover `privileged` or
-   `baseline` changes is for the schema design review to propose and the
-   operator to rule; it names its signer and algorithm only if X-trust-06 is
-   adopted (proposed, not ruled); every standing mode (hold window, standing
-   approval, standing "wait for user", standing refusal) is owner-enrolled and
-   refusable, and none is a default; dropping any other check needs an operator
-   ruling; the schema design review confirms the approval-record shape.
+   rejects, which win over any grant); its ceremony class is still checked
+   against the validator's derived requirement (§9.8); every standing mode
+   (hold window, standing approval, standing "wait for user", standing
+   refusal) is owner-enrolled and refusable, and none is a default; dropping
+   any other check needs an operator ruling. Operator rulings, 2026-11-19
+   (issue 64 choosers): "3. Include all classes" (a standing mode may cover
+   `ordinary`, `privileged` and `baseline` changes, each class enrolled
+   separately and explicitly); "1. Reusable grant (Recommended)" (one grant
+   covers many changes, with persistent per-device replay state for each
+   application: reusable, never replayable); "1. Owner-enrolled trusted
+   signers (Recommended)" (outside developer mode the owner may enroll any
+   explicitly trusted signer within a stated scope, automation and
+   organisational signers included); "1. Bind both fields (Recommended)"
+   (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must
+   match the actual verification, and cannot create trust or enable an
+   unapproved algorithm). Operator rulings, 2026-11-20, PR 75 review (each
+   recorded as "(operator ruling, 2026-11-20, PR 75 review)", the option text
+   quoted): R1 "1. Carve-out (Recommended)" (standing grants never cover
+   changes to the trust root, owner/advisor keys, covered-signer trust, the
+   validator binary/version or the grant replay state; those always need a
+   per-change owner record; other privileged and baseline changes stay
+   grantable); R2 "1. One class per grant (Recommended)" (one class per grant,
+   per-class revocation); R3 "1. Device nonce (Recommended)" (an active
+   enrollment carries a device-issued nonce, a revocation is nonce-less; the
+   replay store must be rollback-protected, and its loss voids every grant on
+   the host); R4 "1. Apply-without-yes modes (Recommended)" (`not_after` is
+   required for standing approval and hold window, optional for wait-for-user
+   and standing refusal); R5 "1. Role in goal file now (Recommended)" (a role,
+   owner or covered-signer, on the goal file's device-trust key entries, in
+   the v7 bump); R6 "1. Ordinary only (Recommended)" (developer mode only on
+   an ordinary grant, enrolled through at least the privileged ceremony, with
+   `not_after` required); R7 "1. Add to carve-out (Recommended)" (`policy-tree` joins
+   the R1 carve-out: a standing application never covers a policy-tree change,
+   which needs a per-change owner record; the carve-out covers goal-diff
+   hunks, which no approval-record schema rule or fixture can express, so it
+   stays an enforcement-PR negative-list item); R8 "1. Separate PR after 75
+   (Recommended)" (the issue 55 goal-file pattern fixes go in their own small
+   PR after 75, "in the same v7 window (no extra bump)"; lead reading, not
+   part of the ruling: C-policy-01 says one version means one acceptance set,
+   so narrowing a pattern without a bump is sound only before any device
+   adopts a v7 baseline); R9 "1. Accept, disclose (Recommended)" (a standing
+   grant knowingly delegates root-equivalent authority to its covered signers,
+   because a covered change may add or alter a service or interlock that runs
+   as root; revocation and expiry stop only later applications and a pending
+   hold, never what an earlier application installed; because that authority
+   is root-equivalent, a covered signer can also, through the code it
+   installs, alter the trust root, the replay store, the validator and the
+   clock, so the R1 carve-out and revocation bind the approval path and not
+   such code, and a grant should be given only to a signer the owner would
+   trust with root); R10 "1. Bind to
+   enrollment (Recommended)" (each application names its enrollment instance
+   in a required `enrollment_nonce`, checked against the stored grant; the
+   worker chose the nonce over a hash of the signed bytes, a choice inside
+   R10 and open to review, because the device already issues it, stores it
+   and signs it into the enrollment, so the check is one string compare with
+   no new byte-range to define); R11 "2.
+   Argon again" (Gemini 4 Argon may stand in for Astra a second time on PR 75
+   reviews). Lead calls in the same round, tightenings that need no ruling:
+   a standing application covers a change only if every hunk and every
+   coverage change of it derives the grant's class on its own, never the
+   maximum (a `version_bump` diff has neither, so a `baseline` grant covers
+   the bump itself; retreating a populated domain is a mixed-class
+   application and is never grantable); the carve-out is default-deny over
+   `device-trust` for every entry kind but `supervisor`; a baseline-class
+   application is refused unless every carved-out entry of the applied
+   baseline and the proposal is equal; a `version_bump` with `new` not above
+   `old` is refused; a migration that changes any `device-trust` entry, a
+   role default included, and any re-adoption are never by standing
+   application; each device nonce comes from a cryptographic random source
+   with at least 128 bits, is never a counter or derived from replay-store
+   state, and is bound to the scope the ceremony showed (record kind, class,
+   `developer_mode`, `grant_id`). The enforcement PR's negative-test list is tracked in
+   [frdminc/tendcf#76](https://github.com/frdminc/tendcf/issues/76). The 2026-11-19 rulings and R1-R11 are the
+   only rulings here; everything else the schema states (terminal revocation,
+   most-restrictive-wins and its tie rules, hold-window timing, persist at
+   intake, an owner's per-change accept over a standing refusal, the Ed25519
+   profile, the approval-record downgrade floor, and the reading of "trust
+   root" in R1) is a **lead proposal**, labelled so in the schema, until the
+   operator rules. The shape is approval-record schema v7
+   (`schema/approval-record.schema.json`; the goal-file family moves to v7
+   together, the grouping decided at the schema design review, PR 62 review
+   Q4 "1. Decide at design review").
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 

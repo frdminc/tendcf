@@ -1,14 +1,14 @@
 # Negative fixtures
 
-One hundred forty-six deliberately broken overlays, plus six byte-class fixtures in
+One hundred eighty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107, 123, 143-144, 146-154, 160, 167-168, 174-175) or the goal-file
-family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173, 176) stays as in the happy path.
+family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173, 176; the approval-record cases of 177-228 overlay one or two of the approval records (the developer-mode case 223 overlays two), except 198, 212, 225 and 226, which overlay `goal-file.json`) stays as in the happy path.
 Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
-the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-176 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below).
+the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-176 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below). Cases 177-183 are schema v7's: the approval record's `record_kind`, `signer` and `sig_alg` (issue 64; below).
 
 **The "Caught by" column is executable.** `bin/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
@@ -57,7 +57,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 7`, one above the current 6 | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 8`, one above the current 7 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -456,6 +456,65 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 174 | `174-site-interlock-command-space` | the Site Model interlock with `command[0]` `/usr/local/bin/tail scale`: the authoring-time half for the executable | schema (`pattern`) |
 | 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 3`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
 | 176 | `176-interlock-command-newline` | `command[0]` is `/opt/homebrew/bin/caddy\n` with a trailing newline, which the `$`-anchored pattern alone accepts: only `prefixItems[0]`'s `not` refuses it | schema (`not`) |
+
+## Approval-record v7 cases (177-228)
+
+Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-change`, `standing-enrollment`, `standing-application`), puts `signer` and `sig_alg` on every record, and (PR 75 review, operator rulings R1-R11 of 2026-11-20) one class per grant, a device nonce on active enrollments, a minimal revocation shape, an expiry on the modes that apply without a yes, and developer mode only on an ordinary grant. The goal file's `advisor-key` entries carry a `role` (R5). Each case below is a one-member change to one happy record (`examples/approval-application.json`, `approval-enrollment.json`, `approval-revocation.json`, `approval-record.json`, or `goal-file.json` for 198, 212, 225 and 226; case 223 overlays two records) and is caught by the schema alone, except 213-216, 218, 221-224, 227 and 228, which the signer-role cross-check `check_approval_roles()` catches (class `approval roles`: schema cannot compare two members), and 225, which `check_goal_file_cross_file()` catches (class `goal cross-file`). Each fails for the one reason its row names; deleting that clause from the schema or the check turns the lint red.
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 177 | `177-application-with-nonce` | a `standing-application` carrying a device `nonce`, which only `per-change` and active enrollments carry | schema (`if/then`) |
+| 178 | `178-application-with-verdict` | a `standing-application` carrying a `verdict`: it claims coverage by a grant and never decides | schema (`if/then`) |
+| 179 | `179-hold-window-no-hold-seconds` | a `hold-window` enrollment with no `hold_seconds` | schema (`if/then`) |
+| 180 | `180-enrollment-class-not-a-class` | an enrollment with `class: everything`, outside the three ceremony classes | schema (`enum`) |
+| 181 | `181-per-change-no-signer` | a `per-change` record with no `signer` | schema (`required`) |
+| 182 | `182-sig-alg-not-approved` | `sig_alg: rsa-pss-sha256`, outside the approved set (`ed25519`) | schema (`enum`) |
+| 183 | `183-application-schema-version-6` | a `standing-application` declaring `schema_version: 6`: the record kinds exist only from 7 | schema (`const`) |
+| 184 | `184-application-no-baseline` | a `standing-application` with no `baseline_sha256`: its only freshness against state, and first adoption is never by application | schema (`required`) |
+| 185 | `185-enrollment-class-array` | an enrollment with `class: [ordinary, privileged]`: one class per grant (R2) | schema (`enum`) |
+| 186 | `186-enrollment-active-no-nonce` | an `active` enrollment with no device `nonce` (R3) | schema (`required`) |
+| 187 | `187-standing-approval-no-not-after` | a `standing-approval` enrollment with no `not_after` (R4) | schema (`required`) |
+| 188 | `188-hold-window-no-not-after` | a `hold-window` enrollment with no `not_after` (R4) | schema (`required`) |
+| 189 | `189-developer-mode-privileged-class` | `developer_mode: true` on a `privileged` grant: developer mode is ordinary only (R6) | schema (`const`) |
+| 190 | `190-developer-mode-no-not-after` | `developer_mode: true` with no `not_after`, on a `wait-for-user` grant whose mode alone would not require one (R6) | schema (`required`) |
+| 191 | `191-revoked-enrollment-with-class` | a `revoked` enrollment carrying a `class`: a revocation has only the minimal shape | schema (`if/then`) |
+| 192 | `192-application-seq-above-2-53` | `application_seq: 9007199254740992`, 2^53: no exact RFC 8785 spelling | schema (`maximum`) |
+| 193 | `193-not-after-impossible-date` | `not_after: 2026-02-30T00:00:00Z`: the pattern admits it, only `format: date-time` refuses it | schema (`format`) |
+| 194 | `194-not-after-trailing-newline` | `not_after` with a trailing newline, which the `$`-anchored pattern alone accepts | schema (`not`) |
+| 195 | `195-grant-id-trailing-newline` | `grant_id` `ci-bot` plus a trailing newline: two spellings of one grant | schema (`not`) |
+| 196 | `196-signer-trailing-newline` | `signer` with a trailing newline: two spellings of one key | schema (`not`) |
+| 197 | `197-covered-signer-trailing-newline` | a `covered_signers` item with a trailing newline | schema (`not`) |
+| 198 | `198-advisor-key-no-role` | a goal file whose `advisor-key` entry has no `role` (R5) | schema (`required`) |
+| 199 | `199-application-with-class` | a `standing-application` that brings its own scope (`class`) | schema (`if/then`) |
+| 200 | `200-per-change-no-record-kind` | a record with no `record_kind`: a v6 producer that bumped only the number | schema (`required`) |
+| 201 | `201-enrollment-with-proposed-sha256` | an enrollment carrying `proposed_sha256`: a grant is not about one change | schema (`if/then`) |
+| 202 | `202-per-change-with-grant-id` | a `per-change` record carrying a `grant_id` | schema (`if/then`) |
+| 203 | `203-application-no-generation` | a `standing-application` with no `generation` | schema (`required`) |
+| 204 | `204-hold-seconds-on-standing-approval` | `hold_seconds` on a `standing-approval` enrollment | schema (`if/else`) |
+| 205 | `205-revoked-enrollment-with-nonce` | a `revoked` enrollment carrying a `nonce`: revocation is nonce-less (R3) | schema (`if/then`) |
+| 206 | `206-enrollment-unknown-mode` | an enrollment with `mode: always-yes` | schema (`enum`) |
+| 207 | `207-enrollment-generation-zero` | an enrollment with `generation: 0` | schema (`minimum`) |
+| 208 | `208-enrollment-duplicate-covered-signers` | the same key twice in `covered_signers` | schema (`uniqueItems`) |
+| 209 | `209-enrollment-no-covered-signers` | `covered_signers: []`: a grant that covers no one | schema (`minItems`) |
+| 210 | `210-per-change-no-sig-alg` | a `per-change` record with no `sig_alg` | schema (`required`) |
+| 211 | `211-enrollment-no-developer-mode` | an `active` enrollment with no `developer_mode`: no default, so no second spelling | schema (`required`) |
+| 212 | `212-advisor-key-unknown-role` | an `advisor-key` entry with `role: admin` | schema (`enum`) |
+| 213 | `213-enrollment-signer-is-host` | an enrollment whose `signer` is the device's own host key | approval roles (host key) |
+| 214 | `214-application-signed-by-owner-key` | an application signed by an `owner` key: owner keys sign consent, never applications | approval roles (role) |
+| 215 | `215-per-change-signed-by-covered-key` | a `per-change` record signed by a `covered-signer` key | approval roles (role) |
+| 216 | `216-covered-signers-unsorted` | a developer-mode enrollment whose `covered_signers` is not in ascending byte order | approval roles (order) |
+| 217 | `217-application-no-enrollment-nonce` | a `standing-application` with no `enrollment_nonce` (R10): it names no enrollment instance, so an old application replays after a re-enrollment | schema (`required`) |
+| 218 | `218-application-enrollment-nonce-mismatch` | an application whose `enrollment_nonce` is not the nonce of the active enrollment it names (R10) | approval roles (enrollment nonce) |
+| 219 | `219-enrollment-with-enrollment-nonce` | an enrollment carrying `enrollment_nonce`, which only an application carries | schema (`if/then`) |
+| 220 | `220-enrollment-nonce-trailing-newline` | `enrollment_nonce` plus a trailing newline: two spellings of one nonce | schema (`not`) |
+| 221 | `221-enrollment-host-in-covered-signers` | an enrollment listing the device's own host key in `covered_signers` | approval roles (host key) |
+| 222 | `222-application-signer-not-in-covered-signers` | a developer-mode grant's application signed by a key the grant does not list (overlays the enrollment and the application) | approval roles (covered signer) |
+| 223 | `223-developer-application-signed-by-owner-key` | a developer-mode grant's application signed by an `owner` key: the exclusion holds in developer mode too (overlays the enrollment and the application) | approval roles (role) |
+| 224 | `224-developer-covered-signer-is-owner-key` | a developer-mode enrollment that lists an `owner` key in `covered_signers` | approval roles (role) |
+| 225 | `225-goal-file-host-key-as-advisor-key` | a goal file whose `advisor-key` map holds the file's own `host` key | goal cross-file |
+| 226 | `226-goal-file-no-owner-key` | a goal file that requires a local yes and holds only `covered-signer` keys: nobody can sign a per-change record | schema (`not`) |
+| 227 | `227-enrollment-covered-signer-not-in-trust-root` | an enrollment listing a covered signer the trust root does not hold, outside developer mode | approval roles (role) |
+| 228 | `228-application-names-no-enrollment` | an application whose `grant_id` names no active enrollment | approval roles (grant) |
 
 ## Every class has a fixture
 

@@ -39,14 +39,15 @@ from .sitemodel import GOAL_FILE_SCHEMA, Document, Schemas, SiteModel
 
 # Must equal the `const` of `tendcf/schema/goal-file.schema.json`
 # `schema_version`; CI fails when it does not (.github/workflows/check.yml).
-GOAL_FILE_SCHEMA_VERSION = 6
+GOAL_FILE_SCHEMA_VERSION = 7
 # `supervisor` entered the device-trust domain at v4 (schema-v4 spec §2.1).
 # The `nixos` host exists only from v4 on (spec §6.2 item 6): the one v3
 # spelling, a `nixos` unit-writer, described nothing.
 SUPERVISOR_SCHEMA_VERSION = 4
-# Older versions this compiler can still state: 3, 4 and 5. For inputs valid
-# under the current Site Model contract, rendering at v4, v5 and v6 differs only
-# in `schema_version` (v6 narrowed the interlock `pre_action.command` argv to an
+# Older versions this compiler can still state: 3, 4, 5 and 6. For inputs valid
+# under the current Site Model contract, rendering at v4, v5, v6 and v7 differs only
+# in `schema_version` (v7 changed the approval record only: the goal-file shape is
+# the same as v6's, so the family moved with it, issue 64; v6 narrowed the interlock `pre_action.command` argv to an
 # alphabet with an absolute command[0], a strict subset of v5's acceptance set,
 # so every Site Model that renders at v6 also renders at v5; v5 changed the unit-writer key language, which is a
 # superset of every launchd prefix nix2cf emits, retired the `dpkg` writer and
@@ -55,13 +56,13 @@ SUPERVISOR_SCHEMA_VERSION = 4
 # arbitrary historical v4 output: v4 permitted `dpkg` unit-writer claims,
 # which v5 rejects. Older-version output is never schema-validated. The spec
 # names no downgrade path at v5 and no device holds a baseline (spec §4 item
-# 1); 3, 4 and 5 stay as the shapes a not-yet-migrated device could still hold
-# (the deploy/linux/canary goal files were v5).
+# 1); 3, 4, 5 and 6 stay as the shapes a not-yet-migrated device could still hold
+# (the deploy/linux/canary goal files were v5, then v6).
 # The current version is derived, so a bump of GOAL_FILE_SCHEMA_VERSION cannot
-# leave the renderer refusing its own version. The literals 3, 4 and 5 are NOT
+# leave the renderer refusing its own version. The literals 3, 4, 5 and 6 are NOT
 # derived: re-justify them (is that still a shape a device may hold?) at every
 # bump.
-SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, GOAL_FILE_SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, GOAL_FILE_SCHEMA_VERSION)
 
 # The one state domain the reference projector reads
 # (`tendcf/bin/projector.py:PROJECTING_DOMAIN`). The Site Model's own domain

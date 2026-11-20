@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the one hundred forty-six deliberately broken fixtures in examples/broken/
+  6. each of the one hundred eighty-six deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 146
+EXPECTED_BROKEN = 198
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -106,7 +106,30 @@ EXAMPLES: dict[str, tuple[str, bool]] = {
     "goal-diff.json": ("goal-diff.schema.json", False),
     "approval-record.json": ("approval-record.schema.json", False),
     "approval-record-reject.json": ("approval-record.schema.json", False),
+    # The two standing kinds (v7, issue 64). Schema-checked examples only:
+    # they are NOT in APPROVAL_RECORDS. An enrollment carries no hashes, so
+    # the per-record hash rules cannot apply to it, and registering the
+    # application would need every whole-family overlay (FAMILY_FILES) and
+    # every ceremony case to overlay it too, or its asserted class would
+    # fire the exclusive `family (ceremony)` claim. No enforcement logic is
+    # added for them. They are still canonical-bytes checked and held to the
+    # family's one host.
+    "approval-enrollment.json": ("approval-record.schema.json", False),
+    "approval-application.json": ("approval-record.schema.json", False),
+    # A revocation has its own minimal shape (grant_state revoked: scope
+    # members forbidden), so it needs its own positive example.
+    "approval-revocation.json": ("approval-record.schema.json", False),
 }
+
+# Every approval-record example, held to the signer-role rules of
+# check_approval_roles(). The per-change pair is also in APPROVAL_RECORDS.
+APPROVAL_EXAMPLES = (
+    "approval-record.json",
+    "approval-record-reject.json",
+    "approval-enrollment.json",
+    "approval-application.json",
+    "approval-revocation.json",
+)
 
 # Fixtures that are PRODUCED, not authored, so no schema pairs with them.
 # examples/host_specific.json is the projector golden: its correctness is
@@ -189,6 +212,7 @@ RULE_DUPLICATE_KEY = "duplicate-key parse"
 RULE_NFC = "NFC check"
 RULE_PARSE = "parse"
 RULE_HARNESS = "harness"
+RULE_APPROVAL_ROLES = "approval roles"
 # One class, not two. A golden that no longer matches and a projection that
 # violates an N-series invariant are the same defect seen from two sides —
 # the bytes reaching $(sys.workdir)/data/host_specific.json are not the bytes
@@ -216,6 +240,7 @@ RULE_CLASSES = frozenset(
         RULE_PARSE,
         RULE_HARNESS,
         RULE_PROJECTION,
+        RULE_APPROVAL_ROLES,
     }
 )
 
@@ -422,7 +447,7 @@ def check_family_canonical_bytes() -> None:
 
 BROKEN_README = BROKEN_DIR / "README.md"
 
-# | 13 | `13-schema-version-bump` | `schema_version: 7`, one above the current 6 | schema (`const`) |
+# | 13 | `13-schema-version-bump` | `schema_version: 8`, one above the current 7 | schema (`const`) |
 _README_ROW = re.compile(r"^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|.*\|\s*(.+?)\s*\|\s*$")
 
 
@@ -1330,6 +1355,161 @@ def validate_loaded(
     # longer a file whose position in the family makes it the wrong place to
     # write a negative.
     check_goal_file_family(loaded)
+    check_approval_roles(loaded)
+
+
+def check_approval_roles(loaded: dict[str, Any]) -> None:
+    """Who may sign what, read off the examples (operator ruling R5, PR 75).
+
+    JSON Schema cannot compare two members of one document, let alone two
+    documents, so the signer-role rules that CAN be checked statically are
+    checked here, against the baseline's trust entries (the device's current
+    trust root): the host key never signs or is covered; per-change records
+    and enrollments are signed by an `owner` key; an application is signed by
+    a `covered-signer` key that the grant names (in developer mode the grant
+    is the source of trust, but an owner key is never an application signer
+    or a covered signer in either mode; the application's `enrollment_nonce`
+    names the grant's enrollment, R10); an active
+    enrollment lists its covered signers in ascending byte order, each a
+    `covered-signer` key unless developer mode is on, and never an owner
+    key or the host. Replay, generation and precedence are device state and
+    stay enforcement-time rules (approval-record.schema.json).
+    """
+    baseline = loaded.get("goal-file-baseline.json")
+    try:
+        advisor = baseline["domains"]["device-trust"]["entries"]["advisor-key"]
+    except (KeyError, TypeError):
+        return  # no readable trust root: the schema layers already object
+    if not isinstance(advisor, dict):
+        return
+    role_of = {
+        key: entry.get("role")
+        for key, entry in advisor.items()
+        if isinstance(entry, dict) and entry.get("state") == "present"
+    }
+    docs = {
+        name: loaded[name]
+        for name in APPROVAL_EXAMPLES
+        if isinstance(loaded.get(name), dict)
+    }
+
+    def key_ok(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"ed25519:[0-9a-f]{64}", value) is not None
+
+    # A record the schema already refuses (missing or malformed key, empty
+    # covered_signers) is the schema layer's finding, not a second one here.
+    def usable(rec: dict[str, Any]) -> bool:
+        covered = rec.get("covered_signers")
+        grant = rec.get("grant_id")
+        return (
+            key_ok(rec.get("signer"))
+            and key_ok(rec.get("host"))
+            and (grant is None or (isinstance(grant, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", grant) is not None))
+            and (covered is None or (isinstance(covered, list) and bool(covered) and all(key_ok(k) for k in covered)))
+        )
+
+    enrollment = docs.get("approval-enrollment.json") or {}
+    enrollment = enrollment if usable(enrollment) else {}
+    for name, rec in docs.items():
+        if not usable(rec):
+            continue
+        label = name.removesuffix(".json")
+        kind, signer, host = rec.get("record_kind"), rec.get("signer"), rec.get("host")
+        if signer == host:
+            fail(
+                f"{label}: signer is the device's own host key — the software "
+                "the gate constrains holds that key, so it never signs consent",
+                rule=RULE_APPROVAL_ROLES,
+            )
+            continue
+        if kind in ("per-change", "standing-enrollment"):
+            if role_of.get(signer) != "owner":
+                fail(
+                    f"{label}: a {kind} record is signed by an `owner` key of "
+                    f"the trust root; {signer!r} is "
+                    f"{role_of.get(signer, 'not an entry')!r}",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+        elif kind == "standing-application":
+            grant = (
+                enrollment
+                if enrollment.get("grant_id") == rec.get("grant_id")
+                and enrollment.get("grant_state") == "active"
+                else None
+            )
+            if grant is None:
+                if not enrollment:
+                    continue  # the enrollment is malformed: the schema layer's finding
+                fail(
+                    f"{label}: grant_id {rec.get('grant_id')!r} names no active "
+                    "enrollment among the examples — an application is checked "
+                    "against the grant it relies on",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+                continue
+            developer = grant.get("developer_mode") is True
+            if role_of.get(signer) == "owner":
+                fail(
+                    f"{label}: an application is never signed by an `owner` "
+                    "key, in developer mode or out of it",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            elif not developer and role_of.get(signer) != "covered-signer":
+                fail(
+                    f"{label}: an application is signed by a `covered-signer` "
+                    f"key of the trust root; {signer!r} is "
+                    f"{role_of.get(signer, 'not an entry')!r}",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            if signer not in (grant.get("covered_signers") or []) and role_of.get(signer) != "owner":
+                fail(
+                    f"{label}: signer {signer!r} is not in the grant's covered_signers",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            bound, issued = rec.get("enrollment_nonce"), grant.get("nonce")
+            if (
+                isinstance(bound, str)
+                and isinstance(issued, str)
+                and re.fullmatch(r"[^\n]{1,128}", bound) is not None
+                and bound != issued
+            ):
+                fail(
+                    f"{label}: enrollment_nonce does not name the grant's "
+                    "enrollment (R10): an application is bound to the "
+                    "enrollment instance it relies on",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+        if kind == "standing-enrollment" and rec.get("grant_state") == "active":
+            covered = rec.get("covered_signers") or []
+            if host in covered:
+                fail(
+                    f"{label}: the host key is listed in covered_signers",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            if covered != sorted(covered):
+                fail(
+                    f"{label}: covered_signers is not in ascending byte order — "
+                    "one grant, one spelling",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            for key in covered:
+                if role_of.get(key) == "owner":
+                    fail(
+                        f"{label}: covered signer {key!r} is an `owner` key of "
+                        "the trust root; an owner key is never covered, in "
+                        "developer mode or out of it",
+                        rule=RULE_APPROVAL_ROLES,
+                    )
+            if rec.get("developer_mode") is False:
+                for key in covered:
+                    if key != host and role_of.get(key) not in ("covered-signer", "owner"):
+                        fail(
+                            f"{label}: covered signer {key!r} is "
+                            f"{role_of.get(key, 'not an entry')!r} in the trust "
+                            "root; outside developer mode it must be a "
+                            "`covered-signer` entry",
+                            rule=RULE_APPROVAL_ROLES,
+                        )
 
 
 def check_negative_fixtures(
@@ -1755,6 +1935,20 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                 "one unit, two contradictory states",
                 rule=RULE_GOAL_CROSS_FILE,
             )
+
+    # --- the device's own host key is never a trust-root entry --------------
+    # advisor_key_map (goal-file.schema.json): the software the gate
+    # constrains holds that key, so it must never be an owner or covered key.
+    own_key = goal_file.get("host")
+    advisor_map = (
+        ((domains.get("device-trust") or {}).get("entries") or {}).get("advisor-key")
+    )
+    if isinstance(own_key, str) and isinstance(advisor_map, dict) and own_key in advisor_map:
+        fail(
+            f"{label}: the device's own host key {own_key!r} is an `advisor-key` "
+            "entry — the software the gate constrains must not hold trust-root authority",
+            rule=RULE_GOAL_CROSS_FILE,
+        )
 
     # --- `tendcf-install` names tendcf's own unit and nothing else ----------
     # §2.2(5). Only on a systemd host: the other supervisors reject the
