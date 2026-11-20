@@ -1,10 +1,11 @@
 #!/bin/sh
 # State 1 macOS VM image prep (issue 70 answers 1-3, slice A).
-# Runs as root inside the guest, copied there and run as one file by `state1_vm.py golden`:
+# Runs as root inside the guest, streamed there and run as one file by `state1_vm.py golden`:
 #     sudo -n /bin/sh prep.sh
 # The only changes to the pinned vanilla image: Spotlight off, automatic updates off, a
-# named list of unused launchd jobs disabled, Gatekeeper on, key-only SSH login (with
-# fresh host keys). No SIP change, no /System change, no Recovery change.
+# named list of unused launchd jobs disabled, Gatekeeper on, Screen Sharing off, key-only SSH
+# login (with fresh host keys, printed as PREP-HOSTKEY for the driver to pin). No SIP change,
+# no /System change, no Recovery change.
 # Idempotent. Snapshots first: the original state is written once, to
 # $STATE_DIR/snapshots/before-*, and every run writes after-* when it is done.
 set -eu
@@ -83,7 +84,9 @@ fi
 
 # 1. Spotlight off.
 mdutil -a -i off >/dev/null 2>&1 || true
-if mdutil -a -s 2>&1 | grep -q 'Indexing enabled'; then die "Spotlight indexing is still enabled"; fi
+mdutil_out=$(mdutil -a -s 2>&1) || die "mdutil -a -s failed: $mdutil_out"
+case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled" ;; esac
+case $mdutil_out in *"Indexing disabled"*) ;; *) die "mdutil -a -s did not report 'Indexing disabled': $mdutil_out" ;; esac
 log "spotlight: off"
 
 # 2. Automatic updates off (softwareupdate itself stays usable).
@@ -99,35 +102,51 @@ spctl --global-enable 2>/dev/null || spctl --master-enable
 spctl --status 2>&1 | grep -q 'assessments enabled' || die "Gatekeeper is not enabled"
 log "gatekeeper: on"
 
-# 4. Named unused launchd jobs.
+# 4. Screen Sharing off. The vanilla image turns it on, with the published admin password,
+# and that is a root-equivalent GUI login for anything on the vmnet. Fatal, not hygiene.
+launchctl disable system/com.apple.screensharing
+launchctl bootout system/com.apple.screensharing >/dev/null 2>&1 || true
+is_disabled() { # is_disabled DOMAIN LABEL: print-disabled lists it as disabled
+    launchctl print-disabled "$1" 2>/dev/null | grep -Eq "\"$2\"[[:space:]]*=>[[:space:]]*(disabled|true)"
+}
+is_disabled system com.apple.screensharing || die "com.apple.screensharing is not disabled"
+if netstat -an -p tcp 2>/dev/null | grep -Eq '[.:]5900[[:space:]].*LISTEN'; then
+    die "something still listens on tcp 5900 (Screen Sharing)"
+fi
+log "screen sharing: disabled, nothing on tcp 5900"
+
+# 5. Named unused launchd jobs (hygiene: a failure is reported, not fatal). A label counts
+# only if its plist ships in the directory matching its domain, and "disabled" means the
+# print-disabled readback says so (launchctl disable itself succeeds for almost any label).
 disabled=0 absent=0 failed=0
 printf '%s\n' "$DISABLE_LIST" | grep -v '^$' >"$STATE_DIR/disable-list.txt"
 while read -r domain label; do
+    case $domain in
+        system) dom=system dirs="/System/Library/LaunchDaemons /Library/LaunchDaemons" ;;
+        gui) dom=gui/$ADMIN_UID dirs="/System/Library/LaunchAgents /Library/LaunchAgents" ;;
+        *) die "bad domain in DISABLE_LIST: $domain" ;;
+    esac
     present=0
-    for dir in /System/Library/LaunchDaemons /System/Library/LaunchAgents /Library/LaunchDaemons /Library/LaunchAgents; do
+    for dir in $dirs; do
         if [ -f "$dir/$label.plist" ]; then present=1; fi
     done
     if [ "$present" -eq 0 ]; then
-        log "launchd $domain/$label: absent, skipped"
+        log "launchd $dom/$label: absent, skipped"
         absent=$((absent + 1))
         continue
     fi
-    case $domain in
-        system) target=system/$label ;;
-        gui) target=gui/$ADMIN_UID/$label ;;
-        *) die "bad domain in DISABLE_LIST: $domain" ;;
-    esac
-    if launchctl disable "$target" >/dev/null 2>&1; then
-        log "launchd $target: disabled"
+    launchctl disable "$dom/$label" </dev/null >/dev/null 2>&1 || true
+    if is_disabled "$dom" "$label"; then
+        log "launchd $dom/$label: disabled (read back)"
         disabled=$((disabled + 1))
     else
-        log "launchd $target: disable FAILED"
+        log "launchd $dom/$label: disable NOT confirmed by print-disabled"
         failed=$((failed + 1))
     fi
 done <"$STATE_DIR/disable-list.txt"
 log "launchd: disabled=$disabled absent=$absent failed=$failed"
 
-# 5. Fresh SSH host keys, once per image: the vanilla tag's keys are the same for every
+# 6. Fresh SSH host keys, once per image: the vanilla tag's keys are the same for every
 # user of that tag. sshd reads them per connection; this session is unaffected.
 if [ ! -f "$STATE_DIR/hostkeys-regenerated" ]; then
     rm -f /etc/ssh/ssh_host_*
@@ -137,7 +156,7 @@ if [ ! -f "$STATE_DIR/hostkeys-regenerated" ]; then
 fi
 [ -f /etc/ssh/ssh_host_ed25519_key.pub ] || die "no ed25519 host key after regeneration"
 
-# 6. Key-only SSH login. macOS sshd_config includes sshd_config.d; first value wins.
+# 7. Key-only SSH login. macOS sshd_config includes sshd_config.d; first value wins.
 grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config \
     || die "/etc/ssh/sshd_config does not include sshd_config.d"
 mkdir -p /etc/ssh/sshd_config.d
@@ -153,11 +172,15 @@ chown root:wheel "$tmp"
 chmod 644 "$tmp"
 mv -f "$tmp" "$SSH_DROPIN"
 effective=$(/usr/sbin/sshd -T -C user=admin,host=localhost,addr=127.0.0.1)
-for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes'; do
+for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no'; do
     printf '%s\n' "$effective" | grep -qx "$want" || die "sshd -T does not show: $want"
 done
 log "sshd: key login only"
 
 snapshot after
 log "wrote after snapshot to $SNAP/after"
+# The authenticated copy of the new host key: the driver pins exactly this line (inside
+# this ssh session), and uses ssh-keyscan only as a cross-check.
+hostkey=$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)
+echo "PREP-HOSTKEY $hostkey"
 echo "PREP-RESULT disabled=$disabled absent=$absent failed=$failed"

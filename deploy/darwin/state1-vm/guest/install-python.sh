@@ -2,7 +2,8 @@
 # State 1 VM: system-wide python.org Python (issue 70 answer 5, slice A).
 # Runs as root inside the guest: sudo -n /bin/sh install-python.sh VERSION URL SHA256 SIGNER
 # One install per image, from the python.org package, never uv per-user copies.
-# Idempotent: exits 0 without downloading when that exact version is installed.
+# Idempotent: downloads nothing when that exact version is installed. The ownership
+# fix-up and its whole-tree assertion run every time.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 [ "$(id -u)" -eq 0 ] || { echo "install-python.sh: must run as root" >&2; exit 1; }
@@ -12,9 +13,30 @@ minor=${version%.*}
 fw=/Library/Frameworks/Python.framework/Versions/$minor
 py=$fw/bin/python$minor
 
+die() { echo "install-python.sh: $*" >&2; exit 1; }
+
 installed() {
     [ -x "$py" ] || return 1
     [ "$("$py" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' </dev/null)" = "$version" ]
+}
+
+# pkgutil --check-signature must exit 0, report Apple's distribution-certificate status and
+# name the leaf certificate exactly "Developer ID Installer: <signer>". The sha256 pin is the
+# real control; this is the second one. Lines are compared whole, after trimming.
+check_signature() {
+    sig=$(pkgutil --check-signature "$1" </dev/null) || die "pkgutil --check-signature failed for $1"
+    got_status=0 got_signer=0
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        case $line in
+            "Status: signed by a developer certificate issued by Apple for distribution") got_status=1 ;;
+            "1. Developer ID Installer: $signer") got_signer=1 ;;
+        esac
+    done <<EOF
+$sig
+EOF
+    [ "$got_status" -eq 1 ] || die "package status is not 'signed by a developer certificate issued by Apple for distribution'"
+    [ "$got_signer" -eq 1 ] || die "package leaf certificate is not 'Developer ID Installer: $signer'"
 }
 
 if installed; then
@@ -23,17 +45,20 @@ else
     work=$(mktemp -d /var/tmp/tendcf-python.XXXXXX)
     trap 'rm -rf "$work"' EXIT
     pkg=$work/python.pkg
-    curl -fsSL --retry 3 --max-time 900 -o "$pkg" "$url" </dev/null
-    echo "$sha256  $pkg" | shasum -a 256 -c - >/dev/null || { echo "install-python.sh: sha256 mismatch for $url" >&2; exit 1; }
-    pkgutil --check-signature "$pkg" | grep -F -- "$signer" >/dev/null \
-        || { echo "install-python.sh: package is not signed by $signer" >&2; exit 1; }
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 900 -o "$pkg" "$url" </dev/null
+    echo "$sha256  $pkg" | shasum -a 256 -c - >/dev/null || die "sha256 mismatch for $url"
+    check_signature "$pkg"
     installer -pkg "$pkg" -target / </dev/null
-    installed || { echo "install-python.sh: $py does not report $version after install" >&2; exit 1; }
+    installed || die "$py does not report $version after install"
 fi
 
-# Root-owned and not group/world writable (checklist step 3's rule, applied to this install).
-owner=$(stat -f '%Su' "$fw")
-mode=$(stat -f '%Lp' "$fw")
-[ "$owner" = root ] || { echo "install-python.sh: $fw owned by $owner" >&2; exit 1; }
-case $mode in *[2367][0-7]|*[0-7][2367]) echo "install-python.sh: $fw mode $mode is group/world writable" >&2; exit 1 ;; esac
+# python.org's postflight leaves the framework root:admin with group write (775). Checklist
+# step 3's rule is root:wheel and not group/world writable, so fix it, then assert it over the
+# whole tree (-h: symlinks themselves; symlink modes are not meaningful and are not tested).
+chown -hR root:wheel "$fw"
+chmod -R go-w "$fw"
+bad=$(find "$fw" \( ! -user root -o ! -group wheel \) -print </dev/null | head -n 5)
+[ -z "$bad" ] || die "not root:wheel: $bad"
+bad=$(find "$fw" ! -type l \( -perm -020 -o -perm -002 \) -print </dev/null | head -n 5)
+[ -z "$bad" ] || die "group or world writable: $bad"
 echo "INSTALL-PYTHON-RESULT version=$version path=$py"
