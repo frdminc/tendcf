@@ -121,7 +121,7 @@ def test_site_model_inputs_validate(schemas: Schemas) -> None:
 def test_example_site_mac_golden(schemas: Schemas) -> None:
     result = compile_host(_model(SITE), _host(SITE), schemas)
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 6
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 7
     assert doc["host"] == HOST_KEY
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "launchd", "state": "present"}}
     sup = doc["domains"]["supervision"]
@@ -303,7 +303,7 @@ def test_nixos_host_without_services_is_deliberately_unmanaged(tendcf: Path, sch
     # no-op on a file with no entries): drift in either repo shows up here.
     assert result.canonical == (tendcf / "deploy" / "linux" / "passthrough" / "goal-file.json").read_bytes()
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 6
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 7
     assert doc["domains"]["supervision"] == {"coverage": "deliberately-unmanaged"}
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "nixos", "state": "present"}}
     assert set(doc["domains"]) == {"device-trust", "supervision"}  # no unit-writer registry travels
@@ -372,13 +372,15 @@ def _host_shapes() -> dict[str, HostSpec]:
     }
 
 
-@pytest.mark.parametrize("old_version", [4, 5])
+@pytest.mark.parametrize("old_version", [4, 5, 6])
 @pytest.mark.parametrize("shape", ["launchd", "nixos", "systemd", "runit"])
 def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str, old_version: int) -> None:
-    """For inputs valid under the current Site Model contract, the v4 and v5 files
-    are the current file with the old version number, for every host shape. The
-    current file is validated against tendcf's schemas (an older file cannot be:
-    the schema is a const). v5 differs from v6 only by the number because v6
+    """For inputs valid under the current Site Model contract, the v4, v5 and v6
+    files are the current file with the old version number, for every host shape.
+    The current file is validated against tendcf's schemas (an older file cannot
+    be: the schema is a const). v6 differs from v7 only by the number because v7
+    changed the approval record alone (issue 64). v5 differs from v6 only by the
+    number because v6
     narrowed the interlock pre_action argv (a strict subset of v5's acceptance
     set): any Site Model valid now was valid at v5, so its v5 rendering is the
     same file; v4 differs from v5 only by the unit-writer key language, the

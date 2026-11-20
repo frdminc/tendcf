@@ -686,7 +686,7 @@ file stays rejected as circular.
   the new shape sits with DC-2 is for the design review the schema bump
   requires (two frontier reviews), within the reading below (dropping any
   check other than the per-change nonce needs an operator ruling). **A reading of the ruling (L5, B2), not
-  part of it (lead decision, PR 62 round-3 review):** a standing approval drops
+  part of it (lead decision, PR 62 review):** a standing approval drops
   only the per-change nonce (DC-2's device nonce); it is signed by an
   owner-held trusted key and keeps B1's other content checks (signed by trusted
   keys, fresh, names this device) and the rest of DC-2 (per-target validity,
@@ -700,6 +700,9 @@ file stays rejected as circular.
   user", standing refusal) is owner-enrolled and refusable, and none is a
   default; dropping any other check needs an operator ruling; the schema design
   review confirms the approval-record shape (AGENTS.md, Android item 5).
+
+  **Erratum (2026-11-20, issue 64):** the operator ruled the questions this reading left open (operator rulings, 2026-11-19, issue 64 choosers): "3. Include all classes" (a standing mode may cover `ordinary`, `privileged` and `baseline` changes, each class enrolled separately and explicitly); "1. Reusable grant (Recommended)" (one grant covers many changes, with persistent per-device replay state for each application: reusable, never replayable); "1. Owner-enrolled trusted signers (Recommended)" (outside developer mode the owner may enroll any explicitly trusted signer within a stated scope, automation and organisational signers included); "1. Bind both fields (Recommended)" (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must match the actual verification, and cannot create trust or enable an unapproved algorithm). So "covers `ordinary` changes only" and "only if X-trust-06 is adopted (proposed, not ruled)" are superseded, and "signed by an owner-held trusted key" now means the enrollment; the changes it covers are signed by a signer the enrollment names. The rest of the reading stands. The shape is approval-record schema v7 (`schema/approval-record.schema.json`: `per-change`, `standing-enrollment` and `standing-application` records; the goal-file family moves to v7 together, PR 62 review Q4). Current wording: `AGENTS.md`, Android item 5.
+
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
   `--simulate-output=json` issue before Step 3 code.

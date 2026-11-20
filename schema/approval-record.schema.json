@@ -2,42 +2,57 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/approval-record.schema.json",
   "title": "Approval record — the signed consent object (D44, C-5)",
-  "description": "Outline from goal-file-schema-reconciliation-2026-08-15.md §11 (§18 item 1); not this document's tested surface — §14.2 review and the fixture set land with the family, not this pass. The signed object is the JCS bytes of this record with `signature` removed (C-5, replacing E1 §5.1's hash-concatenation formula, whose optional briefing member was an encoding-ambiguity hazard). DC-2 applies in full: per-target validity, device nonce, monotonic-counter single use, persisted rejects. Grok's `H(projected_augments)` extension is dropped — with the device-side projector there is no shipped projection to bind (map §9 preamble).",
+  "description": "Outline from goal-file-schema-reconciliation-2026-08-15.md §11 (§18 item 1), extended at v7 for B2's standing modes and X-trust-06 (issue 64); not this document's tested surface — §14.2 review and the fixture set land with the family, not this pass. The signed object is the JCS bytes of this record with `signature` removed (C-5, replacing E1 §5.1's hash-concatenation formula, whose optional briefing member was an encoding-ambiguity hazard). DC-2 applies in full to `per-change` records: per-target validity, device nonce, monotonic-counter single use, persisted rejects. Standing records drop only the per-change nonce (L5, B2) and keep the rest of DC-2: per-target validity (`host`), single use as a per-grant high-water mark (`application_seq`), and persisted rejects, which win over any grant. Grok's `H(projected_augments)` extension is dropped — with the device-side projector there is no shipped projection to bind (map §9 preamble).",
   "type": "object",
   "properties": {
     "schema_version": {
-      "description": "Family version, shared with goal-file and goal-diff (§11).",
-      "const": 6
+      "description": "Family version, shared with goal-file and goal-diff (§11). 7 adds `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record (X-trust-06): the B2 nonce-less shape and X-trust-06 share one bump (PR 62 review Q4 left the grouping to this review), because both change what a v6 validator would accept and C-policy-01 wants one number per acceptance set.",
+      "const": 7
+    },
+    "record_kind": {
+      "description": "Which consent object this is. `per-change`: the v6 record (one yes or no about one change, device nonce, `approval_seq`), plus `signer`/`sig_alg`. `standing-enrollment`: the owner's signed enrolment, update or revocation of one standing mode (B2), the reusable grant. `standing-application`: a covered signer's claim that one change is covered by a live grant; it carries no device nonce and no verdict, and is replay-checked against per-device state instead (ruling 2026-11-19, reusable grant with persistent per-device replay state).",
+      "enum": [
+        "per-change",
+        "standing-enrollment",
+        "standing-application"
+      ]
     },
     "host": {
-      "description": "The target key this record is valid for — DC-2's per-target validity.",
-      "type": "string",
-      "pattern": "^ed25519:[0-9a-f]{64}$"
+      "description": "The target key this record is valid for — DC-2's per-target validity. Every kind names exactly one host; a grant is never fleet-wide.",
+      "$ref": "#/$defs/key_id"
+    },
+    "signer": {
+      "description": "X-trust-06 (adopted, operator ruling 2026-11-19): the typed identifier of the key that produced `signature`, inside the signed bytes. The validator verifies with exactly this key and refuses the record unless the key is in the device's local trust root at verification time with authority for this kind: an owner-held key for `per-change` and `standing-enrollment`; for `standing-application`, a key named in `covered_signers` of the live generation of the grant. Naming a key never creates trust; the trust root is the only source of trust.",
+      "$ref": "#/$defs/key_id"
+    },
+    "sig_alg": {
+      "description": "X-trust-06: the signature algorithm, inside the signed bytes. It MUST equal the algorithm the validator actually verified with and the algorithm the trust root records for `signer`; a mismatch is refused, never retried under another algorithm. Naming an algorithm never enables it: the enum is the approved set, and widening it is a schema_version bump.",
+      "$ref": "#/$defs/sig_alg"
     },
     "baseline_sha256": {
-      "description": "H(old canonical goal file). Absent ONLY at first adoption, where there is no prior approved baseline to name — a named §14.2 review target (TC-11/TC-20 territory), not a property this outline claims to have fully worked out.",
+      "description": "H(old canonical goal file). Absent ONLY at first adoption, where there is no prior approved baseline to name — a named §14.2 review target (TC-11/TC-20 territory), not a property this outline claims to have fully worked out. `per-change` and `standing-application` only.",
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "proposed_sha256": {
-      "description": "H(new canonical goal file) — what `verdict` is a verdict about.",
+      "description": "H(new canonical goal file) — what the record is about. `per-change` and `standing-application` only. A persisted reject (DC-2) of this hash wins over any standing grant: a change the owner refused stays refused until a later per-change accept.",
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "nonce": {
-      "description": "Device-issued, single-use (DC-2). Exact byte encoding is residue, not decided here — this outline states only that it is present and opaque.",
+      "description": "Device-issued, single-use (DC-2). `per-change` only: it is the one check a standing mode drops (L5, B2). Exact byte encoding is residue, not decided here — this outline states only that it is present and opaque.",
       "type": "string",
       "minLength": 1
     },
     "approval_seq": {
-      "description": "Monotonic counter, DC-2 single-use: the validator rejects any record whose approval_seq does not exceed the last persisted one for this host.",
+      "description": "Monotonic counter, DC-2 single-use: the validator rejects any `per-change` record whose approval_seq does not exceed the last persisted one for this host. `per-change` only; standing applications use `application_seq`, a separate counter per grant, so that an owner's yes and a covered signer's application never race for one number.",
       "type": "integer",
       "minimum": 0
     },
     "briefing_sha256": {
-      "description": "Optional: binds the record to the briefing bytes the person actually saw, when one was shown.",
+      "description": "Optional, `per-change` only: binds the record to the briefing bytes the person actually saw, when one was shown.",
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "verdict": {
-      "description": "What the approver decided about proposed_sha256.",
+      "description": "`per-change` only: what the approver decided about proposed_sha256. A reject is persisted (DC-2) and outlives any standing grant; refusing a change shown during a hold window is a `per-change` reject.",
       "enum": [
         "accept",
         "reject",
@@ -53,48 +68,276 @@
       "minItems": 1
     },
     "ceremony_class": {
-      "description": "Asserted by the approver, checked against the validator's own DERIVED requirement (map §9.8) — a mismatch is refused, never silently upgraded or downgraded.",
+      "description": "`per-change` and `standing-application`: asserted by the signer, checked against the validator's own DERIVED requirement (map §9.8) — a mismatch is refused, never silently upgraded or downgraded. For an application it must also be one of the grant's `classes`.",
       "enum": [
         "ordinary",
         "privileged",
         "baseline"
       ]
     },
+    "grant_id": {
+      "description": "`standing-enrollment` and `standing-application`: names one grant on this host. The device keeps, per (host, grant_id), the highest enrolment generation it has accepted, that generation's state and scope, and the application high-water mark; that is the persistent per-device replay state.",
+      "$ref": "#/$defs/grant_id"
+    },
+    "generation": {
+      "description": "`standing-enrollment`: the grant's version. An enrolment is accepted only if its generation exceeds the one stored for (host, grant_id); a second enrolment at the stored generation with other bytes is refused (equivocation), so an old enrolment can never be replayed over a newer one. `standing-application`: the generation it relies on, which must equal the stored, active generation — any re-enrolment or revocation strands every application made under an earlier one.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "grant_state": {
+      "description": "`standing-enrollment` only. `revoked` is terminal for the grant_id: no later generation can reactivate it, and a new grant needs a new grant_id. Revocation is always honoured (Smaller 1), needs only the owner's signature (no device nonce, so it works while the owner is away from the device), and takes effect when it is persisted, before any further application is judged.",
+      "enum": [
+        "active",
+        "revoked"
+      ]
+    },
+    "mode": {
+      "description": "`standing-enrollment` only: the standing mode enrolled (B2). `standing-approval` applies a covered change without a per-change yes; `hold-window` shows it and applies it after `hold_seconds` unless the owner refuses first; `wait-for-user` holds a covered change until the owner answers per change; `standing-refusal` refuses covered changes. Every mode is owner-enrolled and refusable, and none is a default. When several active grants cover one change, the most restrictive wins (refusal, then wait-for-user, then hold-window, then standing-approval).",
+      "enum": [
+        "standing-approval",
+        "hold-window",
+        "wait-for-user",
+        "standing-refusal"
+      ]
+    },
+    "hold_seconds": {
+      "description": "`standing-enrollment` with `mode: hold-window` only, and required there: how long a covered change is shown and refusable before it applies.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "covered_signers": {
+      "description": "`standing-enrollment` only: the keys whose applications this grant covers. Outside developer mode, each must already be an explicitly trusted, enrolled key in the device's trust root (ruling 2026-11-19: any explicitly trusted enrolled signer, automation and organisational signers included); the grant scopes that trust, it never creates it. The grantor is `signer`, which must be owner-held; a covered signer need not be.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/key_id"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "classes": {
+      "description": "`standing-enrollment` only: the ceremony classes the grant covers, each listed explicitly (ruling 2026-11-19: all classes may be covered, each enrolled explicitly; nothing is implied by listing a higher class). The enrolment itself is accepted only through the owner ceremony of the highest class it lists, so a grant can never cover more than its enrolment ceremony did.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "ordinary",
+          "privileged",
+          "baseline"
+        ]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "developer_mode": {
+      "description": "`standing-enrollment` only. `true` is Smaller 1's developer mode: the covered signer may be one of the owner's choosing that the trust root does not otherwise trust, enrolled by this grant for this host only, and the device shows a persistent indicator while any such grant is active. `false`: every covered signer must already be explicitly trusted (see `covered_signers`).",
+      "type": "boolean"
+    },
+    "not_after": {
+      "description": "Optional, `standing-enrollment` only: UTC instant after which the grant covers nothing. Absent means until revoked.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "application_seq": {
+      "description": "`standing-application` only: the per-grant replay counter. The validator accepts an application only if application_seq exceeds the high-water mark stored for (host, grant_id), and it durably persists the new mark BEFORE it applies the change: a crash after the write and before the apply loses that application (fail closed; the signer re-issues with a higher number), and no crash can make one application apply twice. The mark never decreases, across generations included. This keeps DC-2's single use while the grant itself is reused (reusable, not replayable).",
+      "type": "integer",
+      "minimum": 0
+    },
     "signature": {
-      "description": "Detached signature over the JCS bytes of this record with this member removed (C-5). Exact encoding is residue, not decided here.",
+      "description": "Detached signature by `signer` under `sig_alg` over the JCS bytes of this record with this member removed (C-5), so `signer` and `sig_alg` are signed. Exact encoding is residue, not decided here.",
       "type": "string",
       "minLength": 1
     }
   },
   "required": [
     "schema_version",
+    "record_kind",
     "host",
-    "proposed_sha256",
-    "nonce",
-    "approval_seq",
-    "verdict",
-    "ceremony_class",
+    "signer",
+    "sig_alg",
     "signature"
   ],
   "additionalProperties": false,
-  "if": {
-    "properties": {
-      "verdict": {
-        "const": "reject"
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "record_kind": {
+            "const": "per-change"
+          }
+        },
+        "required": [
+          "record_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "schema_version",
+          "record_kind",
+          "host",
+          "signer",
+          "sig_alg",
+          "signature",
+          "proposed_sha256",
+          "nonce",
+          "approval_seq",
+          "verdict",
+          "ceremony_class"
+        ],
+        "properties": {
+          "grant_id": false,
+          "generation": false,
+          "grant_state": false,
+          "mode": false,
+          "hold_seconds": false,
+          "covered_signers": false,
+          "classes": false,
+          "developer_mode": false,
+          "not_after": false,
+          "application_seq": false
+        }
       }
     },
-    "required": [
-      "verdict"
-    ]
-  },
-  "then": {
-    "required": [
-      "refused"
-    ]
-  },
-  "else": {
-    "properties": {
-      "refused": false
+    {
+      "if": {
+        "properties": {
+          "record_kind": {
+            "const": "standing-enrollment"
+          }
+        },
+        "required": [
+          "record_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "schema_version",
+          "record_kind",
+          "host",
+          "signer",
+          "sig_alg",
+          "signature",
+          "grant_id",
+          "generation",
+          "grant_state",
+          "mode",
+          "covered_signers",
+          "classes",
+          "developer_mode"
+        ],
+        "properties": {
+          "baseline_sha256": false,
+          "proposed_sha256": false,
+          "nonce": false,
+          "approval_seq": false,
+          "briefing_sha256": false,
+          "verdict": false,
+          "refused": false,
+          "ceremony_class": false,
+          "application_seq": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_kind": {
+            "const": "standing-application"
+          }
+        },
+        "required": [
+          "record_kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "schema_version",
+          "record_kind",
+          "host",
+          "signer",
+          "sig_alg",
+          "signature",
+          "grant_id",
+          "generation",
+          "application_seq",
+          "proposed_sha256",
+          "ceremony_class"
+        ],
+        "properties": {
+          "nonce": false,
+          "approval_seq": false,
+          "briefing_sha256": false,
+          "verdict": false,
+          "refused": false,
+          "grant_state": false,
+          "mode": false,
+          "hold_seconds": false,
+          "covered_signers": false,
+          "classes": false,
+          "developer_mode": false,
+          "not_after": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "reject"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "required": [
+          "refused"
+        ]
+      },
+      "else": {
+        "properties": {
+          "refused": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "hold-window"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "hold_seconds"
+        ]
+      },
+      "else": {
+        "properties": {
+          "hold_seconds": false
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "key_id": {
+      "description": "A typed key identifier, the same form as `host`.",
+      "type": "string",
+      "pattern": "^ed25519:[0-9a-f]{64}$"
+    },
+    "sig_alg": {
+      "description": "The approved signature algorithms. One today, matching the only key type `key_id` admits.",
+      "enum": [
+        "ed25519"
+      ]
+    },
+    "grant_id": {
+      "description": "Opaque grant name, unique per host; a restricted alphabet so it is one spelling on every surface.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
     }
   }
 }

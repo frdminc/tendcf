@@ -447,20 +447,32 @@ Maybe have a development mode and/or build?").
    signing key, and a release pipeline that refuses the dev flavour are
    **recommended follow-ups, not ruled**.
 5. **A reading of the ruling (L5, B2), not part of it (adversary review of PR
-   62, finding 4; wording: lead decision, PR 62 round-3 review):** a standing
-   approval drops only the per-change nonce (DC-2's device nonce); it is signed
-   by an owner-held trusted key and keeps B1's other content checks (signed by
+   62, finding 4; wording: lead decision, PR 62 review), updated for the
+   operator rulings of 2026-11-19 below (issue 64):** every standing mode that
+   applies a change without a per-change yes (hold window, standing approval)
+   drops only the per-change nonce (DC-2's device nonce); its enrollment is
+   signed by an owner-held trusted key, and each change it covers is signed by
+   a signer the enrollment names; it keeps B1's other content checks (signed by
    trusted keys, fresh, names this device) and the rest of DC-2 (per-target
    validity, monotonic-counter single use or high-water mark, persisted
-   rejects); its ceremony class is still checked against the validator's
-   derived requirement (§9.8); until the operator rules, a standing approval
-   covers `ordinary` changes only; whether one may cover `privileged` or
-   `baseline` changes is for the schema design review to propose and the
-   operator to rule; it names its signer and algorithm only if X-trust-06 is
-   adopted (proposed, not ruled); every standing mode (hold window, standing
-   approval, standing "wait for user", standing refusal) is owner-enrolled and
-   refusable, and none is a default; dropping any other check needs an operator
-   ruling; the schema design review confirms the approval-record shape.
+   rejects, which win over any grant); its ceremony class is still checked
+   against the validator's derived requirement (§9.8); every standing mode
+   (hold window, standing approval, standing "wait for user", standing
+   refusal) is owner-enrolled and refusable, and none is a default; dropping
+   any other check needs an operator ruling. Operator rulings, 2026-11-19
+   (issue 64 choosers): "3. Include all classes" (a standing mode may cover
+   `ordinary`, `privileged` and `baseline` changes, each class enrolled
+   separately and explicitly); "1. Reusable grant (Recommended)" (one grant
+   covers many changes, with persistent per-device replay state for each
+   application: reusable, never replayable); "1. Owner-enrolled trusted
+   signers (Recommended)" (outside developer mode the owner may enroll any
+   explicitly trusted signer within a stated scope, automation and
+   organisational signers included); "1. Bind both fields (Recommended)"
+   (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must
+   match the actual verification, and cannot create trust or enable an
+   unapproved algorithm). The shape is approval-record schema v7
+   (`schema/approval-record.schema.json`; the goal-file family moves to v7
+   together, PR 62 review Q4).
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 
