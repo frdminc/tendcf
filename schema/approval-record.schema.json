@@ -2,15 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/approval-record.schema.json",
   "title": "Approval record — the signed consent object (D44, C-5)",
-  "description": "Outline from goal-file-schema-reconciliation-2026-08-15.md §11 (§18 item 1), extended at v7 for B2's standing modes and X-trust-06 (issue 64); not this document's tested surface — §14.2 review and the fixture set land with the family, not this pass. The signed object is the JCS bytes of this record with `signature` removed (C-5, replacing E1 §5.1's hash-concatenation formula, whose optional briefing member was an encoding-ambiguity hazard). DC-2 applies in full to `per-change` records: per-target validity, device nonce, monotonic-counter single use, persisted rejects. Standing records drop only the per-change nonce (L5, B2) and keep the rest of DC-2: per-target validity (`host`), single use as a per-grant high-water mark (`application_seq`), and persisted rejects, which win over any grant. Grok's `H(projected_augments)` extension is dropped — with the device-side projector there is no shipped projection to bind (map §9 preamble).",
+  "description": "Outline from goal-file-schema-reconciliation-2026-08-15.md §11 (§18 item 1), extended at v7 for B2's standing modes and X-trust-06 (issue 64); not this document's tested surface — §14.2 review and the fixture set land with the family, not this pass. The signed object is the JCS bytes of this record with `signature` removed (C-5, replacing E1 §5.1's hash-concatenation formula, whose optional briefing member was an encoding-ambiguity hazard). DC-2 applies in full to `per-change` records: per-target validity, device nonce, monotonic-counter single use, persisted rejects. Standing records drop only the per-change nonce (L5, B2; an active enrolment carries its own device nonce, R3) and keep the rest of DC-2: per-target validity (`host`), single use as a per-grant high-water mark (`application_seq`), and persisted rejects, which win over any grant. Grok's `H(projected_augments)` extension is dropped — with the device-side projector there is no shipped projection to bind (map §9 preamble). OPERATOR RULINGS built in (each recorded in AGENTS.md, Android item 5). 2026-11-19, issue 64 choosers: \"3. Include all classes\", \"1. Reusable grant (Recommended)\", \"1. Owner-enrolled trusted signers (Recommended)\", \"1. Bind both fields (Recommended)\" (X-trust-06 adopted). 2026-11-20, PR 75 review: R1 \"1. Carve-out (Recommended)\", R2 \"1. One class per grant (Recommended)\", R3 \"1. Device nonce (Recommended)\", R4 \"1. Apply-without-yes modes (Recommended)\", R5 \"1. Role in goal file now (Recommended)\", R6 \"1. Ordinary only (Recommended)\"; each is quoted where it bites, in `signer`, `nonce`, `class`, `developer_mode`, `not_after` and the goal file's `advisor_key_map`. LEAD PROPOSALS, not operator rulings (each is open to the operator, and each is labelled \"(lead proposal)\" where it is stated): terminal revocation per grant_id and what follows from it (honoured at any generation, wins equivocation, tombstones never deleted); most-restrictive-wins and its tie and edge rules; the hold-window timing rules and persist-at-intake; an owner's per-change accept staying available against a covering standing-refusal; the Ed25519 verification profile; approval records' downgrade floor; the reading of \"trust root\" for the R1 carve-out. ENFORCEMENT-TIME RULES stated in the field descriptions are the contract for the enforcement PR. No enforcement code exists yet, and a static fixture cannot express replay, generation, revocation, precedence or crash-order behaviour, which depend on device state; the static constraints that can be written as schema are, and each has a negative fixture.",
   "type": "object",
   "properties": {
     "schema_version": {
-      "description": "Family version, shared with goal-file and goal-diff (§11). 7 adds `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record (X-trust-06): the B2 nonce-less shape and X-trust-06 share one bump (PR 62 review Q4 left the grouping to this review), because both change what a v6 validator would accept and C-policy-01 wants one number per acceptance set.",
+      "description": "Family version, shared with goal-file and goal-diff (§11). 7 adds `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record (X-trust-06): the B2 nonce-less shape and X-trust-06 share one bump, because both change what a v6 validator would accept and C-policy-01 wants one number per acceptance set; the role on the goal file's trust entries (R5) rides the same bump. The grouping was decided at the schema design review (PR 62 review Q4, \"1. Decide at design review\" handed the decision to that review). Approval records have floor = ceiling (lead proposal): a v7 validator refuses an approval record below 7, which lacks the `signer`/`sig_alg` binding, however many older goal-file versions the compiler still reads; there is no older acceptance path for a consent record.",
       "const": 7
     },
     "record_kind": {
-      "description": "Which consent object this is. `per-change`: the v6 record (one yes or no about one change, device nonce, `approval_seq`), plus `signer`/`sig_alg`. `standing-enrollment`: the owner's signed enrolment, update or revocation of one standing mode (B2), the reusable grant. `standing-application`: a covered signer's claim that one change is covered by a live grant; it carries no device nonce and no verdict, and is replay-checked against per-device state instead (ruling 2026-11-19, reusable grant with persistent per-device replay state).",
+      "description": "Which consent object this is. `per-change`: the v6 record (one yes or no about one change, device nonce, `approval_seq`), plus `signer`/`sig_alg`. `standing-enrollment`: the owner's signed enrolment, update or revocation of one standing grant (B2), the reusable grant. `standing-application`: a covered signer's claim that one change is covered by a live grant; it carries no device nonce and no verdict, and is replay-checked against per-device state instead (ruling 2026-11-19, reusable grant with persistent per-device replay state).",
       "enum": [
         "per-change",
         "standing-enrollment",
@@ -22,15 +22,15 @@
       "$ref": "#/$defs/key_id"
     },
     "signer": {
-      "description": "X-trust-06 (adopted, operator ruling 2026-11-19): the typed identifier of the key that produced `signature`, inside the signed bytes. The validator verifies with exactly this key and refuses the record unless the key is in the device's local trust root at verification time with authority for this kind: an owner-held key for `per-change` and `standing-enrollment`; for `standing-application`, a key named in `covered_signers` of the live generation of the grant. Naming a key never creates trust; the trust root is the only source of trust.",
+      "description": "X-trust-06 (adopted, operator ruling 2026-11-19, \"1. Bind both fields (Recommended)\"): the typed identifier of the key that produced `signature`, inside the signed bytes. The validator verifies with exactly this key and refuses the record unless, at verification time, the key is an entry of the right `role` in the device's trust root (the goal file's `device-trust` `advisor-key` entries; operator ruling R5, 2026-11-20, PR 75 review, \"1. Role in goal file now (Recommended)\"): an `owner` key for `per-change` and `standing-enrollment`; for `standing-application`, a key named in `covered_signers` of the live generation of the grant, which outside developer mode must also be a `covered-signer` entry. In developer mode only, a covered signer may be a key the trust root does not hold: the owner's enrolment is then the source of trust for that key, for this host and this grant only, and the trust ends with revocation, expiry or a later generation that omits the key. Outside developer mode naming a key never creates trust. An `owner` key never signs a `standing-application`, and a `covered-signer` key never signs a `per-change` or `standing-enrollment` record. The device's own `host` key is never a `signer` (enforcement-time rule, and a schema_lint cross-check on the examples): the software the gate constrains holds that key.",
       "$ref": "#/$defs/key_id"
     },
     "sig_alg": {
-      "description": "X-trust-06: the signature algorithm, inside the signed bytes. It MUST equal the algorithm the validator actually verified with and the algorithm the trust root records for `signer`; a mismatch is refused, never retried under another algorithm. Naming an algorithm never enables it: the enum is the approved set, and widening it is a schema_version bump.",
+      "description": "X-trust-06: the signature algorithm, inside the signed bytes. It MUST equal the algorithm the validator actually verified with and agree with the `signer` prefix (the typed key prefix is the only algorithm record the trust root holds; when a second algorithm is added, `sig_alg` and the prefix must name the same one); a mismatch is refused, never retried under another algorithm. Naming an algorithm never enables it: the enum is the approved set, and widening it is a schema_version bump. Ed25519 verification profile (lead proposal): RFC 8032 pure Ed25519, canonical encodings only (`S` below the group order, canonical public key and `R`), so the Python validator and the Kotlin agent accept the same signatures.",
       "$ref": "#/$defs/sig_alg"
     },
     "baseline_sha256": {
-      "description": "H(old canonical goal file). Absent ONLY at first adoption, where there is no prior approved baseline to name — a named §14.2 review target (TC-11/TC-20 territory), not a property this outline claims to have fully worked out. `per-change` and `standing-application` only.",
+      "description": "H(old canonical goal file). `per-change`: absent ONLY at first adoption, where there is no prior approved baseline to name — a named §14.2 review target (TC-11/TC-20 territory), not a property this outline claims to have fully worked out. `standing-application`: REQUIRED. The validator refuses an application whose baseline_sha256 is not the baseline currently applied on this host: an application carries no device nonce, so binding the baseline is its only freshness against state (a held-back application released after the owner accepted a later change is refused, never applied over it). First adoption is never by standing application (§9.4: first adoption is a baseline ceremony at first run). Not on `standing-enrollment`.",
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "proposed_sha256": {
@@ -38,21 +38,22 @@
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "nonce": {
-      "description": "Device-issued, single-use (DC-2). `per-change` only: it is the one check a standing mode drops (L5, B2). Exact byte encoding is residue, not decided here — this outline states only that it is present and opaque.",
+      "description": "Device-issued, single-use (DC-2). Present on `per-change` records and on `standing-enrollment` with `grant_state: active`; forbidden on a revocation and on a `standing-application`. Operator ruling R3, 2026-11-20, PR 75 review, \"1. Device nonce (Recommended)\": active enrolments carry a device-issued nonce, revocation is nonce-less. The device issues an enrolment's nonce only inside the on-device owner ceremony of the class that enrolment needs (see `class`, `developer_mode`) and consumes it on acceptance, so a signed enrolment that was never delivered, or one captured and replayed later, carries a nonce the device no longer holds and is refused: that is B1's \"fresh\" for an enrolment, and the evidence that the ceremony took place. A revocation carries none, because it must work while the owner is away from the device. An application carries none (L5, B2: the one check a standing mode drops). Exact byte encoding is residue, not decided here — this outline states only that it is present and opaque.",
       "type": "string",
       "minLength": 1
     },
     "approval_seq": {
-      "description": "Monotonic counter, DC-2 single-use: the validator rejects any `per-change` record whose approval_seq does not exceed the last persisted one for this host. `per-change` only; standing applications use `application_seq`, a separate counter per grant, so that an owner's yes and a covered signer's application never race for one number.",
+      "description": "Monotonic counter, DC-2 single-use: the validator rejects any `per-change` record whose approval_seq does not exceed the last persisted one for this host. `per-change` only; standing applications use `application_seq`, a separate counter per grant, so that an owner's yes and a covered signer's application never race for one number. At most 2^53-1: JCS numbers are IEEE doubles (RFC 8785), so a larger integer has no exact signed spelling.",
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 9007199254740991
     },
     "briefing_sha256": {
       "description": "Optional, `per-change` only: binds the record to the briefing bytes the person actually saw, when one was shown.",
       "$ref": "goal-file.schema.json#/$defs/sha256"
     },
     "verdict": {
-      "description": "`per-change` only: what the approver decided about proposed_sha256. A reject is persisted (DC-2) and outlives any standing grant; refusing a change shown during a hold window is a `per-change` reject.",
+      "description": "`per-change` only: what the approver decided about proposed_sha256. A reject is persisted (DC-2) and outlives any standing grant; refusing a change shown during a hold window is a `per-change` reject, and during a hold window such a reject signed by an owner key that names this host and this `proposed_sha256` stops the apply whatever its ceremony class, nonce or `approval_seq` (a hold window defaults to apply, so the owner's no must not be discardable on a technicality; any doubt during a hold window means the change does not apply — lead proposal, after the Fable review of PR 75).",
       "enum": [
         "accept",
         "reject",
@@ -68,7 +69,7 @@
       "minItems": 1
     },
     "ceremony_class": {
-      "description": "`per-change` and `standing-application`: asserted by the signer, checked against the validator's own DERIVED requirement (map §9.8) — a mismatch is refused, never silently upgraded or downgraded. For an application it must also be one of the grant's `classes`.",
+      "description": "`per-change` and `standing-application`: asserted by the signer, checked against the validator's own DERIVED requirement (map §9.8) — a mismatch is refused, never silently upgraded or downgraded. For an application it must also equal the grant's `class` (no class implies another).",
       "enum": [
         "ordinary",
         "privileged",
@@ -76,23 +77,24 @@
       ]
     },
     "grant_id": {
-      "description": "`standing-enrollment` and `standing-application`: names one grant on this host. The device keeps, per (host, grant_id), the highest enrolment generation it has accepted, that generation's state and scope, and the application high-water mark; that is the persistent per-device replay state.",
+      "description": "`standing-enrollment` and `standing-application`: names one grant on this host. The device keeps, per (host, grant_id), the highest enrolment generation it has accepted, that generation's state and scope, and the application high-water mark: the persistent per-device replay state. Operator ruling R3, 2026-11-20, PR 75 review, \"1. Device nonce (Recommended)\": that store must be rollback-protected (a restore from backup, a reflash, or a reinstall that keeps the host key must not be able to bring back an older copy), and loss of it, or any sign it was rolled back, voids every standing grant on the host (fail closed; re-enrolment by ceremony). Tombstones of revoked grant_ids are never deleted, since deleting one lets the old active enrolment back in (lead proposal).",
       "$ref": "#/$defs/grant_id"
     },
     "generation": {
-      "description": "`standing-enrollment`: the grant's version. An enrolment is accepted only if its generation exceeds the one stored for (host, grant_id); a second enrolment at the stored generation with other bytes is refused (equivocation), so an old enrolment can never be replayed over a newer one. `standing-application`: the generation it relies on, which must equal the stored, active generation — any re-enrolment or revocation strands every application made under an earlier one.",
+      "description": "`standing-enrollment`: the grant's version. An active enrolment is accepted only if its generation exceeds the one stored for (host, grant_id); a second active enrolment at the stored generation with other signed bytes (the JCS bytes without `signature`, so a re-encoded signature is not equivocation) is refused (equivocation), so an old enrolment can never be replayed over a newer one. A revocation is honoured at ANY generation, wins any equivocation, and is accepted even for a grant_id the device has never seen (it stores the tombstone): `revoked` is terminal, so honouring it is replay-safe (lead proposal). `standing-application`: the generation it relies on, which must equal the stored, active generation — any re-enrolment or revocation strands every application made under an earlier one. At most 2^53-1 (RFC 8785 numbers are IEEE doubles); a grant at the top of the range can only be retired by revocation and replaced by a new grant_id.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "grant_state": {
-      "description": "`standing-enrollment` only. `revoked` is terminal for the grant_id: no later generation can reactivate it, and a new grant needs a new grant_id. Revocation is always honoured (Smaller 1), needs only the owner's signature (no device nonce, so it works while the owner is away from the device), and takes effect when it is persisted, before any further application is judged.",
+      "description": "`standing-enrollment` only. `active` is a grant: it carries a device nonce and the full scope (`mode`, `covered_signers`, `class`, `developer_mode`, plus `hold_seconds` and `not_after` where required). `revoked` has its own minimal shape: only the common members, `grant_id`, `generation` and `grant_state` — the scope members and `nonce` are forbidden, so there is one spelling of a revocation and nothing on it to disagree with the stored grant. `revoked` is terminal for the grant_id: no later generation can reactivate it, and a new grant needs a new grant_id (lead proposal). Revocation is always honoured in the public build (Smaller 1; the separate developer build keeps its ignore-revoke override, AGENTS.md Android item 2). It needs only an owner-role signature — not the ceremony of the grant's class, and no device nonce, so it works while the owner is away from the device — and takes effect when it is persisted, before any further application is judged; a hold window pending for that grant ends without applying.",
       "enum": [
         "active",
         "revoked"
       ]
     },
     "mode": {
-      "description": "`standing-enrollment` only: the standing mode enrolled (B2). `standing-approval` applies a covered change without a per-change yes; `hold-window` shows it and applies it after `hold_seconds` unless the owner refuses first; `wait-for-user` holds a covered change until the owner answers per change; `standing-refusal` refuses covered changes. Every mode is owner-enrolled and refusable, and none is a default. When several active grants cover one change, the most restrictive wins (refusal, then wait-for-user, then hold-window, then standing-approval).",
+      "description": "`standing-enrollment` (active) only: the standing mode enrolled (B2). `standing-approval` applies a covered change without a per-change yes; `hold-window` shows it and applies it after `hold_seconds` unless the owner refuses first; `wait-for-user` holds a covered change until the owner answers per change; `standing-refusal` refuses covered changes. Every mode is owner-enrolled and refusable, and none is a default. Precedence (lead proposal): \"covers\" is evaluated over every active, unexpired grant on the host, not only the one an application names; when several cover one change the most restrictive wins (refusal, then wait-for-user, then hold-window, then standing-approval), and among hold-window grants the longest `hold_seconds` wins. An application naming a wait-for-user grant is parked for the owner's per-change answer, and one naming a standing-refusal grant is refused; neither is applied. An owner's own `per-change` accept of the exact `proposed_sha256` is a different object and stays available against a covering standing-refusal or wait-for-user grant: standing modes govern applications, and a persisted reject of that hash still wins over every grant. A persisted reject is keyed on the exact `proposed_sha256`, so a re-rendered file is a new proposal with a new hold window; the owner's remedy is revocation, which the hold-window screen should offer beside refuse.",
       "enum": [
         "standing-approval",
         "hold-window",
@@ -101,12 +103,13 @@
       ]
     },
     "hold_seconds": {
-      "description": "`standing-enrollment` with `mode: hold-window` only, and required there: how long a covered change is shown and refusable before it applies.",
+      "description": "`standing-enrollment` with `mode: hold-window` only, and required there: how long a covered change is shown and refusable before it applies. Timing (lead proposal): the window runs from when the device first shows the change, on a monotonic clock that does not advance while the device is off or asleep; and at the moment of apply the device re-evaluates every check (grant still active, generation still equal, `not_after`, persisted rejects, the covering set, the baseline still the applied one), not only at receipt. At most 2^53-1.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "covered_signers": {
-      "description": "`standing-enrollment` only: the keys whose applications this grant covers. Outside developer mode, each must already be an explicitly trusted, enrolled key in the device's trust root (ruling 2026-11-19: any explicitly trusted enrolled signer, automation and organisational signers included); the grant scopes that trust, it never creates it. The grantor is `signer`, which must be owner-held; a covered signer need not be.",
+      "description": "`standing-enrollment` (active) only: the keys whose applications this grant covers. Outside developer mode each must be a `covered-signer` entry in the trust root (ruling 2026-11-19, \"1. Owner-enrolled trusted signers (Recommended)\": any explicitly trusted enrolled signer, automation and organisational signers included); the grant scopes that trust, it never creates it. In developer mode (R6) a key may be one the trust root does not hold, and the owner's enrolment is then the source of trust for it, for this host and this grant only. An `owner` key is never listed, and the device's own `host` key is never listed (enforcement-time rule, and a schema_lint cross-check on the examples). Listed in ascending byte order of the string, so one grant has one spelling (a schema_lint check on the examples; a JSON Schema cannot compare members). The grantor is `signer`, an `owner` key.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/key_id"
@@ -114,32 +117,32 @@
       "minItems": 1,
       "uniqueItems": true
     },
-    "classes": {
-      "description": "`standing-enrollment` only: the ceremony classes the grant covers, each listed explicitly (ruling 2026-11-19: all classes may be covered, each enrolled explicitly; nothing is implied by listing a higher class). The enrolment itself is accepted only through the owner ceremony of the highest class it lists, so a grant can never cover more than its enrolment ceremony did.",
-      "type": "array",
-      "items": {
-        "enum": [
-          "ordinary",
-          "privileged",
-          "baseline"
-        ]
-      },
-      "minItems": 1,
-      "uniqueItems": true
+    "class": {
+      "description": "`standing-enrollment` (active) only: the ceremony class this grant covers, exactly one. Operator ruling R2, 2026-11-20, PR 75 review, \"1. One class per grant (Recommended)\", with the 2026-11-19 ruling \"3. Include all classes\": every class may be covered, and each class is its own grant, enrolled separately and explicitly; nothing is implied by a higher class, and revocation is per class because it is per grant. A scalar, not an array, so there is no ordering of classes to rule on. The enrolment is accepted only through the owner ceremony of this class (at least the privileged ceremony when `developer_mode` is true, R6), so a grant can never cover more than its enrolment ceremony did. OPERATOR RULING R1, 2026-11-20, PR 75 review, \"1. Carve-out (Recommended)\": standing grants never cover changes to the trust root, owner/advisor keys, covered-signer trust, the validator binary/version or the grant replay state; those always need a per-change owner record. Other privileged and baseline changes stay grantable. Enforcement-time rule for the enforcement PR (and its negative list): a `standing-application` whose change touches any of those is refused, whatever the grant, and the change needs a `per-change` record from an `owner` key. Reading of the list (lead reading, not part of the ruling): the trust root and the owner/advisor and covered-signer key set are the `device-trust` `advisor-key` entries and their roles; the trust root also includes the `trust-policy` entry, which decides whether a local yes is required; the validator binary/version is the `agent` entry; the grant replay state is not expressible in a goal file, and any change that would reach or reset it is covered. The ruled list is closed: `policy-tree`, `supervisor`, schema_version migration and coverage transitions are not on it and stay grantable; whether `policy-tree` (the generic bundle's digest) belongs on it is a question for the operator.",
+      "enum": [
+        "ordinary",
+        "privileged",
+        "baseline"
+      ]
     },
     "developer_mode": {
-      "description": "`standing-enrollment` only. `true` is Smaller 1's developer mode: the covered signer may be one of the owner's choosing that the trust root does not otherwise trust, enrolled by this grant for this host only, and the device shows a persistent indicator while any such grant is active. `false`: every covered signer must already be explicitly trusted (see `covered_signers`).",
+      "description": "`standing-enrollment` (active) only. `true` is Smaller 1's developer mode, ruled in the form of R6 (operator, 2026-11-20, PR 75 review, \"1. Ordinary only (Recommended)\"): developer_mode is true only on a grant whose `class` is `ordinary`, its enrolment needs at least the privileged owner ceremony, and `not_after` is required. A covered signer may then be one of the owner's choosing that the trust root does not hold, enrolled by this grant for this host only: the grant is the source of that trust, which ends with revocation, expiry or a later generation without it, and the device shows a persistent indicator while any such grant is active. `false`: every covered signer must already be a `covered-signer` entry in the trust root (see `covered_signers`).",
       "type": "boolean"
     },
     "not_after": {
-      "description": "Optional, `standing-enrollment` only: UTC instant after which the grant covers nothing. Absent means until revoked.",
+      "description": "`standing-enrollment` (active) only: UTC instant after which the grant covers nothing. REQUIRED when `mode` is `standing-approval` or `hold-window` (operator ruling R4, 2026-11-20, PR 75 review, \"1. Apply-without-yes modes (Recommended)\": the modes that apply a change without a per-change yes), and when `developer_mode` is true (R6); optional for `wait-for-user` and `standing-refusal`, where expiry only returns the device to asking. Absent means until revoked. Expiry is the only bound on a withheld revocation or a stale, undelivered record; it rests on the device clock, so it is a bound, not a guarantee (clock rollback is an enforcement-time concern). One spelling: `YYYY-MM-DDTHH:MM:SSZ`, no fraction, no offset, ranges checked by the pattern and calendar validity by `format: date-time`; a validator that does not check formats must parse the value, and an unparseable or impossible value REFUSES the record, it is never read as absent.",
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "format": "date-time",
+      "not": {
+        "pattern": "\\n"
+      }
     },
     "application_seq": {
-      "description": "`standing-application` only: the per-grant replay counter. The validator accepts an application only if application_seq exceeds the high-water mark stored for (host, grant_id), and it durably persists the new mark BEFORE it applies the change: a crash after the write and before the apply loses that application (fail closed; the signer re-issues with a higher number), and no crash can make one application apply twice. The mark never decreases, across generations included. This keeps DC-2's single use while the grant itself is reused (reusable, not replayable).",
+      "description": "`standing-application` only: the per-grant replay counter. The initial stored mark is 0, so the first application is 1. The validator accepts an application only if application_seq exceeds the high-water mark stored for (host, grant_id), and it durably persists the new mark BEFORE it applies the change — for a hold-window grant, when it accepts the application and starts the hold, before the change is shown (lead proposal): a crash after the write and before the apply loses that application (fail closed; the signer re-issues with a higher number), and no crash can make one application apply twice. The mark never decreases, across generations included. This keeps DC-2's single use while the grant itself is reused (reusable, not replayable). At most 2^53-1 (RFC 8785 numbers are IEEE doubles); a grant whose mark reaches the top can accept no more applications, and its recovery is a new grant_id.",
       "type": "integer",
-      "minimum": 0
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "signature": {
       "description": "Detached signature by `signer` under `sig_alg` over the JCS bytes of this record with this member removed (C-5), so `signer` and `sig_alg` are signed. Exact encoding is residue, not decided here.",
@@ -170,12 +173,6 @@
       },
       "then": {
         "required": [
-          "schema_version",
-          "record_kind",
-          "host",
-          "signer",
-          "sig_alg",
-          "signature",
           "proposed_sha256",
           "nonce",
           "approval_seq",
@@ -189,7 +186,7 @@
           "mode": false,
           "hold_seconds": false,
           "covered_signers": false,
-          "classes": false,
+          "class": false,
           "developer_mode": false,
           "not_after": false,
           "application_seq": false
@@ -209,31 +206,54 @@
       },
       "then": {
         "required": [
-          "schema_version",
-          "record_kind",
-          "host",
-          "signer",
-          "sig_alg",
-          "signature",
           "grant_id",
           "generation",
-          "grant_state",
-          "mode",
-          "covered_signers",
-          "classes",
-          "developer_mode"
+          "grant_state"
         ],
         "properties": {
           "baseline_sha256": false,
           "proposed_sha256": false,
-          "nonce": false,
           "approval_seq": false,
           "briefing_sha256": false,
           "verdict": false,
           "refused": false,
           "ceremony_class": false,
           "application_seq": false
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "grant_state": {
+                  "const": "revoked"
+                }
+              },
+              "required": [
+                "grant_state"
+              ]
+            },
+            "then": {
+              "properties": {
+                "nonce": false,
+                "mode": false,
+                "hold_seconds": false,
+                "covered_signers": false,
+                "class": false,
+                "developer_mode": false,
+                "not_after": false
+              }
+            },
+            "else": {
+              "required": [
+                "nonce",
+                "mode",
+                "covered_signers",
+                "class",
+                "developer_mode"
+              ]
+            }
+          }
+        ]
       }
     },
     {
@@ -249,15 +269,10 @@
       },
       "then": {
         "required": [
-          "schema_version",
-          "record_kind",
-          "host",
-          "signer",
-          "sig_alg",
-          "signature",
           "grant_id",
           "generation",
           "application_seq",
+          "baseline_sha256",
           "proposed_sha256",
           "ceremony_class"
         ],
@@ -271,7 +286,7 @@
           "mode": false,
           "hold_seconds": false,
           "covered_signers": false,
-          "classes": false,
+          "class": false,
           "developer_mode": false,
           "not_after": false
         }
@@ -320,13 +335,61 @@
           "hold_seconds": false
         }
       }
+    },
+    {
+      "$comment": "R4: the modes that apply a change without a per-change yes need an expiry.",
+      "if": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "standing-approval",
+              "hold-window"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "not_after"
+        ]
+      }
+    },
+    {
+      "$comment": "R6: developer mode only on an ordinary grant, and only with an expiry.",
+      "if": {
+        "properties": {
+          "developer_mode": {
+            "const": true
+          }
+        },
+        "required": [
+          "developer_mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "class",
+          "not_after"
+        ],
+        "properties": {
+          "class": {
+            "const": "ordinary"
+          }
+        }
+      }
     }
   ],
   "$defs": {
     "key_id": {
-      "description": "A typed key identifier, the same form as `host`.",
+      "description": "A typed key identifier, the same form as `host`. No trailing newline: Python's `$` matches before one, and two spellings of one key are two answers in two validators (issue 55).",
       "type": "string",
-      "pattern": "^ed25519:[0-9a-f]{64}$"
+      "pattern": "^ed25519:[0-9a-f]{64}$",
+      "not": {
+        "pattern": "\\n"
+      }
     },
     "sig_alg": {
       "description": "The approved signature algorithms. One today, matching the only key type `key_id` admits.",
@@ -335,9 +398,12 @@
       ]
     },
     "grant_id": {
-      "description": "Opaque grant name, unique per host; a restricted alphabet so it is one spelling on every surface.",
+      "description": "Opaque grant name, unique per host; a restricted alphabet so it is one spelling on every surface (no trailing newline, as in `key_id`).",
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "not": {
+        "pattern": "\\n"
+      }
     }
   }
 }

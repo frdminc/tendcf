@@ -20,6 +20,7 @@
         },
         "advisor-key": {
           "advisor-key-1": {
+            "role": "owner",
             "state": "present"
           }
         },

@@ -701,7 +701,7 @@ file stays rejected as circular.
   default; dropping any other check needs an operator ruling; the schema design
   review confirms the approval-record shape (AGENTS.md, Android item 5).
 
-  **Erratum (2026-11-20, issue 64):** the operator ruled the questions this reading left open (operator rulings, 2026-11-19, issue 64 choosers): "3. Include all classes" (a standing mode may cover `ordinary`, `privileged` and `baseline` changes, each class enrolled separately and explicitly); "1. Reusable grant (Recommended)" (one grant covers many changes, with persistent per-device replay state for each application: reusable, never replayable); "1. Owner-enrolled trusted signers (Recommended)" (outside developer mode the owner may enroll any explicitly trusted signer within a stated scope, automation and organisational signers included); "1. Bind both fields (Recommended)" (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must match the actual verification, and cannot create trust or enable an unapproved algorithm). So "covers `ordinary` changes only" and "only if X-trust-06 is adopted (proposed, not ruled)" are superseded, and "signed by an owner-held trusted key" now means the enrollment; the changes it covers are signed by a signer the enrollment names. The rest of the reading stands. The shape is approval-record schema v7 (`schema/approval-record.schema.json`: `per-change`, `standing-enrollment` and `standing-application` records; the goal-file family moves to v7 together, PR 62 review Q4). Current wording: `AGENTS.md`, Android item 5.
+  **Erratum (2026-11-20, issue 64):** the operator ruled the questions this reading left open (operator rulings, 2026-11-19, issue 64 choosers): "3. Include all classes" (a standing mode may cover `ordinary`, `privileged` and `baseline` changes, each class enrolled separately and explicitly); "1. Reusable grant (Recommended)" (one grant covers many changes, with persistent per-device replay state for each application: reusable, never replayable); "1. Owner-enrolled trusted signers (Recommended)" (outside developer mode the owner may enroll any explicitly trusted signer within a stated scope, automation and organisational signers included); "1. Bind both fields (Recommended)" (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must match the actual verification, and cannot create trust or enable an unapproved algorithm). So "covers `ordinary` changes only" and "only if X-trust-06 is adopted (proposed, not ruled)" are superseded, and "signed by an owner-held trusted key" now means the enrollment (signed by an `owner`-role key, R5); the changes it covers are signed by a signer the enrollment names. The rest of the reading stands. The shape is approval-record schema v7 (`schema/approval-record.schema.json`: `per-change`, `standing-enrollment` and `standing-application` records; the goal-file family moves to v7 together, the grouping decided at the schema design review, PR 62 review Q4 "1. Decide at design review"). Operator rulings, 2026-11-20, PR 75 review (the issue 64 schema review), recorded as "(operator ruling, 2026-11-20, PR 75 review)": R1 "1. Carve-out (Recommended)", R2 "1. One class per grant (Recommended)", R3 "1. Device nonce (Recommended)", R4 "1. Apply-without-yes modes (Recommended)", R5 "1. Role in goal file now (Recommended)", R6 "1. Ordinary only (Recommended)": standing grants never cover changes to the trust root, owner/advisor keys, covered-signer trust, the validator binary/version or grant replay state; one class per grant; an active enrollment carries a device-issued nonce (a revocation does not) and the replay store is rollback-protected, its loss voiding every grant on the host; `not_after` is required for standing approval and hold window; the key entries of the goal file carry a role (owner or covered-signer); developer mode is ordinary-only, needs at least the privileged ceremony and `not_after`. Wording follow-up (issue 64): "a standing approval drops only the per-change nonce" reads "every standing mode that applies a change without a per-change yes (hold window, standing approval) drops only the per-change nonce", and an active enrollment carries its own device nonce (R3). Current wording: `AGENTS.md`, Android item 5.
 
 - `cf-agent --simulate` remains an **optional human-facing confirmation**
   of actual-state delta, never a mechanism of the gate. File the upstream
@@ -874,6 +874,8 @@ schema version (v7 or later)**, never v6, which has shipped. Ruled: "the next un
 ruled; the schema design review (two frontier reviews) decides" (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"). Whether the profile/agent-id change and the
 standing-modes record are one version, and which number each takes, is
 that review's call.
+
+**Erratum (2026-11-20, PR 75):** the schema design review decided it. v7 is the standing-modes record (§9.1: `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record, X-trust-06) plus the `role` on the goal file's `advisor-key` entries (operator ruling R5, 2026-11-20, PR 75 review, "1. Role in goal file now (Recommended)"). The goal-file family moved to v7 together, and v7 is **current**: the schema is at v7, not v6. The Android `profile` field and the agent-id change did not ride it and take **v8 or later**, never v7. Current wording: `AGENTS.md`, Android item 5, and `schema/approval-record.schema.json`.
 
 **Amended 2026-11-13 (D46).** There is no device outside the operator's
 own hosts to strand yet, so the
@@ -1329,7 +1331,7 @@ approval record in app-private storage and shows consent; there is no
 full Kotlin port of the validator (operator ruling, 2026-11-14, B3
 sub 2, "1. Termux + Kotlin trust check"). The Python implementation is
 the one normative source on every platform. It is
-built after schema v5 lands (it has; the schema is at v6) and before any
+built after schema v5 lands (it has; the schema was at v6 and since 2026-11-20 is at v7, see the erratum at §9.6) and before any
 further host is enforced (§13). Ruled exception (operator ruling, 2026-11-14, PR 62 review Q1, "2. Exception for the VM"): the §13 stage 1 macOS VM
 may enforce a root `cf-execd` early, before `tendcf-validate` exists at
 stage 4, as an explicit exception like pastebin's: canary only,
@@ -1399,8 +1401,8 @@ nothing:
    version alone does not satisfy DC-11. R-S3-4's accidents-only model
    applies to the passthrough hard checks, not this consent gate. Timing:
    the schema is already at v6 (`"const": 6`, PR 52; v5 was the earlier
-   state), so an id change now costs the next unused schema version (v7
-   or later) and a baseline ceremony per device. Ruled 2026-11-14 (B3 sub
+   state), so an id change costs the next unused schema version (v7
+   or later; since 2026-11-20 v7 is taken, see the erratum at §9.6, so v8 or later) and a baseline ceremony per device. Ruled 2026-11-14 (B3 sub
    1, "1. Field on entries"): the schema bump for the Android `profile`
    field rides this agent-id bump (M-§12-05 item 4). Ruled (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"): the next unused version (v7 or later); grouping not ruled (whether the standing-modes record, §9.1, shares that
    version included); the schema design review (two frontier reviews) decides.

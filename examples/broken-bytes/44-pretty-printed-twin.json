@@ -5,6 +5,11 @@
       "entries": {
         "advisor-key": {
           "ed25519:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2": {
+            "role": "owner",
+            "state": "present"
+          },
+          "ed25519:d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5": {
+            "role": "covered-signer",
             "state": "present"
           }
         },

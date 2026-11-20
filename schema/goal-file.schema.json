@@ -632,7 +632,7 @@
     },
 
     "advisor_key_map": {
-      "description": "id IS the key: for keys, content is identity, so rotation is remove+add — the honest actuation of a rotation, not a scary artifact of it. state 'absent' is a revocation tombstone.",
+      "description": "id IS the key: for keys, content is identity, so rotation is remove+add — the honest actuation of a rotation, not a scary artifact of it. state 'absent' is a revocation tombstone. Since v7 every entry carries a `role` (operator ruling, 2026-11-20, PR 75 review, R5, \"1. Role in goal file now (Recommended)\"), so the trust root says who grants owner authority and whose updates are covered: an `owner` key may sign `per-change` and `standing-enrollment` approval records, a `covered-signer` key may be named in a grant's `covered_signers` and sign `standing-application` records, and no key holds both (one entry per id, one role per entry). A `covered-signer` key never signs a `per-change` or `standing-enrollment` record, and an `owner` key never signs a `standing-application`; the validator refuses either at enforcement time. The device's own host key is never an entry of either role. A tombstone keeps the role it revokes, so there is one spelling of each revocation. Putting the role here is a goal-file shape change, which is why it rides the v7 bump rather than a later one: a later one would be v8 and another baseline ceremony per device. Changing a key's role, or adding or removing a key, is an ordinary `device-trust` hunk and so privileged (§9.8); a standing grant never covers it (approval-record R1 carve-out).",
       "type": "object",
       "propertyNames": {
         "type": "string",
@@ -640,8 +640,14 @@
       },
       "additionalProperties": {
         "type": "object",
-        "properties": { "state": { "enum": ["present", "absent"] } },
-        "required": ["state"],
+        "properties": {
+          "state": { "enum": ["present", "absent"] },
+          "role": {
+            "description": "Who the key is in the trust root: `owner` (grants owner authority: signs per-change records and standing enrollments) or `covered-signer` (an automation or organisational key whose updates a grant may cover). One role per key.",
+            "enum": ["owner", "covered-signer"]
+          }
+        },
+        "required": ["state", "role"],
         "additionalProperties": false
       },
       "minProperties": 1

@@ -451,7 +451,7 @@ Maybe have a development mode and/or build?").
    operator rulings of 2026-11-19 below (issue 64):** every standing mode that
    applies a change without a per-change yes (hold window, standing approval)
    drops only the per-change nonce (DC-2's device nonce); its enrollment is
-   signed by an owner-held trusted key, and each change it covers is signed by
+   signed by an owner-role trusted key, and each change it covers is signed by
    a signer the enrollment names; it keeps B1's other content checks (signed by
    trusted keys, fresh, names this device) and the rest of DC-2 (per-target
    validity, monotonic-counter single use or high-water mark, persisted
@@ -470,9 +470,32 @@ Maybe have a development mode and/or build?").
    organisational signers included); "1. Bind both fields (Recommended)"
    (X-trust-06 adopted: `signer` and `sig_alg` are in the signed bytes, must
    match the actual verification, and cannot create trust or enable an
-   unapproved algorithm). The shape is approval-record schema v7
+   unapproved algorithm). Operator rulings, 2026-11-20, PR 75 review (each
+   recorded as "(operator ruling, 2026-11-20, PR 75 review)", the option text
+   quoted): R1 "1. Carve-out (Recommended)" (standing grants never cover
+   changes to the trust root, owner/advisor keys, covered-signer trust, the
+   validator binary/version or the grant replay state; those always need a
+   per-change owner record; other privileged and baseline changes stay
+   grantable); R2 "1. One class per grant (Recommended)" (one class per grant,
+   per-class revocation); R3 "1. Device nonce (Recommended)" (an active
+   enrollment carries a device-issued nonce, a revocation is nonce-less; the
+   replay store must be rollback-protected, and its loss voids every grant on
+   the host); R4 "1. Apply-without-yes modes (Recommended)" (`not_after` is
+   required for standing approval and hold window, optional for wait-for-user
+   and standing refusal); R5 "1. Role in goal file now (Recommended)" (a role,
+   owner or covered-signer, on the goal file's device-trust key entries, in
+   the v7 bump); R6 "1. Ordinary only (Recommended)" (developer mode only on
+   an ordinary grant, enrolled through at least the privileged ceremony, with
+   `not_after` required). The 2026-11-19 rulings and R1-R6 are the only
+   rulings here; everything else the schema states (terminal revocation,
+   most-restrictive-wins and its tie rules, hold-window timing, persist at
+   intake, an owner's per-change accept over a standing refusal, the Ed25519
+   profile, the approval-record downgrade floor, and the reading of "trust
+   root" in R1) is a **lead proposal**, labelled so in the schema, until the
+   operator rules. The shape is approval-record schema v7
    (`schema/approval-record.schema.json`; the goal-file family moves to v7
-   together, PR 62 review Q4).
+   together, the grouping decided at the schema design review, PR 62 review
+   Q4 "1. Decide at design review").
 
 ## Licensing: the review TUI is AGPL-3.0-only (2026-11-14)
 

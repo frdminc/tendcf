@@ -14,6 +14,7 @@
         },
         "advisor-key": {
           "ed25519:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2": {
+            "role": "owner",
             "state": "present"
           }
         },
