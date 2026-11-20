@@ -34,7 +34,7 @@ python3 state1_vm.py check  --identity ~/.ssh/KEY    # clone, check, reboot, del
 ```
 
 Common options: `--summary FILE` (write the JSON there, not to stdout), `--state-dir DIR`
-(default `~/.local/state/tendcf-state1-vm`: lock, logs, pinned `known_hosts`, `golden.json`),
+(default `~/.local/state/tendcf-state1-vm`: logs, pinned `known_hosts`, `golden.json`),
 `--image FILE`. Exit status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted.
 `--identity` is the private key; a `.pub` path works when ssh-agent holds the key.
 Use a key with no passphrase or one loaded in the agent, because ssh runs with `BatchMode=yes`.
@@ -47,7 +47,12 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 - **`golden`** refuses (exit 2) when the pinned image is not already in the OCI cache; it
   never pulls. It builds into `state1-golden-build` and renames to `state1-golden` last, so a
   half-built image is never the golden one. With `state1-golden` present it does nothing
-  unless `--rebuild`. A leftover `state1-golden-build` is stopped and deleted first.
+  unless `--rebuild`, and then the old golden is deleted only right before the rename (a
+  failed build costs nothing; if the rename itself fails the finished build is kept and the
+  evidence names the `tart rename` to run). A leftover `state1-golden-build` is stopped and
+  deleted first. `image.json` may carry `vanilla_host_key` (`ssh-ed25519 <base64>`): then the
+  bootstrap login is strict against it; without it the first login is trust on first use and
+  `golden.json` records the fingerprint seen (`vanilla_host_key_seen`) so it can be pinned.
 - **`check`** clones `state1-golden` to `state1-check-<run id>` and always deletes it, also on
   failure or on SIGINT/SIGTERM/SIGHUP. A clone left by a killed run is swept at the next start.
 
@@ -56,25 +61,40 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 - **Two-VM cap.** Before every `tart run` (including the restart after a reboot) the driver
   reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
   licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
-- **One driver at a time** (`flock` on `driver.lock`), so the sweeps above can never delete a
-  VM that another run is using.
-- No `sudo`, no host launchd change, no host file outside `--state-dir`, never the operator's
-  real SSH keys (the driver is handed paths and writes nothing to them).
+- **One driver at a time per host** (`flock` on one fixed file,
+  `~/.local/state/tendcf-state1-vm/driver.lock`, opened without following a symlink,
+  whatever `--state-dir` says), because the VM names (`state1-golden-build`,
+  `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
+  so the sweeps above cannot delete a VM another run is using. The cap check is
+  best-effort for VMs that other tools start.
+- No `sudo`, no host launchd change, never the operator's real SSH keys (the driver is handed
+  paths and writes nothing to them). It writes under `--state-dir` and the lock directory;
+  `--summary FILE` may write anywhere you point it, and tart itself writes `~/.tart`.
+- **No host service bound to 0.0.0.0 while `golden` or `check` run.** On tart's default NAT
+  the guest reaches such a service at the bridge gateway, and it runs a third-party image and
+  a downloaded installer as root. tart's softnet isolation needs a setuid-root host install,
+  which this slice does not make.
 
 ## SSH: key login, host key pinned
 
-- The remote command is an argv list quoted with `shlex.join` (one string for the guest's
-  zsh), never a string built from variables. The remote exit status is the wrapper's;
+- The remote command is an argv list with every word single-quoted (one string for the
+  guest's zsh, where a bare `=ls` would expand), never a string built from variables. Key and
+  known_hosts paths with whitespace, `%`, `$` or a leading `~` are refused (ssh would split or
+  expand them). The remote exit status is the wrapper's;
   255 is ssh's own failure. `-F /dev/null` ignores the user's ssh config; no agent or X11
   forwarding, no ControlMaster; `BatchMode=yes`, publickey only, `IdentitiesOnly=yes`.
 - **Host key.** `HostKeyAlias=state1-vm` so the pin does not depend on the DHCP address a
   throwaway clone gets. `prep.sh` regenerates the guest's host keys once (the vanilla tag's
-  keys are shared by everyone who pulls it); `golden` reads the new ed25519 key with
-  `ssh-keyscan` on the private vmnet, checks a strict key login against it, and saves it to
-  `known_hosts` in the state dir. Every clone carries that key, so `check` runs with
-  `StrictHostKeyChecking=yes`: a changed key fails the step, it is never accepted or
-  overwritten. Trust on first use (`accept-new`, scratch file deleted afterwards) is used only
-  inside `golden`, before the pin exists, to a VM the driver just cloned and booted.
+  keys are shared by everyone who pulls it) and prints the new ed25519 public key as
+  `PREP-HOSTKEY ...` **inside the authenticated ssh session that ran it**. `golden` pins
+  exactly that line under the alias straight after prep; `ssh-keyscan` is only a cross-check
+  that must give the same key (any difference fails the build and pins nothing). Every
+  connection after prep (Python install, password check, shutdown) and every `check` uses
+  `StrictHostKeyChecking=yes` against the pinned file: a changed key fails the step, it is
+  never accepted again and never `=no`. Trust on first use (`accept-new`, scratch file deleted
+  afterwards, unless `image.json` pins the vanilla key) is used only before prep, to a VM the
+  driver just cloned and booted. Each guest script runs in one ssh session: it is streamed on
+  stdin to a `mktemp` file that the same session removes.
 - **The one password login** is the vanilla image's published `admin`/`admin`, used by
   `golden` only, to install the public key. It goes through `SSH_ASKPASS` in the environment
   of that ssh process (`BatchMode` is off for it, since BatchMode disables askpass). Nothing
@@ -84,17 +104,24 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 ## What each step proves
 
 `golden` (steps g1-g10): the pinned digest clones and boots headless; the password works
-once; the key installs and `sudo -n` is root; `prep.sh` ran; Python 3.14.10 installed; the new
-host key is pinned and a strict key login works; **password login is refused**; the VM
-stopped cleanly and was saved as `state1-golden` with a record (`golden.json`: digest, script
-hashes, key fingerprints).
+once; the key installs and `sudo -n` is root; `prep.sh` ran; the host key prep printed is
+pinned (keyscan agrees) and a strict key login works; Python 3.14.10 installed over that
+strict login, then made `root:wheel` and checked over the whole tree; **password login is
+refused** (the ssh method list must not offer `password` or `keyboard-interactive`); the guest
+is halted with `shutdown -h now` and `tart run` exits by itself (`tart stop`, a power-off,
+only on a 180 s timeout, and the evidence says so); then it is saved as `state1-golden`
+with a record (`golden.json`: digest, script hashes, key fingerprints).
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
 `after` at the end; Spotlight off (`mdutil -a -i off`); automatic update keys off; Gatekeeper on
-(`spctl --global-enable`); a named list of unused launchd jobs disabled; fresh SSH host keys;
-`/etc/ssh/sshd_config.d/050-tendcf-state1.conf` (no password or keyboard-interactive login),
-verified with `sshd -T`. It changes nothing under `/System`, not SIP, not Recovery.
+(`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
+with `print-disabled`, nothing listening on tcp 5900: fatal, because the vanilla image has it
+on with the published admin password); a named list of unused launchd jobs disabled (read
+back, a failure is reported not fatal); fresh SSH host keys;
+`/etc/ssh/sshd_config.d/050-tendcf-state1.conf` (no password or keyboard-interactive login,
+no root login), verified with `sshd -T`. It changes nothing under `/System`, not SIP, not
+Recovery.
 
 `check` (issue 70 checklist; ids as in the JSON):
 
@@ -103,12 +130,14 @@ verified with `sshd -T`. It changes nothing under `/System`, not SIP, not Recove
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, `root`-owned, not group/world writable | live |
-| 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `perm_ok`/`check_root_owned` is live; 2i applies it to the Python framework) |
+| 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, whole tree `root:wheel`, not group/world writable | live |
+| 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
+| 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree; 2i applies it to the Python framework) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
-| 10, 10a | reboot; ssh returns with a new boot time; 2a-2e and 2g-2i hold again | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2k hold again | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
 | 11 | stop and delete the clone, always | live |
+| 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
 
 ## Open items for the renderer slice
 
@@ -120,6 +149,8 @@ verified with `sshd -T`. It changes nothing under `/System`, not SIP, not Recove
    each of the binary and the policy directory.
 3. Step 10b needs the daemon label; add `launchctl print system/<label>` to the post-reboot
    assertions.
+4. Step 11a (bootout, remove, confirm `launchctl print` fails) needs the installed daemon;
+   it runs before the stop-and-delete that step 11 already does.
 
 ## Things this slice could not verify (no VM was run)
 
@@ -132,5 +163,13 @@ verified with `sshd -T`. It changes nothing under `/System`, not SIP, not Recove
   driver restarts it), the macOS 27 `sshd_config.d` include, `spctl --global-enable`, and the
   `installer -pkg` run for python.org's package (its optional shell-profile step edits the
   console user's profile, which is harmless in a throwaway VM).
-- The admin account still has the vanilla console password. Only SSH is key-only; a console or
-  Recovery login is outside this slice's scope (the VM runs `--no-graphics`).
+- The admin account keeps the vanilla password `admin`/`admin`, **for the local console only**
+  (changing it breaks the image's automatic login and login keychain). Screen Sharing is off
+  (asserted before and after the reboot) and SSH is key-only, so nothing on the network accepts
+  that password; the VM runs `--no-graphics`. Revisit if a later slice needs a password owner.
+- Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
+  Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
+  lines the script compares, that python.org's postflight leaves `root:admin 775` (read from
+  CPython's `postflight.framework`), that `kern.bootsessionuuid` exists in the guest, that
+  `shutdown -h now` ends `tart run`, and that a refused password login prints
+  `Permission denied (publickey).` with no password method listed.
