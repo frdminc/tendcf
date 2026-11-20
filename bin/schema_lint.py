@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 186
+EXPECTED_BROKEN = 198
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -1367,7 +1367,9 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
     trust root): the host key never signs or is covered; per-change records
     and enrollments are signed by an `owner` key; an application is signed by
     a `covered-signer` key that the grant names (in developer mode the grant
-    is the source of trust and the trust root is not consulted); an active
+    is the source of trust, but an owner key is never an application signer
+    or a covered signer in either mode; the application's `enrollment_nonce`
+    names the grant's enrollment, R10); an active
     enrollment lists its covered signers in ascending byte order, each a
     `covered-signer` key unless developer mode is on, and never an owner
     key or the host. Replay, generation and precedence are device state and
@@ -1398,9 +1400,11 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
     # covered_signers) is the schema layer's finding, not a second one here.
     def usable(rec: dict[str, Any]) -> bool:
         covered = rec.get("covered_signers")
+        grant = rec.get("grant_id")
         return (
             key_ok(rec.get("signer"))
             and key_ok(rec.get("host"))
+            and (grant is None or (isinstance(grant, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", grant) is not None))
             and (covered is None or (isinstance(covered, list) and bool(covered) and all(key_ok(k) for k in covered)))
         )
 
@@ -1427,21 +1431,52 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
                     rule=RULE_APPROVAL_ROLES,
                 )
         elif kind == "standing-application":
-            developer = enrollment.get("developer_mode") is True
-            if not developer and role_of.get(signer) != "covered-signer":
+            grant = (
+                enrollment
+                if enrollment.get("grant_id") == rec.get("grant_id")
+                and enrollment.get("grant_state") == "active"
+                else None
+            )
+            if grant is None:
+                if not enrollment:
+                    continue  # the enrollment is malformed: the schema layer's finding
+                fail(
+                    f"{label}: grant_id {rec.get('grant_id')!r} names no active "
+                    "enrollment among the examples — an application is checked "
+                    "against the grant it relies on",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+                continue
+            developer = grant.get("developer_mode") is True
+            if role_of.get(signer) == "owner":
+                fail(
+                    f"{label}: an application is never signed by an `owner` "
+                    "key, in developer mode or out of it",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            elif not developer and role_of.get(signer) != "covered-signer":
                 fail(
                     f"{label}: an application is signed by a `covered-signer` "
                     f"key of the trust root; {signer!r} is "
                     f"{role_of.get(signer, 'not an entry')!r}",
                     rule=RULE_APPROVAL_ROLES,
                 )
-            elif (
-                enrollment.get("grant_id") == rec.get("grant_id")
-                and enrollment.get("grant_state") == "active"
-                and signer not in (enrollment.get("covered_signers") or [])
-            ):
+            if signer not in (grant.get("covered_signers") or []):
                 fail(
                     f"{label}: signer {signer!r} is not in the grant's covered_signers",
+                    rule=RULE_APPROVAL_ROLES,
+                )
+            bound, issued = rec.get("enrollment_nonce"), grant.get("nonce")
+            if (
+                isinstance(bound, str)
+                and isinstance(issued, str)
+                and re.fullmatch(r"[^\n]{1,128}", bound) is not None
+                and bound != issued
+            ):
+                fail(
+                    f"{label}: enrollment_nonce does not name the grant's "
+                    "enrollment (R10): an application is bound to the "
+                    "enrollment instance it relies on",
                     rule=RULE_APPROVAL_ROLES,
                 )
         if kind == "standing-enrollment" and rec.get("grant_state") == "active":
@@ -1457,9 +1492,17 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
                     "one grant, one spelling",
                     rule=RULE_APPROVAL_ROLES,
                 )
+            for key in covered:
+                if role_of.get(key) == "owner":
+                    fail(
+                        f"{label}: covered signer {key!r} is an `owner` key of "
+                        "the trust root; an owner key is never covered, in "
+                        "developer mode or out of it",
+                        rule=RULE_APPROVAL_ROLES,
+                    )
             if rec.get("developer_mode") is False:
                 for key in covered:
-                    if role_of.get(key) != "covered-signer":
+                    if role_of.get(key) not in ("covered-signer", "owner"):
                         fail(
                             f"{label}: covered signer {key!r} is "
                             f"{role_of.get(key, 'not an entry')!r} in the trust "
@@ -1892,6 +1935,20 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                 "one unit, two contradictory states",
                 rule=RULE_GOAL_CROSS_FILE,
             )
+
+    # --- the device's own host key is never a trust-root entry --------------
+    # advisor_key_map (goal-file.schema.json): the software the gate
+    # constrains holds that key, so it must never be an owner or covered key.
+    own_key = goal_file.get("host")
+    advisor_map = (
+        ((domains.get("device-trust") or {}).get("entries") or {}).get("advisor-key")
+    )
+    if isinstance(own_key, str) and isinstance(advisor_map, dict) and own_key in advisor_map:
+        fail(
+            f"{label}: the device's own host key {own_key!r} is an `advisor-key` "
+            "entry — the software the gate constrains must not hold trust-root authority",
+            rule=RULE_GOAL_CROSS_FILE,
+        )
 
     # --- `tendcf-install` names tendcf's own unit and nothing else ----------
     # §2.2(5). Only on a systemd host: the other supervisors reject the

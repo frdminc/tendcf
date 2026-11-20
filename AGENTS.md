@@ -431,8 +431,10 @@ Maybe have a development mode and/or build?").
 
 1. **Every build has a developer mode, open to any owner:** an owner-enrolled
    standing approval for a signer of the owner's choice (the B2 mechanism);
-   revoke and deny are always honoured; a persistent indicator shows the mode
-   is on.
+   revoke and deny are honoured as records, and a revocation or expiry stops
+   every later application and a pending hold, never code or state an earlier
+   application already installed (R9, item 5); a persistent indicator shows
+   the mode is on.
 2. **A separate developer build** exists for tendcf contributors' test
    devices. It keeps the ignore-revoke override. It is never the published
    public build.
@@ -486,13 +488,35 @@ Maybe have a development mode and/or build?").
    owner or covered-signer, on the goal file's device-trust key entries, in
    the v7 bump); R6 "1. Ordinary only (Recommended)" (developer mode only on
    an ordinary grant, enrolled through at least the privileged ceremony, with
-   `not_after` required); R7 (operator ruling, 2026-11-20, PR 75 review)
-   `policy-tree` joins the R1 carve-out (a standing application never covers a
-   policy-tree change; it needs a per-change owner record; the carve-out
-   covers goal-diff hunks, which no approval-record schema rule or fixture can
-   express, so it stays an enforcement-PR negative-list item); R8 (operator
-   ruling, 2026-11-20, PR 75 review) the issue 55 goal-file pattern fixes are
-   out of PR 75, a separate PR later. The 2026-11-19 rulings and R1-R8 are the
+   `not_after` required); R7 "1. Add to carve-out (Recommended)" (`policy-tree` joins
+   the R1 carve-out: a standing application never covers a policy-tree change,
+   which needs a per-change owner record; the carve-out covers goal-diff
+   hunks, which no approval-record schema rule or fixture can express, so it
+   stays an enforcement-PR negative-list item); R8 "1. Separate PR after 75
+   (Recommended)" (the issue 55 goal-file pattern fixes go in their own small
+   PR after 75, "in the same v7 window (no extra bump)"; lead reading, not
+   part of the ruling: C-policy-01 says one version means one acceptance set,
+   so narrowing a pattern without a bump is sound only before any device
+   adopts a v7 baseline); R9 "1. Accept, disclose (Recommended)" (a standing
+   grant knowingly delegates root-equivalent authority to its covered signers,
+   because a covered change may add or alter a service or interlock that runs
+   as root; revocation and expiry stop only later applications and a pending
+   hold, never what an earlier application installed); R10 "1. Bind to
+   enrollment (Recommended)" (each application names its enrollment instance
+   in a required `enrollment_nonce`, checked against the stored grant; the
+   worker chose the nonce over a hash of the signed bytes, a choice inside
+   R10 and open to review, because the device already issues it, stores it
+   and signs it into the enrollment, so the check is one string compare with
+   no new byte-range to define); R11 "2.
+   Argon again" (Gemini 4 Argon may stand in for Astra a second time on PR 75
+   reviews). Lead calls in the same round, tightenings that need no ruling:
+   a standing application covers a change only if every hunk derives the
+   grant's class, never the maximum; the carve-out is default-deny over
+   `device-trust` for every entry kind but `supervisor`; a baseline-class
+   application, a downward `version_bump`, a migration that touches
+   `device-trust` and a re-adoption are never covered unless the device-trust
+   content is equal. The enforcement PR's negative-test list is tracked in
+   [frdminc/tendcf#76](https://github.com/frdminc/tendcf/issues/76). The 2026-11-19 rulings and R1-R11 are the
    only rulings here; everything else the schema states (terminal revocation,
    most-restrictive-wins and its tie rules, hold-window timing, persist at
    intake, an owner's per-change accept over a standing refusal, the Ed25519

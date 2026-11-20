@@ -6,7 +6,7 @@ every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
 `examples/`. The rest of the Site Model (cases 1-12, 107, 123, 143-144, 146-154, 160, 167-168, 174-175) or the goal-file
-family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173, 176; the approval-record cases of 177-197 and 199-216 overlay one of the approval records alone; 198 and 212 overlay `goal-file.json`) stays as in the happy path.
+family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166, 169-173, 176; the approval-record cases of 177-228 overlay one or two of the approval records (the developer-mode case 223 overlays two), except 198, 212, 225 and 226, which overlay `goal-file.json`) stays as in the happy path.
 Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
 the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-176 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below). Cases 177-183 are schema v7's: the approval record's `record_kind`, `signer` and `sig_alg` (issue 64; below).
 
@@ -457,9 +457,9 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 3`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
 | 176 | `176-interlock-command-newline` | `command[0]` is `/opt/homebrew/bin/caddy\n` with a trailing newline, which the `$`-anchored pattern alone accepts: only `prefixItems[0]`'s `not` refuses it | schema (`not`) |
 
-## Approval-record v7 cases (177-216)
+## Approval-record v7 cases (177-228)
 
-Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-change`, `standing-enrollment`, `standing-application`), puts `signer` and `sig_alg` on every record, and (PR 75 review, operator rulings R1-R6 of 2026-11-20) one class per grant, a device nonce on active enrollments, a minimal revocation shape, an expiry on the modes that apply without a yes, and developer mode only on an ordinary grant. The goal file's `advisor-key` entries carry a `role` (R5). Each case below is a one-member change to one happy record (`examples/approval-application.json`, `approval-enrollment.json`, `approval-revocation.json`, `approval-record.json`, or `goal-file.json` for 198 and 212) and is caught by the schema alone, except 213-216, which the signer-role cross-check `check_approval_roles()` catches (class `approval roles`: schema cannot compare two members). Each fails for the one reason its row names; deleting that clause from the schema or the check turns the lint red.
+Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-change`, `standing-enrollment`, `standing-application`), puts `signer` and `sig_alg` on every record, and (PR 75 review, operator rulings R1-R10 of 2026-11-20) one class per grant, a device nonce on active enrollments, a minimal revocation shape, an expiry on the modes that apply without a yes, and developer mode only on an ordinary grant. The goal file's `advisor-key` entries carry a `role` (R5). Each case below is a one-member change to one happy record (`examples/approval-application.json`, `approval-enrollment.json`, `approval-revocation.json`, `approval-record.json`, or `goal-file.json` for 198 and 212) and is caught by the schema alone, except 213-216, which the signer-role cross-check `check_approval_roles()` catches (class `approval roles`: schema cannot compare two members). Each fails for the one reason its row names; deleting that clause from the schema or the check turns the lint red.
 
 | # | Case | Broken input | Caught by |
 |---|------|--------------|-----------|
@@ -503,6 +503,18 @@ Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-c
 | 214 | `214-application-signed-by-owner-key` | an application signed by an `owner` key: owner keys sign consent, never applications | approval roles (role) |
 | 215 | `215-per-change-signed-by-covered-key` | a `per-change` record signed by a `covered-signer` key | approval roles (role) |
 | 216 | `216-covered-signers-unsorted` | a developer-mode enrollment whose `covered_signers` is not in ascending byte order | approval roles (order) |
+| 217 | `217-application-no-enrollment-nonce` | a `standing-application` with no `enrollment_nonce` (R10): it names no enrollment instance, so an old application replays after a re-enrollment | schema (`required`) |
+| 218 | `218-application-enrollment-nonce-mismatch` | an application whose `enrollment_nonce` is not the nonce of the active enrollment it names (R10) | approval roles (enrollment nonce) |
+| 219 | `219-enrollment-with-enrollment-nonce` | an enrollment carrying `enrollment_nonce`, which only an application carries | schema (`if/then`) |
+| 220 | `220-enrollment-nonce-trailing-newline` | `enrollment_nonce` plus a trailing newline: two spellings of one nonce | schema (`not`) |
+| 221 | `221-enrollment-host-in-covered-signers` | an enrollment listing the device's own host key in `covered_signers` | approval roles (host key) |
+| 222 | `222-application-signer-not-in-covered-signers` | an application signed by a key the grant does not list | approval roles (covered signer) |
+| 223 | `223-developer-application-signed-by-owner-key` | a developer-mode grant's application signed by an `owner` key: the exclusion holds in developer mode too (overlays the enrollment and the application) | approval roles (role) |
+| 224 | `224-developer-covered-signer-is-owner-key` | a developer-mode enrollment that lists an `owner` key in `covered_signers` | approval roles (role) |
+| 225 | `225-goal-file-host-key-as-advisor-key` | a goal file whose `advisor-key` map holds the file's own `host` key | goal cross-file |
+| 226 | `226-goal-file-no-owner-key` | a goal file that requires a local yes and holds only `covered-signer` keys: nobody can sign a per-change record | schema (`not`) |
+| 227 | `227-enrollment-covered-signer-not-in-trust-root` | an enrollment listing a covered signer the trust root does not hold, outside developer mode | approval roles (role) |
+| 228 | `228-application-names-no-enrollment` | an application whose `grant_id` names no active enrollment | approval roles (grant) |
 
 ## Every class has a fixture
 
