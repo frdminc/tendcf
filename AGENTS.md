@@ -431,10 +431,11 @@ Maybe have a development mode and/or build?").
 
 1. **Every build has a developer mode, open to any owner:** an owner-enrolled
    standing approval for a signer of the owner's choice (the B2 mechanism);
-   revoke and deny are honoured as records, and a revocation or expiry stops
-   every later application and a pending hold, never code or state an earlier
-   application already installed (R9, item 5); a persistent indicator shows
-   the mode is on.
+   a deny stops the change it names; a revocation or expiry stops later
+   applications and a pending hold, never code or state an earlier
+   application already installed, and that installed root code can itself
+   alter the trust root, the replay store, the validator and the clock (R9,
+   item 5); a persistent indicator shows the mode is on.
 2. **A separate developer build** exists for tendcf contributors' test
    devices. It keeps the ignore-revoke override. It is never the published
    public build.
@@ -501,7 +502,12 @@ Maybe have a development mode and/or build?").
    grant knowingly delegates root-equivalent authority to its covered signers,
    because a covered change may add or alter a service or interlock that runs
    as root; revocation and expiry stop only later applications and a pending
-   hold, never what an earlier application installed); R10 "1. Bind to
+   hold, never what an earlier application installed; because that authority
+   is root-equivalent, a covered signer can also, through the code it
+   installs, alter the trust root, the replay store, the validator and the
+   clock, so the R1 carve-out and revocation bind the approval path and not
+   such code, and a grant should be given only to a signer the owner would
+   trust with root); R10 "1. Bind to
    enrollment (Recommended)" (each application names its enrollment instance
    in a required `enrollment_nonce`, checked against the stored grant; the
    worker chose the nonce over a hash of the signed bytes, a choice inside
@@ -510,12 +516,20 @@ Maybe have a development mode and/or build?").
    no new byte-range to define); R11 "2.
    Argon again" (Gemini 4 Argon may stand in for Astra a second time on PR 75
    reviews). Lead calls in the same round, tightenings that need no ruling:
-   a standing application covers a change only if every hunk derives the
-   grant's class, never the maximum; the carve-out is default-deny over
+   a standing application covers a change only if every hunk and every
+   coverage change of it derives the grant's class on its own, never the
+   maximum (a `version_bump` diff has neither, so a `baseline` grant covers
+   the bump itself; retreating a populated domain is a mixed-class
+   application and is never grantable); the carve-out is default-deny over
    `device-trust` for every entry kind but `supervisor`; a baseline-class
-   application, a downward `version_bump`, a migration that touches
-   `device-trust` and a re-adoption are never covered unless the device-trust
-   content is equal. The enforcement PR's negative-test list is tracked in
+   application is refused unless every carved-out entry of the applied
+   baseline and the proposal is equal; a `version_bump` with `new` not above
+   `old` is refused; a migration that changes any `device-trust` entry, a
+   role default included, and any re-adoption are never by standing
+   application; each device nonce comes from a cryptographic random source
+   with at least 128 bits, is never a counter or derived from replay-store
+   state, and is bound to the scope the ceremony showed (record kind, class,
+   `developer_mode`, `grant_id`). The enforcement PR's negative-test list is tracked in
    [frdminc/tendcf#76](https://github.com/frdminc/tendcf/issues/76). The 2026-11-19 rulings and R1-R11 are the
    only rulings here; everything else the schema states (terminal revocation,
    most-restrictive-wins and its tie rules, hold-window timing, persist at

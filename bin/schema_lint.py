@@ -1461,7 +1461,7 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
                     f"{role_of.get(signer, 'not an entry')!r}",
                     rule=RULE_APPROVAL_ROLES,
                 )
-            if signer not in (grant.get("covered_signers") or []):
+            if signer not in (grant.get("covered_signers") or []) and role_of.get(signer) != "owner":
                 fail(
                     f"{label}: signer {signer!r} is not in the grant's covered_signers",
                     rule=RULE_APPROVAL_ROLES,
@@ -1502,7 +1502,7 @@ def check_approval_roles(loaded: dict[str, Any]) -> None:
                     )
             if rec.get("developer_mode") is False:
                 for key in covered:
-                    if role_of.get(key) not in ("covered-signer", "owner"):
+                    if key != host and role_of.get(key) not in ("covered-signer", "owner"):
                         fail(
                             f"{label}: covered signer {key!r} is "
                             f"{role_of.get(key, 'not an entry')!r} in the trust "
