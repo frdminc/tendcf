@@ -12,14 +12,17 @@ Host-key choice (the same for every connection the driver makes):
 
   * `HostKeyAlias=state1-vm`, so the pinned key does not depend on the IP address
     that vmnet DHCP hands a throwaway clone (addresses are reused across clones).
-  * `golden` regenerates the guest's SSH host keys once (prep.sh), reads the new
-    ed25519 key with ssh-keyscan on the private vmnet, and pins it in a known_hosts
-    file next to the image record. Every clone of `state1-golden` carries that key,
-    so `check` and every later connection use StrictHostKeyChecking=yes against the
-    pinned file: a changed key is a hard failure, not a prompt and not an overwrite.
-  * The only trust-on-first-use connections are the ones inside `golden` before the
-    pin exists (`accept_new`, into a scratch file that is deleted afterwards), to a
-    VM this driver just cloned and booted on the host-only vmnet NAT.
+  * `golden` regenerates the guest's SSH host keys once (prep.sh) and pins the new ed25519
+    key that prep.sh prints inside its own authenticated ssh session (`PREP-HOSTKEY`);
+    ssh-keyscan is only a cross-check that must give the same key. The pin lives in a
+    known_hosts file next to the image record. Every clone of `state1-golden` carries that
+    key, so every connection after prep, and every `check`, uses StrictHostKeyChecking=yes
+    against the pinned file: a changed key is a hard failure, never a prompt, never accepted
+    again, never `=no`.
+  * The only trust-on-first-use connections are the bootstrap ones inside `golden` before
+    prep (`accept_new`, into a scratch file that is deleted afterwards, unless image.json
+    pins the vanilla image's host key), to a VM this driver just cloned and booted on the
+    host-only vmnet NAT.
   * The user's ~/.ssh/config and the system known_hosts are ignored (-F /dev/null,
     GlobalKnownHostsFile=/dev/null), as are agent forwarding, X11 and ControlMaster.
 
@@ -35,7 +38,6 @@ import argparse
 import ipaddress
 import os
 import re
-import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -49,6 +51,7 @@ DEFAULT_BOOTSTRAP_PW = "admin"
 ASKPASS = Path(__file__).resolve().parent / "guest" / "bootstrap-askpass.sh"
 
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+_BAD_PATH_RE = re.compile(r"[\s%$]")
 
 
 @dataclass(frozen=True)
@@ -72,15 +75,27 @@ class Target:
         if self.auth == "key" and not self.identity:
             raise ValueError("key login needs an identity path")
         for p in (self.known_hosts, self.identity):
-            if p and p.startswith("-"):
+            if not p:
+                continue
+            if p.startswith("-"):
                 raise ValueError(f"path looks like an option: {p!r}")
+            # ssh splits UserKnownHostsFile on spaces and expands %tokens, ${ENV} and a
+            # leading ~ in both values: a path using any of them would mean another file.
+            if _BAD_PATH_RE.search(p) or p.startswith("~"):
+                raise ValueError(
+                    f"path has whitespace, % or $ or starts with ~ (ssh would expand it): {p!r}"
+                )
 
 
 def remote_command(argv: list[str]) -> str:
-    """Quote an argv list into the one string ssh sends to the remote shell."""
+    """Quote an argv list into the one string ssh sends to the remote shell.
+
+    Every word is single-quoted, also the ones shlex.join would leave bare: the guest's
+    shell is zsh, where a bare leading `=ls` expands to /bin/ls.
+    """
     if not argv or not all(isinstance(a, str) for a in argv):
         raise ValueError("remote command must be a non-empty list of strings")
-    return shlex.join(argv)
+    return " ".join("'" + a.replace("'", "'\"'\"'") + "'" for a in argv)
 
 
 def ssh_argv(t: Target, remote_argv: list[str], ssh_bin: str = "ssh") -> list[str]:
