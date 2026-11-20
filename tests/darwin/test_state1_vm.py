@@ -47,6 +47,7 @@ OTHER_BLOB = base64.b64encode(
 GOLDEN = IMAGE["golden_name"]
 FW_PYTHON_ORIGINAL = "root:admin 775"  # what python.org's postflight really leaves
 FW_PYTHON_FIXED = "root:wheel 755"
+FW_ROOT = drv.FRAMEWORK_ROOT
 
 
 class Interrupt(drv.Interrupted):
@@ -85,7 +86,15 @@ class FakeWorld:
         self.prepped = False
         self.key_installed = False
         self.stdin_seen = []
-        self.fw_owner = FW_PYTHON_ORIGINAL
+        self.fw_owner = FW_PYTHON_ORIGINAL  # Versions/X.Y (and the root's own stat)
+        # Versions/, Versions/Current and the top-level links: python.org leaves these
+        # root:admin 775 too, and a fix-up scoped to Versions/X.Y does not reach them.
+        self.fw_versions = FW_PYTHON_ORIGINAL
+        self.stat_overrides = {}  # path -> "owner:group mode" for the ancestor stat
+        self.signal_on_tart = (
+            None  # deliver a real SIGTERM when this tart subcommand runs
+        )
+        self.signals_sent = 0
         self.screensharing_on = False
         # behaviour switches
         self.new_hostkey = NEW_BLOB
@@ -122,6 +131,9 @@ class FakeWorld:
     def run(self, argv, *, input_text=None, env=None, timeout=None, log_path=None):
         self.calls.append((list(argv), dict(env) if env else None))
         if argv[0] == "tart":
+            if self.signal_on_tart == argv[1]:
+                self.signals_sent += 1
+                os.kill(os.getpid(), signal.SIGTERM)
             res = self._tart(argv[1:], log_path)
             if self.interrupt_after_tart == argv[1]:
                 raise Interrupt("SIGINT")
@@ -307,6 +319,8 @@ class FakeWorld:
             return self._run_script(r[4:], input_text)
         if r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH]:
             bad = "" if self.fw_owner == FW_PYTHON_FIXED else f"{r[4]}\n"
+            if r[4] == FW_ROOT and self.fw_versions != FW_PYTHON_FIXED:
+                bad += f"{FW_ROOT}/Versions\n"
             return drv.Result(0, bad)
         if r == ["sudo", "-n", "sh", "-c", "id -u"]:
             return drv.Result(0, "0\n")
@@ -346,7 +360,15 @@ class FakeWorld:
             return drv.Result(0, "0\n")
         if r[0].endswith("python3.14"):
             return drv.Result(0, "3.14.10\n")
-        if r[0] == "stat":
+        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"]:
+            return drv.Result(
+                0,
+                "".join(
+                    f"{p} {self.stat_overrides.get(p, FW_PYTHON_FIXED)}\n"
+                    for p in r[3:]
+                ),
+            )
+        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"]:
             return drv.Result(0, self.fw_owner + "\n")
         if r[:3] == ["sysctl", "-n", "kern.bootsessionuuid"]:
             n = self.boot if self.reboot_changes_uuid else 1
@@ -388,7 +410,15 @@ class FakeWorld:
         assert "INSTALL-PYTHON-RESULT" in script, script[:80]
         # The real script's fix-up cannot run here; its presence in the text is what the
         # fake honours. Without it the framework stays python.org's root:admin 775.
-        if "chown -hR root:wheel" in script and "chmod -R go-w" in script:
+        # The whole framework (fwroot) is what the fix-up must cover; a fix-up scoped to
+        # Versions/X.Y ("$fw") leaves Versions/ at root:admin 775.
+        if (
+            f"fwroot={FW_ROOT}\n" in script
+            and 'chown -hR root:wheel "$fwroot"' in script
+            and 'chmod -R go-w "$fwroot"' in script
+        ):
+            self.fw_owner = self.fw_versions = FW_PYTHON_FIXED
+        elif 'chown -hR root:wheel "$fw"' in script and 'chmod -R go-w "$fw"' in script:
             self.fw_owner = FW_PYTHON_FIXED
         return drv.Result(0, f"INSTALL-PYTHON-RESULT version={args[0]} path=/x\n")
 
@@ -450,7 +480,7 @@ class Base(unittest.TestCase):
         self.world.key_installed = True
         self.world.password_login = False
         self.world.prepped = True
-        self.world.fw_owner = FW_PYTHON_FIXED
+        self.world.fw_owner = self.world.fw_versions = FW_PYTHON_FIXED
 
     def golden_args(self, *extra):
         return ["golden", "--pubkey", str(self.pub), *extra]
@@ -711,10 +741,25 @@ class Golden(Base):
         self.world.vms = {"a": {"Running": True}, "b": {"Running": True}}
         rc, s = self.run_cmd(*self.golden_args())
         self.assertEqual(rc, 2)
-        self.assertIn("allows 2 macOS VMs", s["steps"][-1]["evidence"])
+        self.assertIn("2 VMs already running", s["steps"][-1]["evidence"])
         self.assertEqual(s["steps"][-1]["step"], "refused")
         self.assertEqual(self.world.tart_calls("clone"), [])
         self.assertEqual(self.world.tart_calls("run"), [])
+
+    def test_golden_refuses_when_any_other_vm_is_running(self):
+        # No other guest may share the vmnet while the host key is pinned (README).
+        self.world.vms = {"other": {"Running": True}}
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 2)
+        self.assertEqual(s["steps"][-1]["step"], "refused")
+        self.assertIn("other", s["steps"][-1]["evidence"])
+        self.assertIn("to itself", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        self.assertEqual(self.world.tart_calls("run"), [])
+        # a stopped VM is fine
+        self.world.vms = {"other": {"Running": False}}
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
 
     def test_happy_path(self):
         rc, s = self.run_cmd(*self.golden_args())
@@ -754,9 +799,12 @@ class Golden(Base):
         rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
         self.assertEqual(rec["image"], REF)
         self.assertEqual(rec["python"], "3.14.10")
-        self.assertIsNotNone(rec["vanilla_host_key_seen"])
+        # the full public key line (what image.json's vanilla_host_key takes), not a hash
+        self.assertEqual(rec["vanilla_host_key_seen"], f"ssh-ed25519 {VANILLA_BLOB}")
+        self.assertRegex(rec["vanilla_host_key_seen_fingerprint"], r"^SHA256:")
         self.assertFalse((self.ctx.state_dir / "tmp" / self.ctx.run_id).exists())
         self.assertEqual(self.world.fw_owner, FW_PYTHON_FIXED)
+        self.assertEqual(self.world.fw_versions, FW_PYTHON_FIXED)  # the parents too
 
     def test_ssh_trust_model_exact_files_and_modes(self):
         """Before prep: accept-new into the scratch file only. After prep: strict, pinned file."""
@@ -856,15 +904,23 @@ class Golden(Base):
         self.assertEqual(st["2i"]["status"], "pass")
         self.assertEqual(sorted(self.world.vms), [GOLDEN])
 
-    def test_python_ownership_fixup_removed_would_fail_the_check(self):
-        """python.org leaves root:admin 775: without the script's chown/chmod, 2i fails."""
-        self.world.fw_owner = FW_PYTHON_ORIGINAL
-        self.make_golden()
-        self.world.fw_owner = FW_PYTHON_ORIGINAL
+    def test_a_fixup_scoped_to_versions_x_y_leaves_the_parents_and_2i_fails(self):
+        """The old fix-up (chown on "$fw") reaches Versions/X.Y but not Versions/ itself."""
+        orig = self.world._run_script
+
+        def old_script(args, script):
+            script = script.replace("$fwroot", "$fw")
+            return orig(args, script)
+
+        self.world._run_script = old_script
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)  # golden does not run the checks; check does
+        self.assertEqual(self.world.fw_owner, FW_PYTHON_FIXED)
+        self.assertEqual(self.world.fw_versions, FW_PYTHON_ORIGINAL)
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 1)
         self.assertEqual(self.steps(s)["2i"]["status"], "fail")
-        self.assertIn("root:admin 775", self.steps(s)["2i"]["evidence"])
+        self.assertIn("Python.framework/Versions", self.steps(s)["2i"]["evidence"])
 
     def test_password_is_confined_to_the_bootstrap_calls(self):
         self.run_cmd(*self.golden_args())
@@ -939,13 +995,73 @@ class Golden(Base):
             sorted(self.world.vms), [f"{GOLDEN}-build"]
         )  # the new one is kept
 
-    def test_a_guest_that_does_not_halt_is_powered_off_and_the_evidence_says_so(self):
+    def test_a_guest_that_does_not_halt_fails_g10_and_nothing_is_saved(self):
         self.world.shutdown_hangs = True
         rc, s = self.run_cmd(*self.golden_args())
-        self.assertEqual(rc, 0, s)
-        self.assertEqual(len(self.world.tart_calls("stop")), 1)
-        self.assertIn("power-off", self.steps(s)["g10"]["evidence"])
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(len(self.world.tart_calls("stop")), 1)  # the forced one
+        st = self.steps(s)
+        self.assertEqual(st["g10"]["status"], "fail")
+        self.assertIn("powered it off", st["g10"]["evidence"])
+        self.assertIn("not saved", st["g10"]["evidence"])
         self.assertGreaterEqual(self.clock.t, drv.GUEST_SHUTDOWN_WAIT)
+        self.assertEqual(self.world.tart_calls("rename"), [])
+        self.assertEqual(self.world.vms, {})  # the build is removed ...
+        self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+        self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
+
+    def test_a_forced_power_off_keeps_the_build_only_with_keep_on_failure(self):
+        self.world.shutdown_hangs = True
+        rc, _ = self.run_cmd(*self.golden_args("--keep-on-failure"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(sorted(self.world.vms), [f"{GOLDEN}-build"])  # ... kept
+        self.assertFalse(self.world.vms[f"{GOLDEN}-build"]["Running"])
+        self.assertEqual(self.world.tart_calls("rename"), [])
+        self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+
+    def test_a_failed_old_golden_delete_on_a_rebuild_keeps_everything_and_the_old_record(
+        self,
+    ):
+        self.run_cmd(*self.golden_args())
+        old_kh = (self.ctx.state_dir / "known_hosts").read_text()
+        old_rec = (self.ctx.state_dir / "golden.json").read_text()
+        self.world.new_hostkey = OTHER_BLOB  # the rebuilt guest has a different key
+        self.world.fail_tart = {"delete"}
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        self.assertEqual(rc, 1, s)
+        st = self.steps(s)
+        self.assertEqual(st["g10"]["status"], "fail")
+        self.assertIn("removing the old", st["g10"]["evidence"])
+        self.assertNotIn("cleanup", st)  # the finished build is not deleted
+        self.assertEqual(sorted(self.world.vms), sorted([GOLDEN, f"{GOLDEN}-build"]))
+        self.assertEqual(self.world.tart_calls("rename"), [])
+        # the old golden still matches its own record: check's pin and record are unchanged
+        self.assertEqual((self.ctx.state_dir / "known_hosts").read_text(), old_kh)
+        self.assertEqual((self.ctx.state_dir / "golden.json").read_text(), old_rec)
+
+    def test_a_signal_between_the_old_golden_delete_and_the_rename_is_masked(self):
+        self.run_cmd(*self.golden_args())
+        self.world.new_hostkey = OTHER_BLOB
+        self.world.signal_on_tart = "rename"  # a real SIGTERM, right after the delete
+        old = signal.getsignal(signal.SIGTERM)
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        self.assertEqual(self.world.signals_sent, 1)  # it was really sent
+        self.assertEqual(rc, 0, s)  # ignored: the commit is not torn
+        self.assertEqual(sorted(self.world.vms), [GOLDEN])
+        kh = (self.ctx.state_dir / "known_hosts").read_text()
+        self.assertEqual(kh, f"state1-vm ssh-ed25519 {OTHER_BLOB}\n")  # the new record
+        self.assertEqual(signal.getsignal(signal.SIGTERM), old)
+
+    def test_records_are_written_only_after_the_rename_succeeds(self):
+        self.world.fail_tart = {"rename"}
+        rc, _ = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
+        self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+        # the new record is parked beside them, so finishing by hand does not need a rebuild
+        self.assertTrue((self.ctx.state_dir / "known_hosts.pending").exists())
+        rec = json.loads((self.ctx.state_dir / "golden.json.pending").read_text())
+        self.assertEqual(rec["host_key"], f"ssh-ed25519 {NEW_BLOB}")
 
     def test_failure_cleans_up_and_leaves_no_golden(self):
         self.world.fail_prep = True
@@ -1232,6 +1348,7 @@ class Check(Base):
         ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
         self.assertTrue(ok, ev)
         self.assertIn("whole tree", ev)
+        self.assertIn("ancestors root-owned", ev)
         # a stat that passes while something below it does not: the tree form catches it
         self.world.fw_owner = "root:wheel 755"
         orig = self.world._guest
@@ -1245,6 +1362,46 @@ class Check(Base):
         ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
         self.assertFalse(ok)
         self.assertIn("/fw/lib/x.so", ev)
+
+    def test_ownership_helper_checks_every_ancestor_up_to_root(self):
+        t = vmssh.Target(
+            "192.168.64.10",
+            str(self.ctx.state_dir / "known_hosts"),
+            identity=str(self.ident),
+        )
+        self.world.last_started = GOLDEN
+        self.world.vms[GOLDEN]["Running"] = True
+        self.world.fw_owner = FW_PYTHON_FIXED
+        path = f"{FW_ROOT}/Versions/3.14"
+        self.assertEqual(
+            drv.ancestors_of(path),
+            [f"{FW_ROOT}/Versions", FW_ROOT, "/Library/Frameworks", "/Library", "/"],
+        )
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertTrue(ok, ev)
+        for parent, bad in (
+            (f"{FW_ROOT}/Versions", "root:admin 775"),  # python.org: the BLOCK case
+            (FW_ROOT, "root:wheel 775"),
+            ("/Library/Frameworks", "admin:wheel 755"),  # not owned by root
+            ("/Library", "root:wheel 757"),  # world writable
+            ("/", "root:wheel 1777"),  # sticky does not excuse world write
+        ):
+            self.world.stat_overrides = {parent: bad}
+            ok, ev = drv.check_root_owned(self.ctx, t, path)
+            self.assertFalse(ok, (parent, bad))
+            self.assertIn(f"{parent} {bad}", ev)
+        # a stat that cannot report an ancestor fails closed
+        self.world.stat_overrides = {}
+        orig = self.world._guest
+
+        def silent(r, input_text):
+            if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"]:
+                return drv.Result(1, "", "stat: boom")
+            return orig(r, input_text)
+
+        self.world._guest = silent
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertFalse(ok)
 
     def test_a_server_that_still_offers_password_login_fails_2f(self):
         self.world.password_login = (
@@ -1416,19 +1573,74 @@ class Helpers(unittest.TestCase):
             VMDIR / "image.json"
         )  # the shipped pin passes its own validation
 
+    def test_run_script_sh_removes_its_temp_file_and_exits_on_a_signal_trap(self):
+        self.assertIn("trap 'exit 129' HUP INT TERM", drv.RUN_SCRIPT_SH)
+        self.assertIn("trap 'rm -f \"$f\"' EXIT;", drv.RUN_SCRIPT_SH)
+        before = set(Path("/var/tmp").glob("tendcf-state1.*"))
+        r = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                'sudo() { shift; "$@"; }\n' + drv.RUN_SCRIPT_SH,
+                "sh",
+                "arg1",
+            ],
+            input='echo "ran $1"\n',
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual((r.returncode, r.stdout), (0, "ran arg1\n"), r.stderr)
+        self.assertEqual(set(Path("/var/tmp").glob("tendcf-state1.*")), before)
+
+    def test_python_signer_is_validated_as_one_line_name_and_team_id(self):
+        base = json.loads((VMDIR / "image.json").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "image.json"
+
+            def read(signer=None, drop=False):
+                image = json.loads(json.dumps(base))
+                if drop:
+                    del image["python"]["signer"]
+                else:
+                    image["python"]["signer"] = signer
+                path.write_text(json.dumps(image))
+                return drv.read_image_json(path)
+
+            read("Python Software Foundation (BMM5U3QVKW)")  # the shipped shape passes
+            for bad in (
+                None,
+                7,
+                "",
+                "Python Software Foundation",  # no team id
+                "Python Software Foundation (bmm5u3qvkw)",  # lower case
+                "Python Software Foundation (BMM5U3QVK)",  # nine characters
+                "Python Software Foundation (BMM5U3QVKW)\n",  # trailing newline
+                "x\ny (BMM5U3QVKW)",  # two lines
+                " (BMM5U3QVKW)",  # no name
+            ):
+                with self.assertRaises(drv.Refusal, msg=repr(bad)):
+                    read(bad)
+            with self.assertRaises(drv.Refusal):
+                read(drop=True)  # missing: a refusal, not a KeyError in g8
+
     def test_second_signal_inside_the_handler_is_ignored(self):
-        old = signal.getsignal(signal.SIGTERM)
+        old = {s: signal.getsignal(s) for s in drv.SIGNALS}
         with self.assertRaises(drv.Interrupted), drv.signals_to_exception():
             os.kill(os.getpid(), signal.SIGTERM)
-        # in the cleanup after the first signal, a second one must not raise again
-        with contextlib.suppress(drv.Interrupted), drv.signals_to_exception():
+        # in the cleanup after the first signal, any further one must not raise again; the
+        # test fails (an Interrupted escapes the `with`) if the handler stops ignoring them
+        reached_end_of_cleanup = False
+        with drv.signals_to_exception():
             try:
                 os.kill(os.getpid(), signal.SIGTERM)
             except drv.Interrupted:
                 os.kill(os.getpid(), signal.SIGINT)  # ignored, no exception
                 os.kill(os.getpid(), signal.SIGHUP)
-                return
-        self.assertEqual(signal.getsignal(signal.SIGTERM), old)
+                os.kill(os.getpid(), signal.SIGTERM)
+                reached_end_of_cleanup = True
+        self.assertTrue(reached_end_of_cleanup)
+        self.assertEqual({s: signal.getsignal(s) for s in drv.SIGNALS}, old)
 
     def test_atomic_write_never_follows_a_planted_symlink(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1521,8 +1733,10 @@ class GuestScripts(unittest.TestCase):
         text = self.text("install-python.sh")
         i = text.index("installer -pkg")
         for want in (
-            'chown -hR root:wheel "$fw"',
-            'chmod -R go-w "$fw"',
+            'chown -hR root:wheel "$fwroot"',
+            'chmod -R go-w "$fwroot"',
+            'find "$fwroot" \\( ! -user root',
+            'find "$fwroot" ! -type l',
             "! -group wheel",
             "-perm -020 -o -perm -002",
         ):
@@ -1531,6 +1745,35 @@ class GuestScripts(unittest.TestCase):
         # the fix-up and assertion are not inside the "already installed" skip
         self.assertGreater(text.index("chown -hR"), text.index("\nfi\n"))
         self.assertIn("--proto '=https' --proto-redir '=https'", text)
+        # the fix-up and both assertions start at the framework, not at Versions/X.Y
+        self.assertIn("fwroot=/Library/Frameworks/Python.framework\n", text)
+        self.assertNotIn('chown -hR root:wheel "$fw"', text)
+        self.assertNotIn('find "$fw" ', text)
+
+    def test_prep_netstat_check_fails_closed(self):
+        text = self.text("prep.sh")
+        a = text.index("netstat_out=$(")
+        b = text.index("\nfi\n", a) + 4
+        snippet = text[a:b]
+        cases = (
+            ("netstat() { return 1; }", 1, "failed"),
+            ("netstat() { return 0; }", 1, "printed nothing"),
+            ("netstat() { echo 'tcp4 0 0 *.5900 *.* LISTEN'; }", 1, "5900"),
+            ("netstat() { echo 'tcp4 0 0 *.22 *.* LISTEN'; }", 0, ""),
+        )
+        for stub, want_rc, want_msg in cases:
+            r = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    'die() { echo "DIE: $*"; exit 1; }; ' + stub + "\n" + snippet,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r.returncode, want_rc, (stub, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stdout)
 
     def pkgutil_check(
         self, output, rc=0, signer="Python Software Foundation (BMM5U3QVKW)"
