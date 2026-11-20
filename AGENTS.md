@@ -144,6 +144,18 @@ path cannot preserve these checks, hold the review and report the missing check.
      a spike workflow runs with `permissions: contents: read` and no secrets.
    - **Docs freeze (O4).** No new design doc is written for a state-1 piece
      until a spike for that piece has run.
+     Clarified and given a sunset: "1. Clarify + sunset (Recommended)"
+     (operator ruling, 2026-11-20, O4 docs-freeze chooser; the operator first
+     said "Lets discuss the docs-freeze rule in general. It still being in
+     place may be a bug."):
+     1. **Not frozen:** schema files, fixtures and examples, errata items in
+        existing docs, and a design review the operator orders for a piece
+        (for example the schema design review of PR 62 review Q4).
+     2. **Sunset, per piece:** the freeze on a piece lifts once a spike for
+        it has run or the operator orders a design review for it.
+     3. Unchanged: the review tier for whatever is written (O2 and the
+        design-ruling rule below), and the anti-drift intent (13 failure
+        modes 1 and 8): prefer errata and schema over new prose.
    - A PR that needs a frontier review gets it before merge. `docs/handoffs/`
      commits are not PRs and keep the push-in-place exception above. Try the
      reviewers in this order:
