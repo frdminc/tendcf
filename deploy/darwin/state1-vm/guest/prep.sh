@@ -110,7 +110,10 @@ is_disabled() { # is_disabled DOMAIN LABEL: print-disabled lists it as disabled
     launchctl print-disabled "$1" 2>/dev/null | grep -Eq "\"$2\"[[:space:]]*=>[[:space:]]*(disabled|true)"
 }
 is_disabled system com.apple.screensharing || die "com.apple.screensharing is not disabled"
-if netstat -an -p tcp 2>/dev/null | grep -Eq '[.:]5900[[:space:]].*LISTEN'; then
+# Capture netstat and its status: a failing or silent netstat must not read as "nothing listens".
+netstat_out=$(netstat -an -p tcp 2>&1) || die "netstat -an -p tcp failed: $netstat_out"
+[ -n "$netstat_out" ] || die "netstat -an -p tcp printed nothing"
+if printf '%s\n' "$netstat_out" | grep -Eq '[.:]5900[[:space:]].*LISTEN'; then
     die "something still listens on tcp 5900 (Screen Sharing)"
 fi
 log "screen sharing: disabled, nothing on tcp 5900"

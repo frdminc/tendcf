@@ -10,7 +10,8 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 [ "$#" -eq 4 ] || { echo "usage: install-python.sh VERSION URL SHA256 SIGNER" >&2; exit 2; }
 version=$1 url=$2 sha256=$3 signer=$4
 minor=${version%.*}
-fw=/Library/Frameworks/Python.framework/Versions/$minor
+fwroot=/Library/Frameworks/Python.framework
+fw=$fwroot/Versions/$minor
 py=$fw/bin/python$minor
 
 die() { echo "install-python.sh: $*" >&2; exit 1; }
@@ -52,13 +53,17 @@ else
     installed || die "$py does not report $version after install"
 fi
 
-# python.org's postflight leaves the framework root:admin with group write (775). Checklist
-# step 3's rule is root:wheel and not group/world writable, so fix it, then assert it over the
-# whole tree (-h: symlinks themselves; symlink modes are not meaningful and are not tested).
-chown -hR root:wheel "$fw"
-chmod -R go-w "$fw"
-bad=$(find "$fw" \( ! -user root -o ! -group wheel \) -print </dev/null | head -n 5)
+# python.org's installer leaves the framework root:admin with group write (775), and the
+# parents Versions/ and Versions/Current too (CPython build-installer.py "Fix file modes"
+# walks the whole staged framework; postflight.framework repeats it for Versions/X.Y).
+# Checklist step 3's rule is root:wheel and not group/world writable, and an admin-group user
+# who can write Versions/ can rename Versions/X.Y aside. So fix and assert the WHOLE framework
+# (Versions/, Versions/Current and the top-level links included; -h: symlinks themselves,
+# symlink modes are not meaningful and are not tested).
+chown -hR root:wheel "$fwroot"
+chmod -R go-w "$fwroot"
+bad=$(find "$fwroot" \( ! -user root -o ! -group wheel \) -print </dev/null | head -n 5)
 [ -z "$bad" ] || die "not root:wheel: $bad"
-bad=$(find "$fw" ! -type l \( -perm -020 -o -perm -002 \) -print </dev/null | head -n 5)
+bad=$(find "$fwroot" ! -type l \( -perm -020 -o -perm -002 \) -print </dev/null | head -n 5)
 [ -z "$bad" ] || die "group or world writable: $bad"
 echo "INSTALL-PYTHON-RESULT version=$version path=$py"
