@@ -570,10 +570,12 @@ def sha256_text(text: str) -> str:
 
 
 def read_pubkey(path: Path) -> str:
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise Refusal(f"{path}: cannot read the public key: {e}") from e
     lines = [
-        ln.strip()
-        for ln in path.read_text().splitlines()
-        if ln.strip() and not ln.startswith("#")
+        ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")
     ]
     if len(lines) != 1:
         raise Refusal(

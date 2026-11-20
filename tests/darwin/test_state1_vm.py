@@ -690,6 +690,8 @@ class PullAndResolve(Base):
                 {"repository": "-r/x"},
                 {"digest": "sha256:zz"},
             ):
+                if cmd == "resolve" and "digest" in bad:
+                    continue  # resolve is how a missing or stale digest gets found
                 rc, _ = self.run_cmd("--image", self.image_file(**bad), cmd, *extra)
                 self.assertEqual(rc, 2, (cmd, bad))
         self.assertEqual(self.world.calls, [])
@@ -765,7 +767,7 @@ class Golden(Base):
         kh_pinned = f"UserKnownHostsFile={scratch / 'known_hosts.pinned'}"
         prep_argv = next(a for sc, a in self.world.script_calls if "PREP-RESULT" in sc)
         prep_at = next(
-            i for i, (a, _) in enumerate(self.world.ssh_calls) if a is prep_argv
+            i for i, (a, _) in enumerate(self.world.ssh_calls) if a == prep_argv
         )
         before, after = (
             self.world.ssh_calls[: prep_at + 1],
@@ -794,7 +796,7 @@ class Golden(Base):
             a for sc, a in self.world.script_calls if "INSTALL-PYTHON-RESULT" in sc
         )
         self.assertGreater(
-            next(i for i, (a, _) in enumerate(self.world.ssh_calls) if a is py_argv),
+            next(i for i, (a, _) in enumerate(self.world.ssh_calls) if a == py_argv),
             prep_at,
         )
         self.assertIn(kh_pinned, py_argv)
