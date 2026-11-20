@@ -47,12 +47,23 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 - **`golden`** refuses (exit 2) when the pinned image is not already in the OCI cache; it
   never pulls. It builds into `state1-golden-build` and renames to `state1-golden` last, so a
   half-built image is never the golden one. With `state1-golden` present it does nothing
-  unless `--rebuild`, and then the old golden is deleted only right before the rename (a
-  failed build costs nothing; if the rename itself fails the finished build is kept and the
-  evidence names the `tart rename` to run). A leftover `state1-golden-build` is stopped and
-  deleted first. `image.json` may carry `vanilla_host_key` (`ssh-ed25519 <base64>`): then the
-  bootstrap login is strict against it; without it the first login is trust on first use and
-  `golden.json` records the fingerprint seen (`vanilla_host_key_seen`) so it can be pinned.
+  unless `--rebuild`, and then the old golden is deleted only at the commit, right before the
+  rename (a failed build costs nothing). The commit (delete the old golden, rename, then write
+  `known_hosts` and `golden.json`) runs with SIGINT/SIGTERM/SIGHUP ignored, the two record
+  files are written only after the rename succeeded, and from the moment the old golden is
+  touched the finished build is never deleted by cleanup: if the delete or the rename fails the
+  finished build is kept, `known_hosts`/`golden.json` still describe the old golden, and the
+  evidence says what to run (after a failed rename the new record is parked as
+  `known_hosts.pending` and `golden.json.pending` in the state dir). A guest that does not
+  halt by itself within 180 s is powered off with `tart stop`, and that **fails g10**: an image
+  that may be missing its last writes is not saved (the build is removed, or kept with
+  `--keep-on-failure`). A leftover `state1-golden-build` is stopped and deleted first.
+  `golden` also refuses (exit 2) while **any other VM is running**: no other guest may share
+  the vmnet while the host key is pinned (see SSH below). `image.json` may carry
+  `vanilla_host_key` (`ssh-ed25519 <base64>`): then the bootstrap login is strict against it;
+  without it the first login is trust on first use and `golden.json` records the full key line
+  seen (`vanilla_host_key_seen`, with `vanilla_host_key_seen_fingerprint` beside it), which
+  can be pasted into `image.json` as it is.
 - **`check`** clones `state1-golden` to `state1-check-<run id>` and always deletes it, also on
   failure or on SIGINT/SIGTERM/SIGHUP. A clone left by a killed run is swept at the next start.
 
@@ -61,9 +72,11 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 - **Two-VM cap.** Before every `tart run` (including the restart after a reboot) the driver
   reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
   licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
+  `golden` is stricter: it needs the host to itself and refuses when any VM is running.
 - **One driver at a time per host** (`flock` on one fixed file,
   `~/.local/state/tendcf-state1-vm/driver.lock`, opened without following a symlink,
-  whatever `--state-dir` says), because the VM names (`state1-golden-build`,
+  whatever `--state-dir` says; the path follows `$HOME` when the driver starts, so a run under
+  a different `HOME`, a sandbox or `sudo -H` takes a different lock), because the VM names (`state1-golden-build`,
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
   so the sweeps above cannot delete a VM another run is using. The cap check is
   best-effort for VMs that other tools start.
@@ -86,7 +99,10 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 - **Host key.** `HostKeyAlias=state1-vm` so the pin does not depend on the DHCP address a
   throwaway clone gets. `prep.sh` regenerates the guest's host keys once (the vanilla tag's
   keys are shared by everyone who pulls it) and prints the new ed25519 public key as
-  `PREP-HOSTKEY ...` **inside the authenticated ssh session that ran it**. `golden` pins
+  `PREP-HOSTKEY ...` **inside the bootstrap session** (trust on first use, or the pinned
+  vanilla key, whose private half is public: it ships in the public image, so anyone who pulls
+  the digest holds it). That pin is therefore trustworthy only if no other guest is on the
+  vmnet during `golden`, which is why `golden` refuses to start while any other VM runs. `golden` pins
   exactly that line under the alias straight after prep; `ssh-keyscan` is only a cross-check
   that must give the same key (any difference fails the build and pins nothing). Every
   connection after prep (Python install, password check, shutdown) and every `check` uses
@@ -106,17 +122,20 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
 `golden` (steps g1-g10): the pinned digest clones and boots headless; the password works
 once; the key installs and `sudo -n` is root; `prep.sh` ran; the host key prep printed is
 pinned (keyscan agrees) and a strict key login works; Python 3.14.10 installed over that
-strict login, then made `root:wheel` and checked over the whole tree; **password login is
+strict login, then the whole `Python.framework` (`Versions/`, `Versions/Current` and the
+top-level links included, not only `Versions/3.14`) is made `root:wheel` and checked as a
+tree, and every ancestor up to `/` must be root-owned and not group/world writable
+(python.org leaves `Versions/` `root:admin 775`); **password login is
 refused** (the ssh method list must not offer `password` or `keyboard-interactive`); the guest
-is halted with `shutdown -h now` and `tart run` exits by itself (`tart stop`, a power-off,
-only on a 180 s timeout, and the evidence says so); then it is saved as `state1-golden`
-with a record (`golden.json`: digest, script hashes, key fingerprints).
+is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart stop` after
+180 s is a power-off and fails g10); then it is saved as `state1-golden` with a record
+(`golden.json`: digest, script hashes, key fingerprints, the vanilla key line seen).
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
 `after` at the end; Spotlight off (`mdutil -a -i off`); automatic update keys off; Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
-with `print-disabled`, nothing listening on tcp 5900: fatal, because the vanilla image has it
+with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
 back, a failure is reported not fatal); fresh SSH host keys;
 `/etc/ssh/sshd_config.d/050-tendcf-state1.conf` (no password or keyboard-interactive login,
@@ -130,9 +149,9 @@ Recovery.
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, whole tree `root:wheel`, not group/world writable | live |
+| 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
-| 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree; 2i applies it to the Python framework) |
+| 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
 | 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2k hold again | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
