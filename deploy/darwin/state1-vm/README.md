@@ -188,7 +188,10 @@ Recovery.
   that password; the VM runs `--no-graphics`. Revisit if a later slice needs a password owner.
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
   Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
-  lines the script compares, that python.org's postflight leaves `root:admin 775` (read from
-  CPython's `postflight.framework`), that `kern.bootsessionuuid` exists in the guest, that
+  lines the script compares, that python.org's installer leaves `Python.framework/Versions`
+  and the tree `root:admin 775` (read from CPython's `build-installer.py` "Fix file modes" and
+  `postflight.framework`; the installed modes are unverified, which is why the fix-up and the
+  assertion cover the whole framework and every ancestor), that `stat -f '%N %Su:%Sg %Lp'` and
+  `netstat -an -p tcp` print the BSD shapes the driver and `prep.sh` parse, that `kern.bootsessionuuid` exists in the guest, that
   `shutdown -h now` ends `tart run`, and that a refused password login prints
   `Permission denied (publickey).` with no password method listed.
