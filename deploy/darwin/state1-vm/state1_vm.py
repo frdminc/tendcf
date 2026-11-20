@@ -42,7 +42,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vmssh
@@ -54,6 +54,7 @@ DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "tendcf-state1-vm"
 # state1-check-*) are global in tart, so the lock has to be too.
 LOCK_PATH = DEFAULT_STATE_DIR / "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
+FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
@@ -81,7 +82,7 @@ INSTALL_KEY_SH = (
 # session. Nothing is left behind and nothing depends on a second connection.
 RUN_SCRIPT_SH = (
     "umask 077; f=$(mktemp /var/tmp/tendcf-state1.XXXXXX) || exit 1; "
-    "trap 'rm -f \"$f\"' EXIT HUP INT TERM; "
+    "trap 'rm -f \"$f\"' EXIT; trap 'exit 129' HUP INT TERM; "
     'cat > "$f" || exit 1; sudo -n /bin/sh "$f" "$@"'
 )
 # Is the root-owned tree root:wheel and free of group/world write? Prints offenders only.
@@ -308,11 +309,18 @@ def read_image_json(path: Path) -> dict:
             ),
             ("python.sha256", re.compile(r"^[0-9a-f]{64}$"), image["python"]["sha256"]),
             ("python.url", re.compile(r"^https://\S+$"), image["python"]["url"]),
+            (
+                "python.signer",
+                re.compile(r"^[^\n]+ \([A-Z0-9]{10}\)$"),
+                image["python"]["signer"],
+            ),
         ]
     except (KeyError, TypeError) as e:
         raise Refusal(f"{path}: missing or malformed field: {e!r}") from e
     for name, rx, value in checks:
-        if not isinstance(value, str) or not rx.match(value):
+        if not isinstance(value, str) or not rx.fullmatch(
+            value
+        ):  # fullmatch: `$` alone allows a trailing newline
             raise Refusal(f"{path}: bad {name}: {value!r}")
     vanilla = image.get("vanilla_host_key")
     if vanilla is not None and not (
@@ -415,12 +423,22 @@ def oci_names(ctx: Ctx) -> set[str]:
     return {v["Name"] for v in tart_list(ctx, "oci")}
 
 
-def assert_vm_cap(ctx: Ctx) -> list[str]:
-    """Refuse when VM_CAP VMs are already running. Counts every running local VM (conservative)."""
+def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
+    """Refuse when `limit` VMs are already running. Counts every running local VM (conservative).
+
+    The default is Apple's licence cap. golden passes limit=1: it needs the vmnet to itself
+    (no other guest on it while the host key is pinned), so any running VM refuses it.
+    """
     running = sorted(n for n, v in local_vms(ctx).items() if v.get("Running"))
-    if len(running) >= VM_CAP:
+    if len(running) >= limit:
+        why = (
+            f"Apple's licence allows {VM_CAP} macOS VMs at once. Not starting another."
+            if limit >= VM_CAP
+            else "golden needs the host network to itself (no other guest may share the vmnet "
+            "while the host key is pinned). Stop them first."
+        )
         raise Refusal(
-            f"{len(running)} VMs already running ({', '.join(running)}); Apple's licence allows {VM_CAP} macOS VMs at once. Not starting another."
+            f"{len(running)} VMs already running ({', '.join(running)}); {why}"
         )
     return running
 
@@ -640,8 +658,8 @@ def pin_host_key(ctx: Ctx, ip: str, dest: Path, authenticated: tuple[str, str]) 
     return f"{kind} " + fingerprint(f"{kind} {blob}")
 
 
-def kh_fingerprint(path: Path) -> str | None:
-    """Fingerprint of the ed25519 entry in a known_hosts file written for our alias, if any."""
+def kh_key_line(path: Path) -> str | None:
+    """The 'ssh-ed25519 <base64>' line of the entry in a known_hosts file for our alias, if any."""
     try:
         for line in path.read_text().splitlines():
             parts = line.split()
@@ -650,10 +668,19 @@ def kh_fingerprint(path: Path) -> str | None:
                 and parts[0] == vmssh.HOST_ALIAS
                 and parts[1] == "ssh-ed25519"
             ):
-                return fingerprint(f"{parts[1]} {parts[2]}")
+                return f"{parts[1]} {parts[2]}"
     except (OSError, ValueError):
         return None
     return None
+
+
+def kh_fingerprint(path: Path) -> str | None:
+    """Fingerprint of the ed25519 entry in a known_hosts file written for our alias, if any."""
+    line = kh_key_line(path)
+    try:
+        return fingerprint(line) if line else None
+    except ValueError:
+        return None
 
 
 def atomic_write(dest: Path, text: str, mode: int = 0o600) -> None:
@@ -732,16 +759,54 @@ def perm_ok(owner: str, group: str, mode: str) -> bool:
     return owner == "root" and group == "wheel" and (int(mode, 8) & 0o022) == 0
 
 
+def ancestors_of(path: str) -> list[str]:
+    """Every parent of an absolute path, nearest first, ending at '/'."""
+    parents = [str(p) for p in PurePosixPath(path).parents]
+    return parents or ["/"]
+
+
 def check_root_owned(
     ctx: Ctx, t: vmssh.Target, path: str, *, tree: bool = False
 ) -> tuple[bool, str]:
-    """Step 3's rule on one path; with tree=True on everything under it as well."""
+    """Step 3's rule on one path; with tree=True on everything under it as well.
+
+    Every ancestor up to / must also be owned by root and not group/world writable: a
+    writable parent lets its owner group rename the checked directory aside and put another
+    tree in its place (python.org leaves Python.framework/Versions root:admin 775).
+    """
     r = rssh(ctx, t, ["stat", "-f", "%Su:%Sg %Lp", path])
     m = re.fullmatch(r"(\S+):(\S+) ([0-7]+)", r.stdout.strip())
     if r.rc != 0 or not m:
         return False, f"stat {path} failed (rc {r.rc}): {clip(r.stderr, 200)}"
     ok = perm_ok(m[1], m[2], m[3])
     ev = f"{path} {m[1]}:{m[2]} {m[3]}"
+    parents = ancestors_of(path)
+    r = rssh(ctx, t, ["stat", "-f", "%N %Su:%Sg %Lp", *parents])
+    rows = [ln.rsplit(" ", 2) for ln in r.stdout.strip().splitlines()]
+    seen = {}
+    for row in rows:
+        if len(row) == 3:
+            seen[row[0]] = row
+    bad_parents = []
+    for par in parents:
+        row = seen.get(par)
+        pm = re.fullmatch(r"(\S+):(\S+)", row[1]) if row else None
+        if (
+            r.rc != 0
+            or not row
+            or not pm
+            or not re.fullmatch(r"[0-7]+", row[2])
+            or pm[1] != "root"
+            or int(row[2], 8) & 0o022
+        ):
+            bad_parents.append(f"{par} {row[1] + ' ' + row[2] if row else '?'}")
+    parents_ok = not bad_parents
+    ok = ok and parents_ok
+    ev += (
+        f"; {len(parents)} ancestors root-owned, no group/world write"
+        if parents_ok
+        else f"; ancestors not root-owned or writable (rc {r.rc}): {clip(', '.join(bad_parents) or r.stderr, 300)}"
+    )
     if tree:
         r = rssh(ctx, t, ["/bin/sh", "-c", TREE_CHECK_SH, "sh", path])
         offenders = r.stdout.strip()
@@ -756,9 +821,10 @@ def check_root_owned(
 
 
 def python_paths(image: dict) -> tuple[str, str]:
+    """(the whole Python.framework, the interpreter): the root-owned check covers the whole
+    framework (Versions/, Versions/Current and the top-level links), not just Versions/X.Y."""
     minor = image["python"]["version"].rsplit(".", 1)[0]
-    fw = f"/Library/Frameworks/Python.framework/Versions/{minor}"
-    return fw, f"{fw}/bin/python{minor}"
+    return FRAMEWORK_ROOT, f"{FRAMEWORK_ROOT}/Versions/{minor}/bin/python{minor}"
 
 
 def persistent_assertions(
@@ -1094,10 +1160,10 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         f"pinned image {ref} is not in tart's OCI cache; run `state1_vm.py pull` first (golden never pulls)"
                     )
                 swept = sweep(ctx, build)
-                assert_vm_cap(ctx)
+                assert_vm_cap(ctx, limit=1)  # golden: no other VM running at all
                 summary.add(
                     "preflight",
-                    "image cached, stale builds swept, VM cap",
+                    "image cached, stale builds swept, no other VM running",
                     "pass",
                     f"swept {swept or 'nothing'}",
                 )
@@ -1181,6 +1247,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             f"key login + sudo -n failed (rc {r.rc}): {clip(r.stderr, 300)}"
                         )
                     state["vanilla_fp"] = kh_fingerprint(Path(kh_boot))
+                    state["vanilla_key"] = kh_key_line(Path(kh_boot))
                     return f"key login ok; sudo -n is uid 0; vanilla host key {state['vanilla_fp']}"
 
                 def prep() -> str:
@@ -1235,47 +1302,82 @@ def cmd_golden(ctx: Ctx, args) -> int:
 
                 def save() -> str:
                     nonlocal keep_build
+                    # A forced power-off fails this step (stop_vm raises): an image that may
+                    # be missing its last writes is never saved.
                     stopped = stop_vm(ctx, build, vm, pinned_target())
-                    atomic_write(
-                        ctx.state_dir / "known_hosts", Path(kh_pinned).read_text()
+                    pinned_text = Path(kh_pinned).read_text()
+                    record = json.dumps(
+                        {
+                            "image": ref,
+                            "tag": image["tag"],
+                            "built_at": ctx.now().isoformat(timespec="seconds"),
+                            "tart_version": summary.extra.get("tart_version"),
+                            "prep_sha256": sha256_text(
+                                (HERE / "guest" / "prep.sh").read_text()
+                            ),
+                            "install_python_sha256": sha256_text(
+                                (HERE / "guest" / "install-python.sh").read_text()
+                            ),
+                            "python": image["python"]["version"],
+                            "authorized_key": fingerprint(pubkey),
+                            "host_key": state.get("hostkey"),
+                            # the full public key line (it can go into image.json as
+                            # vanilla_host_key), the fingerprint beside it
+                            "vanilla_host_key_seen": state.get("vanilla_key"),
+                            "vanilla_host_key_seen_fingerprint": state.get(
+                                "vanilla_fp"
+                            ),
+                        },
+                        indent=2,
                     )
-                    record = {
-                        "image": ref,
-                        "tag": image["tag"],
-                        "built_at": ctx.now().isoformat(timespec="seconds"),
-                        "tart_version": summary.extra.get("tart_version"),
-                        "prep_sha256": sha256_text(
-                            (HERE / "guest" / "prep.sh").read_text()
-                        ),
-                        "install_python_sha256": sha256_text(
-                            (HERE / "guest" / "install-python.sh").read_text()
-                        ),
-                        "python": image["python"]["version"],
-                        "authorized_key": fingerprint(pubkey),
-                        "host_key": state.get("hostkey"),
-                        "vanilla_host_key_seen": state.get("vanilla_fp"),
-                    }
-                    atomic_write(
-                        ctx.state_dir / "golden.json",
-                        json.dumps(record, indent=2) + "\n",
-                        0o644,
-                    )
-                    # --rebuild: the old golden goes only now, right before the rename, so a
-                    # failed build never costs the working image.
-                    if golden in local_vms(ctx):
-                        summary.add(
-                            "rebuild",
-                            f"remove old {golden} (--rebuild)",
-                            "pass",
-                            remove_vm(ctx, golden),
-                        )
-                    r = ctx.run(["tart", "rename", build, golden], timeout=120)
-                    if r.rc != 0:
+                    # The commit: remove the old golden (--rebuild), rename, then the two
+                    # record files, all with signals ignored so no interrupt can land between
+                    # the steps and leave the old golden gone and the new build deleted. The
+                    # record files are written only after the rename succeeded. keep_build is
+                    # set first: from here on a failure never deletes the finished build.
+                    with signals_ignored():
                         keep_build = True
-                        raise ToolError(
-                            f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}; "
-                            f"the finished build is kept as {build}: run `tart rename {build} {golden}` "
-                            "before the next golden run, which sweeps it"
+                        if golden in local_vms(ctx):
+                            try:
+                                done = remove_vm(ctx, golden)
+                            except ToolError as e:
+                                raise ToolError(
+                                    f"removing the old {golden} failed: {e}; it and the finished "
+                                    f"build {build} are both kept; known_hosts and golden.json "
+                                    "are unchanged"
+                                ) from e
+                            summary.add(
+                                "rebuild",
+                                f"remove old {golden} (--rebuild)",
+                                "pass",
+                                done,
+                            )
+                        r = ctx.run(["tart", "rename", build, golden], timeout=120)
+                        if r.rc != 0:
+                            pending = ""
+                            try:
+                                atomic_write(
+                                    ctx.state_dir / "known_hosts.pending", pinned_text
+                                )
+                                atomic_write(
+                                    ctx.state_dir / "golden.json.pending",
+                                    record + "\n",
+                                    0o644,
+                                )
+                                pending = (
+                                    "; the new record is in known_hosts.pending and golden.json.pending "
+                                    "in the state dir: after the rename, mv them over known_hosts and golden.json"
+                                )
+                            except OSError:
+                                pass
+                            raise ToolError(
+                                f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}; "
+                                f"the finished build is kept as {build}: run `tart rename {build} {golden}` "
+                                f"before the next golden run, which sweeps it{pending}"
+                            )
+                        atomic_write(ctx.state_dir / "known_hosts", pinned_text)
+                        atomic_write(
+                            ctx.state_dir / "golden.json", record + "\n", 0o644
                         )
                     return f"{stopped}; renamed {build} -> {golden}; record and known_hosts written"
 
@@ -1349,8 +1451,9 @@ def stop_vm(ctx: Ctx, name: str, vm: Vm, t: vmssh.Target) -> str:
     """Clean guest shutdown of the build VM, without deleting it.
 
     `shutdown -h now` over ssh lets the guest flush and halt, which ends `tart run`. Only if
-    that does not happen in time is `tart stop` used, and that is a power-off (tart stop makes
-    tart run call VZVirtualMachine.stop, which does not let the guest shut down).
+    that does not happen in time is `tart stop` used to stop the VM, and that is a power-off
+    (tart stop makes tart run call VZVirtualMachine.stop, which does not let the guest shut
+    down): the step then FAILS, because the image may be missing its last writes.
     """
     rssh(
         ctx, t, ["sudo", "-n", "shutdown", "-h", "now"], timeout=60
@@ -1368,9 +1471,10 @@ def stop_vm(ctx: Ctx, name: str, vm: Vm, t: vmssh.Target) -> str:
         raise ToolError(f"{name} did not stop")
     if vm.proc is not None and vm.proc.wait(60) is None:
         vm.proc.kill()
-    return (
-        f"{name}: guest did not halt within {GUEST_SHUTDOWN_WAIT}s; tart stop used "
-        "(a power-off: the last writes may be missing from the image)"
+    raise StepFail(
+        f"{name}: guest did not halt within {GUEST_SHUTDOWN_WAIT}s; tart stop powered it off, "
+        "so the image may be missing its last writes and is not saved (the build is removed; "
+        "--keep-on-failure keeps it for inspection)"
     )
 
 
