@@ -35,7 +35,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -48,11 +50,25 @@ import vmssh
 HERE = Path(__file__).resolve().parent
 DEFAULT_IMAGE_JSON = HERE / "image.json"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "tendcf-state1-vm"
+# One host-wide lock whatever --state-dir says: the VM names (state1-golden-build,
+# state1-check-*) are global in tart, so the lock has to be too.
+LOCK_PATH = DEFAULT_STATE_DIR / "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+HOSTKEY_LINE_RE = re.compile(
+    r"^PREP-HOSTKEY (ssh-ed25519) ([A-Za-z0-9+/]+={0,2})\s*$", re.MULTILINE
+)
+CLONE_ENV = {
+    "TART_NO_AUTO_PRUNE": "1"
+}  # a clone must not prune the 30 GB OCI cache entry
+GUEST_SHUTDOWN_WAIT = 180
+VM_RESTARTS_MAX = 3
 
 # One fixed script, nothing interpolated: reads the public key from stdin.
 INSTALL_KEY_SH = (
@@ -60,7 +76,20 @@ INSTALL_KEY_SH = (
     'IFS= read -r key; touch "$HOME/.ssh/authorized_keys"; chmod 600 "$HOME/.ssh/authorized_keys"; '
     'grep -qxF -- "$key" "$HOME/.ssh/authorized_keys" || printf "%s\\n" "$key" >> "$HOME/.ssh/authorized_keys"'
 )
-PUT_FILE_SH = 'umask 077; cat > "$1"'
+# Run a guest script as root in ONE ssh session: the script arrives on stdin, is stored at
+# an unpredictable mktemp path, run with sudo -n, and removed by the trap in that same
+# session. Nothing is left behind and nothing depends on a second connection.
+RUN_SCRIPT_SH = (
+    "umask 077; f=$(mktemp /var/tmp/tendcf-state1.XXXXXX) || exit 1; "
+    "trap 'rm -f \"$f\"' EXIT HUP INT TERM; "
+    'cat > "$f" || exit 1; sudo -n /bin/sh "$f" "$@"'
+)
+# Is the root-owned tree root:wheel and free of group/world write? Prints offenders only.
+TREE_CHECK_SH = (
+    'test -d "$1" || exit 1; '
+    'find "$1" \\( ! -user root -o ! -group wheel \\) -print | head -n 5; '
+    'find "$1" ! -type l \\( -perm -020 -o -perm -002 \\) -print | head -n 5'
+)
 
 
 class Refusal(Exception):
@@ -178,6 +207,7 @@ class Ctx:
         None
     )
     run_id: str = ""
+    lock_path: Path = LOCK_PATH
 
     def __post_init__(self) -> None:
         if not self.run_id:
@@ -259,9 +289,45 @@ def run_step(
 # ---------------------------------------------------------------- image pin
 
 
+def read_image_json(path: Path) -> dict:
+    """Read and validate image.json (everything but the digest); Refusal, never a traceback."""
+    try:
+        image = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise Refusal(f"{path}: cannot read the image pin: {e}") from e
+    try:
+        checks = [
+            ("repository", REPO_RE, image["repository"]),
+            ("tag", TAG_RE, image["tag"]),
+            ("golden_name", NAME_RE, image["golden_name"]),
+            ("golden_name + -build", NAME_RE, image["golden_name"] + "-build"),
+            (
+                "python.version",
+                re.compile(r"^\d+\.\d+\.\d+$"),
+                image["python"]["version"],
+            ),
+            ("python.sha256", re.compile(r"^[0-9a-f]{64}$"), image["python"]["sha256"]),
+            ("python.url", re.compile(r"^https://\S+$"), image["python"]["url"]),
+        ]
+    except (KeyError, TypeError) as e:
+        raise Refusal(f"{path}: missing or malformed field: {e!r}") from e
+    for name, rx, value in checks:
+        if not isinstance(value, str) or not rx.match(value):
+            raise Refusal(f"{path}: bad {name}: {value!r}")
+    vanilla = image.get("vanilla_host_key")
+    if vanilla is not None and not (
+        isinstance(vanilla, str)
+        and re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}", vanilla)
+    ):
+        raise Refusal(
+            f"{path}: vanilla_host_key must be one 'ssh-ed25519 <base64>' line"
+        )
+    return image
+
+
 def load_image(path: Path) -> dict:
-    image = json.loads(path.read_text())
-    if not image.get("digest", "").startswith("sha256:"):
+    image = read_image_json(path)
+    if not DIGEST_RE.match(str(image.get("digest", ""))):
         raise Refusal(f"{path}: no pinned digest (run `resolve`, then commit it)")
     return image
 
@@ -273,7 +339,18 @@ def image_ref(image: dict) -> str:
 def resolve_digest(ctx: Ctx, image: dict) -> str:
     """Manifest digest of repository:tag from the registry: a HEAD request, no image data."""
     host, _, repo = image["repository"].partition("/")
-    fetch = ctx.fetch or _http_fetch
+    raw_fetch = ctx.fetch or _http_fetch
+
+    def fetch(url: str, headers: dict[str, str], method: str):
+        try:
+            return raw_fetch(url, headers, method)
+        except (
+            OSError,
+            ValueError,
+            urllib.error.URLError,
+        ) as e:  # HTTPError is a URLError
+            raise ToolError(f"registry request failed ({method} {url}): {e}") from e
+
     status, hdrs = fetch(
         f"https://{host}/token?service={host}&scope=repository:{repo}:pull",
         {},
@@ -464,27 +541,24 @@ def wait_for_ssh(ctx: Ctx, vm: Vm, t: vmssh.Target, timeout: float = 300) -> flo
     return ctx.monotonic() - start
 
 
-def put_file(ctx: Ctx, t: vmssh.Target, text: str, remote_path: str) -> None:
-    r = rssh(ctx, t, ["/bin/sh", "-c", PUT_FILE_SH, "sh", remote_path], input_text=text)
-    if r.rc != 0:
-        raise ToolError(
-            f"copy to {remote_path} failed (rc {r.rc}): {clip(r.stderr, 300)}"
-        )
-
-
 def run_guest_script(
     ctx: Ctx, t: vmssh.Target, script: Path, args: list[str], tag: str
 ) -> str:
-    """Copy one script into the guest, run it as root with sudo -n, remove it. Returns stdout."""
-    text = script.read_text()
-    remote = f"/var/tmp/tendcf-state1-{tag}-{ctx.run_id}.sh"
-    put_file(ctx, t, text, remote)
-    try:
-        r = rssh(ctx, t, ["sudo", "-n", "/bin/sh", remote, *args], timeout=1800)
-    finally:
-        rssh(ctx, t, ["rm", "-f", remote], timeout=60)
+    """Stream one script into the guest and run it as root: one ssh session, no leftover file.
+
+    `tag` only names the step in errors. Returns the script's stdout.
+    """
+    r = rssh(
+        ctx,
+        t,
+        ["/bin/sh", "-c", RUN_SCRIPT_SH, "sh", *args],
+        input_text=script.read_text(),
+        timeout=1800,
+    )
     if r.rc != 0:
-        raise StepFail(f"{script.name} rc {r.rc}: {clip(r.stderr + r.stdout, 800)}")
+        raise StepFail(
+            f"{script.name} ({tag}) rc {r.rc}: {clip(r.stderr + r.stdout, 800)}"
+        )
     return r.stdout
 
 
@@ -524,25 +598,75 @@ def fingerprint(pubkey_line: str) -> str:
     )
 
 
-def pin_host_key(ctx: Ctx, ip: str, dest: Path) -> str:
-    """ssh-keyscan the ed25519 host key and write a known_hosts line under the alias."""
+def parse_prep_hostkey(out: str) -> tuple[str, str]:
+    """The key prep.sh printed inside the authenticated ssh session: ('ssh-ed25519', blob)."""
+    found = HOSTKEY_LINE_RE.findall(out)
+    if len(found) != 1:
+        raise StepFail(
+            f"prep.sh printed {len(found)} PREP-HOSTKEY lines, expected exactly one: {clip(out, 300)}"
+        )
+    kind, blob = found[0]
+    try:
+        fingerprint(f"{kind} {blob}")
+    except ValueError as e:
+        raise StepFail("PREP-HOSTKEY blob is not valid base64") from e
+    return kind, blob
+
+
+def keyscan_ed25519(ctx: Ctx, ip: str) -> str:
     r = ctx.run(["ssh-keyscan", "-t", "ed25519", "-T", "10", ip], timeout=60)
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[1] == "ssh-ed25519" and not line.startswith("#"):
-            atomic_write(dest, f"{vmssh.HOST_ALIAS} {parts[1]} {parts[2]}\n")
-            return f"{parts[1]} " + fingerprint(f"{parts[1]} {parts[2]}")
+            return parts[2]
     raise ToolError(
         f"ssh-keyscan returned no ed25519 key (rc {r.rc}): {clip(r.stderr, 300)}"
     )
 
 
+def pin_host_key(ctx: Ctx, ip: str, dest: Path, authenticated: tuple[str, str]) -> str:
+    """Pin the key prep.sh printed (authenticated); ssh-keyscan must agree, or nothing is pinned."""
+    kind, blob = authenticated
+    scanned = keyscan_ed25519(ctx, ip)
+    if scanned != blob:
+        raise StepFail(
+            "ssh-keyscan answered with a different ed25519 key than prep.sh printed inside "
+            f"the authenticated session ({fingerprint(f'{kind} {scanned}')} vs "
+            f"{fingerprint(f'{kind} {blob}')}); nothing was pinned"
+        )
+    atomic_write(dest, f"{vmssh.HOST_ALIAS} {kind} {blob}\n")
+    return f"{kind} " + fingerprint(f"{kind} {blob}")
+
+
+def kh_fingerprint(path: Path) -> str | None:
+    """Fingerprint of the ed25519 entry in a known_hosts file written for our alias, if any."""
+    try:
+        for line in path.read_text().splitlines():
+            parts = line.split()
+            if (
+                len(parts) >= 3
+                and parts[0] == vmssh.HOST_ALIAS
+                and parts[1] == "ssh-ed25519"
+            ):
+                return fingerprint(f"{parts[1]} {parts[2]}")
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def atomic_write(dest: Path, text: str, mode: int = 0o600) -> None:
+    """Write via a fresh mkstemp file in the same directory, then os.replace (no symlink follow)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + f".tmp{os.getpid()}")
-    tmp.write_text(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, dest)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 # ---------------------------------------------------------------- lock, signals
@@ -550,22 +674,37 @@ def atomic_write(dest: Path, text: str, mode: int = 0o600) -> None:
 
 @contextlib.contextmanager
 def driver_lock(ctx: Ctx):
-    ctx.state_dir.mkdir(parents=True, exist_ok=True)
-    with open(ctx.state_dir / "driver.lock", "w") as fh:
+    """One driver per host, whatever --state-dir says; never follows a symlink at the path."""
+    ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(ctx.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise Refusal(f"cannot open the driver lock {ctx.lock_path}: {e}") from e
+    try:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            raise Refusal("another state1_vm.py run holds the driver lock") from e
+            raise Refusal(
+                f"another state1_vm.py run holds the driver lock ({ctx.lock_path})"
+            ) from e
         yield
+    finally:
+        os.close(fd)
+
+
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 @contextlib.contextmanager
 def signals_to_exception():
     def handler(signum, _frame):
+        # Ignore every further signal first: a second one inside the cleanup must not
+        # raise again and skip the summary or the VM removal.
+        for s in SIGNALS:
+            signal.signal(s, signal.SIG_IGN)
         raise Interrupted(signal.Signals(signum).name)
 
-    sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    old = {s: signal.signal(s, handler) for s in sigs}
+    old = {s: signal.signal(s, handler) for s in SIGNALS}
     try:
         yield
     finally:
@@ -575,8 +714,7 @@ def signals_to_exception():
 
 @contextlib.contextmanager
 def signals_ignored():
-    sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    old = {s: signal.signal(s, signal.SIG_IGN) for s in sigs}
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in SIGNALS}
     try:
         yield
     finally:
@@ -587,17 +725,32 @@ def signals_ignored():
 # ---------------------------------------------------------------- guest assertions
 
 
-def perm_ok(owner: str, mode: str) -> bool:
-    """root-owned and not group/world writable (checklist step 3's rule)."""
-    return owner == "root" and (int(mode, 8) & 0o022) == 0
+def perm_ok(owner: str, group: str, mode: str) -> bool:
+    """root:wheel and not group/world writable (checklist step 3's rule)."""
+    return owner == "root" and group == "wheel" and (int(mode, 8) & 0o022) == 0
 
 
-def check_root_owned(ctx: Ctx, t: vmssh.Target, path: str) -> tuple[bool, str]:
+def check_root_owned(
+    ctx: Ctx, t: vmssh.Target, path: str, *, tree: bool = False
+) -> tuple[bool, str]:
+    """Step 3's rule on one path; with tree=True on everything under it as well."""
     r = rssh(ctx, t, ["stat", "-f", "%Su:%Sg %Lp", path])
     m = re.fullmatch(r"(\S+):(\S+) ([0-7]+)", r.stdout.strip())
     if r.rc != 0 or not m:
         return False, f"stat {path} failed (rc {r.rc}): {clip(r.stderr, 200)}"
-    return perm_ok(m[1], m[3]), f"{path} {m[1]}:{m[2]} {m[3]}"
+    ok = perm_ok(m[1], m[2], m[3])
+    ev = f"{path} {m[1]}:{m[2]} {m[3]}"
+    if tree:
+        r = rssh(ctx, t, ["/bin/sh", "-c", TREE_CHECK_SH, "sh", path])
+        offenders = r.stdout.strip()
+        tree_ok = r.rc == 0 and not offenders and not r.stderr.strip()
+        ok = ok and tree_ok
+        ev += (
+            "; whole tree root:wheel, no group/world write"
+            if tree_ok
+            else f"; tree check failed (rc {r.rc}): {clip(offenders or r.stderr, 300)}"
+        )
+    return ok, ev
 
 
 def python_paths(image: dict) -> tuple[str, str]:
@@ -628,7 +781,7 @@ def persistent_assertions(
         (
             "2b",
             "csrutil status: SIP enabled",
-            r.rc == 0 and "status: enabled" in r.stdout,
+            r.rc == 0 and re.search(r"status: enabled\.?\s*$", r.stdout) is not None,
             r.stdout or r.stderr,
         )
     )
@@ -670,6 +823,7 @@ def persistent_assertions(
         "passwordauthentication no",
         "kbdinteractiveauthentication no",
         "pubkeyauthentication yes",
+        "permitrootlogin no",
     }
     out.append(
         (
@@ -685,7 +839,9 @@ def persistent_assertions(
         (
             "2g",
             "Spotlight indexing off",
-            r.rc == 0 and "Indexing enabled" not in r.stdout,
+            r.rc == 0
+            and "Indexing enabled" not in r.stdout
+            and "Indexing disabled" in r.stdout,
             r.stdout or r.stderr,
         )
     )
@@ -709,16 +865,74 @@ def persistent_assertions(
     fw, py = python_paths(image)
     r = rssh(ctx, t, [py, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
     pyver = r.stdout.strip()
-    perm_ok_, perm_ev = check_root_owned(ctx, t, fw)
+    perm_ok_, perm_ev = check_root_owned(ctx, t, fw, tree=True)
     out.append(
         (
             "2i",
-            f"python {image['python']['version']} system-wide, root-owned",
+            f"python {image['python']['version']} system-wide, root:wheel, not group/world writable",
             pyver == image["python"]["version"] and perm_ok_,
             f"{pyver or r.stderr}; {perm_ev}",
         )
     )
+
+    # Screen Sharing: the vanilla image has it on with the published admin password, a
+    # network login that bypasses the pinned ssh key. Off in the launchd database, and
+    # nothing listening on 5900.
+    r = rssh(ctx, t, ["sudo", "-n", "launchctl", "print-disabled", "system"])
+    out.append(
+        (
+            "2j",
+            "Screen Sharing (com.apple.screensharing) disabled",
+            r.rc == 0
+            and re.search(
+                r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)\b', r.stdout
+            )
+            is not None,
+            f"rc {r.rc}; "
+            + (
+                "disabled entry present"
+                if re.search(
+                    r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)', r.stdout
+                )
+                else "no disabled entry for com.apple.screensharing"
+            ),
+        )
+    )
+    r = rssh(ctx, t, ["netstat", "-an", "-p", "tcp"])
+    listening = [
+        ln for ln in r.stdout.splitlines() if re.search(r"[.:]5900\s.*LISTEN", ln)
+    ]
+    out.append(
+        (
+            "2k",
+            "nothing listening on tcp 5900",
+            r.rc == 0 and bool(r.stdout.strip()) and not listening,
+            f"rc {r.rc}; " + (listening[0].strip() if listening else "no listener"),
+        )
+    )
     return out
+
+
+def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
+    """Password login must be refused by the server, not merely fail.
+
+    A server that still offers `password` or `keyboard-interactive` answers a wrong or
+    missing password with "Permission denied (publickey,password,...)": that must fail the
+    step, so the result does not depend on whether the bootstrap password is right.
+    """
+    r = rssh(ctx, vmssh.Target(ip, known_hosts, auth="password"), ["true"])
+    m = re.search(r"Permission denied \(([^)]*)\)", r.stderr)
+    if r.rc == 0 or m is None:
+        raise StepFail(
+            f"password login was not refused as expected (rc {r.rc}): {clip(r.stderr, 300)}"
+        )
+    offered = {x.strip() for x in m[1].split(",")}
+    if offered & {"password", "keyboard-interactive"}:
+        raise StepFail(
+            f"the server still offers {sorted(offered & {'password', 'keyboard-interactive'})}: "
+            + clip(r.stderr, 300)
+        )
+    return "password login refused, methods offered: " + ",".join(sorted(offered))
 
 
 # ---------------------------------------------------------------- commands
@@ -736,7 +950,7 @@ def emit(summary: Summary, ctx: Ctx, summary_path: Path | None) -> None:
 
 def refuse(summary: Summary, ctx: Ctx, args, msg: str) -> int:
     ctx.err("refused: " + msg)
-    summary.add("preflight", "preconditions", "fail", msg)
+    summary.add("refused", "precondition not met", "fail", msg)
     emit(summary, ctx, args.summary)
     return 2
 
@@ -752,7 +966,7 @@ def tart_version(ctx: Ctx) -> str:
 
 def cmd_resolve(ctx: Ctx, args) -> int:
     summary = Summary("resolve", ctx.run_id)
-    image = json.loads(args.image.read_text())
+    image = read_image_json(args.image)
     try:
         digest = resolve_digest(ctx, image)
     except ToolError as e:
@@ -824,6 +1038,20 @@ def cmd_pull(ctx: Ctx, args) -> int:
     return 0 if summary.ok else 1
 
 
+def check_identity(identity: str) -> str:
+    path = os.path.expanduser(identity)
+    if not Path(path).is_file():
+        raise Refusal(f"identity file not found: {path}")
+    return path
+
+
+def clone_vm(ctx: Ctx, src: str, dst: str, timeout: float) -> Result:
+    # TART_NO_AUTO_PRUNE: a clone must not evict the 30 GB pinned image from tart's OCI cache.
+    return ctx.run(
+        ["tart", "clone", src, dst], env={**os.environ, **CLONE_ENV}, timeout=timeout
+    )
+
+
 def cmd_golden(ctx: Ctx, args) -> int:
     summary = Summary("golden", ctx.run_id)
     image = load_image(args.image)
@@ -835,11 +1063,17 @@ def cmd_golden(ctx: Ctx, args) -> int:
     vm = Vm(ctx, build)
     rc = 1
     built = False
-    attempted = False
+    attempted = (
+        False  # the clone may exist: set before the call, cleanup handles "absent"
+    )
+    keep_build = False
+    scratch_made = False
     refusal = ""
     try:
         pubkey = read_pubkey(args.pubkey)
-        identity = args.identity or re.sub(r"\.pub$", "", str(args.pubkey))
+        identity = check_identity(
+            args.identity or re.sub(r"\.pub$", "", str(args.pubkey))
+        )
         with driver_lock(ctx), signals_to_exception():
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
@@ -865,22 +1099,42 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     "pass",
                     f"swept {swept or 'nothing'}",
                 )
-                if golden in local_vms(ctx):
-                    summary.add(
-                        "rebuild",
-                        f"remove old {golden} (--rebuild)",
-                        "pass",
-                        remove_vm(ctx, golden),
-                    )
-                scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+                scratch.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(scratch.parent, 0o700)
+                try:
+                    os.mkdir(
+                        scratch, 0o700
+                    )  # exclusive: never reuse a directory that exists
+                except FileExistsError as e:
+                    raise ToolError(
+                        f"scratch directory {scratch} already exists"
+                    ) from e
+                scratch_made = True
                 kh_scratch = str(scratch / "known_hosts")
                 kh_pinned = str(scratch / "known_hosts.pinned")
-                state: dict[str, str] = {}
+                # Bootstrap leg (before prep rotates the host keys): the image's own key is
+                # the same for every puller of the tag. If image.json pins it, check it strictly;
+                # otherwise trust on first use into the scratch file and record what was seen.
+                vanilla = image.get("vanilla_host_key")
+                if vanilla:
+                    kh_boot = str(scratch / "known_hosts.vanilla")
+                    atomic_write(Path(kh_boot), f"{vmssh.HOST_ALIAS} {vanilla}\n")
+                else:
+                    kh_boot = kh_scratch
+                state: dict[str, object] = {}
+
+                def boot_target(**kw) -> vmssh.Target:
+                    return vmssh.Target(
+                        str(state["ip"]), kh_boot, accept_new=not vanilla, **kw
+                    )
+
+                def pinned_target() -> vmssh.Target:
+                    return vmssh.Target(str(state["ip"]), kh_pinned, identity=identity)
 
                 def clone() -> str:
                     nonlocal attempted
                     attempted = True
-                    r = ctx.run(["tart", "clone", ref, build], timeout=1800)
+                    r = clone_vm(ctx, ref, build, 1800)
                     if r.rc != 0:
                         raise ToolError(
                             f"tart clone failed (rc {r.rc}): {clip(r.stderr or r.stdout, 400)}"
@@ -893,18 +1147,18 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     return f"ip {state['ip']}"
 
                 def boot_ssh() -> str:
-                    t = vmssh.Target(
-                        state["ip"], kh_scratch, auth="password", accept_new=True
+                    t = boot_target(auth="password")
+                    how = (
+                        "strict against the host key pinned in image.json"
+                        if vanilla
+                        else "trust on first use into a scratch file"
                     )
-                    return f"ssh up after {wait_for_ssh(ctx, vm, t):.0f}s (password, trust on first use into a scratch file)"
+                    return f"ssh up after {wait_for_ssh(ctx, vm, t):.0f}s (password, {how})"
 
                 def install_key() -> str:
-                    t = vmssh.Target(
-                        state["ip"], kh_scratch, auth="password", accept_new=True
-                    )
                     r = rssh(
                         ctx,
-                        t,
+                        boot_target(auth="password"),
                         ["/bin/sh", "-c", INSTALL_KEY_SH, "sh"],
                         input_text=pubkey + "\n",
                     )
@@ -915,39 +1169,53 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     return "installed " + fingerprint(pubkey)
 
                 def key_sudo() -> str:
-                    t = vmssh.Target(
-                        state["ip"], kh_scratch, identity=identity, accept_new=True
+                    r = rssh(
+                        ctx,
+                        boot_target(identity=identity),
+                        ["sudo", "-n", "sh", "-c", "id -u"],
                     )
-                    r = rssh(ctx, t, ["sudo", "-n", "sh", "-c", "id -u"])
                     if r.rc != 0 or r.stdout.strip() != "0":
                         raise StepFail(
                             f"key login + sudo -n failed (rc {r.rc}): {clip(r.stderr, 300)}"
                         )
-                    return "key login ok; sudo -n is uid 0"
+                    state["vanilla_fp"] = kh_fingerprint(Path(kh_boot))
+                    return f"key login ok; sudo -n is uid 0; vanilla host key {state['vanilla_fp']}"
 
                 def prep() -> str:
-                    t = vmssh.Target(
-                        state["ip"], kh_scratch, identity=identity, accept_new=True
-                    )
                     script = HERE / "guest" / "prep.sh"
-                    out = run_guest_script(ctx, t, script, [], "prep")
+                    out = run_guest_script(
+                        ctx, boot_target(identity=identity), script, [], "prep"
+                    )
                     m = re.search(r"^PREP-RESULT .*$", out, re.MULTILINE)
                     if not m:
                         raise StepFail(
                             "prep.sh printed no PREP-RESULT line: " + clip(out, 400)
                         )
+                    state["prep_hostkey"] = parse_prep_hostkey(out)
                     return (
                         f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}"
                     )
 
-                def python() -> str:
-                    t = vmssh.Target(
-                        state["ip"], kh_scratch, identity=identity, accept_new=True
+                def pin() -> str:
+                    key = pin_host_key(
+                        ctx,
+                        str(state["ip"]),
+                        Path(kh_pinned),
+                        state["prep_hostkey"],  # type: ignore[arg-type]
                     )
+                    r = rssh(ctx, pinned_target(), ["true"])  # strict from here on
+                    if r.rc != 0:
+                        raise StepFail(
+                            f"strict key login against the pinned host key failed (rc {r.rc}): {clip(r.stderr, 300)}"
+                        )
+                    state["hostkey"] = key
+                    return f"pinned {key} (printed by prep.sh in the authenticated session; ssh-keyscan agrees); strict key login ok"
+
+                def python() -> str:
                     py = image["python"]
                     out = run_guest_script(
                         ctx,
-                        t,
+                        pinned_target(),
                         HERE / "guest" / "install-python.sh",
                         [py["version"], py["url"], py["sha256"], py["signer"]],
                         "python",
@@ -960,30 +1228,12 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         )
                     return m[0]
 
-                def pin() -> str:
-                    key = pin_host_key(ctx, state["ip"], Path(kh_pinned))
-                    t = vmssh.Target(
-                        state["ip"], kh_pinned, identity=identity
-                    )  # strict from here on
-                    r = rssh(ctx, t, ["true"])
-                    if r.rc != 0:
-                        raise StepFail(
-                            f"strict key login against the pinned host key failed (rc {r.rc}): {clip(r.stderr, 300)}"
-                        )
-                    state["hostkey"] = key
-                    return f"pinned {key}; strict key login ok"
-
                 def no_password() -> str:
-                    t = vmssh.Target(state["ip"], kh_pinned, auth="password")
-                    r = rssh(ctx, t, ["true"])
-                    if r.rc == 0 or "permission denied" not in r.stderr.lower():
-                        raise StepFail(
-                            f"password login was not refused as expected (rc {r.rc}): {clip(r.stderr, 300)}"
-                        )
-                    return "password login refused: " + clip(r.stderr, 200)
+                    return refused_password_login(ctx, str(state["ip"]), kh_pinned)
 
                 def save() -> str:
-                    vm_name_ok = stop_vm(ctx, build, vm)
+                    nonlocal keep_build
+                    stopped = stop_vm(ctx, build, vm, pinned_target())
                     atomic_write(
                         ctx.state_dir / "known_hosts", Path(kh_pinned).read_text()
                     )
@@ -1001,18 +1251,31 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         "python": image["python"]["version"],
                         "authorized_key": fingerprint(pubkey),
                         "host_key": state.get("hostkey"),
+                        "vanilla_host_key_seen": state.get("vanilla_fp"),
                     }
                     atomic_write(
                         ctx.state_dir / "golden.json",
                         json.dumps(record, indent=2) + "\n",
                         0o644,
                     )
+                    # --rebuild: the old golden goes only now, right before the rename, so a
+                    # failed build never costs the working image.
+                    if golden in local_vms(ctx):
+                        summary.add(
+                            "rebuild",
+                            f"remove old {golden} (--rebuild)",
+                            "pass",
+                            remove_vm(ctx, golden),
+                        )
                     r = ctx.run(["tart", "rename", build, golden], timeout=120)
                     if r.rc != 0:
+                        keep_build = True
                         raise ToolError(
-                            f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+                            f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}; "
+                            f"the finished build is kept as {build}: run `tart rename {build} {golden}` "
+                            "before the next golden run, which sweeps it"
                         )
-                    return f"{vm_name_ok}; renamed {build} -> {golden}; record and known_hosts written"
+                    return f"{stopped}; renamed {build} -> {golden}; record and known_hosts written"
 
                 steps: list[tuple[str, str, Callable[[], str | None]]] = [
                     ("g1", f"clone pinned image to {build}", clone),
@@ -1022,13 +1285,17 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     ("g5", "key login works; sudo -n is root", key_sudo),
                     (
                         "g6",
-                        "prep.sh (spotlight, updates, launchd, gatekeeper, host keys, sshd)",
+                        "prep.sh (spotlight, updates, screen sharing off, launchd, gatekeeper, host keys, sshd)",
                         prep,
                     ),
-                    ("g7", "python.org Python system-wide", python),
-                    ("g8", "pin the new host key; strict key login", pin),
+                    (
+                        "g7",
+                        "pin the host key prep.sh printed; keyscan agrees; strict key login",
+                        pin,
+                    ),
+                    ("g8", "python.org Python system-wide (strict pinned key)", python),
                     ("g9", "password login refused", no_password),
-                    ("g10", f"stop, save as {golden}", save),
+                    ("g10", f"guest shutdown, save as {golden}", save),
                 ]
                 for sid, name, fn in steps:
                     run_step(summary, sid, name, fn)
@@ -1051,7 +1318,12 @@ def cmd_golden(ctx: Ctx, args) -> int:
                 rc = 130
             finally:
                 with signals_ignored():
-                    if attempted and not built and not args.keep_on_failure:
+                    if (
+                        attempted
+                        and not built
+                        and not keep_build
+                        and not args.keep_on_failure
+                    ):
                         try:
                             summary.add(
                                 "cleanup",
@@ -1061,7 +1333,8 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             )
                         except ToolError as e:
                             summary.add("cleanup", f"remove {build}", "fail", str(e))
-                    shutil.rmtree(scratch, ignore_errors=True)
+                    if scratch_made:
+                        shutil.rmtree(scratch, ignore_errors=True)
     except Refusal as e:
         return refuse(summary, ctx, args, str(e))
     if refusal:
@@ -1070,8 +1343,22 @@ def cmd_golden(ctx: Ctx, args) -> int:
     return 130 if rc == 130 else (0 if summary.ok else 1)
 
 
-def stop_vm(ctx: Ctx, name: str, vm: Vm) -> str:
-    """Graceful stop of the build VM (tart stop signals the tart run process), without deleting it."""
+def stop_vm(ctx: Ctx, name: str, vm: Vm, t: vmssh.Target) -> str:
+    """Clean guest shutdown of the build VM, without deleting it.
+
+    `shutdown -h now` over ssh lets the guest flush and halt, which ends `tart run`. Only if
+    that does not happen in time is `tart stop` used, and that is a power-off (tart stop makes
+    tart run call VZVirtualMachine.stop, which does not let the guest shut down).
+    """
+    rssh(
+        ctx, t, ["sudo", "-n", "shutdown", "-h", "now"], timeout=60
+    )  # the connection drops; its status is not evidence
+
+    def halted() -> bool:
+        return not vm.alive() and not (local_vms(ctx).get(name) or {}).get("Running")
+
+    if wait_until(ctx, halted, GUEST_SHUTDOWN_WAIT, 5):
+        return f"{name}: guest shut down cleanly, tart run exited"
     ctx.run(["tart", "stop", name], timeout=180)
     if not wait_until(
         ctx, lambda: not (local_vms(ctx).get(name) or {}).get("Running"), 120
@@ -1079,7 +1366,10 @@ def stop_vm(ctx: Ctx, name: str, vm: Vm) -> str:
         raise ToolError(f"{name} did not stop")
     if vm.proc is not None and vm.proc.wait(60) is None:
         vm.proc.kill()
-    return f"{name} stopped"
+    return (
+        f"{name}: guest did not halt within {GUEST_SHUTDOWN_WAIT}s; tart stop used "
+        "(a power-off: the last writes may be missing from the image)"
+    )
 
 
 def cmd_check(ctx: Ctx, args) -> int:
@@ -1091,17 +1381,21 @@ def cmd_check(ctx: Ctx, args) -> int:
     vm = Vm(ctx, clone)
     known_hosts = ctx.state_dir / "known_hosts"
     rc = 1
-    cloned = False
+    cloned = False  # the clone may exist: set before the call, cleanup handles "absent"
     refusal = ""
     try:
+        identity = check_identity(args.identity)
         with driver_lock(ctx), signals_to_exception():
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
                 swept = sweep(ctx, CHECK_PREFIX)
-                if golden not in local_vms(ctx):
+                vms = local_vms(ctx)
+                if golden not in vms:
                     raise Refusal(
                         f"{golden} does not exist; run `state1_vm.py golden` first"
                     )
+                if vms[golden].get("Running"):
+                    raise Refusal(f"{golden} is running; stop it before `check`")
                 if not known_hosts.is_file():
                     raise Refusal(
                         f"{known_hosts} is missing (written by golden); run `golden --rebuild`"
@@ -1117,8 +1411,8 @@ def cmd_check(ctx: Ctx, args) -> int:
 
                 def start() -> str:
                     nonlocal cloned
-                    r = ctx.run(["tart", "clone", golden, clone], timeout=600)
                     cloned = True
+                    r = clone_vm(ctx, golden, clone, 600)
                     if r.rc != 0:
                         raise ToolError(
                             f"tart clone failed (rc {r.rc}): {clip(r.stderr or r.stdout, 400)}"
@@ -1126,7 +1420,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                     vm.start()
                     state["ip"] = vm.ip()
                     state["t"] = vmssh.Target(
-                        str(state["ip"]), str(known_hosts), identity=args.identity
+                        str(state["ip"]), str(known_hosts), identity=identity
                     )
                     secs = wait_for_ssh(ctx, vm, state["t"])  # type: ignore[arg-type]
                     return f"cloned {golden} -> {clone}; ip {state['ip']}; ssh up after {secs:.0f}s (key, pinned host key)"
@@ -1134,7 +1428,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                 run_step(
                     summary,
                     "1",
-                    "clone state1-golden, tart run --no-graphics, tart ip --wait, ssh",
+                    f"clone {golden}, tart run --no-graphics, tart ip --wait, ssh",
                     start,
                 )
                 t: vmssh.Target = state["t"]  # type: ignore[assignment]
@@ -1142,20 +1436,11 @@ def cmd_check(ctx: Ctx, args) -> int:
                 for sid, name, ok, ev in persistent_assertions(ctx, image, t):
                     summary.add(sid, name, "pass" if ok else "fail", ev)
 
-                def no_password() -> str:
-                    tp = vmssh.Target(t.ip, t.known_hosts, auth="password")
-                    r = rssh(ctx, tp, ["true"])
-                    if r.rc == 0 or "permission denied" not in r.stderr.lower():
-                        raise StepFail(
-                            f"password login was not refused as expected (rc {r.rc}): {clip(r.stderr, 300)}"
-                        )
-                    return "password login refused: " + clip(r.stderr, 200)
-
                 run_step(
                     summary,
                     "2f",
                     "password login refused from the host",
-                    no_password,
+                    lambda: refused_password_login(ctx, t.ip, t.known_hosts),
                     fatal=False,
                 )
 
@@ -1163,26 +1448,48 @@ def cmd_check(ctx: Ctx, args) -> int:
                     "3",
                     "install path ownership and permissions (root:wheel, not group/world writable)",
                     "skip",
-                    "needs the renderer slice: there is no tendcf build or install command yet. The assertion (perm_ok, check_root_owned) is live and is applied to the Python framework in 2i.",
+                    "needs the renderer slice: there is no tendcf build or install command yet. The assertion (perm_ok, check_root_owned with tree=True) is live and is applied to the Python framework in 2i.",
                 )
                 for sid in ("4", "5", "6", "7", "8", "9"):
                     summary.add(
                         sid, f"checklist step {sid}", "skip", "SKIP: renderer slice"
                     )
 
+                def boot_session(target: vmssh.Target, timeout: float) -> str:
+                    r = rssh(
+                        ctx,
+                        target,
+                        ["sysctl", "-n", "kern.bootsessionuuid"],
+                        timeout=timeout,
+                    )
+                    return r.stdout.strip() if r.rc == 0 else ""
+
                 def reboot() -> str:
-                    r = rssh(ctx, t, ["sysctl", "-n", "kern.boottime"])
-                    before = r.stdout.strip()
-                    if r.rc != 0 or not before:
-                        raise StepFail("could not read kern.boottime before the reboot")
+                    before = boot_session(t, 60)
+                    if not before:
+                        raise StepFail(
+                            "could not read kern.bootsessionuuid before the reboot"
+                        )
                     rssh(
                         ctx, t, ["sudo", "-n", "shutdown", "-r", "now"], timeout=60
                     )  # the connection drops; the status is not evidence
                     state_t = {"t": t}
+                    restarts = 0
 
                     def back() -> bool:
+                        nonlocal restarts
                         if not vm.alive():
-                            vm.start()  # guest restart ended tart run: boot the same VM again (cap re-checked)
+                            # A guest restart can end tart run: boot the same VM again,
+                            # with the cap re-checked, but not forever.
+                            if restarts >= VM_RESTARTS_MAX:
+                                raise StepFail(
+                                    f"tart run exited {restarts} times after the reboot request; not restarting it again (see the run log)"
+                                )
+                            restarts += 1
+                            try:
+                                vm.start()
+                            except Refusal as e:
+                                raise StepFail(f"restart refused: {e}") from e
                         ip = ctx.run(
                             ["tart", "ip", "--wait", "5", clone], timeout=40
                         ).stdout.strip()
@@ -1193,24 +1500,17 @@ def cmd_check(ctx: Ctx, args) -> int:
                         state_t["t"] = vmssh.Target(
                             ip, t.known_hosts, identity=t.identity
                         )
-                        r2 = rssh(
-                            ctx,
-                            state_t["t"],
-                            ["sysctl", "-n", "kern.boottime"],
-                            timeout=45,
-                        )
-                        return (
-                            r2.rc == 0
-                            and bool(r2.stdout.strip())
-                            and r2.stdout.strip() != before
-                        )
+                        now = boot_session(state_t["t"], 45)
+                        return bool(now) and now != before
 
                     if not wait_until(ctx, back, 420, 5):
                         raise StepFail(
-                            "ssh did not come back with a new boot time within 420s"
+                            "ssh did not come back with a new boot session within 420s"
                         )
                     state["t"] = state_t["t"]
-                    return f"boot time changed; ssh back at {state_t['t'].ip}"  # type: ignore[attr-defined]
+                    return (
+                        f"kern.bootsessionuuid changed; ssh back at {state_t['t'].ip}"  # type: ignore[attr-defined]
+                    )
 
                 if run_step(
                     summary, "10", "reboot; ssh comes back", reboot, fatal=False
@@ -1225,13 +1525,26 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "10a",
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
-                        "; ".join(bad) or "2a-2e, 2g-2i re-checked",
+                        "; ".join(bad) or "2a-2e, 2g-2k re-checked",
+                    )
+                else:
+                    summary.add(
+                        "10a",
+                        "image properties still hold after the reboot",
+                        "skip",
+                        "not run: step 10 failed",
                     )
                 summary.add(
                     "10b",
                     "launchctl print system/<label> loads from disk at boot",
                     "skip",
                     "SKIP: renderer slice (there is no daemon to print yet)",
+                )
+                summary.add(
+                    "11a",
+                    "bootout and remove the installed daemon; launchctl print then fails",
+                    "skip",
+                    "SKIP: renderer slice (nothing is installed to bootout or remove yet; step 11's stop and delete below is live)",
                 )
                 rc = 0
             except Refusal as e:
