@@ -314,6 +314,17 @@ Recovery.
 - The launchd disable list in `prep.sh` is a candidate list for a headless VM, applied only to
   labels whose plist ships on the image. The first real run's `before` snapshot is the
   evidence to prune it against.
+- **Observed on the first real run (2026-11-21, macOS 27.2 build 26B123, OpenSSH_10.5p1,
+  LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
+  names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
+  `PubkeyAuthentication yes`, `PermitRootLogin no`, `UsePAM yes`), not the lowercase of stock
+  OpenSSH. `prep.sh` and check 2e (and its post-reboot repeat, 10a) now match whole lines
+  ignoring case. The `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has
+  `Include /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and
+  sorts after ours), and the effective configuration was key-only. The same run confirmed that
+  `tart clone` of the `@sha256:` reference works from the cache, `tart ip --wait` answers, and
+  that the vanilla image's Secure Token is enabled for `admin` (issue 78 stays open: the
+  password rotation comes after g6 and has not run).
 - Assumed from tart's source and docs, not run: `tart list --format json` field names
   (`Name`, `Running`), `tart clone` of an `@sha256:` reference from the OCI cache without a
   pull, `tart ip --wait`, that a guest `shutdown -r` keeps `tart run` alive (if it exits, the

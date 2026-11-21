@@ -180,8 +180,10 @@ chown root:wheel "$tmp"
 chmod 644 "$tmp"
 mv -f "$tmp" "$SSH_DROPIN"
 effective=$(/usr/sbin/sshd -T -C user=admin,host=localhost,addr=127.0.0.1)
+# macOS 27.2's sshd (OpenSSH_10.5p1) prints the keys in CamelCase ("PasswordAuthentication no"),
+# stock OpenSSH in lowercase: match the whole line, ignoring case.
 for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no'; do
-    printf '%s\n' "$effective" | grep -qx "$want" || die "sshd -T does not show: $want"
+    printf '%s\n' "$effective" | grep -qixF "$want" || die "sshd -T does not show: $want"
 done
 log "sshd: key login only"
 

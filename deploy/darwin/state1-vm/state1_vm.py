@@ -1094,7 +1094,9 @@ def persistent_assertions(
             f"user={t.user},host=localhost,addr=127.0.0.1",
         ],
     )
-    cfg = set(r.stdout.split("\n"))
+    # macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase: compare
+    # whole lines, case-folded and stripped.
+    cfg = {ln.strip().lower() for ln in r.stdout.splitlines()}
     want = {
         "passwordauthentication no",
         "kbdinteractiveauthentication no",

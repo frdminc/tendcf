@@ -51,6 +51,16 @@ GOLDEN = IMAGE["golden_name"]
 FW_PYTHON_ORIGINAL = "root:admin 775"  # what python.org's postflight really leaves
 FW_PYTHON_FIXED = "root:wheel 755"
 FW_ROOT = drv.FRAMEWORK_ROOT
+# `sshd -T` on macOS 27.2 (26B123, OpenSSH_10.5p1) prints CamelCase option names (observed on the
+# first real run, issue 70); stock OpenSSH prints them lowercase. Both must be accepted.
+SSHD_CAMEL = (
+    "UsePAM yes\nPermitRootLogin no\nPubkeyAuthentication yes\n"
+    "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthOptions none\n"
+)
+SSHD_LOWER = (
+    "port 22\npasswordauthentication no\nkbdinteractiveauthentication no\n"
+    "pubkeyauthentication yes\npermitrootlogin no\n"
+)
 
 
 class Interrupt(drv.Interrupted):
@@ -104,6 +114,7 @@ class FakeWorld:
         )
         self.signals_sent = 0
         self.screensharing_on = False
+        self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
         # behaviour switches
         self.new_hostkey = NEW_BLOB
         self.keyscan_blob = None  # None: the guest's real current key
@@ -363,10 +374,7 @@ class FakeWorld:
         if r == ["spctl", "--status"]:
             return drv.Result(0, "assessments enabled\n")
         if r[:3] == ["sudo", "-n", "/usr/sbin/sshd"]:
-            return drv.Result(
-                0,
-                "port 22\npasswordauthentication no\nkbdinteractiveauthentication no\npubkeyauthentication yes\npermitrootlogin no\n",
-            )
+            return drv.Result(0, self.sshd_output)
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             return drv.Result(0, "/:\n\tIndexing disabled.\n")
         if r[:4] == ["sudo", "-n", "launchctl", "print-disabled"]:
@@ -2884,6 +2892,46 @@ class Check(Base):
         self.assertIsNone(s)
         self.assertTrue(json.loads(out.read_text())["ok"])
 
+    def test_sshd_effective_config_accepts_camelcase_and_lowercase_output(self):
+        # macOS 27.2 prints CamelCase (the default fake); stock OpenSSH prints lowercase.
+        for name, out in (
+            ("camelcase", SSHD_CAMEL),
+            ("lowercase", SSHD_LOWER),
+            ("crlf and padding", SSHD_CAMEL.replace("\n", "  \r\n")),
+        ):
+            with self.subTest(name):
+                self.world.sshd_output = out
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 0, s)
+                self.assertEqual(self.steps(s)["2e"]["status"], "pass", name)
+
+    def test_sshd_effective_config_still_fails_on_a_wrong_or_missing_line(self):
+        wrong = SSHD_CAMEL.replace(
+            "PasswordAuthentication no", "PasswordAuthentication yes"
+        )
+        cases = (
+            ("password login on", wrong, "passwordauthentication no"),
+            (
+                "option missing",
+                SSHD_CAMEL.replace("KbdInteractiveAuthentication no\n", ""),
+                "kbdinteractiveauthentication no",
+            ),
+            (  # a whole-line match: a longer line does not stand in for the wanted one
+                "only a longer line",
+                SSHD_CAMEL.replace("PermitRootLogin no", "PermitRootLogin no-password"),
+                "permitrootlogin no",
+            ),
+            ("empty output", "", "passwordauthentication no"),
+        )
+        for name, out, missing in cases:
+            with self.subTest(name):
+                self.world.sshd_output = out
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                st = self.steps(s)["2e"]
+                self.assertEqual(st["status"], "fail", name)
+                self.assertIn(missing, st["evidence"], name)
+
     def test_reboot_restarts_tart_run_when_it_exits(self):
         self.world.run_exits_on_reboot = True
         rc, s = self.run_cmd(*self.check_args())
@@ -3862,6 +3910,41 @@ class GuestScripts(unittest.TestCase):
                     "old-and-new dscl form" if want_words == "5" else "root dscl form"
                 )
                 self.assertIn(form, r.stdout, over)
+
+    def test_prep_checks_sshd_effective_config_ignoring_case(self):
+        # the loop that asserts `sshd -T` shows key-only login, run against a fake sshd
+        text = self.text("prep.sh")
+        a = text.index("effective=$(/usr/sbin/sshd -T")
+        b = text.index('log "sshd: key login only"', a)
+        snippet = text[a:b]
+        tmp = Path(tempfile.mkdtemp(prefix="tendcf-prep7-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = tmp / "sshd"
+        fake.write_text('#!/bin/sh\nprintf "%s" "$SSHD_OUT"\n')
+        fake.chmod(0o755)
+        snippet = snippet.replace("/usr/sbin/sshd", str(fake))
+        stub = 'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+        cases = (
+            (SSHD_CAMEL, 0, ""),  # macOS 27.2, as observed
+            (SSHD_LOWER, 0, ""),  # stock OpenSSH
+            (SSHD_CAMEL.replace("PasswordAuthentication no", "PasswordAuthentication yes"),
+             1, "passwordauthentication no"),
+            (SSHD_CAMEL.replace("PubkeyAuthentication yes", "PubkeyAuthentication no"),
+             1, "pubkeyauthentication yes"),
+            (SSHD_CAMEL.replace("PermitRootLogin no", "PermitRootLogin no-password"),
+             1, "permitrootlogin no"),  # whole line, not a prefix
+            ("", 1, "passwordauthentication no"),
+        )  # fmt: skip
+        for out, want_rc, want_msg in cases:
+            r = subprocess.run(
+                ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "SSHD_OUT": out},
+            )
+            self.assertEqual(r.returncode, want_rc, (out, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stdout + r.stderr)
 
     def test_prep_prints_the_host_key_from_inside_the_session(self):
         text = self.text("prep.sh")
