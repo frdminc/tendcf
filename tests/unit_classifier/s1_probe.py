@@ -187,7 +187,9 @@ def link_outside():
     shutil.rmtree(ext, ignore_errors=True)
 
 
-ANY_STATUS = tuple(range(256))
+ANY_STATUS = tuple(range(-128, 256))   # a child killed by a signal has a negative status
+GEN_ETC = "/etc/systemd/system-generators"
+GEN_RUN = "/run/systemd/system-generators"
 
 
 def diag(title, argv, **kw):
@@ -199,8 +201,13 @@ def diag(title, argv, **kw):
 
 
 def journal(title, since, pattern, limit=40):
-    """The journal since `since`, filtered in Python by regex `pattern`, at most `limit` lines."""
-    r = sh(["journalctl", "-b", "--no-pager", "-o", "short-precise", "--since", since])
+    """The journal since `since`, filtered in Python by regex `pattern`, at most `limit` lines.
+    An observation: a missing journalctl is recorded, never raised."""
+    try:
+        r = sh(["journalctl", "-b", "--no-pager", "-o", "short-precise", "--since", since])
+    except OSError as e:
+        out("**%s**\n\n`$ journalctl -b --since '%s'`  (not run: %r)\n" % (title, since, e))
+        return
     keep = [x for x in r.stdout.splitlines() if re.search(pattern, x)]
     out("**%s**\n\n`$ journalctl -b --since '%s'` filtered by `%s`  (rc=%d, %d of %d lines)\n\n```" % (
         title, since, pattern, r.returncode, min(len(keep), limit), len(r.stdout.splitlines())))
@@ -216,8 +223,9 @@ def generator_script(prefix):
 
 def item3_diagnose(gen_dir, gen, since):
     """Issue 51: called only when the manager did not generate the units of the asserted
-    generator. Records where the host runs (the cloud: the ubuntu-24.04 AWS image mounts /run
-    noexec), the generator's directory mount, a by-hand run and the journal's generator lines."""
+    generator. Records where the host runs (the cloud), the generator's directory mount (/run may
+    be mounted noexec: initramfs-tools does it; seen on the ubuntu-24.04 AWS image), a by-hand run
+    and the journal's generator lines."""
     out("### Diagnostics: the generated units are missing (issue 51)\n")
     diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name"])
     diag("host: kernel", ["uname", "-r"])
@@ -232,14 +240,38 @@ def item3_diagnose(gen_dir, gen, since):
     journal("journal: generator lines", since, r"(?i)generator|tendcf|direxec")
 
 
+def missing_generated(listing, names=("tendcf-s1-gen.service", "tendcf-s1-gen-nosrc.service")):
+    """The generated unit names the `list-unit-files` output lacks (compared by whole name:
+    the -nosrc unit alone must not satisfy a check for the other)."""
+    seen = {ln.split()[0] for ln in listing.splitlines() if ln.split()}
+    return [n for n in names if n not in seen]
+
+
+def item3_leftovers(existed, dirs=(GEN_ETC, GEN_RUN), out_glob="/run/systemd/generator*"):
+    """After item 3 (and its reloads): no tendcf-s1* file may remain in a generator directory or in
+    the generator output directories, and a generator directory the probe created must be gone.
+    `existed` maps each directory to whether it existed before the probe. Fails the probe
+    otherwise, and records what it found either way. Returns the list of leftovers."""
+    left = []
+    for d in list(dirs) + sorted(glob.glob(out_glob)):
+        if os.path.isdir(d):
+            left += sorted(glob.glob(d + "/tendcf-s1*"))
+    left += ["%s (a directory the probe created)" % d for d in dirs if not existed.get(d) and os.path.isdir(d)]
+    out("**item 3 leftovers: %s**\n\n```\n%s\n```\n" % ("none" if not left else "FOUND", "\n".join(left)))
+    if left:
+        fail("item 3 left behind: %s" % left)
+    return left
+
+
 def item3_generated():
     out("## Item 3: SourcePath of a generated unit\n")
-    # The asserted generator lives under /etc, not /run: the ubuntu-24.04 AWS runner image
-    # mounts /run noexec, so systemd cannot execve a generator there ("Failed to execute ...:
-    # Permission denied"; issue 51). Which directory holds the generator does not change what is
-    # observed about the generated units, which land in /run/systemd/generator either way.
-    gen_dir = "/etc/systemd/system-generators"
-    gen_dir_existed = os.path.isdir(gen_dir)
+    # The asserted generator lives under /etc, not /run: /run may be mounted noexec
+    # (initramfs-tools does it; seen on the ubuntu-24.04 AWS runner image), and systemd cannot
+    # execve a generator there ("Failed to execute ...: Permission denied"; issue 51). Which
+    # directory holds the generator does not change what is observed about the generated
+    # units, which land in /run/systemd/generator either way.
+    gen_dir = GEN_ETC
+    existed = {d: os.path.isdir(d) for d in (GEN_ETC, GEN_RUN)}
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 10))
     with Sandbox(extra_roots=(gen_dir, "/etc/init.d", "/etc/rc3.d", "/etc/rc2.d", "/etc/rc5.d")) as sb:
         sb.write(gen_dir + "/tendcf-s1-gen", generator_script("tendcf-s1-gen"), mode=0o755)
@@ -248,8 +280,11 @@ def item3_generated():
         show("tendcf-s1-gen.service")
         show("tendcf-s1-gen-nosrc.service")
         r = rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
-        if r.returncode != 0 or "tendcf-s1-gen" not in r.stdout:
+        missing = missing_generated(r.stdout)
+        if r.returncode != 0 or missing:
             item3_diagnose(gen_dir, gen_dir + "/tendcf-s1-gen", since)
+            if r.returncode == 0:   # rc 1 is already recorded as a failure by rec
+                fail("list-unit-files lacks the generated unit(s) %s" % sorted(missing))
         gen_dirs = sorted(glob.glob("/run/systemd/generator*"))
         rec("where the generated fragments lie", ["ls", "-l"] + gen_dirs, grep="tendcf-s1")
         rec("a second daemon-reload", ["systemctl", "daemon-reload"])
@@ -257,14 +292,7 @@ def item3_generated():
     daemon_reload()
     item3_generator_in_run()
     daemon_reload()
-    left = [p for d in [gen_dir] + sorted(glob.glob("/run/systemd/generator*")) if os.path.isdir(d)
-            for p in glob.glob(d + "/tendcf-s1*")]
-    out("**nothing of item 3's generators is left behind**\n\n```\n%s\n```\n" % "\n".join(left + (
-        [gen_dir + " (created by the probe, still there)"] if not gen_dir_existed and os.path.isdir(gen_dir) else [])))
-    if left:
-        fail("item 3 left generator files behind: %s" % left)
-    if not gen_dir_existed and os.path.isdir(gen_dir):
-        fail("item 3 left %s behind, a directory it created" % gen_dir)
+    item3_leftovers(existed)
     if os.path.exists("/usr/lib/systemd/system-generators/systemd-sysv-generator"):
         out("### the real sysv generator (init script plus rc link)\n")
         with Sandbox(extra_roots=("/etc/init.d", "/etc/rc2.d", "/etc/rc3.d", "/etc/rc4.d", "/etc/rc5.d")) as sb:
@@ -285,10 +313,13 @@ def item3_generated():
 
 def item3_generator_in_run():
     """An observation, never a failure, whichever way it comes out: the same generator under
-    /run/systemd/system-generators runs only where /run allows execution. The ubuntu-24.04 AWS
-    runner image mounts /run noexec (systemd then logs "Failed to execute ...: Permission
-    denied" and generates nothing); the Azure image and ubuntu-26.04 do not."""
-    gen_dir = "/run/systemd/system-generators"
+    /run/systemd/system-generators runs only where /run allows execution. /run may be mounted
+    noexec (initramfs-tools does it; seen on the ubuntu-24.04 AWS runner image: systemd then logs
+    "Failed to execute ...: Permission denied" and generates nothing); the Azure image and
+    ubuntu-26.04 do not. A failed reload or cleanup still fails the probe (they are not
+    observations). It is not an assertion that the generator runs on an executable /run: the
+    probe records what systemd does, and a host-dependent assertion is what issue 51 was."""
+    gen_dir = GEN_RUN
     out("### the same generator under %s (an observation: /run may be mounted noexec)\n" % gen_dir)
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
     diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor"])

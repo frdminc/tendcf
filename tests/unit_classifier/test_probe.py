@@ -10,8 +10,10 @@ import ast
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -153,6 +155,106 @@ class EveryObservationIsChecked(unittest.TestCase):
                 if isinstance(node.args[1], ast.BinOp):      # `["x"] + parts` is fine, `"x %s" % y` is not
                     self.assertNotIsInstance(node.args[1].left, ast.Constant)
         self.assertNotIn('"sh", "-c"', src)
+
+
+class Item3Observations(unittest.TestCase):
+    """Issue 51, PR 83 fix round 1: the /run observation never fails the probe on its own, the
+    leftover check does fail it, and the asserted generator's name check judges both names."""
+
+    def quiet(self, fn, *a, **kw):
+        del s1_probe.FAILURES[:]
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            result = fn(*a, **kw)
+        return result, buf.getvalue(), list(s1_probe.FAILURES)
+
+    def test_diag_records_a_missing_program_and_does_not_fail(self):
+        def missing(argv, **kw):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        with mock.patch.object(s1_probe, "sh", missing):
+            result, text, failures = self.quiet(s1_probe.diag, "no findmnt", ["findmnt", "-x"])
+        self.assertIsNone(result)
+        self.assertEqual(failures, [])
+        self.assertIn("not run:", text)
+
+    def test_diag_accepts_every_exit_status_including_a_signal_death(self):
+        for rc in (0, 1, 2, 127, 255, -9, -15):
+            with self.subTest(rc=rc), mock.patch.object(s1_probe, "sh", lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "x\n", "")):
+                _, _, failures = self.quiet(s1_probe.diag, "any status", ["whatever"])
+                self.assertEqual(failures, [])
+
+    def test_rec_still_fails_on_a_signal_death_that_is_not_an_observation(self):
+        with mock.patch.object(s1_probe, "sh", lambda argv, **kw: subprocess.CompletedProcess(argv, -9, "", "")):
+            _, _, failures = self.quiet(s1_probe.rec, "must succeed", ["whatever"])
+        self.assertEqual(len(failures), 1)
+
+    def test_journal_records_a_missing_journalctl_and_does_not_fail(self):
+        def missing(argv, **kw):
+            raise FileNotFoundError(2, "No such file or directory", "journalctl")
+        with mock.patch.object(s1_probe, "sh", missing):
+            result, text, failures = self.quiet(s1_probe.journal, "j", "2026-01-01 00:00:00", "x")
+        self.assertIsNone(result)
+        self.assertEqual(failures, [])
+        self.assertIn("not run:", text)
+
+    def test_journal_filters_by_regex_and_caps_the_lines(self):
+        lines = "".join("Failed to execute %d\nother %d\n" % (i, i) for i in range(5))
+        with mock.patch.object(s1_probe, "sh", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, lines, "")):
+            _, text, failures = self.quiet(s1_probe.journal, "j", "2026-01-01 00:00:00", "Failed to execute", limit=3)
+        self.assertEqual(failures, [])
+        self.assertEqual(text.count("Failed to execute 0") + text.count("Failed to execute 2"), 2)
+        self.assertNotIn("other", text)
+        self.assertNotIn("Failed to execute 3", text)
+
+    def make_dirs(self):
+        root = tempfile.mkdtemp(prefix="tendcf-s1-probe-test-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        etc, run_, outd = (os.path.join(root, n) for n in ("etc-gen", "run-gen", "generator.late"))
+        return etc, run_, outd
+
+    def leftovers(self, existed, etc, run_, outd):
+        return self.quiet(s1_probe.item3_leftovers, existed, dirs=(etc, run_), out_glob=os.path.join(os.path.dirname(outd), "generator*"))
+
+    def test_leftovers_pass_when_nothing_remains(self):
+        etc, run_, outd = self.make_dirs()
+        left, text, failures = self.leftovers({etc: False, run_: False}, etc, run_, outd)
+        self.assertEqual((left, failures), ([], []))
+        self.assertIn("item 3 leftovers: none", text)
+
+    def test_leftovers_fail_on_a_file_in_each_place(self):
+        for which in ("etc", "run", "out"):
+            with self.subTest(which=which):
+                etc, run_, outd = self.make_dirs()
+                d = {"etc": etc, "run": run_, "out": outd}[which]
+                os.makedirs(d)
+                open(os.path.join(d, "tendcf-s1-genrun"), "w").close()
+                existed = {etc: True, run_: True}      # the directories are not the finding here
+                left, text, failures = self.leftovers(existed, etc, run_, outd)
+                self.assertEqual(len(left), 1)
+                self.assertEqual(len(failures), 1)
+                self.assertIn("item 3 leftovers: FOUND", text)
+                self.assertNotIn("leftovers: none", text)
+
+    def test_leftovers_fail_on_a_created_directory_still_there_but_not_on_a_preexisting_one(self):
+        etc, run_, outd = self.make_dirs()
+        os.makedirs(etc)
+        os.makedirs(run_)
+        left, _, failures = self.leftovers({etc: False, run_: True}, etc, run_, outd)
+        self.assertEqual([x.split(" ")[0] for x in left], [etc])
+        self.assertEqual(len(failures), 1)
+
+    def test_a_file_unrelated_to_the_probe_is_not_a_leftover(self):
+        etc, run_, outd = self.make_dirs()
+        os.makedirs(etc)
+        open(os.path.join(etc, "systemd-gpt-auto-generator"), "w").close()
+        left, _, failures = self.leftovers({etc: True, run_: False}, etc, run_, outd)
+        self.assertEqual((left, failures), ([], []))
+
+    def test_the_name_check_judges_both_generated_units(self):
+        both = "tendcf-s1-gen-nosrc.service generated -\ntendcf-s1-gen.service       generated -\n"
+        self.assertEqual(s1_probe.missing_generated(both), [])
+        self.assertEqual(s1_probe.missing_generated("tendcf-s1-gen-nosrc.service generated -\n"), ["tendcf-s1-gen.service"])
+        self.assertEqual(s1_probe.missing_generated("tendcf-s1-gen.service generated -\n"), ["tendcf-s1-gen-nosrc.service"])
+        self.assertEqual(len(s1_probe.missing_generated("")), 2)
 
 
 if __name__ == "__main__":

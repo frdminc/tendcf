@@ -113,7 +113,9 @@ class Sandbox:
             todo.append(d)
             d = os.path.dirname(d)
         for t in reversed(todo):
-            os.mkdir(t)
+            # explicit mode, not the umask's: systemd executes what lies in a generator directory as root
+            os.mkdir(t, 0o755)
+            os.chmod(t, 0o755)
             self.undo.append(lambda t=t: os.rmdir(t))
 
     def write(self, path, text, mode=0o644):
