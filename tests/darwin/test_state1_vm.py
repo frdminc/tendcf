@@ -26,6 +26,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 VMDIR = REPO / "deploy" / "darwin" / "state1-vm"
@@ -491,6 +492,7 @@ def write_marker(
     body = {
         "golden": GOLDEN,
         "state_dir": state_dir or os.path.realpath(ctx.state_dir),
+        "tart_home": drv.tart_home(),
         "key_id": key_id or "20261119T000000Z-made",
         "host_key": host_key
         or "ssh-ed25519 " + drv.fingerprint(f"ssh-ed25519 {NEW_BLOB}"),
@@ -1516,6 +1518,7 @@ class Golden(Base):
             {
                 "golden": GOLDEN,
                 "state_dir": os.path.realpath(self.ctx.state_dir),
+                "tart_home": drv.tart_home(),
                 "key_id": self.ctx.run_id,
                 "host_key": rec["host_key"],
                 "state": "final",
@@ -1623,6 +1626,8 @@ class Golden(Base):
             )
         )
         self.assertIn("does not match the pin", self.exists_evidence)
+        # golden rebuilds by itself: it does not tell the reader to run `golden`
+        self.assertNotIn("run `golden`", self.exists_evidence)
 
     def test_golden_usable_compares_the_records_host_key_with_the_pin(self):
         self.run_cmd(*self.golden_args())
@@ -1844,13 +1849,16 @@ class Golden(Base):
         with patcher:
             rc, s = self.run_cmd(*self.golden_args())
         self.assertEqual(rc, 1)
-        self.assertIn("nothing else", self.steps(s)["g10"]["evidence"])
+        self.assertIn("as it was", self.steps(s)["g10"]["evidence"])
         self.assertEqual(sorted(self.world.vms), [f"{GOLDEN}-build"])
 
     def test_atomic_write_fsyncs_the_file_and_then_the_directory(self):
         from unittest import mock
 
-        with mock.patch.object(drv.os, "fsync", wraps=os.fsync) as fs:
+        with (
+            mock.patch.object(drv, "F_FULLFSYNC", None),
+            mock.patch.object(drv.os, "fsync", wraps=os.fsync) as fs,
+        ):
             drv.atomic_write(self.tmp / "x" / "f", "data")
         self.assertEqual(fs.call_count, 2)  # the temp file, then the directory
 
@@ -2121,6 +2129,298 @@ class Golden(Base):
             ),
             [],
         )
+
+    # ---- PR 80 round 2 ---------------------------------------------------------------------
+
+    def landing_writes(self, plan):
+        """Patch atomic_write so the n-th write of a destination name lands, then reports
+        that its directory could not be synced. plan: {name: n}."""
+        real = drv.atomic_write
+        counts = {}
+
+        def wrapper(dest, text, mode=0o600):
+            name = Path(dest).name
+            counts[name] = counts.get(name, 0) + 1
+            real(dest, text, mode)
+            if plan.get(name) == counts[name]:
+                raise drv.LandedNotDurable(5, "Input/output error")
+
+        return mock.patch.object(drv, "atomic_write", wrapper)
+
+    def pending_files(self):
+        return sorted(
+            p.name
+            for d in (self.ctx.state_dir, self.ctx.lock_path.parent)
+            for p in d.glob("*.pending")
+        )
+
+    def test_the_marker_records_the_tart_home_and_a_run_under_another_one_exits_2(self):
+        x, y = self.tmp / "tartX", self.tmp / "tartY"
+        with mock.patch.dict(os.environ, {"TART_HOME": str(x)}):
+            rc, s = self.run_cmd(*self.golden_args())
+            self.assertEqual(rc, 0, s)
+            self.assertEqual(
+                json.loads(self.owner_file().read_text())["tart_home"],
+                os.path.realpath(x),
+            )
+            rc, s = self.run_cmd(*self.golden_args(), ctx=self.second_run_ctx())
+            self.assertEqual(rc, 0, s)  # the same tart home: nothing to do
+            self.assertIn("nothing to do", self.steps(s)["exists"]["evidence"])
+        clones = len(self.world.tart_calls("clone"))
+        # the same HOME and state dir, another TART_HOME (and the default one): the golden
+        # tart lists there is not the one the marker describes
+        for env in ({"TART_HOME": str(y)}, {"TART_HOME": ""}):
+            with mock.patch.dict(os.environ, env):
+                rc, ev, _ = self.plain(self.second_run_ctx("20261123T000000Z-y"))
+                self.assertEqual(rc, 2, env)
+                self.assertIn("tart home", ev)
+                self.assertIn(
+                    os.path.realpath(x), ev
+                )  # names the one it was written for
+                self.assertIn("--rebuild", ev)
+                rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx())
+                self.assertEqual(rc, 2, env)
+                self.assertIn("tart home", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
+        self.assertEqual(self.world.tart_calls("delete"), [])
+
+    def test_a_golden_that_appears_during_the_build_is_never_deleted_without_rebuild(
+        self,
+    ):
+        real = self.world.run
+        build = f"{GOLDEN}-build"
+
+        def appears(argv, **kw):
+            res = real(argv, **kw)
+            if argv[:2] == ["tart", "clone"] and argv[-1] == build:
+                # a hand `tart rename`, or a driver under another TART_HOME
+                self.world.vms[GOLDEN] = {"Running": False}
+            return res
+
+        with mock.patch.object(self.world, "run", appears):
+            rc, ev, _ = self.plain(self.ctx)
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("nothing was replaced", ev)
+        self.assertNotIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
+        self.assertNotIn(
+            ["tart", "rename", build, GOLDEN], [c for c, _ in self.world.calls]
+        )
+        self.assertIn(GOLDEN, self.world.vms)
+        self.assertFalse(self.owner_file().exists())  # no intent marker was written
+        self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+        # asked for by name it replaces it
+        self.world.vms.pop(GOLDEN)
+        self.world.vms.pop(build, None)
+        with mock.patch.object(self.world, "run", appears):
+            rc, s = self.run_cmd(
+                *self.golden_args("--rebuild"), ctx=self.second_run_ctx()
+            )
+        self.assertEqual(rc, 0, s)
+        self.assertIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
+
+    def test_a_custom_state_dir_must_be_ours_and_not_group_or_world_writable(self):
+        sd = self.tmp / "custom"
+        for mode in (0o777, 0o775, 0o757):
+            sd.mkdir(exist_ok=True)
+            os.chmod(sd, mode)
+            ctx = self.make_ctx(sd, run_id="20261121T000000Z-sd")
+            rc, ev, _ = self.plain(ctx)
+            self.assertEqual(rc, 2, oct(mode))
+            self.assertIn("not group or world writable", ev)
+            self.assertIn(str(sd), ev)
+            self.assertEqual(self.world.tart_calls("clone"), [], oct(mode))
+        os.chmod(sd, 0o755)
+        rc, ev, _ = self.plain(self.make_ctx(sd, run_id="20261121T000000Z-sd2"))
+        self.assertEqual(rc, 0, ev)
+        # a state dir the driver makes is 0700, whatever the umask
+        fresh = self.tmp / "fresh" / "dir"
+        old = os.umask(0)
+        try:
+            rc, ev, _ = self.plain(self.make_ctx(fresh, run_id="20261121T000000Z-sd3"))
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(fresh.stat().st_mode), 0o700, ev)
+
+    def test_a_marker_state_dir_that_is_not_absolute_is_a_torn_or_forged_marker(self):
+        self.run_cmd(*self.golden_args())
+        good = self.owner_file().read_text()
+        owner = json.loads(good)
+        owner["state_dir"] = "."
+        self.owner_file().write_text(json.dumps(owner))
+        old = os.getcwd()
+        os.chdir(self.ctx.state_dir)  # "." IS this state dir: it must not count as one
+        try:
+            self.assertFalse(drv.same_state_dir(self.ctx, "."))
+            rc, ev, _ = self.plain(self.second_run_ctx())
+            self.assertEqual(rc, 2, ev)
+            self.assertIn("not an absolute path", ev)
+            rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx())
+            self.assertEqual(rc, 2)
+            self.assertIn("not an absolute path", s["steps"][-1]["evidence"])
+        finally:
+            os.chdir(old)
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+
+    def test_paths_in_a_suggested_command_are_shell_quoted(self):
+        self.run_cmd(*self.golden_args())
+        odd = self.tmp / "my state; touch pwned"
+        odd.mkdir()
+        owner = json.loads(self.owner_file().read_text())
+        owner["state_dir"] = str(odd)
+        self.owner_file().write_text(json.dumps(owner))
+        quoted = shlex.quote(str(odd))
+        # a state dir with no record of the golden: the hint names the owner to use
+        ctx_c = self.make_ctx(self.tmp / "stateC", run_id="20261121T000000Z-c")
+        rc, ev, _ = self.plain(ctx_c)
+        self.assertEqual(rc, 2)
+        self.assertIn(f"--state-dir {quoted}", ev)
+        self.assertNotIn(f"--state-dir {odd}", ev)
+        # and check, when this state dir has a record but the marker is final for another
+        rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx())
+        self.assertEqual(rc, 2)
+        self.assertIn(f"--state-dir {quoted}", s["steps"][-1]["evidence"])
+
+    def test_an_unreadable_marker_is_not_described_as_no_owner_file(self):
+        self.run_cmd(*self.golden_args())
+        self.owner_file().write_text("not json")
+        (self.ctx.state_dir / "golden.json").unlink()
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2)
+        self.assertIn("unreadable", ev)
+        self.assertNotIn("(no owner file)", ev)
+
+    def test_atomic_write_reports_a_write_that_landed_when_only_the_directory_sync_fails(
+        self,
+    ):
+        dest = self.tmp / "d" / "f"
+        dest.parent.mkdir()
+        dest.write_text("old")
+        real = drv.full_fsync
+
+        def dir_fails(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "Input/output error")
+            real(fd)
+
+        with (
+            mock.patch.object(drv, "full_fsync", dir_fails),
+            self.assertRaises(drv.LandedNotDurable) as cm,
+        ):
+            drv.atomic_write(dest, "new")
+        self.assertIsInstance(cm.exception, OSError)
+        self.assertEqual(dest.read_text(), "new")  # it landed
+        self.assertEqual([p.name for p in dest.parent.iterdir()], ["f"])  # no temp left
+        # a failure before the replace is a plain OSError and leaves the destination alone
+        with (
+            mock.patch.object(drv, "full_fsync", side_effect=OSError(5, "EIO")),
+            self.assertRaises(OSError) as cm,
+        ):
+            drv.atomic_write(dest, "newer")
+        self.assertNotIsInstance(cm.exception, drv.LandedNotDurable)
+        self.assertEqual(dest.read_text(), "new")
+
+    def test_a_landed_intent_write_is_reported_as_landed_and_the_previous_marker_restored(
+        self,
+    ):
+        self.run_cmd(*self.golden_args())
+        before = self.owner_file().read_text()
+        self.world.vms.pop(f"{GOLDEN}-build", None)
+        with self.landing_writes({self.owner_file().name: 1}):
+            rc, s = self.run_cmd(
+                *self.golden_args("--rebuild"), ctx=self.second_run_ctx()
+            )
+        self.assertEqual(rc, 1)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("could not be made durable", ev)
+        self.assertIn("restored", ev)
+        self.assertNotIn("nothing else", ev)
+        self.assertEqual(self.owner_file().read_text(), before)
+        # the old golden was not touched
+        self.assertIn(GOLDEN, self.world.vms)
+        self.assertNotIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
+
+    def test_a_commit_write_that_landed_is_not_called_failed(self):
+        with self.landing_writes({"known_hosts": 1}):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("known_hosts landed", ev)
+        self.assertIn("known_hosts (landed, durability unconfirmed)", ev)
+        self.assertNotIn("writing known_hosts failed", ev)
+        self.assertIn("refuses", ev)  # the owner file says the commit did not finish
+        # the final owner file landed too: nothing is left unfinished, and it says so
+        self.tearDown_world()
+        with self.landing_writes({self.owner_file().name: 2}):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("the final owner file landed", ev)
+        self.assertNotIn("refuses", ev)
+        self.assertEqual(json.loads(self.owner_file().read_text())["state"], "final")
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
+    def test_fsync_asks_the_drive_to_flush_on_macos_and_falls_back_to_fsync(self):
+        with (
+            mock.patch.object(drv, "F_FULLFSYNC", 51),
+            mock.patch.object(drv.fcntl, "fcntl") as fc,
+            mock.patch.object(drv.os, "fsync", wraps=os.fsync) as fs,
+        ):
+            drv.atomic_write(self.tmp / "x" / "f", "data")
+        self.assertEqual([c.args[1] for c in fc.call_args_list], [51, 51])  # file, dir
+        self.assertEqual(fs.call_count, 0)
+        with (
+            mock.patch.object(drv, "F_FULLFSYNC", 51),
+            mock.patch.object(drv.fcntl, "fcntl", side_effect=OSError(25, "ENOTTY")),
+            mock.patch.object(drv.os, "fsync", wraps=os.fsync) as fs,
+        ):
+            drv.atomic_write(self.tmp / "x" / "g", "data")
+        self.assertEqual(fs.call_count, 2)
+        self.assertEqual((self.tmp / "x" / "g").read_text(), "data")
+
+    def test_a_successful_commit_removes_the_parked_files_of_an_earlier_one(self):
+        self.run_cmd(*self.golden_args())
+        self.world.fail_tart = {
+            "delete"
+        }  # the old golden cannot be removed: records parked
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            self.pending_files(),
+            [
+                "golden-owner-" + GOLDEN + ".json.pending",
+                "golden.json.pending",
+                "known_hosts.pending",
+            ],
+        )
+        self.world.fail_tart = set()
+        self.world.vms.pop(f"{GOLDEN}-build", None)
+        rc, s = self.run_cmd(
+            *self.golden_args("--rebuild"),
+            ctx=self.second_run_ctx("20261123T000000Z-x"),
+        )
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.pending_files(), [])
+        ev = self.steps(s)["pending"]["evidence"]
+        for name in ("known_hosts.pending", "golden.json.pending", ".json.pending"):
+            self.assertIn(name, ev)
+        # a commit with nothing parked says nothing about it
+        rc, s = self.run_cmd(
+            *self.golden_args("--rebuild"),
+            ctx=self.second_run_ctx("20261124T000000Z-y"),
+        )
+        self.assertEqual(rc, 0, s)
+        self.assertNotIn("pending", self.steps(s))
+
+    def test_a_hand_finish_message_is_not_promised_when_parking_failed_too(self):
+        patcher, _ = self.failing_writes({"known_hosts": 1, "known_hosts.pending": 1})
+        with patcher:
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("could not be parked", ev)
+        self.assertNotIn("to finish by hand", ev)
 
 
 class Check(Base):
@@ -2710,6 +3010,59 @@ class Check(Base):
         with self.assertRaises(drv.Refusal), drv.driver_lock(self.ctx):
             pass
         self.assertEqual(victim.read_text(), "precious")
+
+    # ---- PR 80 round 2 ---------------------------------------------------------------------
+
+    def test_check_lets_the_login_decide_on_another_dirs_unfinished_commit(self):
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        # B's takeover stopped before it touched the golden: it is still ours, and the login
+        # proves it; the marker only becomes an evidence line
+        write_marker(self.ctx, state_dir=str(other), state="committing")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertIn(
+            "did not finish; the golden is the old or the new build",
+            self.steps(s)["owner"]["evidence"],
+        )
+        self.assertIn(str(other), self.steps(s)["owner"]["evidence"])
+        clones = len(self.world.tart_calls("clone"))
+        self.assertEqual(clones, 1)
+        # a FINAL marker of another state dir still refuses before any clone
+        write_marker(self.ctx, state_dir=str(other))
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("owned by state dir", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
+
+    def test_check_refuses_a_final_marker_of_this_dir_with_another_key(self):
+        write_marker(self.ctx, key_id="20261120T000000Z-someone-else")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("another golden of this state dir's", ev)
+        self.assertIn("golden --rebuild", ev)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        # the same key: it goes on to the login
+        write_marker(self.ctx)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+
+    def test_check_refuses_a_final_marker_written_for_another_tart_home(self):
+        write_marker(self.ctx, tart_home="/nowhere/else/.tart")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("tart home", ev)
+        self.assertIn("/nowhere/else/.tart", ev)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_check_refuses_a_state_dir_others_can_write(self):
+        os.chmod(self.ctx.state_dir, 0o777)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("not group or world writable", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
 
 
 class DsclCodes(unittest.TestCase):
