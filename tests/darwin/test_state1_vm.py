@@ -482,6 +482,24 @@ class Clock:
         return self.t
 
 
+def write_marker(
+    ctx, state_dir=None, state="final", key_id=None, host_key=None, **more
+):
+    """An owner marker as the driver writes it (for a state of the world a test sets up)."""
+    path = drv.owner_path(ctx, GOLDEN)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = {
+        "golden": GOLDEN,
+        "state_dir": state_dir or os.path.realpath(ctx.state_dir),
+        "key_id": key_id or "20261119T000000Z-made",
+        "host_key": host_key
+        or "ssh-ed25519 " + drv.fingerprint(f"ssh-ed25519 {NEW_BLOB}"),
+        "state": state,
+    }
+    body.update(more)
+    path.write_text(json.dumps(body))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="tendcf-vmtest-"))
@@ -1500,6 +1518,7 @@ class Golden(Base):
                 "state_dir": os.path.realpath(self.ctx.state_dir),
                 "key_id": self.ctx.run_id,
                 "host_key": rec["host_key"],
+                "state": "final",
             },
         )
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -1607,12 +1626,12 @@ class Golden(Base):
 
     def test_golden_usable_compares_the_records_host_key_with_the_pin(self):
         self.run_cmd(*self.golden_args())
-        self.assertTrue(drv.golden_usable(self.ctx))
+        self.assertTrue(drv.golden_usable(self.ctx, GOLDEN))
         kh = self.ctx.state_dir / "known_hosts"
         good = kh.read_text()
         kh.write_text(f"{vmssh.HOST_ALIAS} ssh-ed25519 {OTHER_BLOB}\n")
         with self.assertRaises(drv.Refusal) as cm:
-            drv.golden_usable(self.ctx)
+            drv.golden_usable(self.ctx, GOLDEN)
         self.assertIn("does not match the pin", str(cm.exception))
         rc, s = self.run_cmd(
             *self.check_args()
@@ -1626,8 +1645,350 @@ class Golden(Base):
         rec = json.loads(rec_path.read_text())
         del rec["host_key"]
         rec_path.write_text(json.dumps(rec))
-        with self.assertRaises(drv.Refusal):
-            drv.golden_usable(self.ctx)
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.golden_usable(self.ctx, GOLDEN)
+        self.assertIn("has no host_key", str(cm.exception))
+        self.assertNotIn("did not both land", str(cm.exception))
+
+    # ---- PR 80 round 1: the intent marker, crash windows, hardening ----------------------
+
+    def failing_writes(self, plan):
+        """Patch atomic_write so the commit stops at the n-th write of a destination name.
+        plan: {name: n}. Returns the patcher and the list of (name, text) writes seen."""
+        from unittest import mock
+
+        real = drv.atomic_write
+        seen, counts = [], {}
+
+        def wrapper(dest, text, mode=0o600):
+            name = Path(dest).name
+            counts[name] = counts.get(name, 0) + 1
+            seen.append((name, text))
+            if plan.get(name) == counts[name]:
+                raise OSError(28, "No space left on device")
+            return real(dest, text, mode)
+
+        return mock.patch.object(drv, "atomic_write", wrapper), seen
+
+    def two_dirs(self):
+        """A built the golden; returns (ctx_a2, ctx_b): plain `golden` contexts for A and B."""
+        self.run_cmd(*self.golden_args())
+        ctx_b = self.make_ctx(self.tmp / "stateB", run_id="20261121T000000Z-b")
+        return self.second_run_ctx("20261122T000000Z-a2"), ctx_b
+
+    def plain(self, ctx):
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)
+        ev = " | ".join(x["evidence"] for x in s["steps"])
+        return rc, ev, s
+
+    def test_the_commit_invalidates_the_marker_before_any_destructive_step(self):
+        patcher, seen = self.failing_writes({})
+        with patcher:
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        marker = drv.owner_path(self.ctx, GOLDEN).name
+        order = [
+            (n, json.loads(t)["state"] if n == marker else "")
+            for n, t in seen
+            if n in (marker, "known_hosts", "golden.json")
+        ]
+        # intent first (before the delete and the rename), the final marker last
+        self.assertEqual(
+            order,
+            [
+                (marker, "committing"),
+                ("known_hosts", ""),
+                ("golden.json", ""),
+                (marker, "final"),
+            ],
+        )
+
+    def test_a_commit_that_stops_at_any_write_never_leaves_a_stale_blessing(self):
+        # Fable F1 table: every row, takeover by B and a rebuild by A itself
+        rows = [
+            ("intent", {"MARKER": 1}, "untouched"),
+            ("known_hosts", {"known_hosts": 1}, "stopped"),
+            ("golden.json", {"golden.json": 1}, "stopped"),
+            ("final marker", {"MARKER": 2}, "stopped"),
+        ]
+        for takeover in (True, False):
+            for what, plan, kind in rows:
+                with self.subTest(what=what, takeover=takeover):
+                    self.tearDown_world()
+                    ctx_a2, ctx_b = self.two_dirs()
+                    plan = {
+                        (
+                            drv.owner_path(self.ctx, GOLDEN).name
+                            if k == "MARKER"
+                            else k
+                        ): v
+                        for k, v in plan.items()
+                    }
+                    committer = ctx_b if takeover else ctx_a2
+                    patcher, _ = self.failing_writes(plan)
+                    with patcher:
+                        rc, s = self.run_cmd(
+                            *self.golden_args("--rebuild"), ctx=committer
+                        )
+                    self.assertEqual(rc, 1, s)
+                    rc_a, ev_a, _ = self.plain(ctx_a2)
+                    rc_b, ev_b, _ = self.plain(ctx_b)
+                    if kind == "untouched":
+                        # nothing changed: A still owns it and says so; B is refused
+                        self.assertEqual(rc_a, 0, ev_a)
+                        self.assertIn("nothing to do", ev_a)
+                        self.assertEqual(rc_b, 2)
+                    else:
+                        for who, rc_x, ev_x in (("A", rc_a, ev_a), ("B", rc_b, ev_b)):
+                            self.assertEqual(rc_x, 2, (who, ev_x))
+                            self.assertNotIn("nothing to do", ev_x)
+                            self.assertIn("--rebuild", ev_x)
+                        self.assertIn("did not finish", ev_a + ev_b)
+
+    def tearDown_world(self):
+        """Fresh world and state for the next row of a table test."""
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.tmp.mkdir()
+        self.world = FakeWorld()
+        self.ctx = self.make_ctx(self.tmp / "state")
+
+    def test_a_failed_rename_finished_by_hand_over_another_state_dir_is_not_blessed_for_it(
+        self,
+    ):
+        # Fable F1 case 1 and F2: B --rebuild, rename fails, the operator finishes by hand
+        ctx_a2, ctx_b = self.two_dirs()
+        self.world.fail_tart = {"rename"}
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx_b)
+        self.assertEqual(rc, 1)
+        ev = self.steps(s)["g10"]["evidence"]
+        marker = drv.owner_path(self.ctx, GOLDEN)
+        for pending in (
+            "known_hosts.pending",
+            "golden.json.pending",
+            marker.name + ".pending",
+        ):
+            self.assertIn(pending, ev)  # all three are named, and so is the third mv
+        # the golden is absent while the rename is undone (a plain `golden` builds it again);
+        # the owner file says the commit did not finish
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+        # the hand finish: tart rename, then the three mv
+        self.world.vms[GOLDEN] = self.world.vms.pop(f"{GOLDEN}-build")
+        os.replace(
+            ctx_b.state_dir / "known_hosts.pending", ctx_b.state_dir / "known_hosts"
+        )
+        os.replace(
+            ctx_b.state_dir / "golden.json.pending", ctx_b.state_dir / "golden.json"
+        )
+        os.replace(str(marker) + ".pending", marker)
+        # B: plain `golden` says nothing to do, check's pre-boot test passes
+        rc, evb, _ = self.plain(ctx_b)
+        self.assertEqual(rc, 0, evb)
+        self.assertIn("nothing to do", evb)
+        self.assertTrue(drv.golden_usable(ctx_b, GOLDEN))
+        # A (stale record, damaged or not): refused, naming B; `check` names B too
+        rc, eva, _ = self.plain(ctx_a2)
+        self.assertEqual(rc, 2)
+        self.assertIn(os.path.realpath(ctx_b.state_dir), eva)
+        clones = len(self.world.tart_calls("clone"))
+        rc, s = self.run_cmd(*self.check_args(), ctx=ctx_a2)
+        self.assertEqual(rc, 2)
+        self.assertIn(os.path.realpath(ctx_b.state_dir), s["steps"][-1]["evidence"])
+        self.assertEqual(
+            len(self.world.tart_calls("clone")), clones
+        )  # before any clone
+        (
+            ctx_a2.state_dir / "known_hosts"
+        ).unlink()  # even damaged, A never rebuilds over B
+        rc, eva, _ = self.plain(ctx_a2)
+        self.assertEqual(rc, 2, eva)
+
+    def test_a_failed_old_golden_delete_restores_the_previous_marker(self):
+        self.run_cmd(*self.golden_args())
+        marker = drv.owner_path(self.ctx, GOLDEN)
+        before = marker.read_text()
+        self.world.fail_tart = {"delete"}
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
+        self.assertEqual(rc, 1)
+        self.assertEqual(marker.read_text(), before)
+        self.assertIn("restored", self.steps(s)["g10"]["evidence"])
+        # no previous marker (a pre-change golden): the intent marker is removed again
+        marker.unlink()
+        self.world.vms.pop(f"{GOLDEN}-build", None)  # the first run left its build
+        rc, s = self.run_cmd(
+            *self.golden_args("--rebuild"),
+            ctx=self.second_run_ctx("20261123T000000Z-x"),
+        )
+        self.assertEqual(rc, 1)
+        self.assertFalse(marker.exists())
+        self.assertIn("removed again", self.steps(s)["g10"]["evidence"])
+
+    def test_an_oserror_in_a_commit_write_is_a_g10_failure_naming_what_landed(self):
+        marker = drv.owner_path(self.ctx, GOLDEN).name
+        for fail, landed in (
+            ("known_hosts", "nothing"),
+            ("golden.json", "known_hosts"),
+        ):
+            self.tearDown_world()
+            patcher, _ = self.failing_writes({fail: 1})
+            with patcher:
+                rc, s = self.run_cmd(*self.golden_args())
+            self.assertEqual(rc, 1, fail)
+            ev = self.steps(s)["g10"]["evidence"]
+            self.assertEqual(self.steps(s)["g10"]["status"], "fail")
+            self.assertIn(f"writing {fail} failed", ev)
+            self.assertIn(f"written before it: {landed}", ev)
+            self.assertIn(marker + ".pending", ev)
+        # the intent write itself: nothing else was touched
+        self.tearDown_world()
+        patcher, _ = self.failing_writes({marker: 1})
+        with patcher:
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        self.assertIn("nothing else", self.steps(s)["g10"]["evidence"])
+        self.assertEqual(sorted(self.world.vms), [f"{GOLDEN}-build"])
+
+    def test_atomic_write_fsyncs_the_file_and_then_the_directory(self):
+        from unittest import mock
+
+        with mock.patch.object(drv.os, "fsync", wraps=os.fsync) as fs:
+            drv.atomic_write(self.tmp / "x" / "f", "data")
+        self.assertEqual(fs.call_count, 2)  # the temp file, then the directory
+
+    def test_the_marker_is_read_safely(self):
+        self.run_cmd(*self.golden_args())
+        marker = drv.owner_path(self.ctx, GOLDEN)
+        good = marker.read_text()
+        ctx2 = self.second_run_ctx()
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text(good)
+
+        def as_symlink():
+            marker.unlink()
+            marker.symlink_to(elsewhere)
+
+        def as_fifo():
+            marker.unlink()
+            os.mkfifo(marker)
+
+        def as_dir():
+            marker.unlink()
+            marker.mkdir()
+
+        def as_big():
+            marker.write_text(good + " " * (drv.OWNER_MAX_BYTES + 1))
+
+        for what, setup in (
+            ("symlink", as_symlink),
+            ("FIFO", as_fifo),
+            ("directory", as_dir),
+            ("too big", as_big),
+            ("JSON list", lambda: marker.write_text("[]")),
+            ("JSON string", lambda: marker.write_text('"x"')),
+        ):
+            if os.path.lexists(marker):
+                if marker.is_dir() and not marker.is_symlink():
+                    marker.rmdir()
+                else:
+                    marker.unlink()
+            marker.write_text(good)
+            setup()
+            rc, ev, _ = self.plain(ctx2)  # a FIFO must not hang the run
+            self.assertEqual(rc, 2, what)
+            self.assertIn("unreadable owner file", ev, what)
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        # a marker that is not ours
+        from unittest import mock
+
+        if marker.is_dir():
+            marker.rmdir()
+        else:
+            marker.unlink()
+        marker.write_text(good)
+        with (
+            mock.patch.object(drv.os, "getuid", return_value=os.getuid() + 1),
+            self.assertRaises(drv.Refusal) as cm,
+        ):
+            drv.read_owner_raw(marker)
+        self.assertIn("not owned by you", str(cm.exception))
+
+    def test_the_lock_directory_must_be_ours_and_not_group_or_world_writable(self):
+        self.ctx.lock_path.parent.mkdir(mode=0o700)
+        os.chmod(self.ctx.lock_path.parent, 0o777)
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("not group or world writable", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        os.chmod(self.ctx.lock_path.parent, 0o700)
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+
+    def test_an_owner_file_with_a_different_spelling_of_this_state_dir(self):
+        self.run_cmd(*self.golden_args())
+        marker = drv.owner_path(self.ctx, GOLDEN)
+        alias = self.tmp / "alias"
+        alias.symlink_to(self.ctx.state_dir)
+        owner = json.loads(marker.read_text())
+        owner["state_dir"] = str(
+            alias
+        )  # another spelling (a symlink) of this directory
+        marker.write_text(json.dumps(owner))
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+        # a moved or renamed state dir (the recorded path is gone) is a different owner
+        owner["state_dir"] = str(self.tmp / "moved-away")
+        marker.write_text(json.dumps(owner))
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2)
+        self.assertIn("moved-away", ev)
+        self.assertIn("moved or renamed", ev)
+        del owner["state_dir"]
+        marker.write_text(json.dumps(owner))
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2)
+        self.assertIn("no state_dir", ev)
+
+    def test_a_symlinked_and_a_relative_state_dir_are_the_same_owner(self):
+        self.run_cmd(*self.golden_args())
+        link = self.tmp / "statelink"
+        link.symlink_to(self.ctx.state_dir)
+        rc, ev, _ = self.plain(self.make_ctx(link, run_id="20261122T000000Z-l"))
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+        old = os.getcwd()
+        self.addCleanup(os.chdir, old)
+        os.chdir(self.tmp)
+        rc, ev, _ = self.plain(
+            self.make_ctx(Path("state"), run_id="20261122T000001Z-r")
+        )
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
+    def test_an_owner_rebuild_refreshes_the_markers_key_and_host_key(self):
+        self.run_cmd(*self.golden_args())
+        marker = drv.owner_path(self.ctx, GOLDEN)
+        first = json.loads(marker.read_text())
+        self.world.new_hostkey = OTHER_BLOB
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
+        self.assertEqual(rc, 0, s)
+        now = json.loads(marker.read_text())
+        self.assertEqual(now["key_id"], "20261121T000000Z-second")
+        self.assertNotEqual(now["host_key"], first["host_key"])
+        self.assertEqual(
+            now["host_key"],
+            "ssh-ed25519 " + drv.fingerprint(f"ssh-ed25519 {OTHER_BLOB}"),
+        )
+        self.assertEqual(now["state"], "final")
+
+    def test_check_after_another_state_dirs_takeover_exits_2_naming_it(self):
+        ctx_a2, ctx_b = self.two_dirs()
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx_b)
+        self.assertEqual(rc, 0, s)
+        clones = len(self.world.tart_calls("clone"))
+        rc, s = self.run_cmd(*self.check_args(), ctx=ctx_a2)
+        self.assertEqual(rc, 2)
+        self.assertIn(os.path.realpath(ctx_b.state_dir), s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
 
     def test_a_golden_whose_key_is_gone_is_rebuilt_without_asking(self):
         def damage():
@@ -1652,10 +2013,10 @@ class Golden(Base):
 
     def test_golden_and_check_share_one_usability_test(self):
         self.run_cmd(*self.golden_args())
-        self.assertTrue(drv.golden_usable(self.ctx))
+        self.assertTrue(drv.golden_usable(self.ctx, GOLDEN))
         (self.ctx.state_dir / "known_hosts").unlink()
         with self.assertRaises(drv.Refusal):
-            drv.golden_usable(self.ctx)
+            drv.golden_usable(self.ctx, GOLDEN)
         rc, _ = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
 
@@ -2051,30 +2412,75 @@ class Check(Base):
         self.assertEqual(sorted(self.world.vms), [GOLDEN])
         self.assertIn(drv.CHECK_PREFIX + "old", self.steps(s)["preflight"]["evidence"])
 
-    def test_a_golden_this_state_dir_has_no_record_of_points_at_golden_rebuild(self):
-        # plain `golden` refuses such a golden, so the hint must name --rebuild
+    def test_check_hints_depend_on_who_owns_the_golden(self):
         good_rec = (self.ctx.state_dir / "golden.json").read_text()
-        good_kh = (self.ctx.state_dir / "known_hosts").read_text()
+        # no record, no owner file (pre-change golden, or another state dir's, unknown):
+        # plain `golden` refuses it, so the hint names --rebuild and says what it replaces
         (self.ctx.state_dir / "golden.json").unlink()
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
         ev = s["steps"][-1]["evidence"]
         self.assertIn("no record of the golden", ev)
-        self.assertIn("run `golden --rebuild`", ev)
-        # another state dir's: no record and no pin either
-        (self.ctx.state_dir / "known_hosts").unlink()
-        rc, s = self.run_cmd(*self.check_args())
-        self.assertEqual(rc, 2)
-        self.assertIn("run `golden --rebuild`", s["steps"][-1]["evidence"])
-        self.assertEqual(self.world.tart_calls("clone"), [])
-        # a state dir that has its record keeps the plain hint: `golden` rebuilds that itself
-        (self.ctx.state_dir / "golden.json").write_text(good_rec)
-        self.assertTrue(good_kh)  # (known_hosts stays missing)
+        self.assertIn("`golden --rebuild`", ev)
+        self.assertIn("no owner file", ev)
+        # no record, and the owner file names ANOTHER state dir: it is named, and the hint says
+        # that --rebuild here breaks its logins
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        write_marker(self.ctx, state_dir=str(other))
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
         ev = s["steps"][-1]["evidence"]
-        self.assertIn("run `golden`", ev)
-        self.assertNotIn("--rebuild", ev)
+        self.assertIn(str(other), ev)
+        self.assertIn("break", ev)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        # a record, a final marker that is ours and agrees: plain `golden` rebuilds it
+        (self.ctx.state_dir / "golden.json").write_text(good_rec)
+        write_marker(self.ctx)
+        (self.ctx.state_dir / "known_hosts").unlink()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("run `golden` (it rebuilds", s["steps"][-1]["evidence"])
+        # a record but no owner file: `golden` would refuse, the hint says so
+        drv.owner_path(self.ctx, GOLDEN).unlink()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("`golden` will refuse", ev)
+        self.assertIn("no owner file", ev)
+
+    def test_known_hosts_must_be_exactly_the_one_line_the_driver_writes(self):
+        kh = self.ctx.state_dir / "known_hosts"
+        canon = f"{vmssh.HOST_ALIAS} ssh-ed25519 {NEW_BLOB}\n"
+        self.assertEqual(kh.read_text(), canon)
+        self.assertTrue(drv.golden_usable(self.ctx, GOLDEN))
+        bad = {
+            "an extra line": canon + f"{vmssh.HOST_ALIAS} ssh-ed25519 {OTHER_BLOB}\n",
+            "a line before it": f"other ssh-ed25519 {OTHER_BLOB}\n" + canon,
+            "a pattern list": f"{vmssh.HOST_ALIAS},x ssh-ed25519 {NEW_BLOB}\n",
+            "a wildcard": f"* ssh-ed25519 {NEW_BLOB}\n" + canon,
+            "a hashed name": f"|1|abc=|def= ssh-ed25519 {NEW_BLOB}\n" + canon,
+            "a cert authority": f"@cert-authority * ssh-ed25519 {OTHER_BLOB}\n" + canon,
+            "a revoked key": f"@revoked {vmssh.HOST_ALIAS} ssh-ed25519 {OTHER_BLOB}\n"
+            + canon,
+            "junk base64": f"{vmssh.HOST_ALIAS} ssh-ed25519 {NEW_BLOB}!!\n",
+            "a comment": f"{vmssh.HOST_ALIAS} ssh-ed25519 {NEW_BLOB} comment\n",
+            "no newline": canon.rstrip("\n"),
+            "crlf": canon.replace("\n", "\r\n"),
+        }
+        for what, text in bad.items():
+            kh.write_text(text)
+            with self.assertRaises(drv.Refusal, msg=what):
+                drv.golden_usable(self.ctx, GOLDEN)
+            rc, s = self.run_cmd(*self.check_args())
+            self.assertEqual(rc, 2, what)
+            self.assertIn("--rebuild", s["steps"][-1]["evidence"], what)
+            self.assertEqual(self.world.tart_calls("clone"), [], what)
+        # the single-line refusal says why
+        kh.write_text(bad["an extra line"])
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.golden_usable(self.ctx, GOLDEN)
+        self.assertIn("single", str(cm.exception))
 
     def test_refuses_without_golden_or_pinned_key_or_identity(self):
         del self.world.vms[GOLDEN]
