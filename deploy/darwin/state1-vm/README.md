@@ -29,15 +29,16 @@ directory (or by path); the lead runs real passes through `bgrun`.
 ```sh
 python3 state1_vm.py resolve                         # registry digest of the tag; no tart, no pull
 python3 state1_vm.py pull                            # ~30 GB: its own job, so load-watch admits it alone
-python3 state1_vm.py golden --pubkey ~/.ssh/KEY.pub  # build local VM state1-golden (add --rebuild to redo)
-python3 state1_vm.py check  --identity ~/.ssh/KEY    # clone, check, reboot, delete; JSON on stdout
+python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo)
+python3 state1_vm.py check                           # clone, check, reboot, delete; JSON on stdout
 ```
 
-Common options: `--summary FILE` (write the JSON there, not to stdout), `--state-dir DIR`
-(default `~/.local/state/tendcf-state1-vm`: logs, pinned `known_hosts`, `golden.json`),
-`--image FILE`. Exit status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted.
-`--identity` is the private key; a `.pub` path works when ssh-agent holds the key.
-Use a key with no passphrase or one loaded in the agent, because ssh runs with `BatchMode=yes`.
+Neither `golden` nor `check` takes a key or asks for anything: no key argument, no password
+prompt, no operator input (see "Credentials" below). Common options: `--summary FILE` (write
+the JSON there, not to stdout), `--state-dir DIR` (default `~/.local/state/tendcf-state1-vm`:
+logs, pinned `known_hosts`, `golden.json`, the per-golden `keys/`), `--image FILE`. Exit
+status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubkey` and
+`--identity` no longer exist (they are rejected as bad usage).
 
 - **`resolve`** reads the manifest digest for the pinned tag from the registry (an anonymous
   token and one HEAD request). It reports whether the tag has moved; the digest in
@@ -66,6 +67,37 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
   can be pasted into `image.json` as it is.
 - **`check`** clones `state1-golden` to `state1-check-<run id>` and always deletes it, also on
   failure or on SIGINT/SIGTERM/SIGHUP. A clone left by a killed run is swept at the next start.
+  It logs in with the golden's own key, found through `golden.json` (see Credentials).
+
+## Credentials: nothing is typed by the operator
+
+- **SSH key, one per golden.** `golden` mints a fresh ed25519 keypair
+  (`ssh-keygen -t ed25519 -N ''`) for each build, under
+  `<state-dir>/keys/<key id>/id_ed25519` (directory 0700, private key 0600; the key id is the
+  run id). Only the public half is baked into the golden; the private key never leaves the
+  host, is never committed and is never copied into `golden.json`. A rebuild mints a new key,
+  never reuses one, and removes the private keys of every other golden's key id once the new
+  golden is committed (a failed build removes its own key, unless `--keep-on-failure` or a
+  failed rename keeps the build, which needs it). `golden.json` records `key_id` and
+  `authorized_key` (the public key's fingerprint); `check` takes the key from there, refuses if
+  the fingerprint does not match, and refuses a key that is missing, not a regular file (a
+  symlink is refused), or not owned by you with mode 0600. The driver never reads or offers
+  anything in the operator's own `~/.ssh`.
+- **The bootstrap login** is the one password login, and no operator provides it: it is the
+  vanilla image's published `admin`/`admin`, used once by `golden` to install that public key
+  (see SSH below).
+- **Console password, random and not stored.** The vanilla `admin` password is the published
+  `admin`. `prep.sh` replaces it with 32 random alphanumerics made inside the guest, sets it
+  with `dscl . -passwd`, proves it with `dscl . -authonly`, proves the vanilla one no longer
+  authenticates, and then unsets it. It is never printed, never written to a file in the
+  guest, and never sent to the host; nothing needs it afterwards (SSH is key-only, `sudo` is
+  `NOPASSWD`, Screen Sharing is off and asserted). `prep.sh` prints one `PREP-CONSOLE-PW
+  rotated` line and the driver fails g6 unless that line appears exactly once; `golden.json`
+  says `console_password` is "never stored". Consequences, by design: local console login and
+  the login keychain are unusable, and the `/etc/kcpassword` the vanilla image's autologin
+  uses is stale (it holds the old password, XOR-obfuscated); `prep.sh` leaves both alone. If a
+  later slice needs the console password, that is a new decision, not something to read back
+  from here.
 
 ## Guards
 
@@ -80,8 +112,8 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
   so the sweeps above cannot delete a VM another run is using. The cap check is
   best-effort for VMs that other tools start.
-- No `sudo`, no host launchd change, never the operator's real SSH keys (the driver is handed
-  paths and writes nothing to them). It writes under `--state-dir` and the lock directory;
+- No `sudo`, no host launchd change, never the operator's real SSH keys (the driver is not
+  handed any and reads none; it mints its own, see Credentials). It writes under `--state-dir` and the lock directory;
   `--summary FILE` may write anywhere you point it, and tart itself writes `~/.tart`.
 - **No host service bound to 0.0.0.0 while `golden` or `check` run.** On tart's default NAT
   the guest reaches such a service at the bridge gateway, and it runs a third-party image and
@@ -112,15 +144,18 @@ Use a key with no passphrase or one loaded in the agent, because ssh runs with `
   driver just cloned and booted. Each guest script runs in one ssh session: it is streamed on
   stdin to a `mktemp` file that the same session removes.
 - **The one password login** is the vanilla image's published `admin`/`admin`, used by
-  `golden` only, to install the public key. It goes through `SSH_ASKPASS` in the environment
+  `golden` only, to install the golden's public key. It is public knowledge, not a secret and
+  not operator input. It goes through `SSH_ASKPASS` in the environment
   of that ssh process (`BatchMode` is off for it, since BatchMode disables askpass). Nothing
   secret is on a command line, and the driver logs argv only, never environments or stdin.
-  `TENDCF_VM_BOOTSTRAP_PW` overrides the value.
+  `TENDCF_VM_BOOTSTRAP_PW` overrides the value (only for a vanilla image that ships a
+  different default; nothing sets it today).
 
 ## What each step proves
 
-`golden` (steps g1-g10): the pinned digest clones and boots headless; the password works
-once; the key installs and `sudo -n` is root; `prep.sh` ran; the host key prep printed is
+`golden` (steps g1-g10): the pinned digest clones and boots headless; the bootstrap password
+works once; the golden's own freshly minted key installs and `sudo -n` is root; `prep.sh` ran
+(including the console password rotation); the host key prep printed is
 pinned (keyscan agrees) and a strict key login works; Python 3.14.10 installed over that
 strict login, then the whole `Python.framework` (`Versions/`, `Versions/Current` and the
 top-level links included, not only `Versions/3.14`) is made `root:wheel` and checked as a
@@ -129,7 +164,8 @@ tree, and every ancestor up to `/` must be root-owned and not group/world writab
 refused** (the ssh method list must not offer `password` or `keyboard-interactive`); the guest
 is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart stop` after
 180 s is a power-off and fails g10); then it is saved as `state1-golden` with a record
-(`golden.json`: digest, script hashes, key fingerprints, the vanilla key line seen).
+(`golden.json`: digest, script hashes, `key_id`, key fingerprints, the vanilla key line seen,
+`console_password: never stored`); a key from an earlier golden is removed at that commit.
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
@@ -139,7 +175,8 @@ with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netst
 on with the published admin password); a named list of unused launchd jobs disabled (read
 back, a failure is reported not fatal); fresh SSH host keys;
 `/etc/ssh/sshd_config.d/050-tendcf-state1.conf` (no password or keyboard-interactive login,
-no root login), verified with `sshd -T`. It changes nothing under `/System`, not SIP, not
+no root login), verified with `sshd -T`; the console password for `admin` replaced by a random
+one that is proved and dropped (Credentials above). It changes nothing under `/System`, not SIP, not
 Recovery.
 
 `check` (issue 70 checklist; ids as in the JSON):
@@ -151,9 +188,10 @@ Recovery.
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
 | 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
+| 2l | the vanilla console password `admin` no longer authenticates (`dscl . -authonly admin admin` fails with an authentication failure; any other error fails the step) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2k hold again | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
 | 11 | stop and delete the clone, always | live |
 | 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
@@ -182,10 +220,16 @@ Recovery.
   driver restarts it), the macOS 27 `sshd_config.d` include, `spctl --global-enable`, and the
   `installer -pkg` run for python.org's package (its optional shell-profile step edits the
   console user's profile, which is harmless in a throwaway VM).
-- The admin account keeps the vanilla password `admin`/`admin`, **for the local console only**
-  (changing it breaks the image's automatic login and login keychain). Screen Sharing is off
-  (asserted before and after the reboot) and SSH is key-only, so nothing on the network accepts
-  that password; the VM runs `--no-graphics`. Revisit if a later slice needs a password owner.
+- Console password (operator ruling 2026-11-21, replacing the earlier "keep the vanilla
+  password"): the admin password is random per golden and not stored; the admin account is
+  for the local console only, and Screen Sharing is off (asserted before and after the reboot)
+  and SSH is key-only, so nothing on the network or console path is usable. Assumed, not run:
+  that `dscl . -passwd /Users/admin` works as root without the old password on macOS 27, that
+  `dscl . -authonly` exits non-zero with an authentication-failure message (2l matches
+  `eDSAuthFailed` or "authentication ... failed" and treats any other error as a failure), that
+  the password in `dscl`'s argv is visible only inside the throwaway guest for the duration of
+  one command, and that changing it leaves the guest booting and SSH working (the login keychain
+  and `/etc/kcpassword` are left stale on purpose; the first real `golden` and `check` prove it).
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
   Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
   lines the script compares, that python.org's installer leaves `Python.framework/Versions`
