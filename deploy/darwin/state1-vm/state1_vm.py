@@ -175,16 +175,23 @@ class RealRunner:
         timeout: float | None = None,
         log_path: Path | None = None,
         no_tty: bool = False,
+        raw_newlines: bool = False,
     ) -> Result:
+        """raw_newlines: no text mode, so no universal-newline translation (it turns a lone
+        CR or CRLF into "\\n"): bytes in, stdout/stderr decoded as UTF-8 with errors="replace".
+        Opt-in; the default is unchanged for every other caller."""
         out = open(log_path, "ab") if log_path else None  # noqa: SIM115
+        raw = raw_newlines and out is None
         try:
             cp = subprocess.run(
                 argv,
-                input=input_text,
+                input=input_text.encode("utf-8")
+                if raw and input_text is not None
+                else input_text,
                 stdin=None if input_text is not None else subprocess.DEVNULL,
                 stdout=out if out else subprocess.PIPE,
                 stderr=subprocess.STDOUT if out else subprocess.PIPE,
-                text=input_text is not None or out is None,
+                text=(input_text is not None or out is None) and not raw,
                 env=env,
                 timeout=timeout,
                 check=False,
@@ -201,6 +208,12 @@ class RealRunner:
                 out.close()
         if out and log_path:
             return Result(cp.returncode, tail_file(log_path), "")
+        if raw:
+            return Result(
+                cp.returncode,
+                (cp.stdout or b"").decode("utf-8", "replace"),
+                (cp.stderr or b"").decode("utf-8", "replace"),
+            )
         return Result(cp.returncode, cp.stdout or "", cp.stderr or "")
 
     def start(
@@ -632,13 +645,47 @@ def rssh(
     *,
     input_text: str | None = None,
     timeout: float = 120,
+    raw_newlines: bool = False,
 ) -> Result:
+    kw = (
+        {"raw_newlines": True} if raw_newlines else {}
+    )  # opt-in; other callers unchanged
     return ctx.run(
         vmssh.ssh_argv(t, argv),
         input_text=input_text,
         env=vmssh.ssh_env(t),
         timeout=timeout,
+        **kw,
     )
+
+
+SSHD_WANT = frozenset(
+    {
+        "passwordauthentication no",
+        "kbdinteractiveauthentication no",
+        "pubkeyauthentication yes",
+        "permitrootlogin no",
+    }
+)
+
+
+def sshd_key_only(r: Result) -> tuple[bool, str]:
+    """Check 2e: does `sshd -T` show key-only login? (ok, evidence).
+
+    macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase. Accept
+    exactly what prep.sh's `LC_ALL=C grep -qixF` accepts: whole lines split on "\\n" only
+    (never splitlines(): it also splits on \\x0b, \\x0c, \\x1c-\\x1e, U+0085, U+2028 and U+2029,
+    which a quoted sshd value such as Banner can carry, so one printed line could fake a
+    wanted one), no stripping, ASCII-only case folding. The caller must run ssh with
+    raw_newlines=True: in text mode Python turns a lone CR into a newline before this sees
+    it. A CR anywhere in the output fails closed, as grep would see it as part of a line."""
+    cfg = {ln.lower() for ln in r.stdout.split("\n") if ln.isascii()}
+    missing = sorted(SSHD_WANT - cfg)
+    cr = "\r" in r.stdout
+    ev = f"rc {r.rc}; missing {missing}"
+    if cr:
+        ev += "; output contains a carriage return (read untranslated; it could fake or hide a line)"
+    return r.rc == 0 and not cr and not missing, ev
 
 
 def wait_for_ssh(ctx: Ctx, vm: Vm, t: vmssh.Target, timeout: float = 300) -> float:
@@ -1093,27 +1140,10 @@ def persistent_assertions(
             "-C",
             f"user={t.user},host=localhost,addr=127.0.0.1",
         ],
+        raw_newlines=True,  # sshd's bytes untranslated: see sshd_key_only
     )
-    # macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase. Accept
-    # exactly what prep.sh's `grep -qixF` accepts: whole lines split on "\n" only (never
-    # splitlines(): it also splits on \x0b, \x0c, \x1c-\x1e, U+0085, U+2028 and U+2029, which a
-    # quoted sshd value such as Banner can carry, so one printed line could fake a wanted
-    # one), no stripping, ASCII-only case folding.
-    cfg = {ln.lower() for ln in r.stdout.split("\n") if ln.isascii()}
-    want = {
-        "passwordauthentication no",
-        "kbdinteractiveauthentication no",
-        "pubkeyauthentication yes",
-        "permitrootlogin no",
-    }
-    out.append(
-        (
-            "2e",
-            "sshd effective config: key login only",
-            r.rc == 0 and want <= cfg,
-            f"rc {r.rc}; missing {sorted(want - cfg)}",
-        )
-    )
+    ok_2e, ev_2e = sshd_key_only(r)
+    out.append(("2e", "sshd effective config: key login only", ok_2e, ev_2e))
 
     r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
     out.append(

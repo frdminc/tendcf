@@ -318,10 +318,13 @@ Recovery.
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
   `PubkeyAuthentication yes`, `PermitRootLogin no`, `UsePAM yes`), not the lowercase of stock
-  OpenSSH. `prep.sh` (`grep -qixF`: whole line, ignoring case) and check 2e (and its
-  post-reboot repeat, 10a) now accept exactly the same lines: the driver splits on `"\n"` only,
-  strips nothing and folds ASCII case only, so padding, a CR or a line smuggled in through a
-  quoted value (for example a `Banner` holding a form feed) does not count. The
+  OpenSSH. `prep.sh` (`LC_ALL=C grep -qixF`: whole line, ignoring case) and check 2e (and its
+  post-reboot repeat, 10a) accept the same lines: the driver reads sshd's bytes untranslated
+  (`raw_newlines`: no text mode, so Python does not turn a lone CR or CRLF into a newline),
+  splits on `"\n"` only, strips nothing and folds ASCII case only, so padding or a line
+  smuggled in through a quoted value (for example a `Banner` holding a form feed) does not
+  count. Any CR anywhere in the output fails 2e outright, with the reason in the evidence
+  (grep sees a CR as part of its line, so `prep.sh` rejects the same outputs). The
   `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has `Include
   /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and sorts
   after ours), and the effective configuration, as `sshd -T -C user=admin,host=localhost,
