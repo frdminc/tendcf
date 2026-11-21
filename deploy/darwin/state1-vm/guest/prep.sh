@@ -192,14 +192,16 @@ log "sshd: key login only"
 # the login keychain are unusable by design, and an /etc/kcpassword left by the vanilla image's
 # autologin is stale; this script leaves both alone.
 # First run: the vanilla password still authenticates, so use the old-and-new form, which keeps
-# a Secure Token account's credentials in step. Root form only on a re-run, when the previous
+# a Secure Token account's credentials in step (expected; unverified on a real guest). Root form only on a re-run, when the previous
 # random password is unknown. The password is in dscl's argv for the length of these commands,
 # inside this throwaway guest.
 pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
 [ "${#pw}" -eq 32 ] || die "could not generate a console password"
 if dscl . -authonly admin admin >/dev/null 2>&1; then
+    log "console password: vanilla password still authenticates, using the old-and-new dscl form"
     dscl . -passwd /Users/admin admin "$pw" || die "dscl -passwd /Users/admin (old and new) failed"
 else
+    log "console password: vanilla password does not authenticate (re-run), using the root dscl form"
     dscl . -passwd /Users/admin "$pw" || die "dscl -passwd /Users/admin (root form) failed"
 fi
 dscl . -authonly admin "$pw" || die "the new console password does not authenticate"

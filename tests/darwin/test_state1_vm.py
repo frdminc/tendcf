@@ -121,6 +121,7 @@ class FakeWorld:
         self.signal_on = None  # deliver a real SIGTERM to this process
         self.hostkey_mismatch = False
         self.cur_argv = None
+        self.no_tty_calls = []
 
     # -- helpers
     def argvs(self, prefix):
@@ -133,8 +134,19 @@ class FakeWorld:
         return self.hostkeys.get(self.last_started)
 
     # -- runner interface
-    def run(self, argv, *, input_text=None, env=None, timeout=None, log_path=None):
+    def run(
+        self,
+        argv,
+        *,
+        input_text=None,
+        env=None,
+        timeout=None,
+        log_path=None,
+        no_tty=False,
+    ):
         self.calls.append((list(argv), dict(env) if env else None))
+        if no_tty:
+            self.no_tty_calls.append(list(argv))
         if argv[0] == "tart":
             if self.signal_on_tart == argv[1]:
                 self.signals_sent += 1
@@ -580,9 +592,12 @@ class VmsshArgv(unittest.TestCase):
         pw = vmssh.ssh_argv(
             vmssh.Target("192.168.64.10", "/kh", auth="password", no_agent=True), ["x"]
         )
-        self.assertNotIn(
-            "IdentityAgent=none", pw
-        )  # password mode has no identities at all
+        # ssh still opens the agent socket in password mode, so it is told not to
+        self.assertIn("IdentityAgent=none", pw)
+        pw_plain = vmssh.ssh_argv(
+            vmssh.Target("192.168.64.10", "/kh", auth="password"), ["x"]
+        )
+        self.assertNotIn("IdentityAgent=none", pw_plain)
 
     def test_every_word_is_quoted_even_a_leading_equals(self):
         # the guest shell is zsh: a bare `=ls` expands to /bin/ls
@@ -1009,8 +1024,14 @@ class Golden(Base):
         self.assertTrue(
             all(
                 a[:2] in (["tart", "--version"], ["tart", "list"])
-                or a[:3]
-                == ["ssh-keygen", "-y", "-f"]  # the record and key are validated
+                or a[:5]
+                == [
+                    "ssh-keygen",
+                    "-y",
+                    "-P",
+                    "",
+                    "-f",
+                ]  # the record and key are validated
                 for a in new
             ),
             new,
@@ -1424,9 +1445,9 @@ class Golden(Base):
         self.assertEqual(len(self.world.tart_calls("clone")), 1)
         self.assertEqual(self.key_dirs(), [self.ctx.run_id])
 
-    def test_a_golden_that_check_would_refuse_is_rebuilt_without_asking(self):
+    def rebuilt_unattended(self, damage):
         self.run_cmd(*self.golden_args())
-        (self.ctx.state_dir / "golden.json").unlink()  # e.g. a golden from before keys
+        damage()
         ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-second")
         rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)  # no --rebuild
         self.assertEqual(rc, 0, s)
@@ -1437,6 +1458,83 @@ class Golden(Base):
         self.assertEqual(self.key_dirs(), ["20261121T000000Z-second"])
         rc, s = self.run_cmd(*self.check_args(), ctx=ctx2)
         self.assertEqual(rc, 0, s)
+        return s
+
+    def test_a_golden_with_no_record_in_this_state_dir_is_never_replaced_unasked(self):
+        self.run_cmd(*self.golden_args())
+        (
+            self.ctx.state_dir / "golden.json"
+        ).unlink()  # pre-records, or another state dir's
+        ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-second")
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)
+        self.assertEqual(rc, 2)
+        self.assertIn("no record of it", s["steps"][-1]["evidence"])
+        self.assertIn("--rebuild", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        self.assertEqual(self.world.tart_calls("delete"), [])
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])  # nothing minted or swept
+        # asked for by name, it replaces the golden
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(len(self.world.tart_calls("clone")), 2)
+
+    def test_a_golden_whose_key_is_gone_is_rebuilt_without_asking(self):
+        def damage():
+            shutil.rmtree(self.ctx.state_dir / "keys" / self.ctx.run_id)
+
+        self.rebuilt_unattended(damage)
+
+    def test_a_golden_whose_pinned_known_hosts_is_missing_is_rebuilt_without_asking(
+        self,
+    ):
+        # check refuses on this too, so golden may not call the golden "nothing to do"
+        self.rebuilt_unattended((self.ctx.state_dir / "known_hosts").unlink)
+
+    def test_a_golden_whose_known_hosts_has_no_pinned_key_is_rebuilt_without_asking(
+        self,
+    ):
+        self.rebuilt_unattended(
+            lambda: (self.ctx.state_dir / "known_hosts").write_text(
+                "# nothing pinned\n"
+            )
+        )
+
+    def test_golden_and_check_share_one_usability_test(self):
+        self.run_cmd(*self.golden_args())
+        self.assertTrue(drv.golden_usable(self.ctx))
+        (self.ctx.state_dir / "known_hosts").unlink()
+        with self.assertRaises(drv.Refusal):
+            drv.golden_usable(self.ctx)
+        rc, _ = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+
+    def test_a_passphrase_protected_key_is_refused_not_asked_about(self):
+        self.run_cmd(*self.golden_args())
+        priv = self.ctx.state_dir / "keys" / self.ctx.run_id / "id_ed25519"
+        priv.unlink()
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "secret", "-f", str(priv)],
+            check=True,
+        )
+        before = len(self.world.calls)
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.golden_identity(self.ctx)
+        self.assertIn("passphrase", str(cm.exception))
+        keygen = [a for a, _ in self.world.calls[before:] if a[0] == "ssh-keygen"]
+        self.assertEqual(len(keygen), 1)
+        # an empty passphrase on the command line, never a prompt, and no terminal
+        self.assertEqual(keygen[0][:5], ["ssh-keygen", "-y", "-P", "", "-f"])
+        self.assertIn(keygen[0], self.world.no_tty_calls)
+
+    def test_the_real_runner_can_detach_a_child_from_the_terminal(self):
+        # start_new_session: the child leads its own session, so it has no controlling tty
+        code = "import os; print(os.getsid(0) == os.getpid())"
+        here = drv.RealRunner().run([sys.executable, "-c", code], timeout=30)
+        gone = drv.RealRunner().run(
+            [sys.executable, "-c", code], timeout=30, no_tty=True
+        )
+        self.assertEqual(here.stdout.strip(), "False")
+        self.assertEqual(gone.stdout.strip(), "True")
 
     def test_a_failed_build_removes_its_key_unless_kept_for_inspection(self):
         self.world.fail_prep = True
@@ -1449,6 +1547,18 @@ class Golden(Base):
         self.assertEqual(
             self.key_dirs(), ["20261121T000000Z-keep"]
         )  # the kept build needs it
+
+    def test_a_failed_build_says_when_its_key_could_not_be_removed(self):
+        from unittest import mock
+
+        self.world.fail_prep = True
+        with mock.patch.object(drv.shutil, "rmtree"):  # a removal that does nothing
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        st = self.steps(s)["cleanup-key"]
+        self.assertEqual(st["status"], "fail")
+        self.assertIn("still present", st["evidence"])
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])
 
     def test_a_failed_rebuild_keeps_the_working_goldens_key(self):
         self.run_cmd(*self.golden_args())
@@ -1954,6 +2064,11 @@ class Check(Base):
                 + generic.format(code=-14167, name="eDSAuthAccountDisabled"),
             ),
             "right number, wrong name": (14, generic.format(code=-14090, name="eDSNotAuthorized")),
+            "another eDS name beside the pair": (
+                14,
+                generic.format(code=-14090, name="eDSAuthFailed")
+                + "<main> attribute status: eDSRecordNotFound\n",
+            ),
             "ssh's own failure": (255, generic.format(code=-14090, name="eDSAuthFailed")),
         }  # fmt: skip
         for label, (rc_, text) in refused_cases.items():
@@ -2036,6 +2151,8 @@ class DsclCodes(unittest.TestCase):
             "(-14090, eDSAuthFailed)\n(-14167, eDSAuthAccountDisabled)",
             "(-14090, eDSNotAuthorized)",
             "DS Error: -14091 (eDSAuthFailed)",
+            # the one wrong-password pair plus any other eDS name anywhere, as prep.sh does
+            "(-14090, eDSAuthFailed)\n<main> attribute status: eDSRecordNotFound",
         )
         for t in ok:
             self.assertTrue(drv.dscl_auth_failed(t), t)
@@ -2254,7 +2371,7 @@ class GuestScripts(unittest.TestCase):
     def test_prep_console_password_is_random_verified_and_never_printed(self):
         text = self.text("prep.sh")
         a = text.index("pw=$(LC_ALL=C tr")
-        b = text.index('log "console password', a)
+        b = text.index('log "console password: rotated', a)
         b = text.index("\n", b) + 1
         snippet = text[a:b]
         for ln in snippet.splitlines():  # the password is only ever an argument to dscl
@@ -2344,6 +2461,11 @@ class GuestScripts(unittest.TestCase):
             )  # never printed
             if want_words is not None:
                 self.assertEqual((tmp / "log").read_text().strip(), want_words, over)
+                # the form that ran is in the log, so the first real run shows it
+                form = (
+                    "old-and-new dscl form" if want_words == "5" else "root dscl form"
+                )
+                self.assertIn(form, r.stdout, over)
 
     def test_prep_prints_the_host_key_from_inside_the_session(self):
         text = self.text("prep.sh")

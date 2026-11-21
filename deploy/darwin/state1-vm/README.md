@@ -86,9 +86,16 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   a regular file owned by you with mode 0600, and the public half derived from the private key
   (`ssh-keygen -y`) matches the recorded fingerprint. A sweep that cannot remove a stale key
   reports it and fails the `keys` step. Key logins use `IdentitiesOnly=yes` and
-  `IdentityAgent=none`, so the operator's ssh-agent is never contacted. `golden` with a golden
-  whose record or key `check` would refuse rebuilds it, unattended, and says so in the `exists`
-  step. The driver never reads or offers anything in the operator's own `~/.ssh`.
+  `IdentityAgent=none` (also on the password-mode bootstrap and refusal-probe logins), so the
+  operator's ssh-agent is never contacted. `ssh-keygen -y` runs with `-P ''` and no controlling
+  terminal, so a passphrase-protected key is refused, never asked about. `check` and `golden`
+  share one usability test (pinned `known_hosts`, record, key). `golden` with a golden that this
+  state dir's record describes but `check` would refuse (key or pin missing or wrong) rebuilds
+  it, unattended, and says so in the `exists` step; a golden this state dir has **no record**
+  of (another `--state-dir`'s, or one from before records) is not replaced unasked: exit 2,
+  pass `--rebuild`. The one state that still needs a human is a `keys/` or `keys/<id>/`
+  directory with group or world access (or a symlink, or another owner): fix it with `chmod 700`
+  or remove it. The driver never reads or offers anything in the operator's own `~/.ssh`.
 - **The bootstrap login** is the one password login, and no operator provides it: it is the
   vanilla image's published `admin`/`admin`, used once by `golden` to install that public key
   (see SSH below).
@@ -101,7 +108,7 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   rotated` line and the driver fails g6 unless that line appears exactly once; `golden.json`
   says `console_password` is "random per golden, set in the guest, never stored". On the first
   run the vanilla password still authenticates, so `prep.sh` uses the old-and-new form
-  (`dscl . -passwd /Users/admin admin "$pw"`), which keeps a Secure Token account in step;
+  (`dscl . -passwd /Users/admin admin "$pw"`), which is expected to keep a Secure Token account in step (unverified; see "could not verify"); the form used is logged;
   the root form without the old password is only the re-run fallback. Consequences, by design: local console login and
   the login keychain are unusable, and the `/etc/kcpassword` the vanilla image's autologin
   uses is stale (it holds the old password, XOR-obfuscated); `prep.sh` leaves both alone. If a
@@ -237,7 +244,7 @@ Recovery.
   fallback, the root form), that `dscl . -authonly` prints a `-14090`/`eDSAuthFailed` result in
   one of the two shapes the driver parses (`(-14090, eDSAuthFailed)` or `DS Error: -14090
   (eDSAuthFailed)`; anything else fails closed) and that it works for the admin user without
-  `sudo`, that the password in `dscl`'s argv (it is there for two or three commands) is visible
+  `sudo`, that the password in `dscl`'s argv (it is there for two commands) is visible
   only inside the throwaway guest, and that changing it leaves the guest booting and SSH working
   (the login keychain and `/etc/kcpassword` are left stale on purpose). **Secure Token:** the
   vanilla `admin` is probably a Secure Token holder; whether the change also updates the APFS

@@ -156,6 +156,7 @@ class RealRunner:
         env: dict[str, str] | None = None,
         timeout: float | None = None,
         log_path: Path | None = None,
+        no_tty: bool = False,
     ) -> Result:
         out = open(log_path, "ab") if log_path else None  # noqa: SIM115
         try:
@@ -169,6 +170,9 @@ class RealRunner:
                 env=env,
                 timeout=timeout,
                 check=False,
+                # a new session has no controlling terminal: a tool that would prompt on
+                # /dev/tty (ssh-keygen on a passphrase-protected key) cannot
+                start_new_session=no_tty,
             )
         except FileNotFoundError as e:
             return Result(127, "", f"{argv[0]}: {e}")
@@ -1024,7 +1028,8 @@ def dscl_auth_failed(text: str) -> bool:
     eDSAuthAccountDisabled, eDSAuthPasswordExpired, ...) or output with no code is not proof
     that the vanilla password is dead, so it is False."""
     pairs = {m for rx in DSCL_CODE_RES for m in rx.findall(text)}
-    return pairs == {("-14090", "eDSAuthFailed")}
+    names = set(re.findall(r"eDS\w+", text))  # any other name anywhere, as prep.sh does
+    return pairs == {("-14090", "eDSAuthFailed")} and names == {"eDSAuthFailed"}
 
 
 def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
@@ -1034,7 +1039,9 @@ def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
     missing password with "Permission denied (publickey,password,...)": that must fail the
     step, so the result does not depend on whether the bootstrap password is right.
     """
-    r = rssh(ctx, vmssh.Target(ip, known_hosts, auth="password"), ["true"])
+    r = rssh(
+        ctx, vmssh.Target(ip, known_hosts, auth="password", no_agent=True), ["true"]
+    )
     m = re.search(r"Permission denied \(([^)]*)\)", r.stderr)
     if r.rc == 0 or m is None:
         raise StepFail(
@@ -1289,30 +1296,58 @@ def sweep_stale_keys(ctx: Ctx, keep: str) -> tuple[list[str], list[str]]:
     return gone, failed
 
 
+def golden_record(ctx: Ctx) -> tuple[str, str]:
+    """(key_id, authorized_key fingerprint) from this state dir's golden.json; Refusal if
+    there is no usable record."""
+    rec_path = ctx.state_dir / "golden.json"
+    try:
+        rec = json.loads(rec_path.read_text())
+        key_id, want = rec["key_id"], rec["authorized_key"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Refusal(f"{rec_path}: no usable golden record ({e!r})") from e
+    if not isinstance(key_id, str) or not isinstance(want, str):
+        raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
+    return key_id, want
+
+
+def golden_usable(ctx: Ctx) -> str:
+    """The one test of "this state dir can check its golden": the pinned known_hosts file
+    holds our alias's ed25519 key, and the record and key are usable (golden_identity).
+    Returns the private key path; Refusal otherwise. `check` refuses on it and `golden`
+    rebuilds on it, so the two never disagree."""
+    kh = ctx.state_dir / "known_hosts"
+    if not kh.is_file() or kh_fingerprint(kh) is None:
+        raise Refusal(
+            f"{kh} is missing or has no pinned host key (written by golden); run `golden`"
+        )
+    return golden_identity(ctx)
+
+
 def golden_identity(ctx: Ctx) -> str:
     """The private key of the current golden, found through golden.json; Refusal otherwise.
     The private key itself is matched to the recorded fingerprint (its public half is derived
     with `ssh-keygen -y`, not read from the .pub file), so a key from another golden, a
     swapped private key or a hand-edited record is not silently used."""
-    rec_path = ctx.state_dir / "golden.json"
-    again = "run `golden` (add --rebuild if a golden exists)"
+    again = "run `golden`"
     try:
-        rec = json.loads(rec_path.read_text())
-        key_id, want = rec["key_id"], rec["authorized_key"]
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        raise Refusal(f"{rec_path}: no usable golden record ({e!r}); {again}") from e
-    if not isinstance(key_id, str) or not isinstance(want, str):
-        raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
+        key_id, want = golden_record(ctx)
+    except Refusal as e:
+        raise Refusal(f"{e}; {again}") from e
     priv, pub = key_paths(ctx, key_id)
     try:
         private_ok(priv)
     except Refusal as e:
         raise Refusal(f"{e}; {again}") from e
-    r = ctx.run(["ssh-keygen", "-y", "-f", str(priv)], timeout=30)
+    # -P '' (an empty passphrase, never a prompt) and no controlling tty: a passphrase-
+    # protected key (not one this driver minted) is a refusal, not a question on /dev/tty
+    r = ctx.run(
+        ["ssh-keygen", "-y", "-P", "", "-f", str(priv)], timeout=30, no_tty=True
+    )
     derived = r.stdout.strip()
     if r.rc != 0 or not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+( .*)?", derived):
         raise Refusal(
-            f"{priv}: ssh-keygen -y could not read the private key (rc {r.rc}); {again}"
+            f"{priv}: ssh-keygen -y could not read the private key without a passphrase "
+            f"(rc {r.rc}; a key with a passphrase is refused); {again}"
         )
     got = fingerprint(derived)
     pub_got = fingerprint(read_pubkey(pub))
@@ -1366,14 +1401,26 @@ def cmd_golden(ctx: Ctx, args) -> int:
                 names = set(local_vms(ctx))
                 if golden in names and not rebuild:
                     try:
-                        golden_identity(ctx)
+                        golden_record(ctx)
                     except Refusal as e:
-                        # `check` would refuse this golden, and nothing here may wait for a
-                        # human: build it again, and say so.
+                        # The tart golden is global; the record is per state dir. A golden
+                        # this state dir has no record of (another state dir's, or one from
+                        # before records) is not ours to replace unasked.
+                        raise Refusal(
+                            f"{golden} exists but this state dir has no record of it ({e}); "
+                            "it may belong to another state dir or predate records: pass "
+                            "--rebuild to replace it"
+                        ) from e
+                    try:
+                        golden_usable(ctx)
+                    except Refusal as e:
+                        # This state dir's record describes the golden, but `check` would
+                        # refuse it, and nothing here may wait for a human: build it again,
+                        # and say so.
                         rebuild = True
                         summary.add(
                             "exists",
-                            f"{golden} exists but its record or key is unusable",
+                            f"{golden} exists but its pin, record or key is unusable",
                             "pass",
                             f"rebuilding it unattended: {e}",
                         )
@@ -1614,7 +1661,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                                 ) from e
                             summary.add(
                                 "rebuild",
-                                f"remove old {golden} (--rebuild)",
+                                f"remove old {golden} (replaced by this build)",
                                 "pass",
                                 done,
                             )
@@ -1716,8 +1763,17 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         and not keep_build
                         and not args.keep_on_failure
                     ):
-                        with contextlib.suppress(OSError, Refusal):
-                            remove_key_dir(ctx, key_id)
+                        try:
+                            left = remove_key_dir(ctx, key_id)
+                        except (OSError, Refusal) as e:
+                            left = f"left in place: {e}"
+                        if not left.startswith("removed "):
+                            summary.add(
+                                "cleanup-key",
+                                "remove this build's private key",
+                                "fail",
+                                left,
+                            )
     except Refusal as e:
         return refuse(summary, ctx, args, str(e))
     if refusal:
@@ -1780,13 +1836,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                     )
                 if vms[golden].get("Running"):
                     raise Refusal(f"{golden} is running; stop it before `check`")
-                if not known_hosts.is_file():
-                    raise Refusal(
-                        f"{known_hosts} is missing (written by golden); run `golden --rebuild`"
-                    )
-                # the minted key, found through golden.json: read under the lock, so a
-                # concurrent rebuild cannot sweep it between this and its use
-                identity = golden_identity(ctx)
+                # the pin, record and minted key, read under the lock (a concurrent rebuild
+                # cannot sweep the key between this and its use): the same test `golden` uses
+                identity = golden_usable(ctx)
                 assert_vm_cap(ctx)
                 summary.add(
                     "preflight",

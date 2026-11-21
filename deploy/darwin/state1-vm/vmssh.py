@@ -64,8 +64,8 @@ class Target:
         "key"  # "key" (BatchMode, publickey only) or "password" (golden bootstrap only)
     )
     accept_new: bool = False  # trust on first use into known_hosts; scratch file only
-    # key mode: do not talk to the operator's ssh-agent at all (the driver's own minted key
-    # is the only credential); the standalone CLI keeps agent mode for a `.pub` identity
+    # do not talk to the operator's ssh-agent at all, in either mode (the driver's own minted
+    # key is the only credential); the standalone CLI keeps agent mode for a `.pub` identity
     no_agent: bool = False
     connect_timeout: int = 10
 
@@ -115,6 +115,10 @@ def ssh_argv(t: Target, remote_argv: list[str], ssh_bin: str = "ssh") -> list[st
         "-o", "ControlMaster=no", "-o", "ControlPath=none",
         "-o", "LogLevel=ERROR",
     ]  # fmt: skip
+    if t.no_agent:
+        # ssh opens the agent socket and lists its keys even with PubkeyAuthentication=no,
+        # so the operator's agent is left alone in password mode too
+        argv += ["-o", "IdentityAgent=none"]
     if t.auth == "key":
         argv += [
             "-o", "BatchMode=yes",
@@ -124,8 +128,6 @@ def ssh_argv(t: Target, remote_argv: list[str], ssh_bin: str = "ssh") -> list[st
             "-o", "IdentitiesOnly=yes",
             "-i", t.identity or "",
         ]  # fmt: skip
-        if t.no_agent:
-            argv += ["-o", "IdentityAgent=none"]
     else:
         # BatchMode would disable SSH_ASKPASS, so it is off here and only here.
         argv += [
