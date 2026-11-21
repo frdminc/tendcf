@@ -49,13 +49,20 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   never pulls. It builds into `state1-golden-build` and renames to `state1-golden` last, so a
   half-built image is never the golden one. With `state1-golden` present it does nothing
   unless `--rebuild`, and then the old golden is deleted only at the commit, right before the
-  rename (a failed build costs nothing). The commit (delete the old golden, rename, then write
-  `known_hosts` and `golden.json`) runs with SIGINT/SIGTERM/SIGHUP ignored, the two record
-  files are written only after the rename succeeded, and from the moment the old golden is
-  touched the finished build is never deleted by cleanup: if the delete or the rename fails the
-  finished build is kept, `known_hosts`/`golden.json` still describe the old golden, and the
-  evidence says what to run (after a failed rename the new record is parked as
-  `known_hosts.pending` and `golden.json.pending` in the state dir). A guest that does not
+  rename (a failed build costs nothing). The commit runs with SIGINT/SIGTERM/SIGHUP ignored and has five writes in
+  this order: first an **intent owner file** (`"state": "committing"`: this state dir, the new
+  key id and host key), before anything is destroyed; then delete the old golden, rename, write
+  `known_hosts`, write `golden.json`, and last the **final owner file** (`"state": "final"`).
+  The record files are written only after the rename succeeded, and from the moment the old
+  golden is touched the finished build is never deleted by cleanup: if the delete or the rename
+  fails the finished build is kept, `known_hosts`/`golden.json` still describe the old golden
+  (a failed delete puts the previous owner file back; a failed rename leaves the intent one),
+  and the evidence says what to run (the new record is parked as `known_hosts.pending` and
+  `golden.json.pending` in the state dir and `golden-owner-<golden>.json.pending` beside the
+  lock; a hand finish is `tart rename` then three `mv`, the last one making this state dir the
+  owner, after which plain `golden` says "nothing to do" and `check` passes). Every write is
+  atomic (temp file, `fsync`, rename, `fsync` of the directory); a failed write ends the g10
+  step with the list of writes that landed, never a traceback. A guest that does not
   halt by itself within 180 s is powered off with `tart stop`, and that **fails g10**: an image
   that may be missing its last writes is not saved (the build is removed, or kept with
   `--keep-on-failure`). A leftover `state1-golden-build` is stopped and deleted first.
@@ -89,11 +96,38 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   `IdentityAgent=none` (also on the password-mode bootstrap and refusal-probe logins), so the
   operator's ssh-agent is never contacted. `ssh-keygen -y` runs with `-P ''` and no controlling
   terminal, so a passphrase-protected key is refused, never asked about. `check` and `golden`
-  share one usability test (pinned `known_hosts`, record, key). `golden` with a golden that this
-  state dir's record describes but `check` would refuse (key or pin missing or wrong) rebuilds
-  it, unattended, and says so in the `exists` step; a golden this state dir has **no record**
-  of (another `--state-dir`'s, or one from before records) is not replaced unasked: exit 2,
-  pass `--rebuild`. The one state that still needs a human is a `keys/` or `keys/<id>/`
+  share one usability test: `golden.json` parses (and has a `host_key`), `known_hosts` is
+  exactly the one line the driver writes (`state1-vm ssh-ed25519 <key>`; ssh honours every line,
+  pattern, hashed name, `@cert-authority` and `@revoked` entry of a file, so anything else is
+  refused), that key is the record's `host_key` (a kill between the two commit writes, or a
+  hand-moved `.pending` file, leaves them disagreeing), and the recorded key passes the checks
+  above. `check` refuses (exit 2) on any of it before it clones anything.
+  **Owner marker.** The tart golden is global to the host and the records are per
+  `--state-dir`, so the commit writes `~/.local/state/tendcf-state1-vm/golden-owner-<golden
+  name>.json` beside the driver lock: the golden, the resolved state dir, `key_id`, `host_key`
+  and a `state`. The lock directory must be a real directory of yours that is not group or world
+  writable, and the file is read without following a symlink (a FIFO or directory is refused,
+  never waited on). Plain `golden` with the golden present rebuilds it unattended (when the
+  usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
+  this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees
+  with this state dir's `golden.json` (`key_id`, `host_key`). Because the intent file is written
+  before the first destructive step and the final one last, an agreeing final file means the last
+  commit to touch this golden finished, and it was ours. Otherwise plain `golden` exits 2 and
+  replaces nothing: another `--state-dir`'s golden (the message names the owner and says that a
+  rebuild breaks its logins), a golden with **no record** here, an **intent** file (a commit
+  that did not finish: whichever of the old and new build the golden is, nobody may bless it),
+  a **missing** owner file, or a file that disagrees with the record. `golden --rebuild` always
+  replaces and makes this state dir the owner. A moved or renamed state dir is a different
+  owner; the marker (like the lock) follows `$HOME`, and `TART_HOME` is not recorded, so a run
+  under another `HOME` or `TART_HOME` sees other markers (it fails closed: exit 2).
+  **Upgrade note:** a golden built before owner files existed has none, so the first plain
+  `golden` after upgrading exits 2 until one `golden --rebuild` writes it; `check` does not need
+  the marker and still passes. (Letting a passing `check` write the missing marker is tracked as
+  [issue 81](https://github.com/frdminc/tendcf/issues/81).) `check` reads the marker too: a
+  final file naming another state dir or another key exits 2 early, naming the owner; a missing
+  one is ignored. Its hints say what is true for the case at hand (`golden` for an owner,
+  `golden --rebuild` where plain `golden` would refuse, and never `--rebuild` over another
+  state dir's golden without naming it). The one state that still needs a human is a `keys/` or `keys/<id>/`
   directory with group or world access (or a symlink, or another owner): fix it with `chmod 700`
   or remove it. The driver never reads or offers anything in the operator's own `~/.ssh`.
 - **The bootstrap login** is the one password login, and no operator provides it: it is the
