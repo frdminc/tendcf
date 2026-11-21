@@ -1,0 +1,35 @@
+name: s1-flake-diag (TEMPORARY, issue 51; deleted before the PR is final)
+
+on:
+  push:
+    branches: [fix/issue51-s1-generator-flake]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: openssh-server
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends openssh-server
+      - name: probe
+        shell: bash
+        run: sudo -E env TENDCF_TEST_SYSTEMD=1 python3 tests/unit_classifier/s1_probe.py | tee /tmp/s1-probe.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s1diag-${{ matrix.runner }}-${{ matrix.rep }}
+          path: |
+            /tmp/s1-probe.md
+            /tmp/s1-probe-debug-journal.txt
+          retention-days: 7

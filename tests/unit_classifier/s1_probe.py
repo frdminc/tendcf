@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from s1lib import CLASSIFIER, REPO, Sandbox, TestDb, daemon_reload, sh  # noqa: E402
@@ -185,9 +186,89 @@ def link_outside():
     shutil.rmtree(ext, ignore_errors=True)
 
 
+ANY_STATUS = tuple(range(256))
+DEBUG_JOURNAL = "/tmp/s1-probe-debug-journal.txt"   # uploaded with the probe record (linux.yml)
+
+
+def diag(title, argv, **kw):
+    """A diagnostic command: any exit status (or a missing program) is recorded, never a failure."""
+    try:
+        return rec(title, argv, ok=ANY_STATUS, **kw)
+    except OSError as e:
+        out("**%s**\n\n`$ %s`  (not run: %r)\n" % (title, " ".join(argv), e))
+
+
+def journal(title, since, pattern=None, limit=120, save=None):
+    """The journal since `since`, filtered in Python by regex `pattern`, at most `limit` lines."""
+    import re
+    r = sh(["journalctl", "-b", "--no-pager", "-o", "short-precise", "--since", since])
+    ls = r.stdout.splitlines()
+    if save:
+        with open(save, "a") as f:
+            f.write("### %s (since %s, rc=%d, %d lines)\n%s\n" % (title, since, r.returncode, len(ls), r.stdout))
+    keep = [x for x in ls if re.search(pattern, x)] if pattern else ls
+    out("**%s**\n\n`$ journalctl -b --since '%s'%s`  (rc=%d, %d lines, %d shown)\n\n```" % (
+        title, since, " | grep -E '%s'" % pattern if pattern else "", r.returncode, len(ls), min(len(keep), limit)))
+    out("\n".join(keep[:limit]))
+    if r.stderr.strip():
+        out("[stderr] " + r.stderr.rstrip()[:400])
+    out("```\n")
+
+
+def item3_diagnose(gen_dir, gen, since):
+    """Issue 51: on ubuntu-24.04 the manager sometimes never ran our generator. Called only
+    when `list-unit-files tendcf-s1-gen*` misses; it records what the host looked like, runs the
+    generator by hand, and reloads once more with the manager's log level at debug, so the
+    journal says whether the generator was spawned, skipped or failed."""
+    out("### Diagnostics: the generated units are missing (issue 51)\n")
+    out("now: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+    diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name", "/sys/class/dmi/id/bios_vendor"])
+    diag("host: kernel", ["uname", "-a"])
+    diag("host: runner image data", ["cat", "/imagegeneration/imagedata.json"], lines=20)
+    diag("host: PID 1 capabilities", ["grep", "-E", "^Cap", "/proc/1/status"])
+    diag("host: LSMs", ["cat", "/sys/kernel/security/lsm"])
+    diag("host: /etc/systemd/system top level", ["ls", "-l", "--time-style=full-iso", "/etc/systemd/system"], lines=60)
+    diag("host: manager config drop-ins and /etc generators", ["ls", "-lR", "/etc/systemd/system.conf.d", "/run/systemd/system.conf.d",
+         "/usr/lib/systemd/system.conf.d", "/etc/systemd/system-generators"])
+    diag("host: system.conf", ["grep", "-vE", "^(#|$)", "/etc/systemd/system.conf"])
+    diag("host: all mounts", ["findmnt", "-o", "TARGET,FSTYPE,OPTIONS"], lines=80)
+    diag("host: /run/systemd mount options", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", "/run/systemd"])
+    diag("systemd", ["systemctl", "--version"], lines=1)
+    diag("is-system-running", ["systemctl", "is-system-running"])
+    diag("systemd package", ["dpkg-query", "-W", "systemd"])
+    diag("/run mount", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", "/run"])
+    diag("generator file", ["ls", "-ld", "--time-style=full-iso", gen_dir, gen])
+    diag("generator file stat", ["stat", gen])
+    diag("generator search directories", ["ls", "-ld", "--time-style=full-iso",
+         "/run/systemd/system-generators", "/etc/systemd/system-generators",
+         "/usr/local/lib/systemd/system-generators", "/usr/lib/systemd/system-generators"])
+    diag("every generator output directory (unfiltered)", ["ls", "-la", "--time-style=full-iso"] + sorted(glob.glob("/run/systemd/generator*")))
+    diag("youngest processes (apt, dpkg, unattended-upgrades, needrestart?)", ["ps", "-eo", "pid,ppid,etimes,stat,args", "--sort=etimes"], lines=40)
+    d = tempfile.mkdtemp(prefix="tendcf-s1-gentest-", dir="/var/tmp")
+    try:
+        diag("run the generator by hand (does it write the fragments?)", [gen, d, d, d])
+        diag("what it wrote", ["ls", "-l", d])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    journal("journal around the reload (all)", since, limit=150)
+    journal("journal: generators", since, pattern="(?i)generator|tendcf", limit=80)
+    cur = sh(["systemctl", "log-level"]).stdout.strip() or "info"
+    mark = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1))
+    out("manager log level before: `%s`\n" % cur)
+    try:
+        sh(["systemctl", "log-level", "debug"])
+        daemon_reload()
+        diag("list-unit-files after a reload at log level debug", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
+        diag("generator output directories after it", ["ls", "-la", "--time-style=full-iso"] + sorted(glob.glob("/run/systemd/generator*")))
+        journal("journal at debug: generators", mark, pattern="(?i)generator|tendcf", limit=120, save=DEBUG_JOURNAL)
+    finally:
+        sh(["systemctl", "log-level", cur])
+
+
 def item3_generated():
     out("## Item 3: SourcePath of a generated unit\n")
     gen_dir = "/run/systemd/system-generators"
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 10))
     script = ("#!/bin/sh\n"
               "printf '[Unit]\\nDescription=tendcf s1 gen\\nSourcePath=/etc/tendcf-s1-gensrc\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/tendcf-s1-gen.service\"\n"
               "printf '[Unit]\\nDescription=tendcf s1 gen without source\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/tendcf-s1-gen-nosrc.service\"\n")
@@ -197,7 +278,9 @@ def item3_generated():
         out("### a generator of our own (/run/systemd/system-generators/tendcf-s1-gen)\n")
         show("tendcf-s1-gen.service")
         show("tendcf-s1-gen-nosrc.service")
-        rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
+        r = rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
+        if r.returncode != 0 or "tendcf-s1-gen" not in r.stdout:
+            item3_diagnose(gen_dir, gen_dir + "/tendcf-s1-gen", since)
         gen_dirs = sorted(glob.glob("/run/systemd/generator*"))
         rec("where the generated fragments lie", ["ls", "-l"] + gen_dirs, grep="tendcf-s1")
         rec("a second daemon-reload", ["systemctl", "daemon-reload"])
