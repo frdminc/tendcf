@@ -51,6 +51,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vmssh
@@ -88,6 +89,24 @@ TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CONSOLE_PW_LINE_RE = re.compile(r"^PREP-CONSOLE-PW rotated\s*$", re.MULTILINE)
+# prep.sh logs the Secure Token status after the password rotation (issue 78); the driver
+# carries that one line into g6's evidence, which is cut short for a long prep output.
+SECURE_TOKEN_AFTER_RE = re.compile(
+    r"^prep: secure token status \(after\): .*$", re.MULTILINE
+)
+# `mdutil -a -s` says kMDConfigSearchLevelTransitioning while a volume is still changing state
+# after an earlier command (seen right after a reboot, issue 70 run 2): poll, bounded.
+MDUTIL_TRANSITIONING = "kMDConfigSearchLevelTransitioning"
+MDUTIL_SETTLE_TIMEOUT = 120.0
+MDUTIL_SETTLE_INTERVAL = 2.0
+UPDATES_OFF_LINE = "Automatic checking for updates is turned off"
+# the keys prep.sh writes with `defaults` (AutomaticCheckEnabled is not one of them)
+UPDATES_KEYS = (
+    "AutomaticDownload",
+    "AutomaticallyInstallMacOSUpdates",
+    "ConfigDataInstall",
+    "CriticalUpdateInstall",
+)
 HOSTKEY_LINE_RE = re.compile(
     r"^PREP-HOSTKEY (ssh-ed25519) ([A-Za-z0-9+/]+={0,2})\s*$", re.MULTILINE
 )
@@ -1082,8 +1101,137 @@ def python_paths(image: dict) -> tuple[str, str]:
     return FRAMEWORK_ROOT, f"{FRAMEWORK_ROOT}/Versions/{minor}/bin/python{minor}"
 
 
+class Mdutil(NamedTuple):
+    ok: bool
+    evidence: str
+    polls: int
+    waited: float
+
+
+def mdutil_volumes_problem(text: str) -> str | None:
+    """None if `mdutil -a -s` output is only volume headers, each followed by exactly one
+    `Indexing disabled.` line, with `/:` among the headers; else what is wrong.
+
+    A header is a line with no leading blank that ends in ":"; a status line has a leading
+    space or tab. Lines are split on "\n" only and only spaces and tabs count as blank, so a
+    CR, a form feed or any other separator is "unexpected", never a line of its own.
+    prep.sh applies the same rule with awk.
+    """
+    hdr: str | None = None
+    seen = False
+    headers: list[str] = []
+    for ln in text.split("\n"):
+        if all(c in " \t" for c in ln):
+            continue
+        if ln[0] in " \t":
+            if ln.strip(" \t") != "Indexing disabled.":
+                return f"unexpected line {ln!r}"
+            if hdr is None:
+                return f"status before any volume: {ln!r}"
+            if seen:
+                return f"two statuses for {hdr}"
+            seen = True
+        elif ln.endswith(":"):
+            if hdr is not None and not seen:
+                return f"no status for {hdr}"
+            hdr, seen = ln, False
+            headers.append(ln)
+        else:
+            return f"unexpected line {ln!r}"
+    if hdr is not None and not seen:
+        return f"no status for {hdr}"
+    if not headers:
+        return "no volume listed"
+    if "/:" not in headers:
+        return "no / volume listed"
+    return None
+
+
+def _mdutil_done(
+    ok: bool, text: str, why: str, note: str, polls: int, waited: float
+) -> Mdutil:
+    return Mdutil(ok, f"{clip(text.strip(), 300)}{why}; {note}", polls, waited)
+
+
+def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
+    """`mdutil -a -s` says indexing is off on every volume, after a bounded settle.
+
+    Each poll, in this order: "Indexing enabled" anywhere (stdout and stderr together) fails
+    at once; kMDConfigSearchLevelTransitioning anywhere is asked again every
+    MDUTIL_SETTLE_INTERVAL seconds, whatever mdutil's exit status was (it was never recorded),
+    until MDUTIL_SETTLE_TIMEOUT seconds of real time have passed (so about that plus one
+    command); then a non-0 exit fails; then mdutil_volumes_problem must find nothing. The
+    evidence carries every poll's exit status, and the polls and seconds are returned as values.
+    """
+    start = ctx.monotonic()
+    polls = 0
+    rcs: list[int] = []
+    while True:
+        r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
+        polls += 1
+        rcs.append(r.rc)
+        waited = ctx.monotonic() - start
+        text = r.stdout
+        if r.stderr:
+            text += ("" if text.endswith("\n") or not text else "\n") + r.stderr
+        note = f"rc={r.rc} polls={polls} waited={waited:.0f}s rcs={rcs}"
+
+        if "Indexing enabled" in text:
+            return _mdutil_done(False, text, "", note, polls, waited)
+        if MDUTIL_TRANSITIONING in text:
+            if waited + MDUTIL_SETTLE_INTERVAL > MDUTIL_SETTLE_TIMEOUT:
+                return _mdutil_done(
+                    False, text, " (still transitioning)", note, polls, waited
+                )
+            ctx.sleep(MDUTIL_SETTLE_INTERVAL)
+            continue
+        if r.rc != 0:
+            return _mdutil_done(
+                False, text, f" (mdutil exited {r.rc})", note, polls, waited
+            )
+        problem = mdutil_volumes_problem(text)
+        return _mdutil_done(
+            problem is None,
+            text,
+            f" ({problem})" if problem else "",
+            note,
+            polls,
+            waited,
+        )
+
+
+def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
+    """Automatic update checking, download and install are off.
+
+    The check is `softwareupdate --schedule`, which is what the system itself answers with:
+    exit 0, "turned off" present and "turned on" nowhere, in stdout and stderr together.
+    macOS 27.2 drops a raw `defaults write` of AutomaticCheckEnabled (issue 70 run 2: the key
+    was absent from the plist file while the schedule said "turned on"), so prep.sh no longer
+    writes it and its absence is not a failure; if it is present it must read 0. The four
+    keys prep.sh does write must read 0.
+    """
+    r = rssh(ctx, t, ["sudo", "-n", "softwareupdate", "--schedule"])
+    said = (r.stdout + "\n" + r.stderr).strip()
+    ok = r.rc == 0 and UPDATES_OFF_LINE in said and "turned on" not in said
+    ev = [f"schedule rc {r.rc}: {clip(said, 200)!r}"]
+    plist = "/Library/Preferences/com.apple.SoftwareUpdate"
+    for key in UPDATES_KEYS + ("AutomaticCheckEnabled",):
+        r = rssh(ctx, t, ["defaults", "read", plist, key])
+        got = r.stdout.strip() or r.stderr.strip()
+        if (
+            key == "AutomaticCheckEnabled"
+            and r.rc != 0
+            and ("Could not find key" in r.stderr or "does not exist" in r.stderr)
+        ):
+            ev.append(f"{key}=absent")
+            continue
+        ok &= r.rc == 0 and r.stdout.strip() == "0"
+        ev.append(f"{key}={got}")
+    return ok, " ".join(ev)
+
+
 def persistent_assertions(
-    ctx: Ctx, image: dict, t: vmssh.Target
+    ctx: Ctx, image: dict, t: vmssh.Target, facts: dict | None = None
 ) -> list[tuple[str, str, bool, str]]:
     """Checks that must hold on a fresh clone and again after a reboot: (id, name, ok, evidence)."""
     out: list[tuple[str, str, bool, str]] = []
@@ -1145,33 +1293,13 @@ def persistent_assertions(
     ok_2e, ev_2e = sshd_key_only(r)
     out.append(("2e", "sshd effective config: key login only", ok_2e, ev_2e))
 
-    r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
-    out.append(
-        (
-            "2g",
-            "Spotlight indexing off",
-            r.rc == 0
-            and "Indexing enabled" not in r.stdout
-            and "Indexing disabled" in r.stdout,
-            r.stdout or r.stderr,
-        )
-    )
+    md = mdutil_off(ctx, t)
+    out.append(("2g", "Spotlight indexing off", md.ok, md.evidence))
+    if facts is not None:
+        facts["mdutil"] = md
 
-    ev = []
-    ok = True
-    for key in (
-        "AutomaticCheckEnabled",
-        "AutomaticDownload",
-        "AutomaticallyInstallMacOSUpdates",
-    ):
-        r = rssh(
-            ctx,
-            t,
-            ["defaults", "read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
-        )
-        ok &= r.rc == 0 and r.stdout.strip() == "0"
-        ev.append(f"{key}={r.stdout.strip() or r.stderr.strip()}")
-    out.append(("2h", "automatic updates off", ok, " ".join(ev)))
+    ok_2h, ev_2h = updates_off(ctx, t)
+    out.append(("2h", "automatic updates off", ok_2h, ev_2h))
 
     fw, py = python_paths(image)
     r = rssh(ctx, t, [py, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
@@ -2169,8 +2297,19 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "prep.sh did not confirm the console password was rotated: "
                             + clip(out, 300)
                         )
+                    st = SECURE_TOKEN_AFTER_RE.findall(out)
+                    token = (
+                        clip(st[0].removeprefix("prep: "), 300)
+                        if st
+                        else "secure token status (after): not printed by prep.sh"
+                    )
+                    if len(st) > 1:  # evidence only, never a failure
+                        token += (
+                            f" [{len(st)} such lines in the prep output; first shown]"
+                        )
                     return (
-                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}"
+                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}; "
+                        f"{token}"
                     )
 
                 def pin() -> str:
@@ -2801,16 +2940,18 @@ def cmd_check(ctx: Ctx, args) -> int:
                     summary, "10", "reboot; ssh comes back", reboot, fatal=False
                 ):
                     t = state["t"]  # type: ignore[assignment]
+                    facts: dict = {}
+                    after = persistent_assertions(ctx, image, t, facts)
                     bad = [
-                        f"{sid} {name}: {ev}"
-                        for sid, name, ok, ev in persistent_assertions(ctx, image, t)
-                        if not ok
+                        f"{sid} {name}: {ev}" for sid, name, ok, ev in after if not ok
                     ]
                     summary.add(
                         "10a",
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
-                        "; ".join(bad) or "2a-2e, 2g-2l re-checked",
+                        "; ".join(bad)
+                        or "2a-2e, 2g-2l re-checked (2g after the reboot: "
+                        f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s)",
                     )
                 else:
                     summary.add(
