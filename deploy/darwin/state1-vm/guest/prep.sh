@@ -180,8 +180,10 @@ chown root:wheel "$tmp"
 chmod 644 "$tmp"
 mv -f "$tmp" "$SSH_DROPIN"
 effective=$(/usr/sbin/sshd -T -C user=admin,host=localhost,addr=127.0.0.1)
+# macOS 27.2's sshd (OpenSSH_10.5p1) prints the keys in CamelCase ("PasswordAuthentication no"),
+# stock OpenSSH in lowercase: match the whole line, ignoring case.
 for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no'; do
-    printf '%s\n' "$effective" | grep -qx "$want" || die "sshd -T does not show: $want"
+    printf '%s\n' "$effective" | LC_ALL=C grep -qixF "$want" || die "sshd -T does not show: $want"
 done
 log "sshd: key login only"
 
@@ -207,8 +209,10 @@ fi
 dscl . -authonly admin "$pw" || die "the new console password does not authenticate"
 unset pw
 # The vanilla password must be dead, and only by the wrong-password code (-14090,
-# eDSAuthFailed): any other result (no such user, disabled or expired account, no directory,
-# odd output) proves nothing and fails the build.
+# eDSAuthFailed): any other result (disabled or expired account, no directory, odd output)
+# proves nothing and fails the build. A missing user is not another code on macOS 27.2 (a
+# nonexistent name also prints -14090 eDSAuthFailed, observed), so this does not prove the
+# account exists; the ssh login as admin does.
 if auth_out=$(dscl . -authonly admin admin 2>&1); then
     die "the vanilla console password still works"
 fi
