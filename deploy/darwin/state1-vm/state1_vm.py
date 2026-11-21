@@ -6,8 +6,13 @@ re-run after an interruption; every tart and ssh call is an argv list.
 
     state1_vm.py resolve                      tag -> digest from the registry (no tart, no pull)
     state1_vm.py pull                         pull the pinned image (the heavy ~30 GB job)
-    state1_vm.py golden --pubkey K.pub        build the local VM `state1-golden` from the cached image
-    state1_vm.py check  --identity K          clone, check, reboot, delete: JSON summary on stdout
+    state1_vm.py golden                       build the local VM `state1-golden` from the cached image
+    state1_vm.py check                        clone, check, reboot, delete: JSON summary on stdout
+
+Both run with no operator input: `golden` mints a fresh ed25519 key for each golden build
+(private half 0600 under <state-dir>/keys/<key id>/, public half baked into the image) and
+`check` reads it back through `golden.json`. djbclark's own keys are never used or read. The
+guest's console password is randomised in prep.sh and never leaves the guest.
 
 `golden` and `check` never pull: `golden` refuses when the pinned image is not in
 tart's OCI cache, so the heavy pull is admitted as its own job. At most one driver
@@ -33,6 +38,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -62,6 +68,8 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+CONSOLE_PW_LINE_RE = re.compile(r"^PREP-CONSOLE-PW rotated\s*$", re.MULTILINE)
 HOSTKEY_LINE_RE = re.compile(
     r"^PREP-HOSTKEY (ssh-ed25519) ([A-Za-z0-9+/]+={0,2})\s*$", re.MULTILINE
 )
@@ -978,6 +986,26 @@ def persistent_assertions(
             f"rc {r.rc}; " + (listening[0].strip() if listening else "no listener"),
         )
     )
+    # The console password is no longer the vanilla image's published "admin". Only an
+    # authentication failure counts as proof: any other dscl error (no such user, no
+    # directory) must not read as "the password was changed".
+    r = rssh(ctx, t, ["sudo", "-n", "dscl", ".", "-authonly", "admin", "admin"])
+    refused = r.rc != 0 and re.search(
+        r"eDSAuthFailed|authentication.{0,40}failed", r.stdout + r.stderr, re.IGNORECASE
+    )
+    out.append(
+        (
+            "2l",
+            "console password is not the vanilla 'admin' (randomised in prep.sh)",
+            bool(refused),
+            f"rc {r.rc}; "
+            + (
+                "dscl -authonly admin admin: authentication failed"
+                if refused
+                else clip((r.stdout + r.stderr).strip() or "no failure reported", 200)
+            ),
+        )
+    )
     return out
 
 
@@ -1106,11 +1134,116 @@ def cmd_pull(ctx: Ctx, args) -> int:
     return 0 if summary.ok else 1
 
 
-def check_identity(identity: str) -> str:
-    path = os.path.expanduser(identity)
-    if not Path(path).is_file():
-        raise Refusal(f"identity file not found: {path}")
-    return path
+def keys_root(ctx: Ctx) -> Path:
+    return ctx.state_dir / "keys"
+
+
+def key_paths(ctx: Ctx, key_id: str) -> tuple[Path, Path]:
+    """(private, public) key paths of one golden. The key id comes from golden.json or the
+    run id, and becomes a path component, so it is validated first."""
+    if not KEY_ID_RE.match(key_id) or key_id in (".", ".."):
+        raise Refusal(f"unsafe key id {key_id!r}")
+    d = keys_root(ctx) / key_id
+    return d / "id_ed25519", d / "id_ed25519.pub"
+
+
+def mint_keypair(ctx: Ctx, key_id: str) -> tuple[str, str]:
+    """A fresh ed25519 key for one golden: private half 0600 in a 0700 directory under the
+    state dir, outside the repo and unrelated to anyone's ~/.ssh. Returns (public line, private
+    path). Never reuses an existing key: the directory must not exist."""
+    priv, pub = key_paths(ctx, key_id)
+    root = keys_root(ctx)
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    try:
+        os.mkdir(priv.parent, 0o700)  # exclusive
+    except FileExistsError as e:
+        raise ToolError(f"key directory {priv.parent} already exists") from e
+    r = ctx.run(
+        [
+            "ssh-keygen",
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            f"tendcf-state1-vm {key_id}",
+            "-f",
+            str(priv),
+        ],
+        timeout=60,
+    )
+    if r.rc != 0:
+        raise ToolError(f"ssh-keygen failed (rc {r.rc}): {clip(r.stderr, 300)}")
+    line = read_pubkey(pub)
+    if not line.startswith("ssh-ed25519 "):
+        raise ToolError(f"{pub}: ssh-keygen did not produce an ed25519 key")
+    private_ok(priv)
+    return line, str(priv)
+
+
+def private_ok(priv: Path) -> None:
+    """The private key must be a regular file we own, readable by nobody else."""
+    try:
+        st = priv.lstat()
+    except OSError as e:
+        raise Refusal(f"private key {priv} is missing: {e}") from e
+    if not stat.S_ISREG(st.st_mode):
+        raise Refusal(f"private key {priv} is not a regular file")
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refusal(
+            f"private key {priv} must be owned by you and mode 0600 (is {st.st_mode & 0o777:o})"
+        )
+
+
+def remove_key_dir(ctx: Ctx, key_id: str) -> str:
+    d = key_paths(ctx, key_id)[0].parent
+    if d.is_symlink() or not d.is_dir():
+        return f"{d}: absent"
+    shutil.rmtree(d)
+    return f"removed {d}"
+
+
+def sweep_stale_keys(ctx: Ctx, keep: str) -> list[str]:
+    """Remove the private keys of every other (deleted or replaced) golden. Real directories
+    only: a symlink or a stray file under keys/ is left alone."""
+    gone = []
+    root = keys_root(ctx)
+    if not root.is_dir():
+        return gone
+    for d in sorted(root.iterdir()):
+        if d.name == keep or d.is_symlink() or not d.is_dir():
+            continue
+        if not KEY_ID_RE.match(d.name):
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        gone.append(d.name)
+    return gone
+
+
+def golden_identity(ctx: Ctx) -> str:
+    """The private key of the current golden, found through golden.json; Refusal otherwise.
+    The recorded fingerprint must match the key's public half, so a key from another golden
+    (or a hand-edited record) is not silently used."""
+    rec_path = ctx.state_dir / "golden.json"
+    try:
+        rec = json.loads(rec_path.read_text())
+        key_id, want = rec["key_id"], rec["authorized_key"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Refusal(
+            f"{rec_path}: no usable golden record ({e!r}); run `golden --rebuild`"
+        ) from e
+    if not isinstance(key_id, str) or not isinstance(want, str):
+        raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
+    priv, pub = key_paths(ctx, key_id)
+    private_ok(priv)
+    got = fingerprint(read_pubkey(pub))
+    if got != want:
+        raise Refusal(
+            f"{pub} is {got}, golden.json says {want}: the key does not belong to this golden; run `golden --rebuild`"
+        )
+    return str(priv)
 
 
 def clone_vm(ctx: Ctx, src: str, dst: str, timeout: float) -> Result:
@@ -1136,12 +1269,13 @@ def cmd_golden(ctx: Ctx, args) -> int:
     )
     keep_build = False
     scratch_made = False
+    key_made = False
+    key_id = ctx.run_id  # one key per golden build: never reused, never shared
     refusal = ""
+    pubkey = ""
+    identity = ""
     try:
-        pubkey = read_pubkey(args.pubkey)
-        identity = check_identity(
-            args.identity or re.sub(r"\.pub$", "", str(args.pubkey))
-        )
+        key_paths(ctx, key_id)  # the id becomes a path: validate before anything exists
         with driver_lock(ctx), signals_to_exception():
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
@@ -1178,6 +1312,8 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         f"scratch directory {scratch} already exists"
                     ) from e
                 scratch_made = True
+                key_made = True  # the directory may exist from here on
+                pubkey, identity = mint_keypair(ctx, key_id)
                 kh_scratch = str(scratch / "known_hosts")
                 kh_pinned = str(scratch / "known_hosts.pinned")
                 # Bootstrap leg (before prep rotates the host keys): the image's own key is
@@ -1234,7 +1370,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         raise StepFail(
                             f"installing the key failed (rc {r.rc}): {clip(r.stderr, 300)}"
                         )
-                    return "installed " + fingerprint(pubkey)
+                    return f"installed {fingerprint(pubkey)} (minted for this golden, key id {key_id})"
 
                 def key_sudo() -> str:
                     r = rssh(
@@ -1261,6 +1397,11 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "prep.sh printed no PREP-RESULT line: " + clip(out, 400)
                         )
                     state["prep_hostkey"] = parse_prep_hostkey(out)
+                    if len(CONSOLE_PW_LINE_RE.findall(out)) != 1:
+                        raise StepFail(
+                            "prep.sh did not confirm the console password was rotated: "
+                            + clip(out, 300)
+                        )
                     return (
                         f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}"
                     )
@@ -1320,6 +1461,8 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             ),
                             "python": image["python"]["version"],
                             "authorized_key": fingerprint(pubkey),
+                            "key_id": key_id,
+                            "console_password": "random per golden, set in the guest, never stored",
                             "host_key": state.get("hostkey"),
                             # the full public key line (it can go into image.json as
                             # vanilla_host_key), the fingerprint beside it
@@ -1379,6 +1522,16 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         atomic_write(
                             ctx.state_dir / "golden.json", record + "\n", 0o644
                         )
+                        # The replaced golden's key is of no use now: remove it (and the
+                        # private keys of any other deleted golden).
+                        stale = sweep_stale_keys(ctx, key_id)
+                        if stale:
+                            summary.add(
+                                "keys",
+                                "remove private keys of replaced goldens",
+                                "pass",
+                                ", ".join(stale),
+                            )
                     return f"{stopped}; renamed {build} -> {golden}; record and known_hosts written"
 
                 steps: list[tuple[str, str, Callable[[], str | None]]] = [
@@ -1439,6 +1592,15 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             summary.add("cleanup", f"remove {build}", "fail", str(e))
                     if scratch_made:
                         shutil.rmtree(scratch, ignore_errors=True)
+                    # A build that is not kept does not keep its private key either.
+                    if (
+                        key_made
+                        and not built
+                        and not keep_build
+                        and not args.keep_on_failure
+                    ):
+                        with contextlib.suppress(OSError, Refusal):
+                            remove_key_dir(ctx, key_id)
     except Refusal as e:
         return refuse(summary, ctx, args, str(e))
     if refusal:
@@ -1490,7 +1652,7 @@ def cmd_check(ctx: Ctx, args) -> int:
     cloned = False  # the clone may exist: set before the call, cleanup handles "absent"
     refusal = ""
     try:
-        identity = check_identity(args.identity)
+        identity = golden_identity(ctx)  # the minted key, found through golden.json
         with driver_lock(ctx), signals_to_exception():
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
@@ -1631,7 +1793,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "10a",
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
-                        "; ".join(bad) or "2a-2e, 2g-2k re-checked",
+                        "; ".join(bad) or "2a-2e, 2g-2l re-checked",
                     )
                 else:
                     summary.add(
@@ -1730,16 +1892,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g = sub.add_parser("golden", help="build state1-golden from the cached image")
     g.add_argument(
-        "--pubkey",
-        type=Path,
-        required=True,
-        help="operator's public key to install (one line)",
-    )
-    g.add_argument(
-        "--identity",
-        help="matching private key (default: --pubkey without .pub; a .pub works when ssh-agent holds the key)",
-    )
-    g.add_argument(
         "--rebuild",
         action="store_true",
         help="delete an existing state1-golden and build it again",
@@ -1749,13 +1901,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="leave the half-built VM for inspection (swept on the next run)",
     )
-    c = sub.add_parser(
+    sub.add_parser(
         "check", help="clone state1-golden, run the checklist, delete the clone"
-    )
-    c.add_argument(
-        "--identity",
-        required=True,
-        help="private key path (or .pub path with ssh-agent) for key login",
     )
     return ap
 
