@@ -12,6 +12,8 @@ of every ssh call), python.org's real `root:admin 775` framework, the two-VM cap
 
 import base64
 import contextlib
+import errno
+import fcntl
 import io
 import json
 import os
@@ -170,8 +172,8 @@ class FakeWorld:
             return self._ssh(argv, input_text, env or {})
         raise AssertionError(f"unexpected command {argv}")
 
-    def start(self, argv, *, log_path):
-        self.calls.append((list(argv), None))
+    def start(self, argv, *, log_path, env=None):
+        self.calls.append((list(argv), dict(env) if env else None))
         name = argv[-1]
         if self.vms[name]["Running"]:
             raise AssertionError("tart run on a running VM")
@@ -492,13 +494,20 @@ def write_marker(
     body = {
         "golden": GOLDEN,
         "state_dir": state_dir or os.path.realpath(ctx.state_dir),
-        "tart_home": drv.tart_home(),
+        "tart_home": ctx.tart_home,
         "key_id": key_id or "20261119T000000Z-made",
         "host_key": host_key
         or "ssh-ed25519 " + drv.fingerprint(f"ssh-ed25519 {NEW_BLOB}"),
         "state": state,
     }
     body.update(more)
+    path.write_text(json.dumps(body))
+
+
+def drop_tart_home(ctx):
+    path = drv.owner_path(ctx, GOLDEN)
+    body = json.loads(path.read_text())
+    del body["tart_home"]
     path.write_text(json.dumps(body))
 
 
@@ -512,7 +521,7 @@ class Base(unittest.TestCase):
         self.ctx = self.make_ctx(self.tmp / "state")
         self.golden_key_id = "20261119T000000Z-made"
 
-    def make_ctx(self, state_dir, run_id="20261120T000000Z-test"):
+    def make_ctx(self, state_dir, run_id="20261120T000000Z-test", tart_home=""):
         return drv.Ctx(
             state_dir=state_dir,
             runner=self.world,
@@ -521,6 +530,7 @@ class Base(unittest.TestCase):
             err=self.errs.append,
             run_id=run_id,
             lock_path=self.tmp / "lockdir" / "driver.lock",
+            tart_home=tart_home,
         )
 
     def second_run_ctx(self, run_id="20261121T000000Z-second"):
@@ -1506,7 +1516,7 @@ class Golden(Base):
         self.assertEqual(len(self.world.tart_calls("clone")), 2)
 
     def owner_file(self):
-        return self.ctx.lock_path.parent / f"golden-owner-{GOLDEN}.json"
+        return drv.owner_path(self.ctx, GOLDEN)
 
     def test_the_commit_writes_an_owner_marker_beside_the_driver_lock(self):
         rc, s = self.run_cmd(*self.golden_args())
@@ -1518,7 +1528,7 @@ class Golden(Base):
             {
                 "golden": GOLDEN,
                 "state_dir": os.path.realpath(self.ctx.state_dir),
-                "tart_home": drv.tart_home(),
+                "tart_home": self.ctx.tart_home,
                 "key_id": self.ctx.run_id,
                 "host_key": rec["host_key"],
                 "state": "final",
@@ -2132,15 +2142,18 @@ class Golden(Base):
 
     # ---- PR 80 round 2 ---------------------------------------------------------------------
 
-    def landing_writes(self, plan):
+    def landing_writes(self, plan, fail=None):
         """Patch atomic_write so the n-th write of a destination name lands, then reports
-        that its directory could not be synced. plan: {name: n}."""
+        that its directory could not be synced. plan: {name: n}; fail: {name: n} writes that
+        fail outright."""
         real = drv.atomic_write
         counts = {}
 
         def wrapper(dest, text, mode=0o600):
             name = Path(dest).name
             counts[name] = counts.get(name, 0) + 1
+            if (fail or {}).get(name) == counts[name]:
+                raise OSError(28, "No space left on device")
             real(dest, text, mode)
             if plan.get(name) == counts[name]:
                 raise drv.LandedNotDurable(5, "Input/output error")
@@ -2154,35 +2167,94 @@ class Golden(Base):
             for p in d.glob("*.pending")
         )
 
-    def test_the_marker_records_the_tart_home_and_a_run_under_another_one_exits_2(self):
-        x, y = self.tmp / "tartX", self.tmp / "tartY"
-        with mock.patch.dict(os.environ, {"TART_HOME": str(x)}):
-            rc, s = self.run_cmd(*self.golden_args())
-            self.assertEqual(rc, 0, s)
-            self.assertEqual(
-                json.loads(self.owner_file().read_text())["tart_home"],
-                os.path.realpath(x),
-            )
-            rc, s = self.run_cmd(*self.golden_args(), ctx=self.second_run_ctx())
-            self.assertEqual(rc, 0, s)  # the same tart home: nothing to do
-            self.assertIn("nothing to do", self.steps(s)["exists"]["evidence"])
+    def test_each_tart_home_has_its_own_marker_and_a_copied_one_is_refused(self):
+        x = os.path.realpath(self.tmp / "tartX")
+        y = os.path.realpath(self.tmp / "tartY")
+        ctx_x = self.make_ctx(self.ctx.state_dir, "20261120T000000Z-x", tart_home=x)
+        ctx_y = self.make_ctx(self.ctx.state_dir, "20261123T000000Z-y", tart_home=y)
+        self.assertNotEqual(
+            drv.owner_path(ctx_x, GOLDEN), drv.owner_path(ctx_y, GOLDEN)
+        )
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_x)
+        self.assertEqual(rc, 0, s)
+        marker_x = drv.owner_path(ctx_x, GOLDEN)
+        self.assertEqual(json.loads(marker_x.read_text())["tart_home"], x)
+        rc, s = self.run_cmd(
+            *self.golden_args(),
+            ctx=self.make_ctx(ctx_x.state_dir, "20261121T000000Z-x2", tart_home=x),
+        )
+        self.assertEqual(rc, 0, s)  # the same tart home: nothing to do
+        self.assertIn("nothing to do", self.steps(s)["exists"]["evidence"])
         clones = len(self.world.tart_calls("clone"))
-        # the same HOME and state dir, another TART_HOME (and the default one): the golden
-        # tart lists there is not the one the marker describes
-        for env in ({"TART_HOME": str(y)}, {"TART_HOME": ""}):
-            with mock.patch.dict(os.environ, env):
-                rc, ev, _ = self.plain(self.second_run_ctx("20261123T000000Z-y"))
-                self.assertEqual(rc, 2, env)
-                self.assertIn("tart home", ev)
-                self.assertIn(
-                    os.path.realpath(x), ev
-                )  # names the one it was written for
-                self.assertIn("--rebuild", ev)
-                rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx())
-                self.assertEqual(rc, 2, env)
-                self.assertIn("tart home", s["steps"][-1]["evidence"])
+        # the same state dir under another tart home sees no marker of its own: exit 2, and
+        # the old (unkeyed or other) file is never read
+        rc, ev, _ = self.plain(ctx_y)
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("no owner file", ev)
+        self.assertIn("--rebuild", ev)
+        # a marker copied or forged under Y's name still names X: refused, naming it
+        shutil.copy(marker_x, drv.owner_path(ctx_y, GOLDEN))
+        rc, ev, _ = self.plain(ctx_y)
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("tart home", ev)
+        self.assertIn(x, ev)
+        rc, s = self.run_cmd(*self.check_args(), ctx=ctx_y)
+        self.assertEqual(rc, 2)
+        self.assertIn("tart home", s["steps"][-1]["evidence"])
         self.assertEqual(len(self.world.tart_calls("clone")), clones)
         self.assertEqual(self.world.tart_calls("delete"), [])
+
+    def test_the_tart_home_is_resolved_the_way_tart_does(self):
+        pw = Path(drv.pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertEqual(
+            drv.resolve_tart_home({"TART_HOME": "/a/b"}), os.path.realpath("/a/b")
+        )
+        # set but empty: tart uses it as given, which is the cwd
+        self.assertEqual(
+            drv.resolve_tart_home({"TART_HOME": ""}), os.path.realpath(os.getcwd())
+        )
+        self.assertEqual(drv.resolve_tart_home({}), os.path.realpath(pw / ".tart"))
+        self.assertEqual(
+            drv.resolve_tart_home({"CFFIXED_USER_HOME": "/cf"}),
+            os.path.realpath("/cf/.tart"),
+        )
+        # $HOME is not consulted at all
+        self.assertEqual(
+            drv.resolve_tart_home({"HOME": str(self.tmp / "fake")}),
+            os.path.realpath(pw / ".tart"),
+        )
+
+    def test_a_second_home_of_the_same_user_has_the_same_lock_marker_and_tart_home(
+        self,
+    ):
+        before = drv.Ctx(state_dir=self.tmp / "s")
+        fake = self.tmp / "fakehome"
+        with mock.patch.dict(os.environ, {"HOME": str(fake)}):
+            os.environ.pop("TART_HOME", None)
+            under = drv.Ctx(state_dir=self.tmp / "s")
+        self.assertEqual(under.tart_home, before.tart_home)
+        self.assertEqual(under.lock_path, before.lock_path)
+        self.assertEqual(drv.owner_path(under, GOLDEN), drv.owner_path(before, GOLDEN))
+        self.assertEqual(before.lock_path.parent, drv.DEFAULT_STATE_DIR)
+        self.assertNotIn(str(fake), str(under.lock_path))
+
+    def test_every_tart_call_carries_the_resolved_tart_home(self):
+        x = os.path.realpath(self.tmp / "tartX")
+        ctx = self.make_ctx(self.ctx.state_dir, "20261120T000000Z-x", tart_home=x)
+        with mock.patch.dict(os.environ, {"TART_HOME": "/somewhere/else"}):
+            rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)
+            self.assertEqual(rc, 0, s)
+            rc, s = self.run_cmd(
+                *self.check_args(),
+                ctx=self.make_ctx(ctx.state_dir, "20261121T000000Z-c", tart_home=x),
+            )
+            self.assertEqual(rc, 0, s)
+        tart = [(a, e) for a, e in self.world.calls if a[0] == "tart"]
+        self.assertTrue(any(a[1] == "run" for a, _ in tart))  # `tart run` (start) too
+        self.assertTrue(any(a[1] == "clone" for a, _ in tart))
+        for argv, env in tart:
+            self.assertIsNotNone(env, argv)
+            self.assertEqual(env["TART_HOME"], x, argv)
 
     def test_a_golden_that_appears_during_the_build_is_never_deleted_without_rebuild(
         self,
@@ -2218,6 +2290,203 @@ class Golden(Base):
         self.assertEqual(rc, 0, s)
         self.assertIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
 
+    # ---- PR 80 round 3 --------------------------------------------------------------------
+
+    def test_a_marker_without_a_tart_home_is_refused_with_the_true_reason(self):
+        self.run_cmd(*self.golden_args())
+        drop_tart_home(self.ctx)
+        clones = len(self.world.tart_calls("clone"))
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("has no tart_home", ev)
+        self.assertIn("earlier build of this change", ev)
+        self.assertIn("--rebuild", ev)
+        self.assertNotIn("None", ev)
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
+        self.assertEqual(self.world.tart_calls("delete"), [])
+
+    def test_the_recheck_refuses_when_the_marker_names_another_state_dir(self):
+        # B took the golden over, it was then deleted by hand, A still has its old record, and
+        # a golden appears during A's build: the owner answer, not only "no record", decides
+        self.run_cmd(*self.golden_args())
+        other = self.tmp / "stateB"
+        other.mkdir(mode=0o700)
+        owner = json.loads(self.owner_file().read_text())
+        owner["state_dir"] = str(other)
+        self.owner_file().write_text(json.dumps(owner))
+        self.world.vms.pop(GOLDEN)
+        real = self.world.run
+        build = f"{GOLDEN}-build"
+
+        def appears(argv, **kw):
+            res = real(argv, **kw)
+            if argv[:2] == ["tart", "clone"] and argv[-1] == build:
+                self.world.vms[GOLDEN] = {"Running": False}
+            return res
+
+        with mock.patch.object(self.world, "run", appears):
+            rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2, ev)
+        self.assertIn(str(other), ev)
+        self.assertIn("nothing was replaced", ev)
+        self.assertIn(GOLDEN, self.world.vms)
+        self.assertNotIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
+
+    def test_a_golden_that_appears_after_the_recheck_is_kept_and_so_is_the_build(self):
+        build = f"{GOLDEN}-build"
+        real = drv.atomic_write
+        seen = []
+
+        def wrapper(dest, text, mode=0o600):
+            real(dest, text, mode)
+            if Path(dest).name == self.owner_file().name and not seen:
+                seen.append(text)  # the intent file is down: now the golden shows up
+                self.world.vms[GOLDEN] = {"Running": False}
+
+        with mock.patch.object(drv, "atomic_write", wrapper):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        ev = " | ".join(x["evidence"] for x in s["steps"])
+        self.assertIn("appeared after the owner check", ev)
+        self.assertIn("--rebuild", ev)
+        self.assertIn("the owner file is removed again", ev)
+        calls = [c for c, _ in self.world.calls]
+        self.assertNotIn(["tart", "delete", GOLDEN], calls)
+        self.assertNotIn(["tart", "rename", build, GOLDEN], calls)
+        self.assertIn(GOLDEN, self.world.vms)
+        self.assertIn(build, self.world.vms)  # the finished build is kept
+        self.assertFalse(self.owner_file().exists())
+        self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+
+    def test_a_marker_state_dir_with_control_characters_is_refused_and_printed_safely(
+        self,
+    ):
+        self.run_cmd(*self.golden_args())
+        bad = "/tmp/x\x1b[31m\nfake: ok"
+        owner = json.loads(self.owner_file().read_text())
+        owner["state_dir"] = bad
+        self.owner_file().write_text(json.dumps(owner))
+        self.assertFalse(drv.same_state_dir(self.ctx, bad))
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("absolute printable path", ev)
+        self.assertIn(repr(bad), ev)
+        self.assertNotIn("\x1b", ev)
+        self.assertNotIn("\n", ev)
+        # a marker of another state dir with such a name is no better: check refuses too
+        rc, s = self.run_cmd(
+            *self.check_args(), ctx=self.second_run_ctx("20261122T000000Z-c")
+        )
+        self.assertEqual(rc, 2)
+        cev = s["steps"][-1]["evidence"]
+        self.assertIn("absolute printable path", cev)
+        self.assertNotIn("\x1b", cev)
+
+    def test_a_state_dir_is_resolved_once_and_its_parents_are_made_0700(self):
+        target = self.tmp / "real-target"
+        link = self.tmp / "link"
+        link.symlink_to(
+            target
+        )  # dangling: the target is made, not a "File exists" error
+        old = os.umask(0)
+        try:
+            ctx = self.make_ctx(link / "sub", run_id="20261121T000000Z-ln")
+            rc, ev, _ = self.plain(ctx)
+        finally:
+            os.umask(old)
+        self.assertEqual(rc, 0, ev)
+        self.assertEqual(ctx.state_dir, Path(os.path.realpath(target / "sub")))
+        for d in (target, target / "sub"):
+            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, str(d))
+        # a relative path becomes absolute before anything uses it
+        back = os.getcwd()
+        try:
+            os.chdir(self.tmp)
+            rel = self.make_ctx(Path("rel-state"), run_id="20261121T000000Z-rel")
+        finally:
+            os.chdir(back)
+        self.assertTrue(rel.state_dir.is_absolute())
+        self.assertEqual(rel.state_dir, Path(os.path.realpath(self.tmp / "rel-state")))
+        # a symlink to a file is not a state dir
+        afile = self.tmp / "afile"
+        afile.write_text("x")
+        flink = self.tmp / "flink"
+        flink.symlink_to(afile)
+        rc, ev, _ = self.plain(self.make_ctx(flink, run_id="20261121T000000Z-fl"))
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("not a directory", ev)
+
+    def test_full_fsync_falls_back_only_when_the_filesystem_cannot_do_it(self):
+        f = self.tmp / "ff"
+        f.write_text("x")
+        fd = os.open(f, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        for code in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY):
+            with (
+                mock.patch.object(drv, "F_FULLFSYNC", 51),
+                mock.patch.object(drv.fcntl, "fcntl", side_effect=OSError(code, "no")),
+                mock.patch.object(drv.os, "fsync") as fs,
+            ):
+                drv.full_fsync(fd)
+            self.assertEqual(fs.call_count, 1, errno.errorcode[code])
+        with (
+            mock.patch.object(drv, "F_FULLFSYNC", 51),
+            mock.patch.object(
+                drv.fcntl, "fcntl", side_effect=OSError(errno.EIO, "EIO")
+            ),
+            mock.patch.object(drv.os, "fsync") as fs,
+            self.assertRaises(OSError) as cm,
+        ):
+            drv.full_fsync(fd)
+        self.assertEqual(cm.exception.errno, errno.EIO)
+        self.assertEqual(fs.call_count, 0)  # a failed flush is never reported as done
+
+    @unittest.skipUnless(sys.platform == "darwin", "F_FULLFSYNC is a macOS control")
+    def test_the_module_uses_the_real_f_fullfsync_on_macos(self):
+        self.assertEqual(drv.F_FULLFSYNC, fcntl.F_FULLFSYNC)
+
+    def test_parked_file_paths_are_shell_quoted(self):
+        sd = (
+            self.tmp / "my;state"
+        )  # ssh paths may not hold whitespace; `;` still needs quoting
+        rc, s = self.run_cmd(
+            *self.golden_args(), ctx=self.make_ctx(sd, "20261121T000000Z-sp")
+        )
+        self.assertEqual(rc, 0, s)
+        self.world.fail_tart = {"delete"}
+        ctx2 = self.make_ctx(sd, "20261122T000000Z-sp2")
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
+        self.assertEqual(rc, 1)
+        ev = " | ".join(x["evidence"] for x in s["steps"])
+        for name in (
+            "known_hosts.pending",
+            "golden.json.pending",
+            "known_hosts",
+            "golden.json",
+        ):
+            self.assertIn(shlex.quote(str(ctx2.state_dir / name)), ev, name)
+        self.assertNotIn(f" {ctx2.state_dir}/known_hosts", ev)
+
+    def test_a_parked_file_that_landed_is_parked_not_failed(self):
+        self.run_cmd(*self.golden_args())
+        self.world.fail_tart = {"delete"}
+        with self.landing_writes({"known_hosts.pending": 1}):
+            rc, s = self.run_cmd(
+                *self.golden_args("--rebuild"), ctx=self.second_run_ctx()
+            )
+        self.assertEqual(rc, 1)
+        ev = " | ".join(x["evidence"] for x in s["steps"])
+        self.assertIn("the new record is parked as", ev)
+        self.assertNotIn("could not be parked", ev)
+        self.assertEqual(
+            self.pending_files(),
+            [
+                drv.owner_path(self.ctx, GOLDEN).name + ".pending",
+                "golden.json.pending",
+                "known_hosts.pending",
+            ],
+        )
+
     def test_a_custom_state_dir_must_be_ours_and_not_group_or_world_writable(self):
         sd = self.tmp / "custom"
         for mode in (0o777, 0o775, 0o757):
@@ -2239,7 +2508,8 @@ class Golden(Base):
             rc, ev, _ = self.plain(self.make_ctx(fresh, run_id="20261121T000000Z-sd3"))
         finally:
             os.umask(old)
-        self.assertEqual(stat.S_IMODE(fresh.stat().st_mode), 0o700, ev)
+        for d in (fresh, fresh.parent):
+            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, f"{d}: {ev}")
 
     def test_a_marker_state_dir_that_is_not_absolute_is_a_torn_or_forged_marker(self):
         self.run_cmd(*self.golden_args())
@@ -2253,10 +2523,10 @@ class Golden(Base):
             self.assertFalse(drv.same_state_dir(self.ctx, "."))
             rc, ev, _ = self.plain(self.second_run_ctx())
             self.assertEqual(rc, 2, ev)
-            self.assertIn("not an absolute path", ev)
+            self.assertIn("absolute printable path", ev)
             rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx())
             self.assertEqual(rc, 2)
-            self.assertIn("not an absolute path", s["steps"][-1]["evidence"])
+            self.assertIn("absolute printable path", s["steps"][-1]["evidence"])
         finally:
             os.chdir(old)
         self.assertEqual(len(self.world.tart_calls("clone")), 1)
@@ -2348,15 +2618,18 @@ class Golden(Base):
         self.assertIn("known_hosts (landed, durability unconfirmed)", ev)
         self.assertNotIn("writing known_hosts failed", ev)
         self.assertIn("refuses", ev)  # the owner file says the commit did not finish
-        # the final owner file landed too: nothing is left unfinished, and it says so
+        # the final owner file landed too: the commit is complete, so a warning step and rc 0
         self.tearDown_world()
         with self.landing_writes({self.owner_file().name: 2}):
             rc, s = self.run_cmd(*self.golden_args())
-        self.assertEqual(rc, 1)
-        ev = self.steps(s)["g10"]["evidence"]
-        self.assertIn("the final owner file landed", ev)
-        self.assertNotIn("refuses", ev)
+        self.assertEqual(rc, 0, s)
+        step = self.steps(s)["owner"]
+        self.assertEqual(step["status"], "pass")
+        self.assertIn("durability unconfirmed", step["evidence"])
+        self.assertIn("the commit is complete", step["evidence"])
+        self.assertNotIn("refuses", json.dumps(s))
         self.assertEqual(json.loads(self.owner_file().read_text())["state"], "final")
+        self.assertEqual(self.pending_files(), [])  # the cleanup ran
         rc, ev, _ = self.plain(self.second_run_ctx())
         self.assertEqual(rc, 0, ev)
         self.assertIn("nothing to do", ev)
@@ -2389,7 +2662,7 @@ class Golden(Base):
         self.assertEqual(
             self.pending_files(),
             [
-                "golden-owner-" + GOLDEN + ".json.pending",
+                drv.owner_path(self.ctx, GOLDEN).name + ".pending",
                 "golden.json.pending",
                 "known_hosts.pending",
             ],
@@ -3000,7 +3273,10 @@ class Check(Base):
         # and the default lock path does not depend on the state dir at all
         a, b = drv.Ctx(state_dir=Path("/x/a")), drv.Ctx(state_dir=Path("/x/b"))
         self.assertEqual(a.lock_path, b.lock_path)
-        self.assertEqual(a.lock_path, drv.LOCK_PATH)
+        self.assertEqual(
+            a.lock_path,
+            drv.DEFAULT_STATE_DIR / f"driver-{drv.tart_key(a.tart_home)}.lock",
+        )
 
     def test_the_lock_never_follows_a_symlink(self):
         victim = self.tmp / "victim"
@@ -3055,6 +3331,30 @@ class Check(Base):
         ev = s["steps"][-1]["evidence"]
         self.assertIn("tart home", ev)
         self.assertIn("/nowhere/else/.tart", ev)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_check_notes_this_dirs_own_unfinished_commit_and_lets_the_login_decide(
+        self,
+    ):
+        write_marker(self.ctx, state="committing")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["owner"]["evidence"]
+        self.assertIn("a commit by this state dir", ev)
+        self.assertIn("did not finish; the golden is the old or the new build", ev)
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+
+    def test_check_refuses_a_final_marker_without_a_tart_home_and_does_not_blame_ssh(
+        self,
+    ):
+        write_marker(self.ctx)
+        drop_tart_home(self.ctx)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("has no tart_home", ev)
+        self.assertIn("golden --rebuild", ev)
+        self.assertNotIn("would fail at ssh", ev)
         self.assertEqual(self.world.tart_calls("clone"), [])
 
     def test_check_refuses_a_state_dir_others_can_write(self):

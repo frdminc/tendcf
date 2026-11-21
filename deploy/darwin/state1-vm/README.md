@@ -67,10 +67,15 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   directory; on macOS `F_FULLFSYNC`, falling back to `fsync`); a failed write ends the g10 step
   with the list of writes that landed, never a traceback. A write whose rename landed but whose
   directory could not be synced is reported as landed with durability unconfirmed, not as
-  failed (a failed intent write puts the previous owner file back). A guest that does not
+  failed. An intent write whose directory sync fails after the rename puts the previous owner
+  file back; one that fails before the rename leaves that file as it was. If the **final**
+  owner file is the one that landed unsynced, the commit is complete: the step passes with a
+  "durability unconfirmed" note, the cleanup runs and the run exits 0. `F_FULLFSYNC` falls
+  back to plain `fsync` only when the filesystem does not support it (`ENOTSUP`,
+  `EOPNOTSUPP`, `EINVAL`, `ENOTTY`); any other error, `EIO` for one, fails the write. A guest that does not
   halt by itself within 180 s is powered off with `tart stop`, and that **fails g10**: an image
-  that may be missing its last writes is not saved (the build is removed, or kept with
-  `--keep-on-failure`). A leftover `state1-golden-build` is stopped and deleted first.
+  that may be missing its last writes is not saved (the build is removed by the cleanup, or
+  kept with `--keep-on-failure`). A leftover `state1-golden-build` is stopped and deleted first.
   `golden` also refuses (exit 2) while **any other VM is running**: no other guest may share
   the vmnet while the host key is pinned (see SSH below). `image.json` may carry
   `vanilla_host_key` (`ssh-ed25519 <base64>`): then the bootstrap login is strict against it;
@@ -107,14 +112,16 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   refused), that key is the record's `host_key` (a kill between the two commit writes, or a
   hand-moved `.pending` file, leaves them disagreeing), and the recorded key passes the checks
   above. `check` refuses (exit 2) on any of it before it clones anything.
-  **Owner marker.** The tart golden is global to the host and the records are per
-  `--state-dir`, so the commit writes `~/.local/state/tendcf-state1-vm/golden-owner-<golden
-  name>.json` beside the driver lock: the golden, the resolved state dir, `key_id`, `host_key`
-  and a `state`. The lock directory must be a real directory of yours that is not group or world
+  **Owner marker.** The tart golden is global to a tart home and the records are per
+  `--state-dir`, so the commit writes `<passwd home>/.local/state/tendcf-state1-vm/golden-owner-<golden
+  name>-<tart key>.json` beside the driver lock (`<tart key>` is the first 8 hex digits of a
+  SHA-256 of the resolved tart home): the golden, the resolved state dir, the tart home,
+  `key_id`, `host_key` and a `state`. The lock directory must be a real directory of yours that is not group or world
   writable, and the file is read without following a symlink (a FIFO or directory is refused,
   never waited on). The state dir (`--state-dir`, which holds the pin and the record) gets the
-  same ownership and mode check (a symlink to such a directory is the operator's choice; a
-  missing one is made 0700); the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
+  same ownership and mode check (the path is resolved with `realpath` once, at startup, and
+  a symlink to such a directory is the operator's choice; a missing one is made 0700, parents
+  included; a path that is a file is refused); the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
   usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
   this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees
   with this state dir's `golden.json` (`key_id`, `host_key`). Because the intent file is written
@@ -125,17 +132,29 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   that did not finish: whichever of the old and new build the golden is, nobody may bless it),
   a **missing** owner file, or a file that disagrees with the record. `golden --rebuild` always
   replaces and makes this state dir the owner. A moved or renamed state dir is a different
-  owner. The marker (like the lock) follows `$HOME`, but the golden follows the tart home, so
-  the marker records the resolved `TART_HOME` (else `~/.tart`) too: with the same `HOME` and
-  state dir but another `TART_HOME`, the same marker is seen against another set of VMs, and
-  plain `golden` and `check` exit 2 naming the tart home it was written for; under another
-  `HOME` there is no marker, which plain `golden` also refuses (exit 2). A `state_dir` in the
-  marker that is not an absolute path is a torn or forged marker (exit 2; a relative path is
-  never stat'ed). Plain `golden` also re-checks the owner just before it removes an existing
-  golden, so a golden that appeared during the build (a hand `tart rename`, a driver under
-  another `TART_HOME`) is never deleted without `--rebuild`: the build is discarded and
-  nothing is replaced.
-  **Upgrade note:** a golden built before owner files existed has none, so the first plain
+  owner. **The tart home** is resolved once, at startup, the way tart does it: `TART_HOME` if
+  set (even empty, which tart takes as the current directory; made absolute with `realpath`),
+  else `CFFIXED_USER_HOME`, else the passwd home, plus `/.tart`; `$HOME` is never consulted
+  (tart ignores it). The driver exports that value as `TART_HOME` to every `tart` command it
+  runs, so tart and the driver cannot disagree. The lock and the marker live under the passwd
+  home and are keyed by the tart home: one lock and one marker per tart home, and a different
+  `HOME`, a sandbox or `sudo -H` for the same user takes the same ones. A run under another
+  tart home finds no marker of its own, so plain `golden` exits 2 (a missing owner file); a
+  marker copied or forged under that name that records another tart home is refused naming it
+  (and so is `check`). An owner file of an earlier build of this change (named without the
+  tart key) is simply not found and is ignored, never trusted; a keyed one without a
+  `tart_home` field is refused (exit 2) with that reason and one `golden --rebuild` writes it.
+  A `state_dir` in the marker that is not an absolute printable path (a relative path, or one
+  with control characters) is a torn or forged marker (exit 2; it is never stat'ed, and only
+  printed in `repr` form). Plain `golden` also re-checks the owner at the start of the commit,
+  and again at the delete: a golden that was not there at the re-check and is there
+  at the delete (a hand `tart rename`, a driver under another tart home) is not deleted
+  without `--rebuild`; the finished build is kept, the previous owner file put back, and the
+  run exits 1. The remaining unattended deletion is the case where the owner file already
+  names this state dir (a final file that agrees with the record) but the usability test
+  fails: that golden is ours and is replaced.
+  **Upgrade note:** a golden built before owner files existed (or whose owner file is the
+  older unkeyed one) has none, so the first plain
   `golden` after upgrading exits 2 until one `golden --rebuild` writes it; `check` does not need
   the marker and still passes. (Letting a passing `check` write the missing marker is tracked as
   [issue 81](https://github.com/frdminc/tendcf/issues/81).) `check` reads the marker too: a
@@ -174,10 +193,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
   licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
   `golden` is stricter: it needs the host to itself and refuses when any VM is running.
-- **One driver at a time per host** (`flock` on one fixed file,
-  `~/.local/state/tendcf-state1-vm/driver.lock`, opened without following a symlink,
-  whatever `--state-dir` says; the path follows `$HOME` when the driver starts, so a run under
-  a different `HOME`, a sandbox or `sudo -H` takes a different lock), because the VM names (`state1-golden-build`,
+- **One driver at a time per tart home** (`flock` on `<passwd home>/.local/state/tendcf-state1-vm/driver-<tart key>.lock`,
+  opened without following a symlink, whatever `--state-dir` says; it follows the passwd
+  home and the resolved tart home, not `$HOME`, so a run under a different `HOME`, a sandbox
+  or `sudo -H` takes the same lock), because the VM names (`state1-golden-build`,
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
   so the sweeps above cannot delete a VM another run is using. The cap check is
   best-effort for VMs that other tools start.
