@@ -269,7 +269,12 @@ is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart 
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
-`after` at the end; Spotlight off (`mdutil -a -i off`); automatic update keys off; Gatekeeper on
+`after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back with a
+bounded settle: while it says `kMDConfigSearchLevelTransitioning`, ask again every 2 s for at
+most 120 s; `Indexing enabled` or any other answer is fatal at once); automatic updates off
+(the download and install keys through `defaults`, and automatic checking through
+`softwareupdate --schedule off`, read back with `softwareupdate --schedule`, which must say
+`Automatic checking for updates is turned off`); Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
 with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
@@ -286,12 +291,14 @@ Recovery.
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
+| 2g | Spotlight indexing off: `sudo -n mdutil -a -s` says `Indexing disabled.` for every volume and nothing else. While it says `kMDConfigSearchLevelTransitioning` it is asked again every 2 s, at most 120 s; `Indexing enabled`, another answer or a non-0 exit fails at once, and the timeout fails with the last output. The evidence ends `polls=N waited=Ns` | live |
+| 2h | automatic updates off: `sudo -n softwareupdate --schedule` exits 0 and says `Automatic checking for updates is turned off` (not `turned on`), and `AutomaticDownload` and `AutomaticallyInstallMacOSUpdates` read 0. `AutomaticCheckEnabled` is not read and need not exist (see "observed (macOS 27.2 26B123)") | live |
+| 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (a passing 10a names 2g's `polls=N waited=Ns` after the reboot, which measures the post-reboot settle) | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
 | 11 | stop and delete the clone, always | live |
 | 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
@@ -309,7 +316,7 @@ Recovery.
 4. Step 11a (bootout, remove, confirm `launchctl print` fails) needs the installed daemon;
    it runs before the stop-and-delete that step 11 already does.
 
-## Things not yet verified (the first real run, 2026-11-21, stopped at g6)
+## Things not yet verified, and what the real runs observed (2026-11-21)
 
 - The launchd disable list in `prep.sh` is a candidate list for a headless VM, applied only to
   labels whose plist ships on the image. The first real run's `before` snapshot is the
@@ -331,8 +338,28 @@ Recovery.
   addr=127.0.0.1` prints it, was key-only; the live refusal of a password login (g9, 2f) has not
   run. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
   cache, `tart ip --wait` answers, and that the vanilla image's Secure Token is enabled for
-  `admin`. Issue 78 stays open: the password rotation is `prep.sh` step 8, inside g6 and after
-  the step-7 `sshd -T` assertion that failed, so it has not run.
+  `admin`. (Run 2, below, ran the rotation.)
+- **Observed (macOS 27.2 26B123), run 2 on the merged sshd fix (2026-11-21):** `golden` passed
+  g1-g10, so the CamelCase fix works on the real guest and the rotation ran. `check` failed on
+  two things (2h and 10a), diagnosed on a clone of the golden:
+  - **`AutomaticCheckEnabled` does not survive a raw `defaults write`.** `prep.sh` wrote it and
+    read it back as 0, but the golden's `com.apple.SoftwareUpdate.plist` had no such key
+    afterwards (the other four keys were there), nothing on the clone rewrote the file (mtime
+    unchanged over 300 s), and `softwareupdate --schedule` printed `Automatic checking for
+    updates is turned on`. So prep now calls `softwareupdate --schedule off` and 2h trusts only
+    that command's answer. Untested until the next `golden`: that `--schedule off` itself
+    persists.
+  - **`mdutil -s` can say `kMDConfigSearchLevelTransitioning`**, three volumes at once
+    (`Error: unexpected indexing state.  kMDConfigSearchLevelTransitioning`), when read right
+    after the check's reboot. A first boot of a clone never showed it (0 to 300 s after ssh
+    came up: always `Indexing disabled.`). Whether, and for how long, it appears after a
+    reboot is what 10a's `waited=` now measures.
+  - Also, **Secure Token (issue 78), in part:** on a clone of the rotated golden,
+    `sysadminctl -secureTokenStatus admin` says `Secure token is ENABLED for user Managed via
+    Tart`, so the old-and-new `dscl` form did not strip it. `prep.sh` now logs that status
+    after the rotation (`secure token status (after): ...`) and the driver carries the line
+    into g6's evidence. Still unverified: that the volume-owner/FileVault credential followed
+    the new password.
 - Assumed from tart's source and docs, not run: `tart list --format json` field names
   (`Name`, `Running`), that a guest `shutdown -r` keeps `tart run` alive (if it exits, the
   driver restarts it), `spctl --global-enable`, and the `installer -pkg` run for python.org's
@@ -353,8 +380,9 @@ Recovery.
   ENABLED); whether the change also updates the APFS
   crypto-user credential (volume owner, FileVault and Recovery unlock) is unverified, and 2l
   proves only the Directory Services password. `prep.sh` records `sysadminctl -secureTokenStatus
-  admin` in the `before` snapshot and logs it, and changes nothing about the token; the first
-  real `golden` (issue 78) decides.
+  admin` in the `before` snapshot and logs it (and, since run 2, again after the rotation), and
+  changes nothing about the token; run 2 saw it still ENABLED after the rotation (issue 78, in
+  part: see the run 2 bullet above).
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
   Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
   lines the script compares, that python.org's installer leaves `Python.framework/Versions`

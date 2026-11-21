@@ -89,16 +89,34 @@ fi
 
 # 1. Spotlight off.
 mdutil -a -i off >/dev/null 2>&1 || true
-mdutil_out=$(mdutil -a -s 2>&1) || die "mdutil -a -s failed: $mdutil_out"
-case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled" ;; esac
+# mdutil -s answers kMDConfigSearchLevelTransitioning while a volume is still changing state
+# after the command above (macOS 27.2 after a reboot, issue 70 run 2): ask again every 2 s,
+# for at most 120 s. "Indexing enabled" or any other answer is not retried.
+mdutil_polls=1
+while :; do
+    mdutil_out=$(mdutil -a -s 2>&1) || die "mdutil -a -s failed: $mdutil_out"
+    case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled" ;; esac
+    case $mdutil_out in *kMDConfigSearchLevelTransitioning*) ;; *) break ;; esac
+    [ "$mdutil_polls" -lt 61 ] || die "mdutil -a -s still transitioning after 120 s: $mdutil_out"
+    mdutil_polls=$((mdutil_polls + 1))
+    sleep 2
+done
 case $mdutil_out in *"Indexing disabled"*) ;; *) die "mdutil -a -s did not report 'Indexing disabled': $mdutil_out" ;; esac
-log "spotlight: off"
+log "spotlight: off ($mdutil_polls poll(s), $(((mdutil_polls - 1) * 2)) s waited)"
 
 # 2. Automatic updates off (softwareupdate itself stays usable).
-for key in AutomaticCheckEnabled AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall; do
+for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall; do
     defaults write "$SU_PLIST" "$key" -bool false
     [ "$(defaults read "$SU_PLIST" "$key")" = 0 ] || die "$key did not read back as 0"
 done
+# Automatic checking is not a plain preference on macOS 27.2: a raw `defaults write` of
+# AutomaticCheckEnabled read back as 0 here, then the key was gone from the plist file and
+# `softwareupdate --schedule` still said "turned on" (issue 70 run 2). Ask softwareupdate itself,
+# and trust only its own answer.
+su_set=$(softwareupdate --schedule off 2>&1) || die "softwareupdate --schedule off failed: $su_set"
+su_out=$(softwareupdate --schedule 2>&1) || die "softwareupdate --schedule failed: $su_out"
+case $su_out in *"turned on"*) die "automatic update checking is still on: $su_out" ;; esac
+case $su_out in *"Automatic checking for updates is turned off"*) ;; *) die "softwareupdate --schedule did not say 'turned off': $su_out" ;; esac
 defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
 log "automatic updates: off"
 
@@ -220,6 +238,9 @@ auth_codes=$(printf '%s\n' "$auth_out" | grep -Eo 'eDS[A-Za-z]+' | sort -u)
 [ "$auth_codes" = "eDSAuthFailed" ] || die "dscl -authonly admin admin failed for another reason, not a wrong password: $auth_out"
 printf '%s\n' "$auth_out" | grep -q -- '-14090' || die "dscl -authonly admin admin did not report -14090: $auth_out"
 log "console password: rotated to a random value that is not stored"
+# Evidence for issue 78: does the admin account still hold its Secure Token after the rotation?
+# (status only; the driver carries this line into g6's evidence)
+log "secure token status (after): $(sysadminctl -secureTokenStatus admin 2>&1 | tr '\n' ' ')"
 
 snapshot after
 log "wrote after snapshot to $SNAP/after"

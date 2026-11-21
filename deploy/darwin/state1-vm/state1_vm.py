@@ -88,6 +88,17 @@ TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CONSOLE_PW_LINE_RE = re.compile(r"^PREP-CONSOLE-PW rotated\s*$", re.MULTILINE)
+# prep.sh logs the Secure Token status after the password rotation (issue 78); the driver
+# carries that one line into g6's evidence, which is cut short for a long prep output.
+SECURE_TOKEN_AFTER_RE = re.compile(
+    r"^prep: secure token status \(after\): .*$", re.MULTILINE
+)
+# `mdutil -a -s` says kMDConfigSearchLevelTransitioning while a volume is still changing state
+# after an earlier command (seen right after a reboot, issue 70 run 2): poll, bounded.
+MDUTIL_TRANSITIONING = "kMDConfigSearchLevelTransitioning"
+MDUTIL_SETTLE_TIMEOUT = 120.0
+MDUTIL_SETTLE_INTERVAL = 2.0
+UPDATES_OFF_LINE = "Automatic checking for updates is turned off"
 HOSTKEY_LINE_RE = re.compile(
     r"^PREP-HOSTKEY (ssh-ed25519) ([A-Za-z0-9+/]+={0,2})\s*$", re.MULTILINE
 )
@@ -1082,6 +1093,68 @@ def python_paths(image: dict) -> tuple[str, str]:
     return FRAMEWORK_ROOT, f"{FRAMEWORK_ROOT}/Versions/{minor}/bin/python{minor}"
 
 
+def mdutil_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
+    """`mdutil -a -s` says indexing is off on every volume, after a bounded settle.
+
+    While the output contains kMDConfigSearchLevelTransitioning the volume is still changing
+    state: ask again every MDUTIL_SETTLE_INTERVAL seconds for at most MDUTIL_SETTLE_TIMEOUT.
+    "Indexing enabled", a non-0 exit, or any text other than a volume header, "Indexing
+    disabled." and the transitioning error fails at once, never retried into a pass. The
+    evidence ends with `polls=N waited=Ns`, so a run measures how long a reboot's settle took.
+    """
+    start = ctx.monotonic()
+    polls = 0
+    while True:
+        r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
+        polls += 1
+        waited = ctx.monotonic() - start
+        note = f"polls={polls} waited={waited:.0f}s"
+        text = r.stdout
+        if r.rc != 0:
+            return False, f"rc {r.rc}: {clip(r.stdout or r.stderr, 300)}; {note}"
+        if "Indexing enabled" in text:
+            return False, f"{clip(text, 300)}; {note}"
+        if MDUTIL_TRANSITIONING in text:
+            if waited + MDUTIL_SETTLE_INTERVAL > MDUTIL_SETTLE_TIMEOUT:
+                return False, f"still transitioning: {clip(text, 300)}; {note}"
+            ctx.sleep(MDUTIL_SETTLE_INTERVAL)
+            continue
+        odd = [
+            ln
+            for ln in text.splitlines()
+            if ln.strip()
+            and not ln.rstrip().endswith(":")
+            and ln.strip() != "Indexing disabled."
+        ]
+        ok = "Indexing disabled" in text and not odd
+        why = "" if ok else f" (unexpected text {odd[:2]!r})" if odd else ""
+        return ok, f"{clip(text.strip(), 300)}{why}; {note}"
+
+
+def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
+    """Automatic update checking, download and install are off.
+
+    The check is `softwareupdate --schedule`, which is what the system itself answers with.
+    macOS 27.2 drops a raw `defaults write` of AutomaticCheckEnabled (issue 70 run 2: the key
+    was absent from the plist file while the schedule said "turned on"), so that key is not
+    read, and its absence is not a failure. AutomaticDownload and
+    AutomaticallyInstallMacOSUpdates must still read 0.
+    """
+    r = rssh(ctx, t, ["sudo", "-n", "softwareupdate", "--schedule"])
+    said = (r.stdout or r.stderr).strip()
+    ok = r.rc == 0 and UPDATES_OFF_LINE in said and "turned on" not in said
+    ev = [f"schedule rc {r.rc}: {clip(said, 200)!r}"]
+    for key in ("AutomaticDownload", "AutomaticallyInstallMacOSUpdates"):
+        r = rssh(
+            ctx,
+            t,
+            ["defaults", "read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
+        )
+        ok &= r.rc == 0 and r.stdout.strip() == "0"
+        ev.append(f"{key}={r.stdout.strip() or r.stderr.strip()}")
+    return ok, " ".join(ev)
+
+
 def persistent_assertions(
     ctx: Ctx, image: dict, t: vmssh.Target
 ) -> list[tuple[str, str, bool, str]]:
@@ -1145,33 +1218,11 @@ def persistent_assertions(
     ok_2e, ev_2e = sshd_key_only(r)
     out.append(("2e", "sshd effective config: key login only", ok_2e, ev_2e))
 
-    r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
-    out.append(
-        (
-            "2g",
-            "Spotlight indexing off",
-            r.rc == 0
-            and "Indexing enabled" not in r.stdout
-            and "Indexing disabled" in r.stdout,
-            r.stdout or r.stderr,
-        )
-    )
+    ok_2g, ev_2g = mdutil_off(ctx, t)
+    out.append(("2g", "Spotlight indexing off", ok_2g, ev_2g))
 
-    ev = []
-    ok = True
-    for key in (
-        "AutomaticCheckEnabled",
-        "AutomaticDownload",
-        "AutomaticallyInstallMacOSUpdates",
-    ):
-        r = rssh(
-            ctx,
-            t,
-            ["defaults", "read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
-        )
-        ok &= r.rc == 0 and r.stdout.strip() == "0"
-        ev.append(f"{key}={r.stdout.strip() or r.stderr.strip()}")
-    out.append(("2h", "automatic updates off", ok, " ".join(ev)))
+    ok_2h, ev_2h = updates_off(ctx, t)
+    out.append(("2h", "automatic updates off", ok_2h, ev_2h))
 
     fw, py = python_paths(image)
     r = rssh(ctx, t, [py, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
@@ -2169,8 +2220,15 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "prep.sh did not confirm the console password was rotated: "
                             + clip(out, 300)
                         )
+                    st = SECURE_TOKEN_AFTER_RE.search(out)
+                    token = (
+                        clip(st[0].removeprefix("prep: "), 300)
+                        if st
+                        else "secure token status (after): not printed by prep.sh"
+                    )
                     return (
-                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}"
+                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}; "
+                        f"{token}"
                     )
 
                 def pin() -> str:
@@ -2801,16 +2859,23 @@ def cmd_check(ctx: Ctx, args) -> int:
                     summary, "10", "reboot; ssh comes back", reboot, fatal=False
                 ):
                     t = state["t"]  # type: ignore[assignment]
+                    after = persistent_assertions(ctx, image, t)
                     bad = [
-                        f"{sid} {name}: {ev}"
-                        for sid, name, ok, ev in persistent_assertions(ctx, image, t)
-                        if not ok
+                        f"{sid} {name}: {ev}" for sid, name, ok, ev in after if not ok
+                    ]
+                    settle = [
+                        m[0]
+                        for sid, _n, _ok, ev in after
+                        if sid == "2g"
+                        and (m := re.search(r"polls=\d+ waited=\d+s", ev))
                     ]
                     summary.add(
                         "10a",
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
-                        "; ".join(bad) or "2a-2e, 2g-2l re-checked",
+                        "; ".join(bad)
+                        or "2a-2e, 2g-2l re-checked"
+                        + (f" (2g after the reboot: {settle[0]})" if settle else ""),
                     )
                 else:
                     summary.add(

@@ -53,6 +53,18 @@ FW_PYTHON_FIXED = "root:wheel 755"
 FW_ROOT = drv.FRAMEWORK_ROOT
 # `sshd -T` on macOS 27.2 (26B123, OpenSSH_10.5p1) prints CamelCase option names (observed on the
 # first real run, issue 70); stock OpenSSH prints them lowercase. Both must be accepted.
+MDUTIL_OFF = "/:\n\tIndexing disabled.\n/System/Volumes/Data:\n\tIndexing disabled.\n"
+MDUTIL_TRANSITIONING = (
+    "/:\n\tError: unexpected indexing state.  kMDConfigSearchLevelTransitioning\n"
+    "/System/Volumes/Data:\n\tError: unexpected indexing state.  kMDConfigSearchLevelTransitioning\n"
+)
+MDUTIL_ON = "/:\n\tIndexing enabled.\n"
+SU_OFF = "Automatic checking for updates is turned off\n"
+SU_ON = "Automatic checking for updates is turned on\n"
+SECURE_TOKEN_AFTER = (
+    "prep: secure token status (after): 2026-11-21 22:41:08.682 sysadminctl[422:2528] "
+    "Secure token is ENABLED for user Managed via Tart \n"
+)
 SSHD_CAMEL = (
     "UsePAM yes\nPermitRootLogin no\nPubkeyAuthentication yes\n"
     "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthOptions none\n"
@@ -117,6 +129,18 @@ class FakeWorld:
         self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
         self.sshd_rc = 0
         self.sshd_raw_newlines = []  # the raw_newlines flag of each sshd -T call
+        # `sudo -n mdutil -a -s`: the answers still to give, in order ((rc, stdout)), then
+        # mdutil_default for ever; mdutil_calls counts the calls
+        self.mdutil_outputs = []
+        self.mdutil_default = (0, MDUTIL_OFF)
+        self.mdutil_calls = 0
+        # `sudo -n softwareupdate --schedule` and the `defaults read` answers per key
+        self.su_schedule = (0, SU_OFF)
+        self.su_outputs = []  # answers still to give before su_schedule
+        self.defaults_values = {}  # key -> (rc, stdout, stderr)
+        # what prep.sh logs after the rotation, and noise before the PREP-RESULT line
+        self.prep_token_line = SECURE_TOKEN_AFTER
+        self.prep_noise = ""
         # behaviour switches
         self.new_hostkey = NEW_BLOB
         self.keyscan_blob = None  # None: the guest's real current key
@@ -387,7 +411,17 @@ class FakeWorld:
             )
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
-            return drv.Result(0, "/:\n\tIndexing disabled.\n")
+            self.mdutil_calls += 1
+            rc, out = (
+                self.mdutil_outputs.pop(0)
+                if self.mdutil_outputs
+                else self.mdutil_default
+            )
+            return drv.Result(rc, out)
+        if r == ["sudo", "-n", "softwareupdate", "--schedule"]:
+            return drv.Result(
+                *(self.su_outputs.pop(0) if self.su_outputs else self.su_schedule)
+            )
         if r[:4] == ["sudo", "-n", "launchctl", "print-disabled"]:
             on = self.screensharing_on
             return drv.Result(
@@ -420,6 +454,8 @@ class FakeWorld:
                 "Authentication for node /Local/Default failed. (-14090, eDSAuthFailed)\n",
             )
         if r[0] == "defaults":
+            if r[-1] in self.defaults_values:
+                return drv.Result(*self.defaults_values[r[-1]])
             return drv.Result(0, "0\n")
         if r[0].endswith("python3.14"):
             return drv.Result(0, "3.14.10\n")
@@ -474,8 +510,13 @@ class FakeWorld:
                 )
             )
             assert old != self.new_hostkey
+            token = (
+                self.prep_token_line if "secure token status (after)" in script else ""
+            )
             return drv.Result(
-                0, f"prep: ok\n{key}PREP-RESULT disabled=3 absent=22 failed=0\n"
+                0,
+                f"prep: ok\n{self.prep_noise}{token}{key}"
+                "PREP-RESULT disabled=3 absent=22 failed=0\n",
             )
         assert "INSTALL-PYTHON-RESULT" in script, script[:80]
         # The real script's fix-up cannot run here; its presence in the text is what the
@@ -1013,6 +1054,32 @@ class Golden(Base):
         self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
         self.assertFalse((self.ctx.state_dir / "golden.json").exists())
         self.assertEqual(self.world.vms, {})
+
+    def test_g6_evidence_carries_the_secure_token_after_line_even_from_long_output(
+        self,
+    ):
+        # issue 78: the line sits far from the end of a long prep output and still reaches g6
+        self.world.prep_noise = "".join(
+            f"prep: disabled com.apple.example{i}\n" for i in range(400)
+        )
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["g6"]["evidence"]
+        self.assertIn("PREP-RESULT disabled=3 absent=22 failed=0", ev)
+        self.assertIn("secure token status (after):", ev)
+        self.assertIn("Secure token is ENABLED for user Managed via Tart", ev)
+        self.assertNotIn("example399", ev)  # it is the one line, not the noise
+
+    def test_g6_says_so_when_prep_printed_no_secure_token_line(self):
+        self.world.prep_token_line = ""
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(
+            rc, 0, s
+        )  # evidence for issue 78, never a reason to fail the build
+        self.assertIn(
+            "secure token status (after): not printed by prep.sh",
+            self.steps(s)["g6"]["evidence"],
+        )
 
     def test_prep_must_print_exactly_one_valid_hostkey_line(self):
         for n in (0, 2):
@@ -3010,6 +3077,123 @@ class Check(Base):
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn("carriage return", st["evidence"], name)
 
+    # -- 2g / 10a: Spotlight off, with a bounded settle (issue 70 run 2)
+    def test_2g_waits_out_transitioning_and_records_polls_and_seconds(self):
+        self.world.mdutil_outputs = [
+            (0, MDUTIL_TRANSITIONING),
+            (0, MDUTIL_TRANSITIONING),
+        ]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)["2g"]
+        self.assertEqual(st["status"], "pass")
+        self.assertIn("polls=3 waited=4s", st["evidence"])  # 2 s between polls
+
+    def test_2g_transitioning_until_the_timeout_fails_with_the_last_output(self):
+        self.world.mdutil_default = (0, MDUTIL_TRANSITIONING)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        st = self.steps(s)["2g"]
+        self.assertEqual(st["status"], "fail")
+        self.assertIn("still transitioning", st["evidence"])
+        self.assertIn("kMDConfigSearchLevelTransitioning", st["evidence"])
+        self.assertIn("polls=61 waited=120s", st["evidence"])  # bounded at 120 s
+
+    def test_2g_never_retries_indexing_enabled_or_other_text_into_a_pass(self):
+        for name, first, polls in (
+            ("enabled", (0, MDUTIL_ON), 1),
+            ("enabled after transitioning", (0, MDUTIL_TRANSITIONING), 2),
+            ("non-zero exit", (1, MDUTIL_OFF), 1),
+            ("unexpected text", (0, MDUTIL_OFF + "\tSomething else happened\n"), 1),
+            ("no state at all", (0, ""), 1),
+        ):
+            with self.subTest(name):
+                self.world.mdutil_outputs = (
+                    [first, (0, MDUTIL_ON)] if polls == 2 else [first, (0, MDUTIL_OFF)]
+                )
+                self.world.mdutil_calls = 0
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                st = self.steps(s)["2g"]
+                self.assertEqual(st["status"], "fail", name)
+                self.assertIn(f"polls={polls} ", st["evidence"], name)
+                self.world.mdutil_outputs = []
+
+    def test_10a_passes_after_a_post_reboot_settle_and_says_how_long_it_took(self):
+        # 2g passes at once, then the post-reboot read says Transitioning three times
+        self.world.mdutil_outputs = [
+            (0, MDUTIL_OFF),
+            (0, MDUTIL_TRANSITIONING),
+            (0, MDUTIL_TRANSITIONING),
+            (0, MDUTIL_TRANSITIONING),
+        ]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)
+        self.assertIn("polls=1 waited=0s", st["2g"]["evidence"])
+        self.assertEqual(st["10a"]["status"], "pass")
+        self.assertIn("2g after the reboot: polls=4 waited=6s", st["10a"]["evidence"])
+
+    # -- 2h / 10a: automatic updates off, by what softwareupdate itself says
+    def test_2h_passes_on_turned_off_and_does_not_need_the_automaticcheckenabled_key(
+        self,
+    ):
+        self.world.defaults_values["AutomaticCheckEnabled"] = (
+            1,
+            "",
+            "Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.",
+        )
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)["2h"]
+        self.assertEqual(st["status"], "pass")
+        self.assertIn("Automatic checking for updates is turned off", st["evidence"])
+        self.assertIn("AutomaticDownload=0", st["evidence"])
+        self.assertIn("AutomaticallyInstallMacOSUpdates=0", st["evidence"])
+        self.assertNotIn("AutomaticCheckEnabled", st["evidence"])
+        reads = [
+            a[-1] for a, _ in self.world.ssh_calls if "AutomaticCheckEnabled" in a[-1]
+        ]
+        self.assertEqual(reads, [])  # never read at all
+
+    def test_2h_fails_unless_softwareupdate_says_automatic_checking_is_off(self):
+        cases = (
+            ("turned on", (0, SU_ON)),
+            ("empty answer", (0, "")),
+            ("non-zero exit with the right words", (1, SU_OFF)),
+            ("both words", (0, SU_OFF + SU_ON)),
+            ("something else", (0, "Software Update is disabled\n")),
+        )
+        for name, answer in cases:
+            with self.subTest(name):
+                self.world.su_schedule = answer
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                st = self.steps(s)
+                self.assertEqual(st["2h"]["status"], "fail", name)
+                self.assertIn("schedule rc", st["2h"]["evidence"], name)
+
+    def test_2h_still_needs_download_and_install_to_read_zero(self):
+        for key in ("AutomaticDownload", "AutomaticallyInstallMacOSUpdates"):
+            with self.subTest(key):
+                self.world.defaults_values[key] = (0, "1\n", "")
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                st = self.steps(s)["2h"]
+                self.assertEqual(st["status"], "fail")
+                self.assertIn(f"{key}=1", st["evidence"])
+
+    def test_10a_reruns_2h_and_reports_a_schedule_that_turned_back_on(self):
+        # the golden says "off" at the first read; after the reboot it says "on"
+        self.world.su_outputs = [(0, SU_OFF), (0, SU_ON)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        st = self.steps(s)
+        self.assertEqual(st["2h"]["status"], "pass")
+        self.assertEqual(st["10a"]["status"], "fail")
+        self.assertIn("2h automatic updates off: schedule rc 0", st["10a"]["evidence"])
+        self.assertIn("turned on", st["10a"]["evidence"])
+
     def test_reboot_restarts_tart_run_when_it_exits(self):
         self.world.run_exits_on_reboot = True
         rc, s = self.run_cmd(*self.check_args())
@@ -4115,6 +4299,141 @@ class GuestScripts(unittest.TestCase):
             )
             self.assertEqual(r.returncode, want_rc, (rc_env, r.stdout, r.stderr))
             self.assertNotIn("REACHED", r.stdout)
+
+    def fake_bin(self, name, body):
+        d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        f = d / name
+        f.write_text("#!/bin/sh\n" + body)
+        f.chmod(0o755)
+        return d
+
+    def run_snippet(self, snippet, fakes, env=None):
+        """Run a slice of prep.sh with fake tools first on PATH: nothing on the host is touched."""
+        bins = [self.fake_bin(n, b) for n, b in fakes.items()]
+        stub = (
+            'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+            'log() { printf "prep: %s\\n" "$*"; }\n'
+        )
+        path = ":".join(str(b) for b in bins) + ":/usr/bin:/bin"
+        return subprocess.run(
+            ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": path, **(env or {})},
+        )
+
+    def test_prep_settles_mdutil_with_a_bounded_retry(self):
+        text = self.text("prep.sh")
+        a = text.index("mdutil_polls=1")
+        b = text.index('log "spotlight: off', a)
+        snippet = text[a : text.index("\n", b) + 1]
+        self.assertNotIn("/usr/bin/mdutil", snippet)
+        seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-seq-"))
+        self.addCleanup(shutil.rmtree, seq, True)
+        fakes = {
+            # the Nth call prints $SEQ/out.N, else $SEQ/out.last; the exit status is MDUTIL_RC
+            "mdutil": 'D=$SEQ; n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n + 1)); '
+            'echo "$n" >"$D/n"; f="$D/out.$n"; [ -f "$f" ] || f="$D/out.last"; '
+            'cat "$f"; exit "${MDUTIL_RC:-0}"\n',
+            "sleep": 'echo "$1" >>"$SEQ/slept"\n',
+        }
+
+        def run(outs, last, rc="0"):
+            for f in seq.iterdir():
+                f.unlink()
+            for i, o in enumerate(outs, 1):
+                (seq / f"out.{i}").write_text(o)
+            (seq / "out.last").write_text(last)
+            return self.run_snippet(snippet, fakes, {"SEQ": str(seq), "MDUTIL_RC": rc})
+
+        slept = lambda: (
+            (seq / "slept").read_text().split() if (seq / "slept").exists() else []
+        )
+        r = run([MDUTIL_TRANSITIONING] * 2, MDUTIL_OFF)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("3 poll(s), 4 s waited", r.stdout)
+        self.assertEqual(slept(), ["2", "2"])
+        r = run([], MDUTIL_TRANSITIONING)  # never settles: 60 waits of 2 s, then dies
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still transitioning after 120 s", r.stderr)
+        self.assertEqual(len(slept()), 60)
+        r = run([MDUTIL_ON], MDUTIL_OFF)  # enabled is never retried into a pass
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still enabled", r.stderr)
+        self.assertEqual(slept(), [])
+        r = run([MDUTIL_TRANSITIONING], MDUTIL_ON)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still enabled", r.stderr)
+        r = run([], "something else\n")  # not the wanted answer, and not retried
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("did not report 'Indexing disabled'", r.stderr)
+        self.assertEqual(slept(), [])
+        r = run([], MDUTIL_OFF, rc="1")  # a failing mdutil dies, whatever it printed
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("mdutil -a -s failed", r.stderr)
+
+    def test_prep_turns_automatic_update_checks_off_through_softwareupdate(self):
+        text = self.text("prep.sh")
+        loop = text[
+            text.index("for key in ") : text.index("done", text.index("for key in "))
+        ]
+        self.assertNotIn("AutomaticCheckEnabled", loop)  # macOS 27.2 drops that raw key
+        for key in (
+            "AutomaticDownload",
+            "AutomaticallyInstallMacOSUpdates",
+            "ConfigDataInstall",
+            "CriticalUpdateInstall",
+        ):
+            self.assertIn(key, loop)
+        a = text.index("su_set=$(softwareupdate --schedule off")
+        b = text.index('is turned off"*)', a)
+        snippet = text[a : text.index("\n", b) + 1]
+        code = [ln for ln in snippet.split("\n") if ln and not ln.startswith("#")]
+        self.assertEqual(
+            len(code), 4, code
+        )  # set, read back, two case checks: nothing else
+        fakes = {
+            # `--schedule off` -> rc SU_SET_RC; `--schedule` -> prints SU_OUT, rc SU_RC
+            "softwareupdate": 'if [ "$2" = off ]; then echo "set"; exit "${SU_SET_RC:-0}"; fi; '
+            'printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
+        }
+        off = "Automatic checking for updates is turned off\n"
+        on = "Automatic checking for updates is turned on\n"
+        for name, env, want_rc, want_msg in (
+            ("off", {"SU_OUT": off}, 0, ""),
+            ("still on", {"SU_OUT": on}, 1, "still on"),
+            ("both words", {"SU_OUT": off + on}, 1, "still on"),
+            ("empty answer", {"SU_OUT": ""}, 1, "did not say 'turned off'"),
+            ("other words", {"SU_OUT": "disabled\n"}, 1, "did not say 'turned off'"),
+            (
+                "set fails",
+                {"SU_OUT": off, "SU_SET_RC": "1"},
+                1,
+                "--schedule off failed",
+            ),
+            ("read-back fails", {"SU_OUT": off, "SU_RC": "1"}, 1, "--schedule failed"),
+        ):
+            with self.subTest(name):
+                r = self.run_snippet(snippet, fakes, env)
+                self.assertEqual(r.returncode, want_rc, (r.stdout, r.stderr))
+                self.assertIn(want_msg, r.stderr)
+        # it runs after the defaults loop and before Gatekeeper, and the old raw write is gone
+        self.assertLess(text.index("su_set=$("), text.index("# 3. Gatekeeper on"))
+
+    def test_prep_records_the_secure_token_status_after_the_rotation(self):
+        text = self.text("prep.sh")
+        self.assertIn("secure token status (after)", text)
+        self.assertLess(
+            text.index('log "console password: rotated'),
+            text.index("secure token status (after)"),
+        )
+        self.assertLess(
+            text.index("secure token status (after)"), text.index("snapshot after")
+        )
+        self.assertNotIn("-resetPasswordFor", text)  # status only
+        self.assertNotIn("-secureTokenOn", text)
 
     def test_prep_prints_the_host_key_from_inside_the_session(self):
         text = self.text("prep.sh")
