@@ -58,13 +58,15 @@ import vmssh
 HERE = Path(__file__).resolve().parent
 DEFAULT_IMAGE_JSON = HERE / "image.json"
 # The account's home from the passwd entry, never $HOME: tart itself (Foundation) ignores
-# $HOME, so a second $HOME of the same user must not mean a second lock or marker.
+# $HOME, so a second $HOME of the same user must not mean a second lock (or marker).
 DEFAULT_STATE_DIR = (
     Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "state" / "tendcf-state1-vm"
 )
-# One lock per tart home (see resolve_tart_home) whatever --state-dir says: the VM names
-# (state1-golden-build, state1-check-*) are global within a tart home, so the lock has to be
-# too, and two tart homes are two sets of VMs.
+# One host-wide lock (DEFAULT_STATE_DIR/driver.lock, the name master uses) whatever
+# --state-dir and the tart home say: the VM names (state1-golden-build, state1-check-*) are
+# global to a tart home and the state dirs are shared across tart homes, so one driver at a
+# time per host. Only the owner marker is keyed by tart home.
+LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
@@ -220,20 +222,49 @@ def tail_file(path: Path, limit: int = EVIDENCE_MAX) -> str:
 def resolve_tart_home(environ: dict[str, str] | None = None) -> str:
     """The tart home `tart` itself uses, resolved (tart's Config.swift): $TART_HOME whenever
     it is set, even to the empty string (realpath("") is the cwd, as in tart); else the
-    account's home (CFFIXED_USER_HOME if set, else the passwd entry: never $HOME) plus
+    account's home (CFFIXED_USER_HOME if set, even empty, else the passwd entry: never $HOME) plus
     /.tart. Computed once per run (Ctx) and exported as TART_HOME to every tart call, so tart
     and this driver cannot disagree."""
     env = os.environ if environ is None else environ
     raw = env.get("TART_HOME")
     if raw is not None:
         return os.path.realpath(raw)
-    base = env.get("CFFIXED_USER_HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    base = env.get("CFFIXED_USER_HOME")  # set but empty is the cwd, as in Foundation
+    if base is None:
+        base = pwd.getpwuid(os.getuid()).pw_dir
     return os.path.realpath(os.path.join(base, ".tart"))
 
 
 def tart_key(tart_home: str) -> str:
     """A short stable name part for one tart home: its lock and its owner markers."""
-    return hashlib.sha256(tart_home.encode()).hexdigest()[:8]
+    return hashlib.sha256(os.fsencode(tart_home)).hexdigest()[:8]
+
+
+def state_dir_link_problem(given: Path) -> str:
+    """Why a --state-dir that is itself a symlink must not be followed ("" when fine): one
+    that dangles would make the driver create its target (and missing parents) wherever the
+    link points, and one that another user owns lets them choose where the state dir is. A
+    symlink of ours to an existing directory is the operator's choice and stays accepted.
+    Ancestors of the path are not checked (tracked in issue 82)."""
+    try:
+        st = os.lstat(given)
+    except OSError:
+        return ""  # missing (made later) or unreadable (the stat there says so)
+    if not stat.S_ISLNK(st.st_mode):
+        return ""
+    if st.st_uid != os.getuid():
+        return (
+            f"the state dir {str(given)!r} is a symlink owned by uid {st.st_uid}, not you: "
+            "refusing to follow it (pass the real directory)"
+        )
+    try:
+        os.stat(given)
+    except OSError:
+        return (
+            f"the state dir {str(given)!r} is a symlink that points nowhere: refusing to "
+            "create its target (make the directory or pass a real path)"
+        )
+    return ""
 
 
 @dataclass
@@ -250,16 +281,18 @@ class Ctx:
     run_id: str = ""
     lock_path: Path | None = None
     tart_home: str = ""
+    state_dir_refusal: str = ""
 
     def __post_init__(self) -> None:
+        # a symlink given as the state dir that dangles, or is not ours, is refused (by
+        # check_state_dir, before anything is created) rather than followed
+        self.state_dir_refusal = state_dir_link_problem(Path(self.state_dir))
         # resolved once, at startup: a later retarget of a symlink or a chdir cannot move it
         self.state_dir = Path(os.path.realpath(self.state_dir))
         if not self.tart_home:
             self.tart_home = resolve_tart_home()
         if self.lock_path is None:
-            self.lock_path = (
-                DEFAULT_STATE_DIR / f"driver-{tart_key(self.tart_home)}.lock"
-            )
+            self.lock_path = DEFAULT_STATE_DIR / LOCK_NAME
         if not self.run_id:
             self.run_id = (
                 self.now().strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(2)
@@ -814,7 +847,8 @@ def write_landed(dest: Path, text: str, mode: int = 0o600) -> None:
 
 @contextlib.contextmanager
 def driver_lock(ctx: Ctx):
-    """One driver per host, whatever --state-dir says; never follows a symlink at the path."""
+    """One driver per host (one lock file, whatever --state-dir and the tart home say); never
+    follows a symlink at the path."""
     ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # the owner marker beside the lock gates an unattended rebuild: nobody else may plant,
     # replace or delete it, so the directory is ours and not group or world writable
@@ -852,6 +886,8 @@ def check_state_dir(ctx: Ctx) -> None:
     included, so a later retarget or chdir does not move it); a missing one is made 0700 with
     its missing parents (umask 077 around the mkdir). Mode bits only: macOS ACLs are not
     considered, and ancestors of an existing path are not checked."""
+    if ctx.state_dir_refusal:
+        raise Refusal(ctx.state_dir_refusal)
     old = os.umask(0o077)
     try:
         ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1458,10 +1494,11 @@ def golden_record(ctx: Ctx) -> tuple[str, str]:
     return rec["key_id"], rec["authorized_key"]
 
 
-# The owner marker. The tart golden is global to the host and the records are per
-# --state-dir, so one file per golden name lives beside the driver lock (the lock is per host
-# whatever --state-dir says, so every state dir sees it): ~/.local/state/tendcf-state1-vm/
-# golden-owner-<golden name>.json. It is a compare-only input: nothing in it ever reaches ssh.
+# The owner marker. The tart golden is global to a tart home and the records are per
+# --state-dir, so one file per golden name and tart home lives beside the driver lock (the
+# lock directory is the passwd home's, whatever --state-dir says, so every state dir sees it):
+# <passwd home>/.local/state/tendcf-state1-vm/golden-owner-<golden name>-<tart key>.json. It
+# is a compare-only input: nothing in it ever reaches ssh.
 OWNER_FINAL = "final"
 OWNER_COMMITTING = "committing"
 OWNER_MAX_BYTES = 64 * 1024
@@ -2325,13 +2362,18 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         removed = False
                         if golden in local_vms(ctx):
                             if not (args.rebuild or present_at_check):
-                                # it appeared after the owner re-check: nobody checked it
-                                back = restore_marker(prev_marker, prev_readable)
+                                # it appeared after the owner re-check: nobody checked
+                                # it, so no marker may bless it: the intent (committing)
+                                # marker stays, and plain `golden` refuses until --rebuild
                                 raise ToolError(
                                     f"{golden} appeared after the owner check, so it was "
-                                    f"not replaced; {back}; the finished build is kept as "
-                                    f"{build}: run `golden --rebuild` to replace {golden} "
-                                    "(this state dir then owns it)"
+                                    f"not replaced; the owner file now says a commit did "
+                                    f"not finish, so plain `golden` refuses (exit 2) until "
+                                    f"`--rebuild`; the finished build is kept as {build} "
+                                    "but no records were parked, so it cannot be finished "
+                                    "by hand: `golden --rebuild` sweeps it, replaces "
+                                    f"{golden} and builds afresh (this state dir then "
+                                    "owns it)"
                                 )
                             try:
                                 done = remove_vm(ctx, golden)

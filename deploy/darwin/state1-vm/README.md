@@ -121,7 +121,8 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   never waited on). The state dir (`--state-dir`, which holds the pin and the record) gets the
   same ownership and mode check (the path is resolved with `realpath` once, at startup, and
   a symlink to such a directory is the operator's choice; a missing one is made 0700, parents
-  included; a path that is a file is refused); the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
+  included; a path that is a file is refused, and so is a `--state-dir` that is itself a
+  symlink that points nowhere or is not yours: nothing is created through it); the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
   usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
   this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees
   with this state dir's `golden.json` (`key_id`, `host_key`). Because the intent file is written
@@ -134,11 +135,14 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   replaces and makes this state dir the owner. A moved or renamed state dir is a different
   owner. **The tart home** is resolved once, at startup, the way tart does it: `TART_HOME` if
   set (even empty, which tart takes as the current directory; made absolute with `realpath`),
-  else `CFFIXED_USER_HOME`, else the passwd home, plus `/.tart`; `$HOME` is never consulted
-  (tart ignores it). The driver exports that value as `TART_HOME` to every `tart` command it
+  else `CFFIXED_USER_HOME` (set but empty is the current directory, as in Foundation), else
+  the passwd home, plus `/.tart`; `$HOME` is never consulted (tart ignores it). The driver exports that value as `TART_HOME` to every `tart` command it
   runs, so tart and the driver cannot disagree. The lock and the marker live under the passwd
-  home and are keyed by the tart home: one lock and one marker per tart home, and a different
-  `HOME`, a sandbox or `sudo -H` for the same user takes the same ones. A run under another
+  home: one host-wide lock (see Guards), and one marker per tart home (named by the tart
+  key), and a different `HOME`, a sandbox or `sudo -H` for the same user takes the same ones.
+  The marker is keyed, the state dir is not: a state dir is not meant to be shared across
+  tart homes (one `golden.json` can describe one golden), so use one `--state-dir` per tart
+  home. A run under another
   tart home finds no marker of its own, so plain `golden` exits 2 (a missing owner file); a
   marker copied or forged under that name that records another tart home is refused naming it
   (and so is `check`). An owner file of an earlier build of this change (named without the
@@ -149,8 +153,9 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   printed in `repr` form). Plain `golden` also re-checks the owner at the start of the commit,
   and again at the delete: a golden that was not there at the re-check and is there
   at the delete (a hand `tart rename`, a driver under another tart home) is not deleted
-  without `--rebuild`; the finished build is kept, the previous owner file put back, and the
-  run exits 1. The remaining unattended deletion is the case where the owner file already
+  without `--rebuild`; the finished build is kept (no records are parked, so it cannot be
+  finished by hand), the owner file stays `committing`, so plain `golden` exits 2 until
+  `golden --rebuild` sweeps the kept build and builds afresh, and the run exits 1. The remaining unattended deletion is the case where the owner file already
   names this state dir (a final file that agrees with the record) but the usability test
   fails: that golden is ours and is replaced.
   **Upgrade note:** a golden built before owner files existed (or whose owner file is the
@@ -193,10 +198,12 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
   licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
   `golden` is stricter: it needs the host to itself and refuses when any VM is running.
-- **One driver at a time per tart home** (`flock` on `<passwd home>/.local/state/tendcf-state1-vm/driver-<tart key>.lock`,
-  opened without following a symlink, whatever `--state-dir` says; it follows the passwd
-  home and the resolved tart home, not `$HOME`, so a run under a different `HOME`, a sandbox
-  or `sudo -H` takes the same lock), because the VM names (`state1-golden-build`,
+- **One driver at a time per host** (`flock` on one fixed file,
+  `<passwd home>/.local/state/tendcf-state1-vm/driver.lock`, opened without following a
+  symlink, whatever `--state-dir` and the tart home say; the path follows the passwd home, not
+  `$HOME`, so a run under a different `HOME`, a sandbox or `sudo -H` takes the same lock, and
+  an older driver and this one exclude each other when `$HOME` is the passwd home), because
+  the VM names (`state1-golden-build`,
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
   so the sweeps above cannot delete a VM another run is using. The cap check is
   best-effort for VMs that other tools start.

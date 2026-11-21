@@ -2223,6 +2223,13 @@ class Golden(Base):
             drv.resolve_tart_home({"HOME": str(self.tmp / "fake")}),
             os.path.realpath(pw / ".tart"),
         )
+        # an empty CFFIXED_USER_HOME is the cwd, as in Foundation (not the passwd home)
+        self.assertEqual(
+            drv.resolve_tart_home({"CFFIXED_USER_HOME": ""}),
+            os.path.realpath(os.path.join(os.getcwd(), ".tart")),
+        )
+        # a name that is not UTF-8 still gets a key
+        self.assertRegex(drv.tart_key(os.fsdecode(b"/x/\xff/.tart")), r"^[0-9a-f]{8}$")
 
     def test_a_second_home_of_the_same_user_has_the_same_lock_marker_and_tart_home(
         self,
@@ -2332,8 +2339,8 @@ class Golden(Base):
         self.assertIn(GOLDEN, self.world.vms)
         self.assertNotIn(["tart", "delete", GOLDEN], [c for c, _ in self.world.calls])
 
-    def test_a_golden_that_appears_after_the_recheck_is_kept_and_so_is_the_build(self):
-        build = f"{GOLDEN}-build"
+    def appears_after_the_intent(self):
+        """Patch atomic_write so the golden shows up right after the intent owner file."""
         real = drv.atomic_write
         seen = []
 
@@ -2343,20 +2350,52 @@ class Golden(Base):
                 seen.append(text)  # the intent file is down: now the golden shows up
                 self.world.vms[GOLDEN] = {"Running": False}
 
-        with mock.patch.object(drv, "atomic_write", wrapper):
-            rc, s = self.run_cmd(*self.golden_args())
-        self.assertEqual(rc, 1, s)
+        return mock.patch.object(drv, "atomic_write", wrapper)
+
+    def check_late_appearance(self, s, since=0):
+        build = f"{GOLDEN}-build"
+        self.assertEqual(s["ok"], False)
         ev = " | ".join(x["evidence"] for x in s["steps"])
         self.assertIn("appeared after the owner check", ev)
         self.assertIn("--rebuild", ev)
-        self.assertIn("the owner file is removed again", ev)
-        calls = [c for c, _ in self.world.calls]
+        self.assertIn("no records were parked", ev)
+        self.assertIn("sweeps it", ev)
+        calls = [c for c, _ in self.world.calls[since:]]
         self.assertNotIn(["tart", "delete", GOLDEN], calls)
         self.assertNotIn(["tart", "rename", build, GOLDEN], calls)
         self.assertIn(GOLDEN, self.world.vms)
         self.assertIn(build, self.world.vms)  # the finished build is kept
-        self.assertFalse(self.owner_file().exists())
+        # no marker blesses a golden nobody checked: the intent file stays
+        self.assertEqual(
+            json.loads(self.owner_file().read_text())["state"], "committing"
+        )
+
+    def test_a_golden_that_appears_after_the_recheck_is_kept_and_so_is_the_build(self):
+        with self.appears_after_the_intent():
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.check_late_appearance(s)
         self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+        # the next plain golden refuses (this state dir has no record of that golden)
+        rc, ev, _ = self.plain(self.second_run_ctx())
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("--rebuild", ev)
+
+    def test_a_late_golden_does_not_restore_a_previous_final_marker(self):
+        self.run_cmd(*self.golden_args())
+        self.assertEqual(json.loads(self.owner_file().read_text())["state"], "final")
+        self.world.vms.pop(
+            GOLDEN
+        )  # deleted by hand; the final marker and record remain
+        since = len(self.world.calls)
+        with self.appears_after_the_intent():
+            rc, s = self.run_cmd(*self.golden_args(), ctx=self.second_run_ctx())
+        self.assertEqual(rc, 1, s)
+        self.check_late_appearance(s, since)
+        # the next plain golden must not say "nothing to do" over a golden nobody checked
+        rc, ev, _ = self.plain(self.second_run_ctx("20261123T000000Z-next"))
+        self.assertEqual(rc, 2, ev)
+        self.assertNotIn("nothing to do", ev)
 
     def test_a_marker_state_dir_with_control_characters_is_refused_and_printed_safely(
         self,
@@ -2383,21 +2422,26 @@ class Golden(Base):
         self.assertNotIn("\x1b", cev)
 
     def test_a_state_dir_is_resolved_once_and_its_parents_are_made_0700(self):
-        target = self.tmp / "real-target"
-        link = self.tmp / "link"
-        link.symlink_to(
-            target
-        )  # dangling: the target is made, not a "File exists" error
+        # missing parents are made 0700 whatever the umask
+        deep = self.tmp / "a" / "b" / "c"
         old = os.umask(0)
         try:
-            ctx = self.make_ctx(link / "sub", run_id="20261121T000000Z-ln")
+            ctx = self.make_ctx(deep, run_id="20261121T000000Z-deep")
             rc, ev, _ = self.plain(ctx)
         finally:
             os.umask(old)
         self.assertEqual(rc, 0, ev)
-        self.assertEqual(ctx.state_dir, Path(os.path.realpath(target / "sub")))
-        for d in (target, target / "sub"):
+        for d in (deep, deep.parent, deep.parent.parent):
             self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, str(d))
+        # a symlink of ours to a directory of ours is the operator's choice: resolved once
+        real_dir = self.tmp / "real-dir"
+        real_dir.mkdir(mode=0o700)
+        link = self.tmp / "link"
+        link.symlink_to(real_dir)
+        ctx = self.make_ctx(link, run_id="20261121T000000Z-ln")
+        self.assertEqual(ctx.state_dir, Path(os.path.realpath(real_dir)))
+        link.unlink()  # a later retarget cannot move it
+        self.assertEqual(ctx.state_dir, Path(os.path.realpath(real_dir)))
         # a relative path becomes absolute before anything uses it
         back = os.getcwd()
         try:
@@ -2415,6 +2459,33 @@ class Golden(Base):
         rc, ev, _ = self.plain(self.make_ctx(flink, run_id="20261121T000000Z-fl"))
         self.assertEqual(rc, 2, ev)
         self.assertIn("not a directory", ev)
+
+    def test_a_symlink_state_dir_that_dangles_is_refused_and_creates_nothing(self):
+        target = self.tmp / "elsewhere" / "target"
+        link = self.tmp / "dangling"
+        link.symlink_to(target)
+        for cmd in (self.golden_args(), self.check_args()):
+            rc, s = self.run_cmd(*cmd, ctx=self.make_ctx(link, "20261121T000000Z-dg"))
+            self.assertEqual(rc, 2, s)
+            self.assertIn("points nowhere", s["steps"][-1]["evidence"])
+        self.assertFalse(target.exists())
+        self.assertFalse(target.parent.exists())
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_a_symlink_state_dir_that_is_not_ours_is_refused(self):
+        real_dir = self.tmp / "theirs"
+        real_dir.mkdir(mode=0o700)
+        link = self.tmp / "foreign"
+        link.symlink_to(real_dir)
+        # the link's owner is "someone else" for the Ctx that reads it
+        with mock.patch.object(drv.os, "getuid", return_value=os.getuid() + 1):
+            ctx = self.make_ctx(link, "20261121T000000Z-fo")
+        self.assertIn("not you", ctx.state_dir_refusal)
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)
+        self.assertEqual(rc, 2, s)
+        self.assertIn("refusing to follow", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        self.assertEqual(list(real_dir.iterdir()), [])  # nothing written into it
 
     def test_full_fsync_falls_back_only_when_the_filesystem_cannot_do_it(self):
         f = self.tmp / "ff"
@@ -3273,10 +3344,39 @@ class Check(Base):
         # and the default lock path does not depend on the state dir at all
         a, b = drv.Ctx(state_dir=Path("/x/a")), drv.Ctx(state_dir=Path("/x/b"))
         self.assertEqual(a.lock_path, b.lock_path)
-        self.assertEqual(
-            a.lock_path,
-            drv.DEFAULT_STATE_DIR / f"driver-{drv.tart_key(a.tart_home)}.lock",
+        # one fixed file under the passwd home, the name master uses, whatever the tart home
+        self.assertEqual(a.lock_path, drv.DEFAULT_STATE_DIR / "driver.lock")
+        c = drv.Ctx(state_dir=Path("/x/a"), tart_home="/some/other/.tart")
+        self.assertNotEqual(c.tart_home, a.tart_home)
+        self.assertEqual(c.lock_path, a.lock_path)
+        # while the marker is per tart home
+        self.assertNotEqual(drv.owner_path(c, GOLDEN), drv.owner_path(a, GOLDEN))
+
+    def test_the_default_state_dir_is_the_passwd_homes_whatever_home_says(self):
+        fake = self.tmp / "fakehome"
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                (
+                    "import sys; sys.path.insert(0, sys.argv[1]); import state1_vm; "
+                    "print(state1_vm.DEFAULT_STATE_DIR)"
+                ),
+                str(drv.HERE),
+            ],
+            env={**os.environ, "HOME": str(fake)},
+            cwd=self.tmp,
+            capture_output=True,
+            text=True,
+            check=True,
         )
+        pw = drv.pwd.getpwuid(os.getuid()).pw_dir
+        self.assertEqual(
+            r.stdout.strip(), str(Path(pw) / ".local" / "state" / "tendcf-state1-vm")
+        )
+        self.assertNotIn(str(fake), r.stdout)
 
     def test_the_lock_never_follows_a_symlink(self):
         victim = self.tmp / "victim"
