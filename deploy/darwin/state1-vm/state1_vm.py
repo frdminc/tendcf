@@ -28,11 +28,13 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -55,10 +57,26 @@ import vmssh
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_IMAGE_JSON = HERE / "image.json"
-DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "tendcf-state1-vm"
-# One host-wide lock whatever --state-dir says: the VM names (state1-golden-build,
-# state1-check-*) are global in tart, so the lock has to be too.
-LOCK_PATH = DEFAULT_STATE_DIR / "driver.lock"
+# The account's home from the passwd entry, never $HOME: tart itself (Foundation) ignores
+# $HOME, so a second $HOME of the same user must not mean a second lock (or marker).
+
+
+def account_home(environ: dict[str, str] | None = None) -> str:
+    """The account's home from the passwd entry, never $HOME, like Foundation; $HOME (else
+    "/") only when this uid has no passwd entry (a container or a sandbox), where Foundation
+    also falls back to it."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return (os.environ if environ is None else environ).get("HOME") or "/"
+
+
+DEFAULT_STATE_DIR = Path(account_home()) / ".local" / "state" / "tendcf-state1-vm"
+# One lock per account (DEFAULT_STATE_DIR/driver.lock, the name master uses) whatever
+# --state-dir and the tart home say: the VM names (state1-golden-build, state1-check-*) are
+# global to a tart home and the state dirs are shared across tart homes, so one driver at a
+# time per account. Only the owner marker is keyed by tart home.
+LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
@@ -185,11 +203,14 @@ class RealRunner:
             return Result(cp.returncode, tail_file(log_path), "")
         return Result(cp.returncode, cp.stdout or "", cp.stderr or "")
 
-    def start(self, argv: list[str], *, log_path: Path) -> RealProc:
+    def start(
+        self, argv: list[str], *, log_path: Path, env: dict[str, str] | None = None
+    ) -> RealProc:
         log = open(log_path, "ab")  # noqa: SIM115
         try:
             p = subprocess.Popen(
                 argv,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -208,6 +229,54 @@ def tail_file(path: Path, limit: int = EVIDENCE_MAX) -> str:
     return data.decode("utf-8", "replace")
 
 
+def resolve_tart_home(environ: dict[str, str] | None = None) -> str:
+    """The tart home `tart` itself uses, resolved (tart's Config.swift): $TART_HOME whenever
+    it is set, even to the empty string (realpath("") is the cwd, as in tart); else the
+    account's home (CFFIXED_USER_HOME if set, even empty, else the passwd entry: never $HOME) plus
+    /.tart. Computed once per run (Ctx) and exported as TART_HOME to every tart call, so tart
+    and this driver cannot disagree."""
+    env = os.environ if environ is None else environ
+    raw = env.get("TART_HOME")
+    if raw is not None:
+        return os.path.realpath(raw)
+    base = env.get("CFFIXED_USER_HOME")  # set but empty is the cwd, as in Foundation
+    if base is None:
+        base = account_home(env)
+    return os.path.realpath(os.path.join(base, ".tart"))
+
+
+def tart_key(tart_home: str) -> str:
+    """A short stable name part for one tart home: its lock and its owner markers."""
+    return hashlib.sha256(os.fsencode(tart_home)).hexdigest()[:8]
+
+
+def state_dir_link_problem(given: Path) -> str:
+    """Why a --state-dir that is itself a symlink must not be followed ("" when fine): one
+    that dangles would make the driver create its target (and missing parents) wherever the
+    link points, and one that another user owns lets them choose where the state dir is. A
+    symlink of ours to an existing directory is the operator's choice and stays accepted.
+    Ancestors of the path are not checked (tracked in issue 82)."""
+    try:
+        st = os.lstat(given)
+    except OSError:
+        return ""  # missing (made later) or unreadable (the stat there says so)
+    if not stat.S_ISLNK(st.st_mode):
+        return ""
+    if st.st_uid != os.getuid():
+        return (
+            f"the state dir {str(given)!r} is a symlink owned by uid {st.st_uid}, not you: "
+            "refusing to follow it (pass the real directory)"
+        )
+    try:
+        os.stat(given)
+    except OSError:
+        return (
+            f"the state dir {str(given)!r} is a symlink that points nowhere: refusing to "
+            "create its target (make the directory or pass a real path)"
+        )
+    return ""
+
+
 @dataclass
 class Ctx:
     state_dir: Path
@@ -220,18 +289,39 @@ class Ctx:
         None
     )
     run_id: str = ""
-    lock_path: Path = LOCK_PATH
+    lock_path: Path | None = None
+    tart_home: str = ""
+    state_dir_refusal: str = ""
 
     def __post_init__(self) -> None:
+        # resolved once, at startup: a later retarget of a symlink or a chdir cannot move it
+        given = Path(self.state_dir)
+        self.state_dir = Path(os.path.realpath(given))
+        # a symlink given as the state dir that dangles, or is not ours, is refused (by
+        # check_state_dir, before anything is created) rather than followed. Judged after
+        # the realpath: a link planted before it is seen here, one planted after it is a
+        # name the resolved path no longer is (check_state_dir uses lstat)
+        self.state_dir_refusal = state_dir_link_problem(given)
+        if not self.tart_home:
+            self.tart_home = resolve_tart_home()
+        if self.lock_path is None:
+            self.lock_path = DEFAULT_STATE_DIR / LOCK_NAME
         if not self.run_id:
             self.run_id = (
                 self.now().strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(2)
             )
 
+    def tart_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
+        """The environment of a tart call: the given one (else ours) with TART_HOME pinned to
+        the home this run resolved."""
+        return {**(os.environ if env is None else env), "TART_HOME": self.tart_home}
+
     def run(self, argv: list[str], **kw) -> Result:
         self.err(
             "$ " + shlex.join(argv)
         )  # argv only: environments and stdin are never logged
+        if argv and argv[0] == "tart":
+            kw["env"] = self.tart_env(kw.get("env"))
         return self.runner.run(argv, **kw)  # type: ignore[attr-defined]
 
     def logs(self) -> Path:
@@ -511,7 +601,9 @@ class Vm:
         log = self.ctx.logs() / f"{self.name}-run.log"
         argv = ["tart", "run", "--no-graphics", self.name]
         self.ctx.err("$ " + shlex.join(argv) + f"   (log {log})")
-        self.proc = self.ctx.runner.start(argv, log_path=log)  # type: ignore[attr-defined]
+        self.proc = self.ctx.runner.start(  # type: ignore[attr-defined]
+            argv, log_path=log, env=self.ctx.tart_env()
+        )
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -624,7 +716,7 @@ def read_pubkey(path: Path) -> str:
 
 
 def fingerprint(pubkey_line: str) -> str:
-    blob = base64.b64decode(pubkey_line.split()[1])
+    blob = base64.b64decode(pubkey_line.split()[1], validate=True)
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip(
         "="
     )
@@ -666,24 +758,29 @@ def pin_host_key(ctx: Ctx, ip: str, dest: Path, authenticated: tuple[str, str]) 
             f"the authenticated session ({fingerprint(f'{kind} {scanned}')} vs "
             f"{fingerprint(f'{kind} {blob}')}); nothing was pinned"
         )
-    atomic_write(dest, f"{vmssh.HOST_ALIAS} {kind} {blob}\n")
+    write_landed(dest, f"{vmssh.HOST_ALIAS} {kind} {blob}\n")
     return f"{kind} " + fingerprint(f"{kind} {blob}")
+
+
+def kh_key_line_of(text: str) -> str | None:
+    """The 'ssh-ed25519 <base64>' line of the first entry for our alias in known_hosts text."""
+    for line in text.splitlines():
+        parts = line.split()
+        if (
+            len(parts) >= 3
+            and parts[0] == vmssh.HOST_ALIAS
+            and parts[1] == "ssh-ed25519"
+        ):
+            return f"{parts[1]} {parts[2]}"
+    return None
 
 
 def kh_key_line(path: Path) -> str | None:
     """The 'ssh-ed25519 <base64>' line of the entry in a known_hosts file for our alias, if any."""
     try:
-        for line in path.read_text().splitlines():
-            parts = line.split()
-            if (
-                len(parts) >= 3
-                and parts[0] == vmssh.HOST_ALIAS
-                and parts[1] == "ssh-ed25519"
-            ):
-                return f"{parts[1]} {parts[2]}"
+        return kh_key_line_of(path.read_text())
     except (OSError, ValueError):
         return None
-    return None
 
 
 def kh_fingerprint(path: Path) -> str | None:
@@ -695,19 +792,67 @@ def kh_fingerprint(path: Path) -> str | None:
         return None
 
 
+class LandedNotDurable(OSError):
+    """The write replaced its destination, but the directory could not be synced: the new text
+    is in place and nothing says it will survive a power loss. Never "the write failed"."""
+
+
+# macOS: fsync only reaches the drive's cache; F_FULLFSYNC makes the drive flush (APFS orders
+# writes either way, but the intent marker must be on disk before anything is destroyed).
+F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None) if sys.platform == "darwin" else None
+
+
+def full_fsync(fd: int) -> None:
+    if F_FULLFSYNC is not None:
+        try:
+            fcntl.fcntl(fd, F_FULLFSYNC)
+            return
+        except OSError as e:
+            if e.errno not in (
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+                errno.EINVAL,
+                errno.ENOTTY,
+            ):
+                raise  # a real I/O error is not "unsupported": fsync could report success
+    os.fsync(fd)
+
+
 def atomic_write(dest: Path, text: str, mode: int = 0o600) -> None:
-    """Write via a fresh mkstemp file in the same directory, then os.replace (no symlink follow)."""
+    """Write via a fresh mkstemp file in the same directory (fsync), then os.replace (no
+    symlink follow), then fsync the directory. A failure before the replace leaves the
+    destination as it was (OSError); one after it raises LandedNotDurable: the text is in
+    place."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".")
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
+            fh.flush()
+            full_fsync(fh.fileno())  # the data is on disk before the rename can be
         os.chmod(tmp, mode)
         os.replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    try:
+        dfd = os.open(dest.parent, os.O_RDONLY)
+        try:
+            full_fsync(dfd)  # and the rename is durable
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        raise LandedNotDurable(
+            f"{dest} was replaced but its directory could not be synced ({e})"
+        ) from e
+
+
+def write_landed(dest: Path, text: str, mode: int = 0o600) -> None:
+    """atomic_write for files whose durability nobody depends on (scratch files, the summary,
+    parked copies): a write that landed with its directory unsynced is a write that landed."""
+    with contextlib.suppress(LandedNotDurable):
+        atomic_write(dest, text, mode)
 
 
 # ---------------------------------------------------------------- lock, signals
@@ -715,8 +860,27 @@ def atomic_write(dest: Path, text: str, mode: int = 0o600) -> None:
 
 @contextlib.contextmanager
 def driver_lock(ctx: Ctx):
-    """One driver per host, whatever --state-dir says; never follows a symlink at the path."""
-    ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    """One driver per account (one lock file under the account's passwd home, whatever
+    --state-dir and the tart home say); never follows a symlink at the path."""
+    try:
+        ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        raise Refusal(
+            f"cannot create the lock directory {ctx.lock_path.parent}: {e}"
+        ) from e
+    # the owner marker beside the lock gates an unattended rebuild: nobody else may plant,
+    # replace or delete it, so the directory is ours and not group or world writable
+    try:
+        st = ctx.lock_path.parent.lstat()
+    except OSError as e:
+        raise Refusal(f"cannot inspect {ctx.lock_path.parent}: {e}") from e
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise Refusal(
+            f"{ctx.lock_path.parent} (the driver lock and owner markers) must be a real "
+            f"directory owned by you and not group or world writable (is uid {st.st_uid}, "
+            f"mode {st.st_mode & 0o777:o})"
+        )
+    check_state_dir(ctx)
     try:
         fd = os.open(ctx.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as e:
@@ -731,6 +895,38 @@ def driver_lock(ctx: Ctx):
         yield
     finally:
         os.close(fd)
+
+
+def check_state_dir(ctx: Ctx) -> None:
+    """The state dir holds the pin (known_hosts) and the record (golden.json) that `check`
+    trusts: it must be a directory of ours that is not group or world writable (the same rule
+    as the lock directory). Ctx resolved it once at startup (symlinks and relative paths
+    included, so a later retarget or chdir does not move it); a missing one is made 0700 with
+    its missing parents (umask 077 around the mkdir). Mode bits only: macOS ACLs are not
+    considered, and ancestors of an existing path are not checked."""
+    if ctx.state_dir_refusal:
+        raise Refusal(ctx.state_dir_refusal)
+    old = os.umask(0o077)
+    try:
+        ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except FileExistsError:
+        pass  # a file: the check below says so
+    except OSError as e:
+        raise Refusal(f"cannot create the state dir {ctx.state_dir}: {e}") from e
+    finally:
+        os.umask(old)
+    try:
+        st = ctx.state_dir.lstat()  # resolved already: a link here was planted since
+    except OSError as e:
+        raise Refusal(f"cannot inspect the state dir {ctx.state_dir}: {e}") from e
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refusal(f"the state dir {ctx.state_dir} is not a directory")
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise Refusal(
+            f"the state dir {ctx.state_dir} (the pinned known_hosts and golden.json) must be "
+            f"a directory owned by you and not group or world writable (is uid "
+            f"{st.st_uid}, mode {st.st_mode & 0o777:o})"
+        )
 
 
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -1062,7 +1258,7 @@ def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
 def emit(summary: Summary, ctx: Ctx, summary_path: Path | None) -> None:
     text = json.dumps(summary.as_dict(), indent=2) + "\n"
     if summary_path:
-        atomic_write(summary_path, text, 0o644)
+        write_landed(summary_path, text, 0o644)
         ctx.err(f"summary written to {summary_path}")
     else:
         sys.stdout.write(text)
@@ -1296,9 +1492,8 @@ def sweep_stale_keys(ctx: Ctx, keep: str) -> tuple[list[str], list[str]]:
     return gone, failed
 
 
-def golden_record(ctx: Ctx) -> tuple[str, str]:
-    """(key_id, authorized_key fingerprint) from this state dir's golden.json; Refusal if
-    there is no usable record."""
+def read_golden_record(ctx: Ctx) -> dict:
+    """This state dir's golden.json as a dict; Refusal if there is no usable record."""
     rec_path = ctx.state_dir / "golden.json"
     try:
         rec = json.loads(rec_path.read_text())
@@ -1307,37 +1502,419 @@ def golden_record(ctx: Ctx) -> tuple[str, str]:
         raise Refusal(f"{rec_path}: no usable golden record ({e!r})") from e
     if not isinstance(key_id, str) or not isinstance(want, str):
         raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
-    return key_id, want
+    return rec
 
 
-def golden_usable(ctx: Ctx) -> str:
-    """The one test of "this state dir can check its golden": the pinned known_hosts file
-    holds our alias's ed25519 key, and the record and key are usable (golden_identity).
-    Returns the private key path; Refusal otherwise. `check` refuses on it and `golden`
-    rebuilds on it, so the two never disagree."""
-    kh = ctx.state_dir / "known_hosts"
-    if not kh.is_file() or kh_fingerprint(kh) is None:
-        raise Refusal(
-            f"{kh} is missing or has no pinned host key (written by golden); run `golden`"
+def golden_record(ctx: Ctx) -> tuple[str, str]:
+    """(key_id, authorized_key fingerprint) from this state dir's golden.json; Refusal if
+    there is no usable record."""
+    rec = read_golden_record(ctx)
+    return rec["key_id"], rec["authorized_key"]
+
+
+# The owner marker. The tart golden is global to a tart home and the records are per
+# --state-dir, so one file per golden name and tart home lives beside the driver lock (the
+# lock directory is the passwd home's, whatever --state-dir says, so every state dir sees it):
+# <passwd home>/.local/state/tendcf-state1-vm/golden-owner-<golden name>-<tart key>.json. It
+# is a compare-only input: nothing in it ever reaches ssh.
+OWNER_FINAL = "final"
+OWNER_COMMITTING = "committing"
+OWNER_MAX_BYTES = 64 * 1024
+
+
+def owner_path(ctx: Ctx, golden: str) -> Path:
+    if not NAME_RE.fullmatch(golden):
+        raise Refusal(f"unsafe golden name {golden!r}")
+    return (
+        ctx.lock_path.parent / f"golden-owner-{golden}-{tart_key(ctx.tart_home)}.json"
+    )  # type: ignore[union-attr]
+
+
+def owner_state_dir(ctx: Ctx) -> str:
+    return os.path.realpath(ctx.state_dir)
+
+
+def bad_marker_state_dir(recorded: object) -> bool:
+    """A marker `state_dir` that is a string but not an absolute, printable path: a torn or
+    forged marker. Never stat'ed (a relative path would be the cwd) and never printed except
+    with !r (a control character would reach the terminal)."""
+    return isinstance(recorded, str) and (
+        not os.path.isabs(recorded) or not recorded.isprintable()
+    )
+
+
+def same_state_dir(ctx: Ctx, recorded: object) -> bool:
+    """The marker's state dir is this one: equal realpaths, else the same directory by
+    os.path.samefile (APFS is case-insensitive: two spellings, one directory). A moved or
+    renamed state dir is a different owner."""
+    if not isinstance(recorded, str):
+        return False
+    if recorded == owner_state_dir(ctx):
+        return True
+    if bad_marker_state_dir(recorded):
+        return False  # never stat a relative path out of a file: "." would be the cwd
+    try:
+        return os.path.samefile(recorded, ctx.state_dir)
+    except OSError:
+        return False
+
+
+def read_owner_raw(path: Path) -> str | None:
+    """The marker's text, None if there is no file. Refusal, never a hang, for anything but a
+    regular file of ours of bounded size: opened with O_NOFOLLOW (a symlink is refused) and
+    O_NONBLOCK (a FIFO does not block the open), then fstat'ed."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refusal(f"{path} cannot be opened ({e})") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refusal(f"{path} is not a regular file")
+        if st.st_uid != os.getuid():
+            raise Refusal(f"{path} is not owned by you (uid {st.st_uid})")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= OWNER_MAX_BYTES:
+            chunk = os.read(fd, OWNER_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size > OWNER_MAX_BYTES:
+        raise Refusal(f"{path} is larger than {OWNER_MAX_BYTES} bytes")
+    try:
+        return b"".join(chunks).decode()
+    except ValueError as e:
+        raise Refusal(f"{path} is not UTF-8 text ({e})") from e
+
+
+def read_owner_file(path: Path) -> dict | None:
+    """The marker as a dict, None if there is no file; Refusal for any defect."""
+    raw = read_owner_raw(path)
+    if raw is None:
+        return None
+    try:
+        owner = json.loads(raw)
+    except ValueError as e:
+        raise Refusal(f"{path} is not JSON ({e})") from e
+    if not isinstance(owner, dict):
+        raise Refusal(f"{path} is JSON but not an object")
+    return owner
+
+
+def write_owner(
+    ctx: Ctx,
+    golden: str,
+    key_id: str,
+    host_key: str | None,
+    state: str = OWNER_FINAL,
+    dest: Path | None = None,
+) -> None:
+    """Write the marker (atomic: temp, fsync, rename, fsync of the directory). `committing`
+    is the intent marker a commit writes before its first destructive step; `final` is the
+    last write of the commit. `dest` parks a copy (the `.pending` file a hand finish moves)."""
+    atomic_write(
+        dest or owner_path(ctx, golden),
+        json.dumps(
+            {
+                "golden": golden,
+                "state_dir": owner_state_dir(ctx),
+                "tart_home": ctx.tart_home,
+                "key_id": key_id,
+                "host_key": host_key,
+                "state": state,
+            },
+            indent=2,
         )
-    return golden_identity(ctx)
+        + "\n",
+    )
 
 
-def golden_identity(ctx: Ctx) -> str:
+def owner_refusal(ctx: Ctx, golden: str, rec: dict | None) -> str:
+    """Empty when this state dir may replace the golden unasked, else why not (the text
+    `golden` refuses with, and the hint `check` gives). That needs a final marker that names
+    this golden, this state dir (same directory) and the key id and host key of this state
+    dir's golden.json (`rec`, None if it has none). A commit writes a `committing` marker
+    before its first destructive step and the `final` one last, so an agreeing final marker
+    means the last commit to touch this golden finished, and it was ours. A missing marker
+    (a golden from before markers), another state dir's, a commit that did not finish and
+    one that disagrees with the record are all "not ours to replace unasked"."""
+    path = owner_path(ctx, golden)
+    hint = "pass --rebuild to replace it (this state dir then owns it)"
+    try:
+        owner = read_owner_file(path)
+    except Refusal as e:
+        return f"unreadable owner file: {e}; {hint}"
+    if owner is None:
+        return (
+            f"{golden} has no owner file ({path}): it was built before owners were "
+            f"recorded; {hint}"
+        )
+    if owner.get("golden") != golden:
+        return f"{path} names golden {owner.get('golden')!r}, not {golden}; {hint}"
+    here = owner_state_dir(ctx)
+    done = owner.get("state") == OWNER_FINAL
+    other = owner.get("state_dir")
+    if not isinstance(other, str):
+        return f"{path} is an owner file with no state_dir; {hint}"
+    if bad_marker_state_dir(other):
+        return (
+            f"{path} names the state dir {other!r}, which is not an absolute printable "
+            f"path: a torn or forged owner file; {hint}"
+        )
+    if not same_state_dir(ctx, other):
+        return (
+            f"{golden} is owned by state dir {other!r}, not this one ({here})"
+            + ("" if done else " (its commit did not finish)")
+            + f"; replacing it from here would break that state dir's logins ({path}); "
+            f"{hint}. A moved or renamed state dir is a different owner"
+        )
+    if not isinstance(owner.get("tart_home"), str):
+        return f"{path} has no tart_home (written by an earlier build of this change); {hint}"
+    if owner["tart_home"] != ctx.tart_home:
+        return (
+            f"{path} was written for tart home {owner['tart_home']!r}, this run uses "
+            f"{ctx.tart_home!r} (TART_HOME): the golden here is not the one that owner file "
+            f"describes; {hint}"
+        )
+    if not done:
+        return (
+            f"{path}: a commit of {golden} by this state dir (key "
+            f"{owner.get('key_id')!r}) did not finish, so the golden is the old or the "
+            f"new build; {hint}"
+        )
+    if (
+        rec is None
+        or owner.get("key_id") != rec["key_id"]
+        or owner.get("host_key") != rec.get("host_key")
+    ):
+        return (
+            f"{path} names key {owner.get('key_id')!r} and host key "
+            f"{owner.get('host_key')!r}, golden.json "
+            + (
+                f"names {rec['key_id']!r} and {rec.get('host_key')!r}"
+                if rec
+                else "is missing"
+            )
+            + f": the commit's writes did not all land; {hint}"
+        )
+    return ""
+
+
+def takeover_hint(ctx: Ctx, golden: str) -> str:
+    """What to tell an operator whose state dir has no record of an existing golden: never
+    `--rebuild` over another state dir's golden without naming it."""
+    try:
+        owner = read_owner_file(owner_path(ctx, golden))
+    except Refusal as e:
+        return (
+            f"it may belong to another state dir (its owner file is unreadable: {e}); "
+            "`golden --rebuild` replaces it for every state dir that uses it"
+        )
+    other = owner.get("state_dir") if owner else None
+    if (
+        isinstance(other, str)
+        and not bad_marker_state_dir(other)
+        and not same_state_dir(ctx, other)
+    ):
+        return (
+            f"it is owned by state dir {other!r} (use `--state-dir {shlex.quote(other)}`); "
+            "`golden --rebuild` here would take it over and break that state dir's logins"
+        )
+    if owner is None:
+        return (
+            "it may belong to another state dir or predate records (no owner file); "
+            "`golden --rebuild` replaces it for every state dir that uses it"
+        )
+    return "`golden --rebuild` replaces it"
+
+
+def run_hint(ctx: Ctx, golden: str, rec: dict) -> str:
+    """What to run when this state dir has a record but `check` would refuse the golden:
+    plain `golden` rebuilds it unattended only for its owner."""
+    why = owner_refusal(ctx, golden, rec)
+    if not why:
+        return "run `golden` (it rebuilds an owner's golden unattended; `golden --rebuild` forces it)"
+    return f"`golden` will refuse: {why}"
+
+
+def check_owner_refusal(ctx: Ctx, golden: str) -> tuple[str, str]:
+    """For `check`: (refusal, note). Refuse early when a *final* marker positively says the
+    golden is another state dir's, another tart home's or another key's. A commit that did
+    not finish (a `committing` marker) proves nothing about whose login works, so the login
+    decides and the note says what the marker says. A missing or unreadable marker is
+    ignored: login is the proof for a golden from before markers, and this never blesses
+    anything."""
+    try:
+        owner = read_owner_file(owner_path(ctx, golden))
+    except Refusal:
+        return "", ""
+    if not owner:
+        return "", ""
+    final = owner.get("state") == OWNER_FINAL
+    other = owner.get("state_dir")
+    if bad_marker_state_dir(other):
+        return (
+            (
+                f"the owner file names the state dir {other!r}, which is not an absolute "
+                "printable path: a torn or forged owner file; fix it with `golden --rebuild`"
+            ),
+            "",
+        )
+    if isinstance(other, str) and not same_state_dir(ctx, other):
+        if final:
+            return (
+                (
+                    f"{golden} is owned by state dir {other!r}, not this one "
+                    f"({owner_state_dir(ctx)}): this state dir's pin and key are not its pin "
+                    f"and key, so `check` here would fail at ssh. Run "
+                    f"`check --state-dir {shlex.quote(other)}`; `golden --rebuild` here would "
+                    "take it over and break that state dir's logins"
+                ),
+                "",
+            )
+        return "", (
+            f"a commit by {other!r} did not finish; the golden is the old or the new build"
+        )
+    if not final:
+        return "", (
+            f"a commit by this state dir (key {owner.get('key_id')!r}) did not finish; "
+            "the golden is the old or the new build"
+        )
+    if not isinstance(owner.get("tart_home"), str):
+        return (
+            (
+                "this owner file has no tart_home (written by an earlier build of this "
+                "change); run `golden --rebuild`"
+            ),
+            "",
+        )
+    if owner["tart_home"] != ctx.tart_home:
+        return (
+            (
+                f"the owner file was written for tart home {owner['tart_home']!r}, this run "
+                f"uses {ctx.tart_home!r} (TART_HOME): the golden here is not the one it "
+                "describes, so `check` would fail at ssh. Use the TART_HOME of the build, or "
+                "`golden --rebuild` here"
+            ),
+            "",
+        )
+    try:
+        rec = read_golden_record(ctx)
+    except Refusal:
+        return "", ""
+    if owner.get("key_id") != rec["key_id"]:
+        return (
+            (
+                f"the owner file names key {owner.get('key_id')!r}, golden.json names "
+                f"{rec['key_id']!r}: this record describes another golden of this state "
+                "dir's; `check` would fail at ssh. Run `golden --rebuild`"
+            ),
+            "",
+        )
+    return "", ""
+
+
+def canonical_pin_blob(text: str) -> str | None:
+    """The key blob if `text` is exactly the known_hosts text the driver writes, a single
+    `<alias> ssh-ed25519 <base64>` line, else None. ssh honours every line of a file, patterns,
+    hashed names, @cert-authority and @revoked included, so anything else is not "the pin"."""
+    parts = text.split(" ")
+    if len(parts) != 3 or parts[0] != vmssh.HOST_ALIAS or parts[1] != "ssh-ed25519":
+        return None
+    blob = parts[2].removesuffix("\n")
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", blob):
+        return None
+    try:
+        fingerprint(f"ssh-ed25519 {blob}")
+    except (ValueError, IndexError):
+        return None
+    if text != f"{vmssh.HOST_ALIAS} ssh-ed25519 {blob}\n":
+        return None
+    return blob
+
+
+def golden_usable(
+    ctx: Ctx, golden: str, rec: dict | None = None, hint: str | None = None
+) -> str:
+    """The one test of "this state dir can check its golden": golden.json parses, the pinned
+    known_hosts file is exactly one canonical line holding our alias's ed25519 key, that key
+    is the record's `host_key`, and the record's key is usable (golden_identity). Returns the
+    private key path; Refusal otherwise. `check` refuses on it and `golden` rebuilds on it,
+    so the two never disagree. (Whether this state dir may replace the golden is a separate
+    test: owner_refusal.) `hint` replaces the "what to run" text ("" for `golden`, which
+    rebuilds by itself and says so)."""
+    if rec is None:
+        try:
+            rec = read_golden_record(ctx)
+        except Refusal as e:
+            raise Refusal(
+                f"{e}; this state dir has no record of the golden: {takeover_hint(ctx, golden)}"
+            ) from e
+    again = run_hint(ctx, golden, rec) if hint is None else hint
+    kh = ctx.state_dir / "known_hosts"
+    try:
+        kh_text = (
+            kh.read_bytes().decode() if kh.is_file() else ""
+        )  # no newline translation
+    except (OSError, ValueError):
+        kh_text = ""
+    if kh_key_line_of(kh_text) is None:
+        raise Refusal(
+            f"{kh} is missing or has no pinned host key (written by golden){then(again)}"
+        )
+    blob = canonical_pin_blob(kh_text)
+    if blob is None:
+        raise Refusal(
+            f"{kh} is not the single `{vmssh.HOST_ALIAS} ssh-ed25519 <key>` line the driver "
+            f"writes (an extra line, pattern, hashed name, @cert-authority or @revoked entry "
+            f"would change what ssh trusts){then(again)}"
+        )
+    pinned = fingerprint(f"ssh-ed25519 {blob}")
+    host_key = rec.get("host_key")
+    if host_key is None:
+        raise Refusal(
+            "golden.json has no host_key: a record from before host keys were "
+            f"recorded{then(again)}"
+        )
+    if host_key != f"ssh-ed25519 {pinned}":
+        # golden.json and known_hosts are two writes: a kill between them (or a hand-moved
+        # .pending file) leaves one of them describing another golden
+        raise Refusal(
+            f"golden.json host_key {host_key!r} does not match the pin in {kh} "
+            f"(ssh-ed25519 {pinned}): the two commit writes did not both land{then(again)}"
+        )
+    return golden_identity(ctx, rec, again)
+
+
+def then(again: str) -> str:
+    """ "; <hint>" or nothing when there is no hint (golden rebuilds by itself)."""
+    return f"; {again}" if again else ""
+
+
+def golden_identity(
+    ctx: Ctx, rec: dict | None = None, again: str = "run `golden`"
+) -> str:
     """The private key of the current golden, found through golden.json; Refusal otherwise.
     The private key itself is matched to the recorded fingerprint (its public half is derived
     with `ssh-keygen -y`, not read from the .pub file), so a key from another golden, a
     swapped private key or a hand-edited record is not silently used."""
-    again = "run `golden`"
-    try:
-        key_id, want = golden_record(ctx)
-    except Refusal as e:
-        raise Refusal(f"{e}; {again}") from e
+    if rec is None:
+        try:
+            rec = read_golden_record(ctx)
+        except Refusal as e:
+            raise Refusal(f"{e}{then(again)}") from e
+    key_id, want = rec["key_id"], rec["authorized_key"]
     priv, pub = key_paths(ctx, key_id)
     try:
         private_ok(priv)
     except Refusal as e:
-        raise Refusal(f"{e}; {again}") from e
+        raise Refusal(f"{e}{then(again)}") from e
     # -P '' (an empty passphrase, never a prompt) and no controlling tty: a passphrase-
     # protected key (not one this driver minted) is a refusal, not a question on /dev/tty
     r = ctx.run(
@@ -1347,14 +1924,14 @@ def golden_identity(ctx: Ctx) -> str:
     if r.rc != 0 or not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+( .*)?", derived):
         raise Refusal(
             f"{priv}: ssh-keygen -y could not read the private key without a passphrase "
-            f"(rc {r.rc}; a key with a passphrase is refused); {again}"
+            f"(rc {r.rc}; a key with a passphrase is refused){then(again)}"
         )
     got = fingerprint(derived)
     pub_got = fingerprint(read_pubkey(pub))
     if got != want or pub_got != want:
         raise Refusal(
             f"{priv} is {got} (its .pub says {pub_got}), golden.json says {want}: "
-            f"the key does not belong to this golden; {again}"
+            f"the key does not belong to this golden{then(again)}"
         )
     return str(priv)
 
@@ -1401,18 +1978,22 @@ def cmd_golden(ctx: Ctx, args) -> int:
                 names = set(local_vms(ctx))
                 if golden in names and not rebuild:
                     try:
-                        golden_record(ctx)
+                        rec = read_golden_record(ctx)
                     except Refusal as e:
                         # The tart golden is global; the record is per state dir. A golden
                         # this state dir has no record of (another state dir's, or one from
                         # before records) is not ours to replace unasked.
                         raise Refusal(
                             f"{golden} exists but this state dir has no record of it ({e}); "
-                            "it may belong to another state dir or predate records: pass "
-                            "--rebuild to replace it"
+                            f"{takeover_hint(ctx, golden)}"
                         ) from e
+                    # A record is per state dir, the tart golden is global: only the state
+                    # dir a finished owner file names may rebuild or bless it unasked.
+                    not_owner = owner_refusal(ctx, golden, rec)
+                    if not_owner:
+                        raise Refusal(not_owner)
                     try:
-                        golden_usable(ctx)
+                        golden_usable(ctx, golden, rec, hint="")
                     except Refusal as e:
                         # This state dir's record describes the golden, but `check` would
                         # refuse it, and nothing here may wait for a human: build it again,
@@ -1429,7 +2010,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "exists",
                             f"{golden} already exists",
                             "pass",
-                            "nothing to do; its record and key are usable; pass --rebuild to build it again",
+                            "nothing to do; this state dir owns it and its record, pin and key agree; pass --rebuild to build it again",
                         )
                         emit(summary, ctx, args.summary)
                         return 0
@@ -1465,7 +2046,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                 vanilla = image.get("vanilla_host_key")
                 if vanilla:
                     kh_boot = str(scratch / "known_hosts.vanilla")
-                    atomic_write(Path(kh_boot), f"{vmssh.HOST_ALIAS} {vanilla}\n")
+                    write_landed(Path(kh_boot), f"{vmssh.HOST_ALIAS} {vanilla}\n")
                 else:
                     kh_boot = kh_scratch
                 state: dict[str, object] = {}
@@ -1623,42 +2204,207 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         indent=2,
                     )
 
-                    # The commit: remove the old golden (--rebuild), rename, then the two
-                    # record files, all with signals ignored so no interrupt can land between
-                    # the steps and leave the old golden gone and the new build deleted. The
-                    # record files are written only after the rename succeeded. keep_build is
-                    # set first: from here on a failure never deletes the finished build.
-                    def park_record() -> str:
+                    # The commit, all with signals ignored so no interrupt can land between
+                    # the steps and leave the old golden gone and the new build deleted:
+                    #   0. the intent marker (state "committing": this state dir, the new key
+                    #      id and host key), before the first destructive step. From here a
+                    #      marker that is not "final" makes every state dir's plain `golden`
+                    #      refuse (exit 2, hint --rebuild), whatever stops the commit later;
+                    #   1. remove the old golden (--rebuild), 2. rename the build into place,
+                    #   3. known_hosts, 4. golden.json, 5. the final marker, last.
+                    # keep_build is set first: from here on a failure never deletes the
+                    # finished build.
+                    marker = owner_path(ctx, golden)
+                    landed: list[str] = []
+                    pending_files = [
+                        ctx.state_dir / "known_hosts.pending",
+                        ctx.state_dir / "golden.json.pending",
+                        marker.with_name(marker.name + ".pending"),
+                    ]
+
+                    def park_record(renamed: bool) -> str:
                         # The new record (it names this build's key) beside the old one, so
-                        # finishing by hand does not need a rebuild and the key is not orphaned.
+                        # finishing by hand does not need a rebuild and the key is not
+                        # orphaned: all three files of the commit, the marker last. "" when
+                        # parking failed too.
+                        kh_p, rec_p, marker_p = pending_files
                         try:
-                            atomic_write(
-                                ctx.state_dir / "known_hosts.pending", pinned_text
-                            )
-                            atomic_write(
-                                ctx.state_dir / "golden.json.pending",
-                                record + "\n",
-                                0o644,
-                            )
+                            write_landed(kh_p, pinned_text)
+                            write_landed(rec_p, record + "\n", 0o644)
+                            with contextlib.suppress(LandedNotDurable):
+                                write_owner(
+                                    ctx,
+                                    golden,
+                                    key_id,
+                                    state.get("hostkey"),  # type: ignore[arg-type]
+                                    OWNER_FINAL,
+                                    marker_p,
+                                )
                         except OSError:
                             return ""
                         return (
-                            "; the new record is in known_hosts.pending and golden.json.pending "
-                            "in the state dir (golden.json.pending names its key): after the "
-                            "rename, mv them over known_hosts and golden.json"
+                            f"the new record is parked as {shlex.quote(str(kh_p))}, "
+                            f"{shlex.quote(str(rec_p))} (it names the new key) and "
+                            f"{shlex.quote(str(marker_p))}: "
+                            + ("" if renamed else "after the rename, ")
+                            + "mv them over "
+                            f"{shlex.quote(str(ctx.state_dir / 'known_hosts'))}, "
+                            f"{shlex.quote(str(ctx.state_dir / 'golden.json'))} and "
+                            f"{shlex.quote(str(marker))} (the last one makes this state dir "
+                            "the owner)"
                         )
 
+                    def finish_note(renamed: bool) -> str:
+                        parked = park_record(renamed)
+                        if parked:
+                            return f"; to finish by hand: {parked}, or run `golden --rebuild`"
+                        return (
+                            "; the new record could not be parked either, so only "
+                            "`golden --rebuild` finishes it"
+                        )
+
+                    def commit_write(label: str, write: Callable[[], None]) -> None:
+                        try:
+                            write()
+                        except LandedNotDurable as e:
+                            landed.append(f"{label} (landed, durability unconfirmed)")
+                            if label == "the final owner file":
+                                # every write of the commit landed: it is complete, only the
+                                # directory sync of the last one is unconfirmed. Go on to the
+                                # cleanup; the run still exits 0.
+                                summary.add(
+                                    "owner",
+                                    "final owner file written",
+                                    "pass",
+                                    f"landed, durability unconfirmed ({e}); the commit is "
+                                    "complete",
+                                )
+                                return
+                            raise ToolError(
+                                f"{label} landed but its directory could not be synced "
+                                f"({e}), so it may not survive a power loss; written: "
+                                f"{', '.join(landed)}; the commit stops here; {golden} is "
+                                "renamed into place and the owner file says its commit did "
+                                "not finish, so plain `golden` refuses (exit 2) until "
+                                f"`--rebuild`{finish_note(True)}"
+                            ) from e
+                        except OSError as e:
+                            raise ToolError(
+                                f"writing {label} failed ({e}); written before it: "
+                                f"{', '.join(landed) or 'nothing'}; {golden} is renamed into "
+                                "place and the owner file says its commit did not finish, so "
+                                f"plain `golden` refuses (exit 2) until `--rebuild`"
+                                f"{finish_note(True)}"
+                            ) from e
+                        landed.append(label)
+
+                    def restore_marker(prev: str | None, readable: bool) -> str:
+                        """Put the owner file back as it was before the intent write."""
+                        try:
+                            if not readable:
+                                return (
+                                    "the previous owner file was unreadable and the owner "
+                                    "file now says a commit did not finish"
+                                )
+                            if prev is None:
+                                marker.unlink(missing_ok=True)
+                                return "the owner file is removed again"
+                            atomic_write(marker, prev)
+                            return "the previous owner file is restored"
+                        except LandedNotDurable:
+                            return (
+                                "the previous owner file is restored (durability "
+                                "unconfirmed)"
+                            )
+                        except OSError as e2:
+                            return (
+                                f"the owner file could NOT be restored ({e2}): it says a "
+                                "commit did not finish, so plain `golden` refuses (exit 2) "
+                                "until --rebuild"
+                            )
+
                     with signals_ignored():
+                        # Never delete a golden this run did not check: one that appeared
+                        # during the build (a hand `tart rename`, a driver under another
+                        # TART_HOME) is owner-checked again here, after the lock was taken
+                        # and before the intent marker (which would itself refuse).
+                        present_at_check = False
+                        if not args.rebuild and golden in local_vms(ctx):
+                            present_at_check = True
+                            try:
+                                rec_now = read_golden_record(ctx)
+                            except Refusal as e:
+                                raise Refusal(
+                                    f"{golden} exists but this state dir has no record of "
+                                    f"it ({e}); it was not checked before the build, so "
+                                    f"nothing was replaced and the finished build is not "
+                                    f"installed (the cleanup removes it unless "
+                                    f"--keep-on-failure); {takeover_hint(ctx, golden)}"
+                                ) from e
+                            why = owner_refusal(ctx, golden, rec_now)
+                            if why:
+                                raise Refusal(
+                                    f"{golden} is not this state dir's to replace without "
+                                    f"--rebuild; nothing was replaced and the finished "
+                                    f"build is not installed (the cleanup removes it unless "
+                                    f"--keep-on-failure): {why}"
+                                )
                         keep_build = True
+                        try:
+                            prev_marker: str | None = read_owner_raw(marker)
+                            prev_readable = True
+                        except Refusal:
+                            prev_marker, prev_readable = None, False
+                        try:
+                            write_owner(
+                                ctx,
+                                golden,
+                                key_id,
+                                state.get("hostkey"),  # type: ignore[arg-type]
+                                OWNER_COMMITTING,
+                            )
+                        except OSError as e:
+                            if isinstance(e, LandedNotDurable):
+                                state_now = (
+                                    "the intent owner file landed but could not be made "
+                                    f"durable; {restore_marker(prev_marker, prev_readable)}"
+                                )
+                            else:
+                                state_now = "the owner file is as it was"
+                            raise ToolError(
+                                f"writing the intent owner file failed ({e}); {state_now}; "
+                                f"the old {golden}, known_hosts and golden.json are as they "
+                                f"were and the finished build is kept as {build} (the next "
+                                "golden run sweeps it)"
+                            ) from e
+                        removed = False
                         if golden in local_vms(ctx):
+                            if not (args.rebuild or present_at_check):
+                                # it appeared after the owner re-check: nobody checked
+                                # it, so no marker may bless it: the intent (committing)
+                                # marker stays, and plain `golden` refuses until --rebuild
+                                raise ToolError(
+                                    f"{golden} appeared after the owner check, so it was "
+                                    f"not replaced; the owner file now says a commit did "
+                                    f"not finish, so plain `golden` refuses (exit 2) until "
+                                    f"`--rebuild`; the finished build is kept as {build} "
+                                    "but no records were parked, so it cannot be finished "
+                                    "by hand: `golden --rebuild` sweeps it, replaces "
+                                    f"{golden} and builds afresh (this state dir then "
+                                    "owns it)"
+                                )
                             try:
                                 done = remove_vm(ctx, golden)
                             except ToolError as e:
+                                # the old golden and its records are unchanged: so is the
+                                # owner file, again
+                                back = restore_marker(prev_marker, prev_readable)
                                 raise ToolError(
                                     f"removing the old {golden} failed: {e}; it and the finished "
                                     f"build {build} are both kept; known_hosts and golden.json "
-                                    f"are unchanged{park_record()}"
+                                    f"are unchanged; {back}{finish_note(False)}"
                                 ) from e
+                            removed = True
                             summary.add(
                                 "rebuild",
                                 f"remove old {golden} (replaced by this build)",
@@ -1669,13 +2415,68 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         if r.rc != 0:
                             raise ToolError(
                                 f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}; "
-                                f"the finished build is kept as {build}: run `tart rename {build} {golden}` "
-                                f"before the next golden run, which sweeps it{park_record()}"
+                                f"the finished build is kept as {build}: run `tart rename "
+                                f"{build} {golden}` before the next golden run, which sweeps "
+                                "it; the owner file says the commit did not finish, so "
+                                + (
+                                    "the old golden is gone and plain `golden` builds again "
+                                    "(rename first to keep this build)"
+                                    if removed
+                                    else "plain `golden` refuses (exit 2) until --rebuild "
+                                    "or the hand finish"
+                                )
+                                + finish_note(False)
                             )
-                        atomic_write(ctx.state_dir / "known_hosts", pinned_text)
-                        atomic_write(
-                            ctx.state_dir / "golden.json", record + "\n", 0o644
+                        commit_write(
+                            "known_hosts",
+                            lambda: atomic_write(
+                                ctx.state_dir / "known_hosts", pinned_text
+                            ),
                         )
+                        commit_write(
+                            "golden.json",
+                            lambda: atomic_write(
+                                ctx.state_dir / "golden.json", record + "\n", 0o644
+                            ),
+                        )
+                        # last: a final marker that agrees with the record means every write
+                        # of the commit landed
+                        commit_write(
+                            "the final owner file",
+                            lambda: write_owner(
+                                ctx,
+                                golden,
+                                key_id,
+                                state.get("hostkey"),  # type: ignore[arg-type]
+                            ),
+                        )
+                        # Parked files of an earlier unfinished commit describe a build that
+                        # is gone now: a late hand finish from an old message would install
+                        # their record, pin and marker over this one.
+                        gone: list[str] = []
+                        stuck_pending: list[str] = []
+                        for pf in pending_files:
+                            try:
+                                pf.unlink()
+                                gone.append(str(pf))
+                            except FileNotFoundError:
+                                pass
+                            except OSError as e:
+                                stuck_pending.append(f"{pf}: {e}")
+                        if gone or stuck_pending:
+                            summary.add(
+                                "pending",
+                                "remove parked files of an earlier unfinished commit",
+                                "fail" if stuck_pending else "pass",
+                                "; ".join(
+                                    (["removed " + ", ".join(gone)] if gone else [])
+                                    + (
+                                        ["NOT removed: " + "; ".join(stuck_pending)]
+                                        if stuck_pending
+                                        else []
+                                    )
+                                ),
+                            )
                         # The replaced golden's key is of no use now: remove it (and the
                         # private keys of any other deleted golden).
                         try:
@@ -1696,7 +2497,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                                     )
                                 ),
                             )
-                    return f"{stopped}; renamed {build} -> {golden}; record and known_hosts written"
+                    return f"{stopped}; renamed {build} -> {golden}; record, known_hosts and owner marker written"
 
                 steps: list[tuple[str, str, Callable[[], str | None]]] = [
                     ("g1", f"clone pinned image to {build}", clone),
@@ -1838,7 +2639,12 @@ def cmd_check(ctx: Ctx, args) -> int:
                     raise Refusal(f"{golden} is running; stop it before `check`")
                 # the pin, record and minted key, read under the lock (a concurrent rebuild
                 # cannot sweep the key between this and its use): the same test `golden` uses
-                identity = golden_usable(ctx)
+                not_ours, owner_note = check_owner_refusal(ctx, golden)
+                if not_ours:
+                    raise Refusal(not_ours)
+                if owner_note:
+                    summary.add("owner", "owner file", "pass", owner_note)
+                identity = golden_usable(ctx, golden)
                 assert_vm_cap(ctx)
                 summary.add(
                     "preflight",
