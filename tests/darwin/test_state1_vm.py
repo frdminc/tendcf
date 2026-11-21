@@ -85,7 +85,11 @@ class FakeWorld:
         self.password_login = True  # the server accepts password logins (vanilla image)
         self.prepped = False
         self.key_installed = False
+        self.installed_blob = None  # the key blob in authorized_keys
         self.stdin_seen = []
+        self.console_pw_default = False  # the vanilla 'admin' still logs in
+        self.dscl_error = None  # a dscl failure that is not an authentication failure
+        self.prep_console_lines = 1
         self.fw_owner = FW_PYTHON_ORIGINAL  # Versions/X.Y (and the root's own stat)
         # Versions/, Versions/Current and the top-level links: python.org leaves these
         # root:admin 775 too, and a fix-up scoped to Versions/X.Y does not reach them.
@@ -138,6 +142,9 @@ class FakeWorld:
             if self.interrupt_after_tart == argv[1]:
                 raise Interrupt("SIGINT")
             return res
+        if argv[0] == "ssh-keygen":  # a real one: the minted key must be a real key
+            r = subprocess.run(argv, capture_output=True, text=True, check=False)
+            return drv.Result(r.returncode, r.stdout, r.stderr)
         if argv[0] == "ssh-keyscan":
             blob = self.keyscan_blob or self.current_key()
             return drv.Result(
@@ -295,6 +302,14 @@ class FakeWorld:
                 return self._denied("publickey,password,keyboard-interactive")
         elif not self.key_installed:
             return self._denied("publickey")
+        else:  # key login: the offered key must be the one in authorized_keys
+            ident = Path(argv[argv.index("-i") + 1])
+            try:
+                offered = Path(str(ident) + ".pub").read_text().split()[1]
+            except (OSError, IndexError):
+                offered = None
+            if offered != self.installed_blob:
+                return self._denied("publickey")
         if self.interrupt_on and remote[0] == self.interrupt_on:
             raise Interrupt("SIGINT")
         if self.signal_on and remote[0] == self.signal_on:
@@ -313,6 +328,7 @@ class FakeWorld:
             return drv.Result(0)
         if r[:3] == ["/bin/sh", "-c", drv.INSTALL_KEY_SH]:
             self.key_installed = True
+            self.installed_blob = input_text.split()[1]
             self.stdin_seen.append(input_text)
             return drv.Result(0)
         if r[:3] == ["/bin/sh", "-c", drv.RUN_SCRIPT_SH]:
@@ -355,6 +371,16 @@ class FakeWorld:
                     if self.screensharing_on
                     else ""
                 ),
+            )
+        if r[:4] == ["sudo", "-n", "dscl", "."]:
+            if self.dscl_error:
+                return drv.Result(1, "", self.dscl_error)
+            if self.console_pw_default:
+                return drv.Result(0)
+            return drv.Result(
+                14,
+                "",
+                "Authentication for node /Local/Default failed. (-14090, eDSAuthFailed)\n",
             )
         if r[0] == "defaults":
             return drv.Result(0, "0\n")
@@ -402,6 +428,7 @@ class FakeWorld:
             key = (
                 f"PREP-HOSTKEY ssh-ed25519 {self.new_hostkey}\n"
                 * self.prep_hostkey_lines
+                + "PREP-CONSOLE-PW rotated\n" * self.prep_console_lines
             )
             assert old != self.new_hostkey
             return drv.Result(
@@ -442,21 +469,16 @@ class Base(unittest.TestCase):
         self.clock = Clock()
         self.errs = []
         self.ctx = self.make_ctx(self.tmp / "state")
-        self.pub = self.tmp / "id_test.pub"
-        self.pub.write_text(PUBKEY + "\n")
-        self.ident = (
-            self.tmp / "id_test"
-        )  # the private half: only its existence is checked
-        self.ident.write_text("not a real key\n")
+        self.golden_key_id = "20261119T000000Z-made"
 
-    def make_ctx(self, state_dir):
+    def make_ctx(self, state_dir, run_id="20261120T000000Z-test"):
         return drv.Ctx(
             state_dir=state_dir,
             runner=self.world,
             sleep=self.clock.sleep,
             monotonic=self.clock.now,
             err=self.errs.append,
-            run_id="20261120T000000Z-test",
+            run_id=run_id,
             lock_path=self.tmp / "lockdir" / "driver.lock",
         )
 
@@ -481,12 +503,25 @@ class Base(unittest.TestCase):
         self.world.password_login = False
         self.world.prepped = True
         self.world.fw_owner = self.world.fw_versions = FW_PYTHON_FIXED
+        # the golden's own minted key, as `golden` would have left it
+        pub, priv = drv.mint_keypair(self.ctx, self.golden_key_id)
+        (self.ctx.state_dir / "golden.json").write_text(
+            json.dumps(
+                {"key_id": self.golden_key_id, "authorized_key": drv.fingerprint(pub)}
+            )
+        )
+        self.world.installed_blob = pub.split()[1]
+        self.ident = priv  # the golden's private key (a path)
+
+    def key_dirs(self):
+        root = self.ctx.state_dir / "keys"
+        return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
 
     def golden_args(self, *extra):
-        return ["golden", "--pubkey", str(self.pub), *extra]
+        return ["golden", *extra]
 
     def check_args(self, *extra):
-        return [*extra, "check", "--identity", str(self.ident)]
+        return [*extra, "check"]
 
     def image_file(self, **changes):
         image = json.loads((VMDIR / "image.json").read_text())
@@ -704,13 +739,7 @@ class PullAndResolve(Base):
 
     def test_unreadable_or_bad_image_pins_are_refused_with_exit_2(self):
         for cmd in ("resolve", "pull", "golden", "check"):
-            extra = (
-                ["--pubkey", str(self.pub)]
-                if cmd == "golden"
-                else ["--identity", str(self.ident)]
-                if cmd == "check"
-                else []
-            )
+            extra = []
             rc, _ = self.run_cmd("--image", str(self.tmp / "missing.json"), cmd, *extra)
             self.assertEqual(rc, 2, cmd)
             for bad in (
@@ -792,7 +821,10 @@ class Golden(Base):
         self.assertFalse(self.world.vms[GOLDEN]["Running"])
         self.assertEqual(self.world.tart_calls("pull"), [])
         # the public key (only) went to the guest on stdin; no script was left anywhere
-        self.assertEqual(self.world.stdin_seen, [PUBKEY + "\n"])
+        minted = (
+            self.ctx.state_dir / "keys" / self.ctx.run_id / "id_ed25519.pub"
+        ).read_text()
+        self.assertEqual(self.world.stdin_seen, [minted.strip() + "\n"])
         # the host key printed by prep.sh is the pinned one, under the alias
         kh = (self.ctx.state_dir / "known_hosts").read_text()
         self.assertEqual(kh, f"state1-vm ssh-ed25519 {NEW_BLOB}\n")
@@ -1169,25 +1201,147 @@ class Golden(Base):
         self.assertIn("host key mismatch", self.steps(s)["g3"]["evidence"])
         self.assertEqual(self.world.vms, {})
 
-    def test_bad_public_key_files_are_refused(self):
-        bad = self.tmp / "bad.pub"
-        bad.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n")
-        rc, _ = self.run_cmd("golden", "--pubkey", str(bad))
-        self.assertEqual(rc, 2)
-        bad.write_text(PUBKEY + "\n" + PUBKEY + "\n")
-        rc, _ = self.run_cmd("golden", "--pubkey", str(bad))
-        self.assertEqual(rc, 2)
-        rc, _ = self.run_cmd("golden", "--pubkey", str(self.tmp / "absent.pub"))
-        self.assertEqual(rc, 2)  # no traceback, exit 2
+    def test_the_operator_key_flags_are_gone(self):
+        for argv in (
+            ["golden", "--pubkey", "k.pub"],
+            ["golden", "--identity", "k"],
+            ["check", "--identity", "k"],
+        ):
+            with (
+                self.assertRaises(SystemExit) as cm,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                drv.main(argv, self.ctx)
+            self.assertEqual(cm.exception.code, 2, argv)
         self.assertEqual(self.world.calls, [])
 
-    def test_missing_private_key_is_refused_before_anything_starts(self):
-        lonely = self.tmp / "lonely.pub"
-        lonely.write_text(PUBKEY + "\n")
-        rc, s = self.run_cmd("golden", "--pubkey", str(lonely))
-        self.assertEqual(rc, 2)
-        self.assertIn("identity file not found", s["steps"][-1]["evidence"])
-        self.assertEqual(self.world.tart_calls("clone"), [])
+    def test_golden_mints_its_own_key_and_never_touches_the_operators(self):
+        operator_dir = str(Path.home() / ("." + "ssh"))
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        key_dir = self.ctx.state_dir / "keys" / self.ctx.run_id
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])
+        self.assertEqual(stat.S_IMODE(key_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((key_dir / "id_ed25519").stat().st_mode), 0o600)
+        pub = (key_dir / "id_ed25519.pub").read_text().strip()
+        self.assertTrue(pub.startswith("ssh-ed25519 "))
+        self.assertNotIn(pub.split()[1], (VANILLA_BLOB, NEW_BLOB))
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        self.assertEqual(rec["key_id"], self.ctx.run_id)
+        self.assertEqual(rec["authorized_key"], drv.fingerprint(pub))
+        # every key login offers the minted key, never anything of the operator's
+        offered = {
+            argv[argv.index("-i") + 1]
+            for argv, _ in self.world.ssh_calls
+            if "-i" in argv
+        }
+        self.assertEqual(offered, {str(key_dir / "id_ed25519")})
+        for argv, _ in self.world.calls:
+            self.assertFalse(any(operator_dir in a for a in argv), argv)
+        self.assertNotIn(
+            "PRIVATE KEY", (self.ctx.state_dir / "golden.json").read_text()
+        )
+
+    def test_a_golden_and_check_run_asks_for_nothing(self):
+        from unittest import mock
+
+        with (
+            mock.patch("builtins.input", side_effect=AssertionError("prompted")),
+            mock.patch.dict(os.environ),
+        ):
+            os.environ.pop(vmssh.BOOTSTRAP_PW_ENV, None)
+            rc, s = self.run_cmd(*self.golden_args())
+            self.assertEqual(rc, 0, s)
+            rc, s = self.run_cmd(*self.check_args())
+            self.assertEqual(rc, 0, s)
+
+    def test_a_rebuild_mints_a_new_key_and_removes_the_old_one(self):
+        self.run_cmd(*self.golden_args())
+        first = self.ctx.run_id
+        old_pub = (self.ctx.state_dir / "keys" / first / "id_ed25519.pub").read_text()
+        second = "20261121T000000Z-test2"
+        ctx2 = self.make_ctx(self.ctx.state_dir, run_id=second)
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.key_dirs(), [second])  # the old private key is gone
+        new_pub = (self.ctx.state_dir / "keys" / second / "id_ed25519.pub").read_text()
+        self.assertNotEqual(old_pub.split()[1], new_pub.split()[1])
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        self.assertEqual(rec["key_id"], second)
+        self.assertEqual(self.steps(s)["keys"]["evidence"], first)
+        rc, s = self.run_cmd(*self.check_args(), ctx=ctx2)  # check uses the new key
+        self.assertEqual(rc, 0, s)
+
+    def test_stale_keys_of_other_goldens_are_swept_but_not_symlinks_or_strays(self):
+        keys = self.ctx.state_dir / "keys"
+        (keys / "old-golden").mkdir(parents=True)
+        (keys / "old-golden" / "id_ed25519").write_text("x")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "precious").write_text("keep")
+        (keys / "linked").symlink_to(outside)
+        (keys / "stray-file").write_text("x")
+        gone = drv.sweep_stale_keys(self.ctx, keep="current")
+        self.assertEqual(gone, ["old-golden"])
+        self.assertTrue((outside / "precious").exists())
+        self.assertTrue((keys / "stray-file").exists())
+
+    def test_a_failed_build_removes_its_key_unless_kept_for_inspection(self):
+        self.world.fail_prep = True
+        rc, _ = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.key_dirs(), [])
+        ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-keep")
+        rc, _ = self.run_cmd(*self.golden_args("--keep-on-failure"), ctx=ctx2)
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            self.key_dirs(), ["20261121T000000Z-keep"]
+        )  # the kept build needs it
+
+    def test_a_failed_rebuild_keeps_the_working_goldens_key(self):
+        self.run_cmd(*self.golden_args())
+        self.world.fail_prep = True
+        ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-bad")
+        rc, _ = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])  # still the old golden's
+        self.world.fail_prep = False
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+
+    def test_a_rename_failure_keeps_the_new_key_and_records_it_in_the_pending_file(
+        self,
+    ):
+        self.world.fail_tart = {"rename"}
+        rc, _ = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])
+        rec = json.loads((self.ctx.state_dir / "golden.json.pending").read_text())
+        self.assertEqual(rec["key_id"], self.ctx.run_id)
+
+    def test_prep_must_confirm_the_console_password_rotation(self):
+        for n in (0, 2):
+            self.world.prep_console_lines = n
+            rc, s = self.run_cmd(*self.golden_args())
+            self.assertEqual(rc, 1, n)
+            self.assertEqual(self.steps(s)["g6"]["status"], "fail", n)
+            self.assertIn("console password", self.steps(s)["g6"]["evidence"])
+            self.assertFalse((self.ctx.state_dir / "golden.json").exists())
+
+    def test_the_console_password_is_recorded_as_never_stored(self):
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        self.assertIn("never stored", rec["console_password"])
+        # the host holds no console password: no file but the minted key is secret material
+        files = sorted(p.name for p in self.ctx.state_dir.rglob("*") if p.is_file())
+        self.assertEqual(
+            sorted(
+                set(files)
+                - {"known_hosts", "golden.json", "id_ed25519.pub", "id_ed25519"}
+            ),
+            [],
+        )
 
 
 class Check(Base):
@@ -1202,7 +1356,7 @@ class Check(Base):
         self.assertTrue(s["ok"])
         self.assertEqual(s["schema"], drv.SCHEMA)
         for sid in (
-            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k",
+            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l",
             "10", "10a", "11",
         ):  # fmt: skip
             self.assertEqual(st[sid]["status"], "pass", (sid, st[sid]))
@@ -1488,11 +1642,72 @@ class Check(Base):
         (self.ctx.state_dir / "known_hosts").unlink()
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
-        self.make_golden()
-        rc, s = self.run_cmd("check", "--identity", str(self.tmp / "nokey"))
-        self.assertEqual(rc, 2)
-        self.assertIn("identity file not found", s["steps"][-1]["evidence"])
         self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_check_refuses_without_the_goldens_key(self):
+        priv = Path(self.ident)
+        rec_path = self.ctx.state_dir / "golden.json"
+        good = rec_path.read_text()
+
+        def refused(want):
+            rc, s = self.run_cmd(*self.check_args())
+            self.assertEqual(rc, 2, want)
+            self.assertIn(want, s["steps"][-1]["evidence"])
+
+        rec_path.unlink()
+        refused("no usable golden record")
+        # an id that tries to leave the keys directory
+        rec_path.write_text(
+            json.dumps({"key_id": "../../etc", "authorized_key": "SHA256:x"})
+        )
+        refused("unsafe key id")
+        # a record for a key that is not there
+        rec_path.write_text(
+            json.dumps({"key_id": "nope", "authorized_key": "SHA256:x"})
+        )
+        refused("is missing")
+        # the right key but a wrong fingerprint in the record
+        rec_path.write_text(
+            json.dumps({"key_id": self.golden_key_id, "authorized_key": "SHA256:wrong"})
+        )
+        refused("does not belong to this golden")
+        # a private key other users can read
+        rec_path.write_text(good)
+        os.chmod(priv, 0o644)
+        refused("mode 0600")
+        # a symlinked private key
+        os.chmod(priv, 0o600)
+        real = priv.with_name("real")
+        priv.rename(real)
+        priv.symlink_to(real)
+        refused("not a regular file")
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        self.assertEqual(self.world.tart_calls("run"), [])
+
+    def test_check_logs_in_with_the_minted_key_only(self):
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        offered = {
+            argv[argv.index("-i") + 1]
+            for argv, _ in self.world.ssh_calls
+            if "-i" in argv
+        }
+        self.assertEqual(offered, {self.ident})
+
+    def test_2l_console_password_must_not_be_the_vanilla_one(self):
+        self.world.console_pw_default = True  # 'admin' still authenticates
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2l"]["status"], "fail")
+        self.assertEqual(self.steps(s)["10a"]["status"], "fail")  # and after the reboot
+
+    def test_2l_only_an_authentication_failure_counts(self):
+        self.world.dscl_error = (
+            "<main> attribute status: eDSRecordNotFound\nInvalid Path"
+        )
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2l"]["status"], "fail")
 
     def test_a_second_driver_is_refused_while_the_lock_is_held(self):
         with drv.driver_lock(self.ctx):
@@ -1727,6 +1942,55 @@ class GuestScripts(unittest.TestCase):
             text.index("launchctl disable system/com.apple.screensharing"),
             text.index("# 5. Named unused launchd jobs"),
         )
+
+    def test_prep_console_password_is_random_verified_and_never_printed(self):
+        text = self.text("prep.sh")
+        a = text.index("pw=$(LC_ALL=C tr")
+        b = text.index('log "console password', a)
+        b = text.index("\n", b) + 1
+        snippet = text[a:b]
+        for ln in snippet.splitlines():  # the password is only ever an argument to dscl
+            if "pw" in ln.replace("password", ""):
+                self.assertRegex(
+                    ln,
+                    r'^(pw=\$\(LC_ALL=C tr .*urandom.*|\[ "\$\{#pw\}".*|dscl \. -(passwd /Users/admin|authonly admin) "\$pw".*|unset pw)$',
+                    ln,
+                )
+        self.assertLess(text.index("pw=$(LC_ALL=C tr"), text.index("snapshot after"))
+        self.assertLess(
+            text.index('echo "PREP-CONSOLE-PW rotated"'),
+            text.index('echo "PREP-RESULT'),
+        )
+        stub = (
+            'log() { printf "prep: %s\\n" "$*"; }\n'
+            'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+            'dscl() { [ "$4" = admin ] || [ "${#4}" -eq 32 ] || return 99\n'
+            '  case "$2" in -passwd) return "$PASSWD_RC";; '
+            '-authonly) if [ "$4" = admin ]; then return "$OLD_RC"; fi; return "$NEW_RC";; esac; }\n'
+        )
+        cases = (
+            ({"PASSWD_RC": "0", "OLD_RC": "1", "NEW_RC": "0"}, 0, "rotated"),
+            ({"PASSWD_RC": "1", "OLD_RC": "1", "NEW_RC": "0"}, 1, "dscl -passwd"),
+            (
+                {"PASSWD_RC": "0", "OLD_RC": "1", "NEW_RC": "1"},
+                1,
+                "does not authenticate",
+            ),
+            ({"PASSWD_RC": "0", "OLD_RC": "0", "NEW_RC": "0"}, 1, "still works"),
+        )
+        for env, want_rc, want_msg in cases:
+            r = subprocess.run(
+                ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", **env},
+            )
+            self.assertEqual(r.returncode, want_rc, (env, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stdout + r.stderr)
+            self.assertNotRegex(
+                r.stdout + r.stderr, r"[A-Za-z0-9]{32}"
+            )  # never printed
 
     def test_prep_prints_the_host_key_from_inside_the_session(self):
         text = self.text("prep.sh")
