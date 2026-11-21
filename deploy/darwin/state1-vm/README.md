@@ -288,7 +288,7 @@ Recovery.
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
 | 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
-| 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (record not found, account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule) | live |
+| 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
 | 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again | live |
@@ -309,7 +309,7 @@ Recovery.
 4. Step 11a (bootout, remove, confirm `launchctl print` fails) needs the installed daemon;
    it runs before the stop-and-delete that step 11 already does.
 
-## Things this slice could not verify (no VM was run)
+## Things not yet verified (the first real run, 2026-11-21, stopped at g6)
 
 - The launchd disable list in `prep.sh` is a candidate list for a headless VM, applied only to
   labels whose plist ships on the image. The first real run's `before` snapshot is the
@@ -318,19 +318,23 @@ Recovery.
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
   `PubkeyAuthentication yes`, `PermitRootLogin no`, `UsePAM yes`), not the lowercase of stock
-  OpenSSH. `prep.sh` and check 2e (and its post-reboot repeat, 10a) now match whole lines
-  ignoring case. The `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has
-  `Include /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and
-  sorts after ours), and the effective configuration was key-only. The same run confirmed that
-  `tart clone` of the `@sha256:` reference works from the cache, `tart ip --wait` answers, and
-  that the vanilla image's Secure Token is enabled for `admin` (issue 78 stays open: the
-  password rotation comes after g6 and has not run).
+  OpenSSH. `prep.sh` (`grep -qixF`: whole line, ignoring case) and check 2e (and its
+  post-reboot repeat, 10a) now accept exactly the same lines: the driver splits on `"\n"` only,
+  strips nothing and folds ASCII case only, so padding, a CR or a line smuggled in through a
+  quoted value (for example a `Banner` holding a form feed) does not count. The
+  `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has `Include
+  /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and sorts
+  after ours), and the effective configuration, as `sshd -T -C user=admin,host=localhost,
+  addr=127.0.0.1` prints it, was key-only; the live refusal of a password login (g9, 2f) has not
+  run. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
+  cache, `tart ip --wait` answers, and that the vanilla image's Secure Token is enabled for
+  `admin`. Issue 78 stays open: the password rotation is `prep.sh` step 8, inside g6 and after
+  the step-7 `sshd -T` assertion that failed, so it has not run.
 - Assumed from tart's source and docs, not run: `tart list --format json` field names
-  (`Name`, `Running`), `tart clone` of an `@sha256:` reference from the OCI cache without a
-  pull, `tart ip --wait`, that a guest `shutdown -r` keeps `tart run` alive (if it exits, the
-  driver restarts it), the macOS 27 `sshd_config.d` include, `spctl --global-enable`, and the
-  `installer -pkg` run for python.org's package (its optional shell-profile step edits the
-  console user's profile, which is harmless in a throwaway VM).
+  (`Name`, `Running`), that a guest `shutdown -r` keeps `tart run` alive (if it exits, the
+  driver restarts it), `spctl --global-enable`, and the `installer -pkg` run for python.org's
+  package (its optional shell-profile step edits the console user's profile, which is harmless
+  in a throwaway VM).
 - Console password (operator ruling 2026-11-21, replacing the earlier "keep the vanilla
   password"): the admin password is random per golden and not stored; the admin account is
   for the local console only, and Screen Sharing is off (asserted before and after the reboot)
@@ -342,7 +346,8 @@ Recovery.
   `sudo`, that the password in `dscl`'s argv (it is there for two commands) is visible
   only inside the throwaway guest, and that changing it leaves the guest booting and SSH working
   (the login keychain and `/etc/kcpassword` are left stale on purpose). **Secure Token:** the
-  vanilla `admin` is probably a Secure Token holder; whether the change also updates the APFS
+  vanilla `admin` is a Secure Token holder (the first run's `before` snapshot logged it
+  ENABLED); whether the change also updates the APFS
   crypto-user credential (volume owner, FileVault and Recovery unlock) is unverified, and 2l
   proves only the Directory Services password. `prep.sh` records `sysadminctl -secureTokenStatus
   admin` in the `before` snapshot and logs it, and changes nothing about the token; the first

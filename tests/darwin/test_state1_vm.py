@@ -2897,7 +2897,9 @@ class Check(Base):
         for name, out in (
             ("camelcase", SSHD_CAMEL),
             ("lowercase", SSHD_LOWER),
-            ("crlf and padding", SSHD_CAMEL.replace("\n", "  \r\n")),
+            ("ascii upper case", SSHD_CAMEL.upper()),  # grep -i accepts it too
+            # a line with non-ASCII text elsewhere in the output is just another line
+            ("non-ascii line elsewhere", SSHD_CAMEL + "Banner /café\n"),
         ):
             with self.subTest(name):
                 self.world.sshd_output = out
@@ -2909,8 +2911,37 @@ class Check(Base):
         wrong = SSHD_CAMEL.replace(
             "PasswordAuthentication no", "PasswordAuthentication yes"
         )
+        # F1 (PR 86 review): a quoted value (Banner, ...) can carry a separator that
+        # str.splitlines() honours, so one printed line would fake the wanted one.
+        smuggled = [
+            (f"smuggled line after U+{ord(sep):04X}", wrong + f"Banner /x{sep}PasswordAuthentication no\n")
+            for sep in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ")
+        ]  # fmt: skip
         cases = (
             ("password login on", wrong, "passwordauthentication no"),
+            *((n, o, "passwordauthentication no") for n, o in smuggled),
+            # prep.sh's grep -qixF rejects padding and a CR, so the driver does too
+            (
+                "trailing padding",
+                SSHD_CAMEL.replace(
+                    "PasswordAuthentication no\n", "PasswordAuthentication no  \n"
+                ),
+                "passwordauthentication no",
+            ),
+            (
+                "trailing CR",
+                SSHD_CAMEL.replace(
+                    "PasswordAuthentication no\n", "PasswordAuthentication no\r\n"
+                ),
+                "passwordauthentication no",
+            ),
+            (
+                "leading space",
+                SSHD_CAMEL.replace(
+                    "PasswordAuthentication no\n", " PasswordAuthentication no\n"
+                ),
+                "passwordauthentication no",
+            ),
             (
                 "option missing",
                 SSHD_CAMEL.replace("KbdInteractiveAuthentication no\n", ""),
@@ -3923,6 +3954,12 @@ class GuestScripts(unittest.TestCase):
         fake.write_text('#!/bin/sh\nprintf "%s" "$SSHD_OUT"\n')
         fake.chmod(0o755)
         snippet = snippet.replace("/usr/sbin/sshd", str(fake))
+        # A2: the replace must have taken, and the slice must never be able to run the host's
+        # sshd or write anything on the host.
+        self.assertNotIn("/usr/sbin/sshd", snippet)
+        self.assertIn(str(fake), snippet)
+        self.assertNotRegex(snippet, r"(^|[\s;|&(])(mv|rm|cp|tee|chmod|chown|mkdir)\s")
+        self.assertNotIn(">", snippet)
         stub = 'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
         cases = (
             (SSHD_CAMEL, 0, ""),  # macOS 27.2, as observed
@@ -3934,6 +3971,18 @@ class GuestScripts(unittest.TestCase):
             (SSHD_CAMEL.replace("PermitRootLogin no", "PermitRootLogin no-password"),
              1, "permitrootlogin no"),  # whole line, not a prefix
             ("", 1, "passwordauthentication no"),
+            # padding, a CR and a leading space are not the wanted line (and the driver agrees)
+            (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no  \n"),
+             1, "passwordauthentication no"),
+            (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no\r\n"),
+             1, "passwordauthentication no"),
+            (SSHD_CAMEL.replace("PasswordAuthentication no\n", " PasswordAuthentication no\n"),
+             1, "passwordauthentication no"),
+            # a separator inside a quoted value does not make a second line, in grep either
+            (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
+             + "Banner /x\x0cPasswordAuthentication no\n", 1, "passwordauthentication no"),
+            (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
+             + "Banner /x PasswordAuthentication no\n", 1, "passwordauthentication no"),
         )  # fmt: skip
         for out, want_rc, want_msg in cases:
             r = subprocess.run(

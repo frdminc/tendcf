@@ -1094,9 +1094,12 @@ def persistent_assertions(
             f"user={t.user},host=localhost,addr=127.0.0.1",
         ],
     )
-    # macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase: compare
-    # whole lines, case-folded and stripped.
-    cfg = {ln.strip().lower() for ln in r.stdout.splitlines()}
+    # macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase. Accept
+    # exactly what prep.sh's `grep -qixF` accepts: whole lines split on "\n" only (never
+    # splitlines(): it also splits on \x0b, \x0c, \x1c-\x1e, U+0085, U+2028 and U+2029, which a
+    # quoted sshd value such as Banner can carry, so one printed line could fake a wanted
+    # one), no stripping, ASCII-only case folding.
+    cfg = {ln.lower() for ln in r.stdout.split("\n") if ln.isascii()}
     want = {
         "passwordauthentication no",
         "kbdinteractiveauthentication no",
@@ -1190,9 +1193,11 @@ def persistent_assertions(
     )
     # The console password is no longer the vanilla image's published "admin". Only the
     # wrong-password result, by code (-14090, eDSAuthFailed), counts as proof: every other
-    # dscl result (no such user, disabled or expired account, no directory, unparseable
-    # output, ssh's own 255) must not read as "the password was changed". No sudo: -authonly
-    # only verifies a credential.
+    # dscl result (disabled or expired account, no directory, unparseable output, ssh's own
+    # 255) must not read as "the password was changed". A missing user is not another code on
+    # macOS 27.2: it also prints -14090 eDSAuthFailed (observed with a nonexistent name), so
+    # this step does not prove the account exists; the key login as admin does. No sudo:
+    # -authonly only verifies a credential.
     r = rssh(ctx, t, ["dscl", ".", "-authonly", "admin", "admin"])
     refused = r.rc not in (0, 255) and dscl_auth_failed(r.stdout + r.stderr)
     out.append(
