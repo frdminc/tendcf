@@ -216,5 +216,23 @@ class Failures(unittest.TestCase):
             sb.write(os.path.join(self.d, "a"), "x")
 
 
+class CreatedDirectories(unittest.TestCase):
+    """A directory the sandbox creates for a path is 0755 whatever the umask (issue 51: systemd
+    runs what lies in /etc/systemd/system-generators as root), and is removed again."""
+
+    def test_created_directory_mode_does_not_depend_on_the_umask(self):
+        d = tempfile.mkdtemp(prefix="tendcf-s1-sbx-")
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", d]))
+        old = os.umask(0)
+        try:
+            with Sandbox(roots=[d], run=None) as sb:
+                sb.write(os.path.join(d, "gen", "sub", "g"), "x", mode=0o755)
+                self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, "gen")).st_mode), 0o755)
+                self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, "gen", "sub")).st_mode), 0o755)
+        finally:
+            os.umask(old)
+        self.assertFalse(os.path.exists(os.path.join(d, "gen")))
+
+
 if __name__ == "__main__":
     unittest.main()
