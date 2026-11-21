@@ -1007,7 +1007,13 @@ class Golden(Base):
         self.assertEqual(s["steps"][-1]["step"], "exists")
         new = [a for a, _ in self.world.calls[before:]]
         self.assertTrue(
-            all(a[:2] in (["tart", "--version"], ["tart", "list"]) for a in new), new
+            all(
+                a[:2] in (["tart", "--version"], ["tart", "list"])
+                or a[:3]
+                == ["ssh-keygen", "-y", "-f"]  # the record and key are validated
+                for a in new
+            ),
+            new,
         )
         self.assertEqual(len(self.world.tart_calls("clone")), 1)
 
@@ -1325,7 +1331,7 @@ class Golden(Base):
         self.assertNotEqual(old_pub.split()[1], new_pub.split()[1])
         rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
         self.assertEqual(rec["key_id"], second)
-        self.assertEqual(self.steps(s)["keys"]["evidence"], first)
+        self.assertEqual(self.steps(s)["keys"]["evidence"], f"removed {first}")
         rc, s = self.run_cmd(*self.check_args(), ctx=ctx2)  # check uses the new key
         self.assertEqual(rc, 0, s)
 
@@ -1845,7 +1851,8 @@ class Check(Base):
         }
         self.assertEqual(offered, {self.ident})
         for argv, _ in self.world.ssh_calls:
-            self.assertIn("IdentityAgent=none", argv)  # never the operator's agent
+            if "-i" in argv:  # the password-refusal probe has no identity at all
+                self.assertIn("IdentityAgent=none", argv)  # never the operator's agent
 
     def test_check_refuses_a_swapped_private_key(self):
         other = self.tmp / "other-key"
