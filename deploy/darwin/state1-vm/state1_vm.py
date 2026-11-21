@@ -986,13 +986,13 @@ def persistent_assertions(
             f"rc {r.rc}; " + (listening[0].strip() if listening else "no listener"),
         )
     )
-    # The console password is no longer the vanilla image's published "admin". Only an
-    # authentication failure counts as proof: any other dscl error (no such user, no
-    # directory) must not read as "the password was changed".
-    r = rssh(ctx, t, ["sudo", "-n", "dscl", ".", "-authonly", "admin", "admin"])
-    refused = r.rc != 0 and re.search(
-        r"eDSAuthFailed|authentication.{0,40}failed", r.stdout + r.stderr, re.IGNORECASE
-    )
+    # The console password is no longer the vanilla image's published "admin". Only the
+    # wrong-password result, by code (-14090, eDSAuthFailed), counts as proof: every other
+    # dscl result (no such user, disabled or expired account, no directory, unparseable
+    # output, ssh's own 255) must not read as "the password was changed". No sudo: -authonly
+    # only verifies a credential.
+    r = rssh(ctx, t, ["dscl", ".", "-authonly", "admin", "admin"])
+    refused = r.rc not in (0, 255) and dscl_auth_failed(r.stdout + r.stderr)
     out.append(
         (
             "2l",
@@ -1000,13 +1000,31 @@ def persistent_assertions(
             bool(refused),
             f"rc {r.rc}; "
             + (
-                "dscl -authonly admin admin: authentication failed"
+                "dscl -authonly admin admin: -14090 eDSAuthFailed"
                 if refused
                 else clip((r.stdout + r.stderr).strip() or "no failure reported", 200)
             ),
         )
     )
     return out
+
+
+# dscl prints a failure as "... failed. (-14090, eDSAuthFailed)" or "<dscl_cmd> DS Error:
+# -14090 (eDSAuthFailed)" (forum and vendor threads; not run here).
+DSCL_CODE_RES = (
+    re.compile(r"\((-?\d+),\s*(eDS\w+)\)"),
+    re.compile(r"DS Error:\s*(-?\d+)\s*\((eDS\w+)\)"),
+)
+
+
+def dscl_auth_failed(text: str) -> bool:
+    """True only when the output names the wrong-password code and no other code.
+
+    -14090 eDSAuthFailed is "the credential was rejected". Any other code (eDSRecordNotFound,
+    eDSAuthAccountDisabled, eDSAuthPasswordExpired, ...) or output with no code is not proof
+    that the vanilla password is dead, so it is False."""
+    pairs = {m for rx in DSCL_CODE_RES for m in rx.findall(text)}
+    return pairs == {("-14090", "eDSAuthFailed")}
 
 
 def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
@@ -1141,24 +1159,50 @@ def keys_root(ctx: Ctx) -> Path:
 def key_paths(ctx: Ctx, key_id: str) -> tuple[Path, Path]:
     """(private, public) key paths of one golden. The key id comes from golden.json or the
     run id, and becomes a path component, so it is validated first."""
-    if not KEY_ID_RE.match(key_id) or key_id in (".", ".."):
+    if not KEY_ID_RE.fullmatch(key_id) or key_id in (".", ".."):
         raise Refusal(f"unsafe key id {key_id!r}")
     d = keys_root(ctx) / key_id
     return d / "id_ed25519", d / "id_ed25519.pub"
 
 
-def mint_keypair(ctx: Ctx, key_id: str) -> tuple[str, str]:
+def secure_dir(path: Path, what: str) -> None:
+    """A real directory (never a symlink) owned by us with no group or world access.
+    lstat, so a symlink to somewhere else (the operator's own ssh directory, say) is refused
+    instead of followed."""
+    try:
+        st = path.lstat()
+    except OSError as e:
+        raise Refusal(f"{what} {path} is missing: {e}") from e
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refusal(
+            f"{what} {path} must be a real directory, not a symlink or a file"
+        )
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refusal(
+            f"{what} {path} must be owned by you with no group or world access "
+            f"(is uid {st.st_uid}, mode {st.st_mode & 0o777:o})"
+        )
+
+
+def mint_keypair(
+    ctx: Ctx, key_id: str, created: Callable[[], None] | None = None
+) -> tuple[str, str]:
     """A fresh ed25519 key for one golden: private half 0600 in a 0700 directory under the
     state dir, outside the repo and unrelated to anyone's ~/.ssh. Returns (public line, private
-    path). Never reuses an existing key: the directory must not exist."""
+    path). Never reuses an existing key: the directory must not exist. `created` is called
+    right after this call made the key directory, so the caller removes only what it made."""
     priv, pub = key_paths(ctx, key_id)
     root = keys_root(ctx)
-    root.mkdir(parents=True, exist_ok=True)
-    os.chmod(root, 0o700)
+    ctx.state_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(root, 0o700)
+    secure_dir(root, "keys directory")  # never chmod or follow a symlinked root
     try:
         os.mkdir(priv.parent, 0o700)  # exclusive
     except FileExistsError as e:
         raise ToolError(f"key directory {priv.parent} already exists") from e
+    if created is not None:
+        created()
     r = ctx.run(
         [
             "ssh-keygen",
@@ -1184,7 +1228,10 @@ def mint_keypair(ctx: Ctx, key_id: str) -> tuple[str, str]:
 
 
 def private_ok(priv: Path) -> None:
-    """The private key must be a regular file we own, readable by nobody else."""
+    """The private key must be a regular file we own, readable by nobody else, in a key
+    directory and a keys directory that are real directories we own."""
+    secure_dir(priv.parent.parent, "keys directory")
+    secure_dir(priv.parent, "key directory")
     try:
         st = priv.lstat()
     except OSError as e:
@@ -1199,49 +1246,80 @@ def private_ok(priv: Path) -> None:
 
 def remove_key_dir(ctx: Ctx, key_id: str) -> str:
     d = key_paths(ctx, key_id)[0].parent
-    if d.is_symlink() or not d.is_dir():
-        return f"{d}: absent"
-    shutil.rmtree(d)
-    return f"removed {d}"
+    try:
+        secure_dir(keys_root(ctx), "keys directory")
+        secure_dir(d, "key directory")
+    except Refusal as e:
+        return f"left in place: {e}"
+    shutil.rmtree(d, ignore_errors=True)
+    return f"{d}: still present" if os.path.lexists(d) else f"removed {d}"
 
 
-def sweep_stale_keys(ctx: Ctx, keep: str) -> list[str]:
-    """Remove the private keys of every other (deleted or replaced) golden. Real directories
-    only: a symlink or a stray file under keys/ is left alone."""
-    gone = []
+def sweep_stale_keys(ctx: Ctx, keep: str) -> tuple[list[str], list[str]]:
+    """Remove the private keys of every other (deleted or replaced) golden: (removed, failed).
+    The keys directory must be a real directory we own (a symlinked root is never followed:
+    Refusal). Only real directories are touched: a symlink or a stray file under keys/ is
+    left alone. A name counts as removed only if it is really gone afterwards."""
+    gone: list[str] = []
+    failed: list[str] = []
     root = keys_root(ctx)
-    if not root.is_dir():
-        return gone
+    if not os.path.lexists(root):
+        return gone, failed
+    secure_dir(root, "keys directory")
     for d in sorted(root.iterdir()):
-        if d.name == keep or d.is_symlink() or not d.is_dir():
+        if d.name == keep or not KEY_ID_RE.fullmatch(d.name):
             continue
-        if not KEY_ID_RE.match(d.name):
+        try:
+            st = d.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(
+            st.st_mode
+        ):  # a symlink or a stray file: not ours to remove
+            continue
+        try:
+            secure_dir(d, "key directory")
+        except Refusal as e:
+            failed.append(f"{d.name} ({e})")
             continue
         shutil.rmtree(d, ignore_errors=True)
-        gone.append(d.name)
-    return gone
+        (failed if os.path.lexists(d) else gone).append(
+            f"{d.name} (still present after removal)" if os.path.lexists(d) else d.name
+        )
+    return gone, failed
 
 
 def golden_identity(ctx: Ctx) -> str:
     """The private key of the current golden, found through golden.json; Refusal otherwise.
-    The recorded fingerprint must match the key's public half, so a key from another golden
-    (or a hand-edited record) is not silently used."""
+    The private key itself is matched to the recorded fingerprint (its public half is derived
+    with `ssh-keygen -y`, not read from the .pub file), so a key from another golden, a
+    swapped private key or a hand-edited record is not silently used."""
     rec_path = ctx.state_dir / "golden.json"
+    again = "run `golden` (add --rebuild if a golden exists)"
     try:
         rec = json.loads(rec_path.read_text())
         key_id, want = rec["key_id"], rec["authorized_key"]
     except (OSError, ValueError, KeyError, TypeError) as e:
-        raise Refusal(
-            f"{rec_path}: no usable golden record ({e!r}); run `golden --rebuild`"
-        ) from e
+        raise Refusal(f"{rec_path}: no usable golden record ({e!r}); {again}") from e
     if not isinstance(key_id, str) or not isinstance(want, str):
         raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
     priv, pub = key_paths(ctx, key_id)
-    private_ok(priv)
-    got = fingerprint(read_pubkey(pub))
-    if got != want:
+    try:
+        private_ok(priv)
+    except Refusal as e:
+        raise Refusal(f"{e}; {again}") from e
+    r = ctx.run(["ssh-keygen", "-y", "-f", str(priv)], timeout=30)
+    derived = r.stdout.strip()
+    if r.rc != 0 or not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+( .*)?", derived):
         raise Refusal(
-            f"{pub} is {got}, golden.json says {want}: the key does not belong to this golden; run `golden --rebuild`"
+            f"{priv}: ssh-keygen -y could not read the private key (rc {r.rc}); {again}"
+        )
+    got = fingerprint(derived)
+    pub_got = fingerprint(read_pubkey(pub))
+    if got != want or pub_got != want:
+        raise Refusal(
+            f"{priv} is {got} (its .pub says {pub_got}), golden.json says {want}: "
+            f"the key does not belong to this golden; {again}"
         )
     return str(priv)
 
@@ -1271,6 +1349,12 @@ def cmd_golden(ctx: Ctx, args) -> int:
     scratch_made = False
     key_made = False
     key_id = ctx.run_id  # one key per golden build: never reused, never shared
+    rebuild = args.rebuild
+
+    def key_dir_made() -> None:
+        nonlocal key_made
+        key_made = True  # only after this run's own exclusive mkdir succeeded
+
     refusal = ""
     pubkey = ""
     identity = ""
@@ -1280,15 +1364,28 @@ def cmd_golden(ctx: Ctx, args) -> int:
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
                 names = set(local_vms(ctx))
-                if golden in names and not args.rebuild:
-                    summary.add(
-                        "exists",
-                        f"{golden} already exists",
-                        "pass",
-                        "nothing to do; pass --rebuild to build it again",
-                    )
-                    emit(summary, ctx, args.summary)
-                    return 0
+                if golden in names and not rebuild:
+                    try:
+                        golden_identity(ctx)
+                    except Refusal as e:
+                        # `check` would refuse this golden, and nothing here may wait for a
+                        # human: build it again, and say so.
+                        rebuild = True
+                        summary.add(
+                            "exists",
+                            f"{golden} exists but its record or key is unusable",
+                            "pass",
+                            f"rebuilding it unattended: {e}",
+                        )
+                    else:
+                        summary.add(
+                            "exists",
+                            f"{golden} already exists",
+                            "pass",
+                            "nothing to do; its record and key are usable; pass --rebuild to build it again",
+                        )
+                        emit(summary, ctx, args.summary)
+                        return 0
                 if ref not in oci_names(ctx):
                     raise Refusal(
                         f"pinned image {ref} is not in tart's OCI cache; run `state1_vm.py pull` first (golden never pulls)"
@@ -1312,8 +1409,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         f"scratch directory {scratch} already exists"
                     ) from e
                 scratch_made = True
-                key_made = True  # the directory may exist from here on
-                pubkey, identity = mint_keypair(ctx, key_id)
+                pubkey, identity = mint_keypair(ctx, key_id, created=key_dir_made)
                 kh_scratch = str(scratch / "known_hosts")
                 kh_pinned = str(scratch / "known_hosts.pinned")
                 # Bootstrap leg (before prep rotates the host keys): the image's own key is
@@ -1329,11 +1425,17 @@ def cmd_golden(ctx: Ctx, args) -> int:
 
                 def boot_target(**kw) -> vmssh.Target:
                     return vmssh.Target(
-                        str(state["ip"]), kh_boot, accept_new=not vanilla, **kw
+                        str(state["ip"]),
+                        kh_boot,
+                        accept_new=not vanilla,
+                        no_agent=True,
+                        **kw,
                     )
 
                 def pinned_target() -> vmssh.Target:
-                    return vmssh.Target(str(state["ip"]), kh_pinned, identity=identity)
+                    return vmssh.Target(
+                        str(state["ip"]), kh_pinned, identity=identity, no_agent=True
+                    )
 
                 def clone() -> str:
                     nonlocal attempted
@@ -1473,11 +1575,32 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         },
                         indent=2,
                     )
+
                     # The commit: remove the old golden (--rebuild), rename, then the two
                     # record files, all with signals ignored so no interrupt can land between
                     # the steps and leave the old golden gone and the new build deleted. The
                     # record files are written only after the rename succeeded. keep_build is
                     # set first: from here on a failure never deletes the finished build.
+                    def park_record() -> str:
+                        # The new record (it names this build's key) beside the old one, so
+                        # finishing by hand does not need a rebuild and the key is not orphaned.
+                        try:
+                            atomic_write(
+                                ctx.state_dir / "known_hosts.pending", pinned_text
+                            )
+                            atomic_write(
+                                ctx.state_dir / "golden.json.pending",
+                                record + "\n",
+                                0o644,
+                            )
+                        except OSError:
+                            return ""
+                        return (
+                            "; the new record is in known_hosts.pending and golden.json.pending "
+                            "in the state dir (golden.json.pending names its key): after the "
+                            "rename, mv them over known_hosts and golden.json"
+                        )
+
                     with signals_ignored():
                         keep_build = True
                         if golden in local_vms(ctx):
@@ -1487,7 +1610,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                                 raise ToolError(
                                     f"removing the old {golden} failed: {e}; it and the finished "
                                     f"build {build} are both kept; known_hosts and golden.json "
-                                    "are unchanged"
+                                    f"are unchanged{park_record()}"
                                 ) from e
                             summary.add(
                                 "rebuild",
@@ -1497,26 +1620,10 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             )
                         r = ctx.run(["tart", "rename", build, golden], timeout=120)
                         if r.rc != 0:
-                            pending = ""
-                            try:
-                                atomic_write(
-                                    ctx.state_dir / "known_hosts.pending", pinned_text
-                                )
-                                atomic_write(
-                                    ctx.state_dir / "golden.json.pending",
-                                    record + "\n",
-                                    0o644,
-                                )
-                                pending = (
-                                    "; the new record is in known_hosts.pending and golden.json.pending "
-                                    "in the state dir: after the rename, mv them over known_hosts and golden.json"
-                                )
-                            except OSError:
-                                pass
                             raise ToolError(
                                 f"tart rename failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}; "
                                 f"the finished build is kept as {build}: run `tart rename {build} {golden}` "
-                                f"before the next golden run, which sweeps it{pending}"
+                                f"before the next golden run, which sweeps it{park_record()}"
                             )
                         atomic_write(ctx.state_dir / "known_hosts", pinned_text)
                         atomic_write(
@@ -1524,13 +1631,23 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         )
                         # The replaced golden's key is of no use now: remove it (and the
                         # private keys of any other deleted golden).
-                        stale = sweep_stale_keys(ctx, key_id)
-                        if stale:
+                        try:
+                            stale, stuck = sweep_stale_keys(ctx, key_id)
+                        except Refusal as e:
+                            stale, stuck = [], [str(e)]
+                        if stale or stuck:
                             summary.add(
                                 "keys",
                                 "remove private keys of replaced goldens",
-                                "pass",
-                                ", ".join(stale),
+                                "fail" if stuck else "pass",
+                                "; ".join(
+                                    (["removed " + ", ".join(stale)] if stale else [])
+                                    + (
+                                        ["NOT removed: " + "; ".join(stuck)]
+                                        if stuck
+                                        else []
+                                    )
+                                ),
                             )
                     return f"{stopped}; renamed {build} -> {golden}; record and known_hosts written"
 
@@ -1538,7 +1655,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     ("g1", f"clone pinned image to {build}", clone),
                     ("g2", "boot --no-graphics, tart ip --wait", boot),
                     ("g3", "ssh reachable (vanilla password, once)", boot_ssh),
-                    ("g4", "install the operator's public key", install_key),
+                    ("g4", "install this golden's own public key", install_key),
                     ("g5", "key login works; sudo -n is root", key_sudo),
                     (
                         "g6",
@@ -1652,7 +1769,6 @@ def cmd_check(ctx: Ctx, args) -> int:
     cloned = False  # the clone may exist: set before the call, cleanup handles "absent"
     refusal = ""
     try:
-        identity = golden_identity(ctx)  # the minted key, found through golden.json
         with driver_lock(ctx), signals_to_exception():
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
@@ -1668,6 +1784,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                     raise Refusal(
                         f"{known_hosts} is missing (written by golden); run `golden --rebuild`"
                     )
+                # the minted key, found through golden.json: read under the lock, so a
+                # concurrent rebuild cannot sweep it between this and its use
+                identity = golden_identity(ctx)
                 assert_vm_cap(ctx)
                 summary.add(
                     "preflight",
@@ -1688,7 +1807,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                     vm.start()
                     state["ip"] = vm.ip()
                     state["t"] = vmssh.Target(
-                        str(state["ip"]), str(known_hosts), identity=identity
+                        str(state["ip"]),
+                        str(known_hosts),
+                        identity=identity,
+                        no_agent=True,
                     )
                     secs = wait_for_ssh(ctx, vm, state["t"])  # type: ignore[arg-type]
                     return f"cloned {golden} -> {clone}; ip {state['ip']}; ssh up after {secs:.0f}s (key, pinned host key)"
@@ -1766,7 +1888,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                         except ValueError:
                             return False
                         state_t["t"] = vmssh.Target(
-                            ip, t.known_hosts, identity=t.identity
+                            ip, t.known_hosts, identity=t.identity, no_agent=True
                         )
                         now = boot_session(state_t["t"], 45)
                         return bool(now) and now != before

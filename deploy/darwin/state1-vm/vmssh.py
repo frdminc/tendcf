@@ -6,7 +6,7 @@ guest's login shell with shlex.join, never a string built from variables. The
 exit status of the remote command is the exit status of this wrapper; 255 is
 ssh's own (connect, host key or auth failure).
 
-    vmssh.py --ip 192.168.64.5 --known-hosts KH --identity ~/.ssh/key -- sw_vers -productVersion
+    vmssh.py --ip 192.168.64.5 --known-hosts KH --identity STATE_DIR/keys/ID/id_ed25519 -- sw_vers -productVersion
 
 Host-key choice (the same for every connection the driver makes):
 
@@ -64,6 +64,9 @@ class Target:
         "key"  # "key" (BatchMode, publickey only) or "password" (golden bootstrap only)
     )
     accept_new: bool = False  # trust on first use into known_hosts; scratch file only
+    # key mode: do not talk to the operator's ssh-agent at all (the driver's own minted key
+    # is the only credential); the standalone CLI keeps agent mode for a `.pub` identity
+    no_agent: bool = False
     connect_timeout: int = 10
 
     def __post_init__(self) -> None:
@@ -121,6 +124,8 @@ def ssh_argv(t: Target, remote_argv: list[str], ssh_bin: str = "ssh") -> list[st
             "-o", "IdentitiesOnly=yes",
             "-i", t.identity or "",
         ]  # fmt: skip
+        if t.no_agent:
+            argv += ["-o", "IdentityAgent=none"]
     else:
         # BatchMode would disable SSH_ASKPASS, so it is off here and only here.
         argv += [

@@ -78,11 +78,17 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   host, is never committed and is never copied into `golden.json`. A rebuild mints a new key,
   never reuses one, and removes the private keys of every other golden's key id once the new
   golden is committed (a failed build removes its own key, unless `--keep-on-failure` or a
-  failed rename keeps the build, which needs it). `golden.json` records `key_id` and
-  `authorized_key` (the public key's fingerprint); `check` takes the key from there, refuses if
-  the fingerprint does not match, and refuses a key that is missing, not a regular file (a
-  symlink is refused), or not owned by you with mode 0600. The driver never reads or offers
-  anything in the operator's own `~/.ssh`.
+  failed rename or a failed removal of the old golden keeps the build, which needs it; the
+  record naming that key is then parked as `golden.json.pending`). `golden.json` records
+  `key_id` and `authorized_key` (the public key's fingerprint); `check` takes the key from
+  there, under the driver lock, and refuses (exit 2) unless `keys/` and `keys/<id>/` are real
+  directories (never symlinks) owned by you with no group or world access, the private key is
+  a regular file owned by you with mode 0600, and the public half derived from the private key
+  (`ssh-keygen -y`) matches the recorded fingerprint. A sweep that cannot remove a stale key
+  reports it and fails the `keys` step. Key logins use `IdentitiesOnly=yes` and
+  `IdentityAgent=none`, so the operator's ssh-agent is never contacted. `golden` with a golden
+  whose record or key `check` would refuse rebuilds it, unattended, and says so in the `exists`
+  step. The driver never reads or offers anything in the operator's own `~/.ssh`.
 - **The bootstrap login** is the one password login, and no operator provides it: it is the
   vanilla image's published `admin`/`admin`, used once by `golden` to install that public key
   (see SSH below).
@@ -93,7 +99,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   guest, and never sent to the host; nothing needs it afterwards (SSH is key-only, `sudo` is
   `NOPASSWD`, Screen Sharing is off and asserted). `prep.sh` prints one `PREP-CONSOLE-PW
   rotated` line and the driver fails g6 unless that line appears exactly once; `golden.json`
-  says `console_password` is "never stored". Consequences, by design: local console login and
+  says `console_password` is "random per golden, set in the guest, never stored". On the first
+  run the vanilla password still authenticates, so `prep.sh` uses the old-and-new form
+  (`dscl . -passwd /Users/admin admin "$pw"`), which keeps a Secure Token account in step;
+  the root form without the old password is only the re-run fallback. Consequences, by design: local console login and
   the login keychain are unusable, and the `/etc/kcpassword` the vanilla image's autologin
   uses is stale (it holds the old password, XOR-obfuscated); `prep.sh` leaves both alone. If a
   later slice needs the console password, that is a new decision, not something to read back
@@ -188,7 +197,7 @@ Recovery.
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
 | 2g-2i | Spotlight off; automatic updates off; Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
-| 2l | the vanilla console password `admin` no longer authenticates (`dscl . -authonly admin admin` fails with an authentication failure; any other error fails the step) | live |
+| 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (record not found, account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
 | 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again | live |
@@ -224,12 +233,18 @@ Recovery.
   password"): the admin password is random per golden and not stored; the admin account is
   for the local console only, and Screen Sharing is off (asserted before and after the reboot)
   and SSH is key-only, so nothing on the network or console path is usable. Assumed, not run:
-  that `dscl . -passwd /Users/admin` works as root without the old password on macOS 27, that
-  `dscl . -authonly` exits non-zero with an authentication-failure message (2l matches
-  `eDSAuthFailed` or "authentication ... failed" and treats any other error as a failure), that
-  the password in `dscl`'s argv is visible only inside the throwaway guest for the duration of
-  one command, and that changing it leaves the guest booting and SSH working (the login keychain
-  and `/etc/kcpassword` are left stale on purpose; the first real `golden` and `check` prove it).
+  that `dscl . -passwd /Users/admin admin NEW` works on macOS 27 (and, only as the re-run
+  fallback, the root form), that `dscl . -authonly` prints a `-14090`/`eDSAuthFailed` result in
+  one of the two shapes the driver parses (`(-14090, eDSAuthFailed)` or `DS Error: -14090
+  (eDSAuthFailed)`; anything else fails closed) and that it works for the admin user without
+  `sudo`, that the password in `dscl`'s argv (it is there for two or three commands) is visible
+  only inside the throwaway guest, and that changing it leaves the guest booting and SSH working
+  (the login keychain and `/etc/kcpassword` are left stale on purpose). **Secure Token:** the
+  vanilla `admin` is probably a Secure Token holder; whether the change also updates the APFS
+  crypto-user credential (volume owner, FileVault and Recovery unlock) is unverified, and 2l
+  proves only the Directory Services password. `prep.sh` records `sysadminctl -secureTokenStatus
+  admin` in the `before` snapshot and logs it, and changes nothing about the token; the first
+  real `golden` (issue 78) decides.
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
   Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
   lines the script compares, that python.org's installer leaves `Python.framework/Versions`
