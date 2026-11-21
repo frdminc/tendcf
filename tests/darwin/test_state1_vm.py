@@ -412,12 +412,13 @@ class FakeWorld:
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             self.mdutil_calls += 1
-            rc, out = (
-                self.mdutil_outputs.pop(0)
-                if self.mdutil_outputs
-                else self.mdutil_default
+            return drv.Result(
+                *(
+                    self.mdutil_outputs.pop(0)
+                    if self.mdutil_outputs
+                    else self.mdutil_default
+                )
             )
-            return drv.Result(rc, out)
         if r == ["sudo", "-n", "softwareupdate", "--schedule"]:
             return drv.Result(
                 *(self.su_outputs.pop(0) if self.su_outputs else self.su_schedule)
@@ -1069,6 +1070,14 @@ class Golden(Base):
         self.assertIn("secure token status (after):", ev)
         self.assertIn("Secure token is ENABLED for user Managed via Tart", ev)
         self.assertNotIn("example399", ev)  # it is the one line, not the noise
+
+    def test_g6_evidence_counts_repeated_secure_token_lines(self):
+        # F7b: more than one line is said, not hidden; still never a failure
+        self.world.prep_token_line = SECURE_TOKEN_AFTER * 2
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["g6"]["evidence"]
+        self.assertIn("[2 such lines in the prep output; first shown]", ev)
 
     def test_g6_says_so_when_prep_printed_no_secure_token_line(self):
         self.world.prep_token_line = ""
@@ -3135,26 +3144,55 @@ class Check(Base):
         self.assertIn("2g after the reboot: polls=4 waited=6s", st["10a"]["evidence"])
 
     # -- 2h / 10a: automatic updates off, by what softwareupdate itself says
-    def test_2h_passes_on_turned_off_and_does_not_need_the_automaticcheckenabled_key(
-        self,
-    ):
+    def test_2h_passes_on_turned_off_with_automaticcheckenabled_absent(self):
         self.world.defaults_values["AutomaticCheckEnabled"] = (
             1,
             "",
-            "Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.",
+            "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.",
         )
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
         st = self.steps(s)["2h"]
         self.assertEqual(st["status"], "pass")
         self.assertIn("Automatic checking for updates is turned off", st["evidence"])
-        self.assertIn("AutomaticDownload=0", st["evidence"])
-        self.assertIn("AutomaticallyInstallMacOSUpdates=0", st["evidence"])
-        self.assertNotIn("AutomaticCheckEnabled", st["evidence"])
-        reads = [
-            a[-1] for a, _ in self.world.ssh_calls if "AutomaticCheckEnabled" in a[-1]
-        ]
-        self.assertEqual(reads, [])  # never read at all
+        for key in (
+            "AutomaticDownload",
+            "AutomaticallyInstallMacOSUpdates",
+            "ConfigDataInstall",
+            "CriticalUpdateInstall",
+        ):
+            self.assertIn(f"{key}=0", st["evidence"])
+        self.assertIn("AutomaticCheckEnabled=absent", st["evidence"])
+
+    def test_2h_automaticcheckenabled_present_must_read_zero_and_other_errors_fail(
+        self,
+    ):
+        for name, answer, ok in (
+            ("present and 0", (0, "0\n", ""), True),
+            ("present and 1", (0, "1\n", ""), False),
+            ("other error", (1, "", "Operation not permitted"), False),
+        ):
+            with self.subTest(name):
+                self.world.defaults_values["AutomaticCheckEnabled"] = answer
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 0 if ok else 1, s)
+                self.assertEqual(
+                    self.steps(s)["2h"]["status"], "pass" if ok else "fail", name
+                )
+        del self.world.defaults_values["AutomaticCheckEnabled"]
+
+    def test_2h_reads_stdout_and_stderr_together(self):
+        for name, answer, ok in (
+            ("on on stderr", (0, SU_OFF, SU_ON), False),
+            ("off only on stderr", (0, "", SU_OFF), True),
+        ):
+            with self.subTest(name):
+                self.world.su_schedule = answer
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 0 if ok else 1, s)
+                self.assertEqual(
+                    self.steps(s)["2h"]["status"], "pass" if ok else "fail", name
+                )
 
     def test_2h_fails_unless_softwareupdate_says_automatic_checking_is_off(self):
         cases = (
@@ -3173,8 +3211,13 @@ class Check(Base):
                 self.assertEqual(st["2h"]["status"], "fail", name)
                 self.assertIn("schedule rc", st["2h"]["evidence"], name)
 
-    def test_2h_still_needs_download_and_install_to_read_zero(self):
-        for key in ("AutomaticDownload", "AutomaticallyInstallMacOSUpdates"):
+    def test_2h_needs_all_four_keys_prep_writes_at_zero(self):
+        for key in (
+            "AutomaticDownload",
+            "AutomaticallyInstallMacOSUpdates",
+            "ConfigDataInstall",
+            "CriticalUpdateInstall",
+        ):
             with self.subTest(key):
                 self.world.defaults_values[key] = (0, "1\n", "")
                 rc, s = self.run_cmd(*self.check_args())
@@ -3193,6 +3236,116 @@ class Check(Base):
         self.assertEqual(st["10a"]["status"], "fail")
         self.assertIn("2h automatic updates off: schedule rc 0", st["10a"]["evidence"])
         self.assertIn("turned on", st["10a"]["evidence"])
+
+    # -- PR 88 round r1: the order of the 2g rule, the per-volume rule, structured 10a note
+    def test_2g_retries_transitioning_whatever_the_exit_status_was(self):
+        # F1: the exit status of mdutil while Transitioning was never recorded
+        self.world.mdutil_outputs = [
+            (1, MDUTIL_TRANSITIONING),
+            (1, MDUTIL_TRANSITIONING),
+        ]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["2g"]["evidence"]
+        self.assertEqual(self.steps(s)["2g"]["status"], "pass")
+        self.assertIn("polls=3 waited=4s", ev)
+        self.assertIn(
+            "rcs=[1, 1, 0]", ev
+        )  # every poll's exit status is in the evidence
+
+    def test_2g_transitioning_with_exit_1_to_the_timeout_fails(self):
+        self.world.mdutil_default = (1, MDUTIL_TRANSITIONING)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        st = self.steps(s)["2g"]
+        self.assertEqual(st["status"], "fail")
+        self.assertIn("still transitioning", st["evidence"])
+        self.assertIn("rc=1 polls=61 waited=120s", st["evidence"])
+
+    def test_2g_wants_every_volume_with_exactly_one_disabled_line(self):
+        root = "/:\n\tIndexing disabled.\n"
+        cases = (
+            ("header with no status", root + "/System/Volumes/Data:\n", "no status for"),
+            (
+                "header with no status, then another volume",
+                root + "/System/Volumes/Data:\n/System/Volumes/Preboot:\n\tIndexing disabled.\n",
+                "no status for /System/Volumes/Data:",
+            ),
+            (
+                "status line ending in a colon",
+                root + "/System/Volumes/Data:\n\tIndexing state:\n",
+                "unexpected line",
+            ),
+            (
+                "two statuses for one volume",
+                root + "\tIndexing disabled.\n",
+                "two statuses for /:",
+            ),
+            (
+                "disabled and an unknown error",
+                root + "/System/Volumes/Data:\n\tError: unknown indexing state.\n",
+                "unexpected line",
+            ),
+            ("no root volume", "/System/Volumes/Data:\n\tIndexing disabled.\n", "no / volume"),
+            ("status before any volume", "\tIndexing disabled.\n" + root, "status before any volume"),
+            ("a CR is not a line break", "/:\r\n\tIndexing disabled.\r\n", "unexpected line"),
+            ("a form feed is not a line break", root + "\x0c/Data:\n", "no status for \x0c/Data:"),
+        )  # fmt: skip
+        for name, out, why in cases:
+            with self.subTest(name):
+                self.world.mdutil_default = (0, out)
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                st = self.steps(s)["2g"]
+                self.assertEqual(st["status"], "fail", name)
+                self.assertIn(why, st["evidence"], name)
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+
+    def test_2g_reads_stderr_too(self):
+        hdrs = "/:\n/System/Volumes/Data:\n"
+        # Transitioning only on stderr is retried, never passed; Indexing enabled on stderr fails
+        self.world.mdutil_outputs = [
+            (
+                0,
+                hdrs,
+                "\tError: unexpected indexing state.  kMDConfigSearchLevelTransitioning\n",
+            )
+        ]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertIn("polls=2 ", self.steps(s)["2g"]["evidence"])
+        self.world.mdutil_default = (0, MDUTIL_OFF, "\tIndexing enabled.\n")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        self.assertIn("polls=1 ", self.steps(s)["2g"]["evidence"])
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+        # the whole answer on stderr is read like stdout
+        self.world.mdutil_default = (0, "", MDUTIL_OFF)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+
+    def test_2g_one_volume_transitioning_with_the_others_disabled_is_retried(self):
+        mixed = "/:\n\tIndexing disabled.\n" + MDUTIL_TRANSITIONING.split("\n", 2)[2]
+        self.world.mdutil_outputs = [(0, mixed), (0, mixed)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertIn("polls=3 waited=4s", self.steps(s)["2g"]["evidence"])
+        self.world.mdutil_default = (0, mixed)  # and never passed while it lasts
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        self.assertIn("still transitioning", self.steps(s)["2g"]["evidence"])
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+
+    def test_10a_settle_note_is_the_drivers_own_value_not_guest_text(self):
+        # A4: a guest header that looks like the note must not be taken for it
+        spoof = "polls=9 waited=99s:\n\tIndexing disabled.\n" + MDUTIL_OFF
+        self.world.mdutil_outputs = [(0, MDUTIL_OFF), (0, spoof)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["10a"]["evidence"]
+        self.assertIn("2g after the reboot: polls=1 waited=0s", ev)
+        self.assertNotIn("polls=9", ev)
 
     def test_reboot_restarts_tart_run_when_it_exits(self):
         self.world.run_exits_on_reboot = True
@@ -4308,71 +4461,116 @@ class GuestScripts(unittest.TestCase):
         f.chmod(0o755)
         return d
 
-    def run_snippet(self, snippet, fakes, env=None):
-        """Run a slice of prep.sh with fake tools first on PATH: nothing on the host is touched."""
-        bins = [self.fake_bin(n, b) for n, b in fakes.items()]
+    def run_snippet(self, snippet, fakes, env=None, links=()):
+        """Run a slice of prep.sh with only fake tools on PATH (plus the named host tools,
+        symlinked into the fake directory): the host's own tools cannot be reached."""
+        d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, body in fakes.items():
+            f = d / name
+            f.write_text("#!/bin/sh\n" + body)
+            f.chmod(0o755)
+        for name in links:
+            (d / name).symlink_to(shutil.which(name, path="/usr/bin:/bin"))
         stub = (
             'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
             'log() { printf "prep: %s\\n" "$*"; }\n'
         )
-        path = ":".join(str(b) for b in bins) + ":/usr/bin:/bin"
         return subprocess.run(
             ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
             capture_output=True,
             text=True,
             check=False,
-            env={"PATH": path, **(env or {})},
+            env={"PATH": str(d), **(env or {})},
         )
 
     def test_prep_settles_mdutil_with_a_bounded_retry(self):
         text = self.text("prep.sh")
-        a = text.index("mdutil_polls=1")
+        a = text.index("mdutil_start=$(date +%s)")
         b = text.index('log "spotlight: off', a)
         snippet = text[a : text.index("\n", b) + 1]
-        self.assertNotIn("/usr/bin/mdutil", snippet)
+        for host in ("/usr/bin/mdutil", "/usr/bin/awk", "/bin/sleep"):
+            self.assertNotIn(host, snippet)
         seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-seq-"))
         self.addCleanup(shutil.rmtree, seq, True)
         fakes = {
-            # the Nth call prints $SEQ/out.N, else $SEQ/out.last; the exit status is MDUTIL_RC
+            # the Nth call prints $SEQ/out.N (else out.last) and costs MDUTIL_COST seconds of
+            # the fake clock; sleep advances it; date prints it; the exit status is MDUTIL_RC
             "mdutil": 'D=$SEQ; n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n + 1)); '
-            'echo "$n" >"$D/n"; f="$D/out.$n"; [ -f "$f" ] || f="$D/out.last"; '
+            'echo "$n" >"$D/n"; echo "$n" >>"$D/calls"; f="$D/out.$n"; [ -f "$f" ] || f="$D/out.last"; '
+            'c=$(cat "$D/clock"); echo $((c + ${MDUTIL_COST:-0})) >"$D/clock"; '
             'cat "$f"; exit "${MDUTIL_RC:-0}"\n',
-            "sleep": 'echo "$1" >>"$SEQ/slept"\n',
+            "sleep": 'c=$(cat "$SEQ/clock"); echo $((c + $1)) >"$SEQ/clock"; echo "$1" >>"$SEQ/slept"\n',
+            "date": 'cat "$SEQ/clock"\n',
         }
 
-        def run(outs, last, rc="0"):
+        def run(outs, last, rc="0", cost="0"):
             for f in seq.iterdir():
                 f.unlink()
             for i, o in enumerate(outs, 1):
                 (seq / f"out.{i}").write_text(o)
             (seq / "out.last").write_text(last)
-            return self.run_snippet(snippet, fakes, {"SEQ": str(seq), "MDUTIL_RC": rc})
+            (seq / "clock").write_text("1000\n")
+            return self.run_snippet(
+                snippet,
+                fakes,
+                {"SEQ": str(seq), "MDUTIL_RC": rc, "MDUTIL_COST": cost},
+                links=("awk", "cat"),
+            )
 
-        slept = lambda: (
-            (seq / "slept").read_text().split() if (seq / "slept").exists() else []
-        )
+        def slept():
+            f = seq / "slept"
+            return f.read_text().split() if f.exists() else []
+
+        def calls():
+            f = seq / "calls"
+            return len(f.read_text().split()) if f.exists() else 0
+
         r = run([MDUTIL_TRANSITIONING] * 2, MDUTIL_OFF)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("3 poll(s), 4 s waited", r.stdout)
+        self.assertIn("3 poll(s), 4 s elapsed", r.stdout)
         self.assertEqual(slept(), ["2", "2"])
-        r = run([], MDUTIL_TRANSITIONING)  # never settles: 60 waits of 2 s, then dies
+        # F1: Transitioning with exit 1 is retried; to the timeout it dies, 120 s of real time
+        r = run([MDUTIL_TRANSITIONING], MDUTIL_OFF, rc="1")
+        self.assertEqual(r.returncode, 1)  # the final answer has exit 1: not a pass
+        self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)
+        self.assertGreaterEqual(calls(), 2)
+        r = run([], MDUTIL_TRANSITIONING, rc="1")
         self.assertEqual(r.returncode, 1)
         self.assertIn("still transitioning after 120 s", r.stderr)
+        self.assertIn("(rc 1)", r.stderr)
         self.assertEqual(len(slept()), 60)
-        r = run([MDUTIL_ON], MDUTIL_OFF)  # enabled is never retried into a pass
+        # F4: real elapsed time, not the number of waits: a slow mdutil shortens the loop
+        r = run([], MDUTIL_TRANSITIONING, cost="30")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("still enabled", r.stderr)
-        self.assertEqual(slept(), [])
-        r = run([MDUTIL_TRANSITIONING], MDUTIL_ON)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("still enabled", r.stderr)
-        r = run([], "something else\n")  # not the wanted answer, and not retried
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("did not report 'Indexing disabled'", r.stderr)
-        self.assertEqual(slept(), [])
+        self.assertIn("still transitioning after", r.stderr)
+        self.assertLess(calls(), 10)
+        # enabled is never retried into a pass, before or after a Transitioning poll
+        for outs in ([MDUTIL_ON], [MDUTIL_TRANSITIONING]):
+            r = run(outs, MDUTIL_ON)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("still enabled", r.stderr)
+        # the per-volume rule, same as the driver's
+        root = "/:\n\tIndexing disabled.\n"
+        for name, out, why in (
+            ("header with no status", root + "/System/Volumes/Data:\n", "no status for"),
+            ("status ending in a colon", root + "/Data:\n\tIndexing state:\n", "unexpected line"),
+            ("two statuses", root + "\tIndexing disabled.\n", "two statuses for /:"),
+            ("disabled and an unknown error", root + "/Data:\n\tError: unknown indexing state.\n", "unexpected line"),
+            ("no root volume", "/Data:\n\tIndexing disabled.\n", "no / volume listed"),
+            ("empty", "", "no volume listed"),
+            ("a CR is not a line break", "/:\r\n\tIndexing disabled.\r\n", "unexpected line"),
+        ):  # fmt: skip
+            with self.subTest(name):
+                r = run([], out)
+                self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+                self.assertIn(why, r.stderr)
+                self.assertEqual(slept(), [])
+        r = run([], MDUTIL_OFF)  # all volumes disabled passes
+        self.assertEqual(r.returncode, 0, r.stderr)
         r = run([], MDUTIL_OFF, rc="1")  # a failing mdutil dies, whatever it printed
         self.assertEqual(r.returncode, 1)
-        self.assertIn("mdutil -a -s failed", r.stderr)
+        self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)
 
     def test_prep_turns_automatic_update_checks_off_through_softwareupdate(self):
         text = self.text("prep.sh")
@@ -4394,11 +4592,15 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(
             len(code), 4, code
         )  # set, read back, two case checks: nothing else
+        self.assertNotIn("/usr/sbin/softwareupdate", snippet)
         fakes = {
             # `--schedule off` -> rc SU_SET_RC; `--schedule` -> prints SU_OUT, rc SU_RC
-            "softwareupdate": 'if [ "$2" = off ]; then echo "set"; exit "${SU_SET_RC:-0}"; fi; '
+            "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; '
+            'if [ "$2" = off ]; then echo "set"; exit "${SU_SET_RC:-0}"; fi; '
             'printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
         }
+        seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-su-"))
+        self.addCleanup(shutil.rmtree, seq, True)
         off = "Automatic checking for updates is turned off\n"
         on = "Automatic checking for updates is turned on\n"
         for name, env, want_rc, want_msg in (
@@ -4416,9 +4618,13 @@ class GuestScripts(unittest.TestCase):
             ("read-back fails", {"SU_OUT": off, "SU_RC": "1"}, 1, "--schedule failed"),
         ):
             with self.subTest(name):
-                r = self.run_snippet(snippet, fakes, env)
+                (seq / "su-calls").unlink(missing_ok=True)
+                r = self.run_snippet(snippet, fakes, {**env, "SEQ": str(seq)})
                 self.assertEqual(r.returncode, want_rc, (r.stdout, r.stderr))
                 self.assertIn(want_msg, r.stderr)
+                # the fake, and only the fake, ran: --schedule off first, then the read-back
+                said = (seq / "su-calls").read_text().split("\n")
+                self.assertEqual(said[0], "--schedule off", name)
         # it runs after the defaults loop and before Gatekeeper, and the old raw write is gone
         self.assertLess(text.index("su_set=$("), text.index("# 3. Gatekeeper on"))
 

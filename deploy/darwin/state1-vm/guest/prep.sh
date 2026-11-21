@@ -90,19 +90,49 @@ fi
 # 1. Spotlight off.
 mdutil -a -i off >/dev/null 2>&1 || true
 # mdutil -s answers kMDConfigSearchLevelTransitioning while a volume is still changing state
-# after the command above (macOS 27.2 after a reboot, issue 70 run 2): ask again every 2 s,
-# for at most 120 s. "Indexing enabled" or any other answer is not retried.
-mdutil_polls=1
+# after the command above (macOS 27.2 after a reboot, issue 70 run 2): ask again every 2 s until
+# 120 s of real time have passed. Order, every poll: "Indexing enabled" anywhere is fatal; then
+# Transitioning anywhere is retried whatever mdutil's exit status was (that status was never
+# recorded); then a non-0 exit is fatal; then the whole answer must be volume headers (a line
+# ending in ":"), each followed by exactly one "Indexing disabled." line, "/:" among them.
+mdutil_start=$(date +%s)
+mdutil_polls=0
 while :; do
-    mdutil_out=$(mdutil -a -s 2>&1) || die "mdutil -a -s failed: $mdutil_out"
-    case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled" ;; esac
-    case $mdutil_out in *kMDConfigSearchLevelTransitioning*) ;; *) break ;; esac
-    [ "$mdutil_polls" -lt 61 ] || die "mdutil -a -s still transitioning after 120 s: $mdutil_out"
     mdutil_polls=$((mdutil_polls + 1))
+    mdutil_rc=0
+    mdutil_out=$(mdutil -a -s 2>&1) || mdutil_rc=$?
+    case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled (rc $mdutil_rc): $mdutil_out" ;; esac
+    case $mdutil_out in *kMDConfigSearchLevelTransitioning*) ;; *) break ;; esac
+    mdutil_waited=$(($(date +%s) - mdutil_start))
+    [ "$mdutil_waited" -lt 120 ] || die "mdutil -a -s still transitioning after $mdutil_waited s, $mdutil_polls poll(s) (rc $mdutil_rc): $mdutil_out"
     sleep 2
 done
-case $mdutil_out in *"Indexing disabled"*) ;; *) die "mdutil -a -s did not report 'Indexing disabled': $mdutil_out" ;; esac
-log "spotlight: off ($mdutil_polls poll(s), $(((mdutil_polls - 1) * 2)) s waited)"
+[ "$mdutil_rc" -eq 0 ] || die "mdutil -a -s failed (rc $mdutil_rc): $mdutil_out"
+mdutil_bad=$(printf '%s\n' "$mdutil_out" | awk '
+    function fail(msg) { if (!bad) print msg; bad = 1 }
+    /^[ \t]*$/ { next }
+    /^[ \t]/ {
+        line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+        if (line != "Indexing disabled.") fail("unexpected line: " $0)
+        else if (hdr == "") fail("status before any volume: " $0)
+        else if (seen) fail("two statuses for " hdr)
+        else seen = 1
+        next
+    }
+    /:$/ {
+        if (hdr != "" && !seen) fail("no status for " hdr)
+        hdr = $0; seen = 0; headers++
+        if (hdr == "/:") root = 1
+        next
+    }
+    { fail("unexpected line: " $0) }
+    END {
+        if (hdr != "" && !seen) fail("no status for " hdr)
+        if (headers == 0) fail("no volume listed")
+        else if (!root) fail("no / volume listed")
+    }')
+[ -z "$mdutil_bad" ] || die "mdutil -a -s: $mdutil_bad: $mdutil_out"
+log "spotlight: off ($mdutil_polls poll(s), $(($(date +%s) - mdutil_start)) s elapsed)"
 
 # 2. Automatic updates off (softwareupdate itself stays usable).
 for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall; do

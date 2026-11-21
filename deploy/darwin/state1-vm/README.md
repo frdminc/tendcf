@@ -269,12 +269,14 @@ is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart 
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
-`after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back with a
-bounded settle: while it says `kMDConfigSearchLevelTransitioning`, ask again every 2 s for at
-most 120 s; `Indexing enabled` or any other answer is fatal at once); automatic updates off
-(the download and install keys through `defaults`, and automatic checking through
-`softwareupdate --schedule off`, read back with `softwareupdate --schedule`, which must say
-`Automatic checking for updates is turned off`); Gatekeeper on
+`after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back: `Indexing
+enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere is retried every
+2 s until 120 s of real time have passed, whatever mdutil's exit status (that status was never
+recorded); then a non-0 exit is fatal; then the answer must be volume headers (a line ending
+in `:`), each followed by exactly one `Indexing disabled.` line, with `/:` among them, and
+nothing else); automatic updates off (the four keys prep writes through `defaults`, and
+automatic checking through `softwareupdate --schedule off`, read back with `softwareupdate
+--schedule`, which must say `Automatic checking for updates is turned off`); Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
 with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
@@ -291,14 +293,14 @@ Recovery.
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g | Spotlight indexing off: `sudo -n mdutil -a -s` says `Indexing disabled.` for every volume and nothing else. While it says `kMDConfigSearchLevelTransitioning` it is asked again every 2 s, at most 120 s; `Indexing enabled`, another answer or a non-0 exit fails at once, and the timeout fails with the last output. The evidence ends `polls=N waited=Ns` | live |
-| 2h | automatic updates off: `sudo -n softwareupdate --schedule` exits 0 and says `Automatic checking for updates is turned off` (not `turned on`), and `AutomaticDownload` and `AutomaticallyInstallMacOSUpdates` read 0. `AutomaticCheckEnabled` is not read and need not exist (see "observed (macOS 27.2 26B123)") | live |
+| 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together. Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` among them, and nothing else (the same rule as `prep.sh`). Lines split on `\n` only, so a CR or form feed is never a line break. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
+| 2h | automatic updates off: `sudo -n softwareupdate --schedule` (stdout and stderr together) exits 0, says `Automatic checking for updates is turned off`, and says `turned on` nowhere; `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall` and `CriticalUpdateInstall` (the four keys `prep.sh` writes) read 0. `AutomaticCheckEnabled` absent is fine (macOS 27.2 drops it; see "observed (macOS 27.2 26B123)"); present, it must read 0 | live |
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (a passing 10a names 2g's `polls=N waited=Ns` after the reboot, which measures the post-reboot settle) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (a passing 10a names 2g's own `polls=N waited=Ns` after the reboot, a value the driver returns, not text read back from the guest's output; it measures the post-reboot settle) | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
 | 11 | stop and delete the clone, always | live |
 | 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
