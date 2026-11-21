@@ -4,8 +4,9 @@
 #     sudo -n /bin/sh prep.sh
 # The only changes to the pinned vanilla image: Spotlight off, automatic updates off, a
 # named list of unused launchd jobs disabled, Gatekeeper on, Screen Sharing off, key-only SSH
-# login (with fresh host keys, printed as PREP-HOSTKEY for the driver to pin). No SIP change,
-# no /System change, no Recovery change.
+# login (with fresh host keys, printed as PREP-HOSTKEY for the driver to pin), and a random
+# console password for admin that is never stored (PREP-CONSOLE-PW). No SIP change, no
+# /System change, no Recovery change.
 # Idempotent. Snapshots first: the original state is written once, to
 # $STATE_DIR/snapshots/before-*, and every run writes after-* when it is done.
 set -eu
@@ -180,10 +181,27 @@ for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubke
 done
 log "sshd: key login only"
 
+# 8. Console password. The vanilla image's is the published "admin". Replace it with a random
+# one made here, set by root, proved with dscl -authonly, and then dropped: it lives in a shell
+# variable only, never printed, never written to a file, never sent to the host. Nothing needs
+# it afterwards (ssh is key-only, sudo is NOPASSWD, Screen Sharing is off). So console login
+# and the login keychain are unusable by design, and an /etc/kcpassword left by the vanilla
+# image's autologin is stale; this script leaves both alone.
+pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+[ "${#pw}" -eq 32 ] || die "could not generate a console password"
+dscl . -passwd /Users/admin "$pw" || die "dscl -passwd /Users/admin failed"
+dscl . -authonly admin "$pw" || die "the new console password does not authenticate"
+if dscl . -authonly admin admin >/dev/null 2>&1; then
+    die "the vanilla console password still works"
+fi
+unset pw
+log "console password: rotated to a random value that is not stored"
+
 snapshot after
 log "wrote after snapshot to $SNAP/after"
 # The authenticated copy of the new host key: the driver pins exactly this line (inside
 # this ssh session), and uses ssh-keyscan only as a cross-check.
 hostkey=$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)
 echo "PREP-HOSTKEY $hostkey"
+echo "PREP-CONSOLE-PW rotated"
 echo "PREP-RESULT disabled=$disabled absent=$absent failed=$failed"
