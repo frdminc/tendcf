@@ -64,9 +64,7 @@ jobs:
         if: always()
         with:
           name: s1-probe-${{ matrix.runner }}
-          path: |
-            /tmp/s1-probe.md
-            /tmp/s1-probe-debug-journal.txt
+          path: /tmp/s1-probe.md
           retention-days: 14
       # linux-targets.md step 7: the canonical root-owned install and a root
       # cf-execd, with the canary service, on a real systemd manager. After

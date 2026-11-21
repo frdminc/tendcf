@@ -3,13 +3,14 @@
 
 Root, Linux, booted by systemd, and TENDCF_TEST_SYSTEMD=1 (it writes unit files
 under /etc/systemd/system, /run/systemd/system, /usr/lib/systemd/system, plus
-/run/systemd/system-generators and /etc/init.d for item 3, all removed again).
+/etc/systemd/system-generators, /run/systemd/system-generators and /etc/init.d for item 3, all removed again).
 Prints a markdown record to stdout; run it in CI and paste the observed rows
 into the spec's section 3.5 results. Dpkg behaviour is measured on a private
 admindir under /var/tmp with real dpkg, never on the host database.
 """
 import glob
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -187,95 +188,63 @@ def link_outside():
 
 
 ANY_STATUS = tuple(range(256))
-DEBUG_JOURNAL = "/tmp/s1-probe-debug-journal.txt"   # uploaded with the probe record (linux.yml)
 
 
 def diag(title, argv, **kw):
-    """A diagnostic command: any exit status (or a missing program) is recorded, never a failure."""
+    """An observation or diagnostic command: any exit status (or a missing program) is recorded, never a failure."""
     try:
         return rec(title, argv, ok=ANY_STATUS, **kw)
     except OSError as e:
         out("**%s**\n\n`$ %s`  (not run: %r)\n" % (title, " ".join(argv), e))
 
 
-def journal(title, since, pattern=None, limit=120, save=None):
+def journal(title, since, pattern, limit=40):
     """The journal since `since`, filtered in Python by regex `pattern`, at most `limit` lines."""
-    import re
     r = sh(["journalctl", "-b", "--no-pager", "-o", "short-precise", "--since", since])
-    ls = r.stdout.splitlines()
-    if save:
-        with open(save, "a") as f:
-            f.write("### %s (since %s, rc=%d, %d lines)\n%s\n" % (title, since, r.returncode, len(ls), r.stdout))
-    keep = [x for x in ls if re.search(pattern, x)] if pattern else ls
-    out("**%s**\n\n`$ journalctl -b --since '%s'%s`  (rc=%d, %d lines, %d shown)\n\n```" % (
-        title, since, " | grep -E '%s'" % pattern if pattern else "", r.returncode, len(ls), min(len(keep), limit)))
+    keep = [x for x in r.stdout.splitlines() if re.search(pattern, x)]
+    out("**%s**\n\n`$ journalctl -b --since '%s'` filtered by `%s`  (rc=%d, %d of %d lines)\n\n```" % (
+        title, since, pattern, r.returncode, min(len(keep), limit), len(r.stdout.splitlines())))
     out("\n".join(keep[:limit]))
-    if r.stderr.strip():
-        out("[stderr] " + r.stderr.rstrip()[:400])
     out("```\n")
 
 
+def generator_script(prefix):
+    return ("#!/bin/sh\n"
+            "printf '[Unit]\\nDescription=tendcf s1 gen\\nSourcePath=/etc/tendcf-s1-gensrc\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/%s.service\"\n"
+            "printf '[Unit]\\nDescription=tendcf s1 gen without source\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/%s-nosrc.service\"\n" % (prefix, prefix))
+
+
 def item3_diagnose(gen_dir, gen, since):
-    """Issue 51: on ubuntu-24.04 the manager sometimes never ran our generator. Called only
-    when `list-unit-files tendcf-s1-gen*` misses; it records what the host looked like, runs the
-    generator by hand, and reloads once more with the manager's log level at debug, so the
-    journal says whether the generator was spawned, skipped or failed."""
+    """Issue 51: called only when the manager did not generate the units of the asserted
+    generator. Records where the host runs (the cloud: the ubuntu-24.04 AWS image mounts /run
+    noexec), the generator's directory mount, a by-hand run and the journal's generator lines."""
     out("### Diagnostics: the generated units are missing (issue 51)\n")
-    out("now: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-    diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name", "/sys/class/dmi/id/bios_vendor"])
-    diag("host: kernel", ["uname", "-a"])
-    diag("host: runner image data", ["cat", "/imagegeneration/imagedata.json"], lines=20)
-    diag("host: PID 1 capabilities", ["grep", "-E", "^Cap", "/proc/1/status"])
-    diag("host: LSMs", ["cat", "/sys/kernel/security/lsm"])
-    diag("host: /etc/systemd/system top level", ["ls", "-l", "--time-style=full-iso", "/etc/systemd/system"], lines=60)
-    diag("host: manager config drop-ins and /etc generators", ["ls", "-lR", "/etc/systemd/system.conf.d", "/run/systemd/system.conf.d",
-         "/usr/lib/systemd/system.conf.d", "/etc/systemd/system-generators"])
-    diag("host: system.conf", ["grep", "-vE", "^(#|$)", "/etc/systemd/system.conf"])
-    diag("host: all mounts", ["findmnt", "-o", "TARGET,FSTYPE,OPTIONS"], lines=80)
-    diag("host: /run/systemd mount options", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", "/run/systemd"])
-    diag("systemd", ["systemctl", "--version"], lines=1)
-    diag("is-system-running", ["systemctl", "is-system-running"])
-    diag("systemd package", ["dpkg-query", "-W", "systemd"])
-    diag("/run mount", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", "/run"])
+    diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name"])
+    diag("host: kernel", ["uname", "-r"])
+    diag("mount of the generator directory", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", gen_dir])
     diag("generator file", ["ls", "-ld", "--time-style=full-iso", gen_dir, gen])
-    diag("generator file stat", ["stat", gen])
-    diag("generator search directories", ["ls", "-ld", "--time-style=full-iso",
-         "/run/systemd/system-generators", "/etc/systemd/system-generators",
-         "/usr/local/lib/systemd/system-generators", "/usr/lib/systemd/system-generators"])
-    diag("every generator output directory (unfiltered)", ["ls", "-la", "--time-style=full-iso"] + sorted(glob.glob("/run/systemd/generator*")))
-    diag("youngest processes (apt, dpkg, unattended-upgrades, needrestart?)", ["ps", "-eo", "pid,ppid,etimes,stat,args", "--sort=etimes"], lines=40)
     d = tempfile.mkdtemp(prefix="tendcf-s1-gentest-", dir="/var/tmp")
     try:
         diag("run the generator by hand (does it write the fragments?)", [gen, d, d, d])
         diag("what it wrote", ["ls", "-l", d])
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    journal("journal around the reload (all)", since, limit=150)
-    journal("journal: generators", since, pattern="(?i)generator|tendcf", limit=80)
-    cur = sh(["systemctl", "log-level"]).stdout.strip() or "info"
-    mark = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1))
-    out("manager log level before: `%s`\n" % cur)
-    try:
-        sh(["systemctl", "log-level", "debug"])
-        daemon_reload()
-        diag("list-unit-files after a reload at log level debug", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
-        diag("generator output directories after it", ["ls", "-la", "--time-style=full-iso"] + sorted(glob.glob("/run/systemd/generator*")))
-        journal("journal at debug: generators", mark, pattern="(?i)generator|tendcf", limit=120, save=DEBUG_JOURNAL)
-    finally:
-        sh(["systemctl", "log-level", cur])
+    journal("journal: generator lines", since, r"(?i)generator|tendcf|direxec")
 
 
 def item3_generated():
     out("## Item 3: SourcePath of a generated unit\n")
-    gen_dir = "/run/systemd/system-generators"
+    # The asserted generator lives under /etc, not /run: the ubuntu-24.04 AWS runner image
+    # mounts /run noexec, so systemd cannot execve a generator there ("Failed to execute ...:
+    # Permission denied"; issue 51). Which directory holds the generator does not change what is
+    # observed about the generated units, which land in /run/systemd/generator either way.
+    gen_dir = "/etc/systemd/system-generators"
+    gen_dir_existed = os.path.isdir(gen_dir)
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 10))
-    script = ("#!/bin/sh\n"
-              "printf '[Unit]\\nDescription=tendcf s1 gen\\nSourcePath=/etc/tendcf-s1-gensrc\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/tendcf-s1-gen.service\"\n"
-              "printf '[Unit]\\nDescription=tendcf s1 gen without source\\n[Service]\\nExecStart=/bin/true\\n' > \"$1/tendcf-s1-gen-nosrc.service\"\n")
     with Sandbox(extra_roots=(gen_dir, "/etc/init.d", "/etc/rc3.d", "/etc/rc2.d", "/etc/rc5.d")) as sb:
-        sb.write(gen_dir + "/tendcf-s1-gen", script, mode=0o755)
+        sb.write(gen_dir + "/tendcf-s1-gen", generator_script("tendcf-s1-gen"), mode=0o755)
         daemon_reload()
-        out("### a generator of our own (/run/systemd/system-generators/tendcf-s1-gen)\n")
+        out("### a generator of our own (%s/tendcf-s1-gen)\n" % gen_dir)
         show("tendcf-s1-gen.service")
         show("tendcf-s1-gen-nosrc.service")
         r = rec("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-gen*"])
@@ -286,6 +255,16 @@ def item3_generated():
         rec("a second daemon-reload", ["systemctl", "daemon-reload"])
         rec("do the generated fragments survive it?", ["ls"] + gen_dirs, grep="tendcf-s1")
     daemon_reload()
+    item3_generator_in_run()
+    daemon_reload()
+    left = [p for d in [gen_dir] + sorted(glob.glob("/run/systemd/generator*")) if os.path.isdir(d)
+            for p in glob.glob(d + "/tendcf-s1*")]
+    out("**nothing of item 3's generators is left behind**\n\n```\n%s\n```\n" % "\n".join(left + (
+        [gen_dir + " (created by the probe, still there)"] if not gen_dir_existed and os.path.isdir(gen_dir) else [])))
+    if left:
+        fail("item 3 left generator files behind: %s" % left)
+    if not gen_dir_existed and os.path.isdir(gen_dir):
+        fail("item 3 left %s behind, a directory it created" % gen_dir)
     if os.path.exists("/usr/lib/systemd/system-generators/systemd-sysv-generator"):
         out("### the real sysv generator (init script plus rc link)\n")
         with Sandbox(extra_roots=("/etc/init.d", "/etc/rc2.d", "/etc/rc3.d", "/etc/rc4.d", "/etc/rc5.d")) as sb:
@@ -302,6 +281,26 @@ def item3_generated():
     else:
         out("systemd-sysv-generator is absent on this host: no sysv unit can be generated.\n")
     daemon_reload()
+
+
+def item3_generator_in_run():
+    """An observation, never a failure, whichever way it comes out: the same generator under
+    /run/systemd/system-generators runs only where /run allows execution. The ubuntu-24.04 AWS
+    runner image mounts /run noexec (systemd then logs "Failed to execute ...: Permission
+    denied" and generates nothing); the Azure image and ubuntu-26.04 do not."""
+    gen_dir = "/run/systemd/system-generators"
+    out("### the same generator under %s (an observation: /run may be mounted noexec)\n" % gen_dir)
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
+    diag("host: cloud (DMI)", ["grep", "-H", "", "/sys/class/dmi/id/sys_vendor"])
+    diag("mount options of /run (as seen)", ["findmnt", "-no", "TARGET,FSTYPE,OPTIONS", "-T", "/run"])
+    with Sandbox(extra_roots=(gen_dir,)) as sb:
+        sb.write(gen_dir + "/tendcf-s1-genrun", generator_script("tendcf-s1-genrun"), mode=0o755)
+        daemon_reload()
+        r = diag("list-unit-files", ["systemctl", "list-unit-files", "--no-pager", "--no-legend", "tendcf-s1-genrun*"])
+        ran = bool(r and "tendcf-s1-genrun" in r.stdout)
+        out("**result: a generator under /run %s**\n" % ("ran: its units were generated" if ran else "did not run: no units were generated"))
+        if not ran:
+            journal("journal: generator lines", since, r"(?i)Failed to execute|tendcf-s1-genrun")
 
 
 def item6_7_dropins():

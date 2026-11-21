@@ -18,8 +18,9 @@ matter, and the real getty@.service has no instance a fixture can hold loaded
 without starting an agetty.
 
 Files are written only under /etc/systemd/system, /run/systemd/system and
-/usr/lib/systemd/system, plus /run/systemd/system-generators (a tmpfs directory
-beside them) for the rows that need a generated unit. The private dpkg database
+/usr/lib/systemd/system, plus /etc/systemd/system-generators (created and removed
+again if absent; not /run, which the ubuntu-24.04 AWS image mounts noexec, issue 51) for
+the rows that need a generated unit. The private dpkg database
 lives under /var/tmp, and so do the target of the "symlink to a target outside the tree" row and
 the claims files.
 """
@@ -37,7 +38,7 @@ from s1lib import CLASSIFIER, CleanupError, Sandbox, TestDb, daemon_reload, sh  
 U = "/usr/lib/systemd/system"
 E = "/etc/systemd/system"
 R = "/run/systemd/system"
-GEN = "/run/systemd/system-generators"
+GEN = "/etc/systemd/system-generators"   # not /run: the ubuntu-24.04 AWS image mounts /run noexec (issue 51)
 SVC = "[Unit]\nDescription=tendcf s1 fixture\n[Service]\nExecStart=/bin/true\n"
 TPL = "[Unit]\nDescription=tendcf s1 template\n[Service]\nExecStart=/bin/sleep 600\n"
 
