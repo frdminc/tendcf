@@ -482,6 +482,10 @@ class Base(unittest.TestCase):
             lock_path=self.tmp / "lockdir" / "driver.lock",
         )
 
+    def second_run_ctx(self, run_id="20261121T000000Z-second"):
+        # every real run has its own run id, hence its own key id
+        return self.make_ctx(self.ctx.state_dir, run_id=run_id)
+
     def run_cmd(self, *argv, ctx=None):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -983,7 +987,7 @@ class Golden(Base):
 
     def test_rebuild_replaces_the_existing_golden_only_at_the_rename(self):
         self.run_cmd(*self.golden_args())
-        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
         self.assertEqual(rc, 0, s)
         self.assertEqual(len(self.world.tart_calls("clone")), 2)
         self.assertEqual(self.world.tart_calls("delete"), [["tart", "delete", GOLDEN]])
@@ -998,7 +1002,7 @@ class Golden(Base):
     def test_a_failed_rebuild_keeps_the_working_golden(self):
         self.run_cmd(*self.golden_args())
         self.world.fail_prep = True
-        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
         self.assertEqual(rc, 1)
         self.assertIn(GOLDEN, self.world.vms)  # still there
         self.assertEqual(
@@ -1020,7 +1024,7 @@ class Golden(Base):
     def test_rename_failure_on_a_rebuild_after_the_old_golden_is_gone(self):
         self.run_cmd(*self.golden_args())
         self.world.fail_tart = {"rename"}
-        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
         self.assertEqual(rc, 1)
         self.assertEqual(self.steps(s)["rebuild"]["status"], "pass")  # the old one went
         self.assertEqual(
@@ -1059,7 +1063,7 @@ class Golden(Base):
         old_rec = (self.ctx.state_dir / "golden.json").read_text()
         self.world.new_hostkey = OTHER_BLOB  # the rebuilt guest has a different key
         self.world.fail_tart = {"delete"}
-        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
         self.assertEqual(rc, 1, s)
         st = self.steps(s)
         self.assertEqual(st["g10"]["status"], "fail")
@@ -1078,7 +1082,7 @@ class Golden(Base):
         self.world.new_hostkey = OTHER_BLOB
         self.world.signal_on_tart = "rename"  # a real SIGTERM, right after the delete
         old = signal.getsignal(signal.SIGTERM)
-        rc, s = self.run_cmd(*self.golden_args("--rebuild"))
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=self.second_run_ctx())
         self.assertEqual(self.world.signals_sent, 1)  # it was really sent
         self.assertEqual(rc, 0, s)  # ignored: the commit is not torn
         self.assertEqual(sorted(self.world.vms), [GOLDEN])
@@ -1300,12 +1304,15 @@ class Golden(Base):
 
     def test_a_failed_rebuild_keeps_the_working_goldens_key(self):
         self.run_cmd(*self.golden_args())
+        working_blob = self.world.installed_blob
         self.world.fail_prep = True
         ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-bad")
         rc, _ = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
         self.assertEqual(rc, 1)
         self.assertEqual(self.key_dirs(), [self.ctx.run_id])  # still the old golden's
         self.world.fail_prep = False
+        # the fake has one guest state; the working golden's disk still holds its own key
+        self.world.installed_blob = working_blob
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
 
@@ -1638,7 +1645,7 @@ class Check(Base):
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
         self.assertIn("golden", s["steps"][-1]["evidence"])
-        self.make_golden()
+        self.world.vms[GOLDEN] = {"Running": False}
         (self.ctx.state_dir / "known_hosts").unlink()
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)
@@ -1721,6 +1728,8 @@ class Check(Base):
             self.tmp / "other-state"
         )  # same lock path, other state dir
         other.run_id = "20261120T000000Z-other"
+        # a golden record and key in the other state dir, so only the lock can refuse
+        shutil.copytree(self.ctx.state_dir, other.state_dir)
         with drv.driver_lock(self.ctx):
             rc, s = self.run_cmd(
                 *self.check_args("--state-dir", str(other.state_dir)), ctx=other
