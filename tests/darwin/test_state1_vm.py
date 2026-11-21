@@ -1313,6 +1313,8 @@ class Golden(Base):
         self.world.fail_prep = False
         # the fake has one guest state; the working golden's disk still holds its own key
         self.world.installed_blob = working_blob
+        # likewise the failed build's bootstrap state
+        self.world.password_login = False
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
 
