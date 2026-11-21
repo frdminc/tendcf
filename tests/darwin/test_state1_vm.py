@@ -2472,13 +2472,80 @@ class Golden(Base):
         self.assertFalse(target.parent.exists())
         self.assertEqual(self.world.tart_calls("clone"), [])
 
+    def test_the_account_home_falls_back_to_home_only_without_a_passwd_entry(self):
+        pw = drv.pwd.getpwuid(os.getuid()).pw_dir
+        self.assertEqual(drv.account_home({"HOME": "/ignored"}), pw)
+        with mock.patch.object(drv.pwd, "getpwuid", side_effect=KeyError("uid")):
+            self.assertEqual(drv.account_home({"HOME": "/h"}), "/h")
+            self.assertEqual(drv.account_home({}), "/")
+            self.assertEqual(
+                drv.resolve_tart_home({"HOME": "/h"}), os.path.realpath("/h/.tart")
+            )
+            ctx = self.make_ctx(self.tmp / "nopw", "20261121T000000Z-np")
+        self.assertTrue(ctx.tart_home)  # no traceback for a uid without a passwd entry
+
+    def test_a_dangling_link_planted_right_after_the_realpath_is_still_refused(self):
+        link = self.tmp / "late-link"
+        target = self.tmp / "late-parent" / "target"
+        real_rp = os.path.realpath
+
+        def plant_after(path, *a, **kw):
+            res = real_rp(path, *a, **kw)
+            if os.fspath(path) == str(link) and not link.is_symlink():
+                link.symlink_to(target)  # the planter wins the window
+            return res
+
+        with mock.patch.object(drv.os.path, "realpath", plant_after):
+            ctx = self.make_ctx(link, "20261121T000000Z-lw")
+        self.assertIn("points nowhere", ctx.state_dir_refusal)
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)
+        self.assertEqual(rc, 2, s)
+        self.assertFalse(target.parent.exists())
+
+    def test_a_link_planted_at_the_resolved_state_dir_is_not_followed(self):
+        real_dir = self.tmp / "planted-real"
+        real_dir.mkdir(mode=0o700)
+        path = self.tmp / "fresh-state"
+        ctx = self.make_ctx(
+            path, "20261121T000000Z-pl"
+        )  # missing: nothing to refuse yet
+        self.assertEqual(ctx.state_dir_refusal, "")
+        path.symlink_to(real_dir)  # planted between startup and the check
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)
+        self.assertEqual(rc, 2, s)
+        self.assertIn("not a directory", s["steps"][-1]["evidence"])
+        self.assertEqual(list(real_dir.iterdir()), [])
+
+    def test_a_lock_directory_that_cannot_be_made_is_a_clean_refusal(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("a file")
+        ctx = self.make_ctx(self.tmp / "state-x", "20261121T000000Z-lk")
+        ctx.lock_path = blocker / "sub" / "driver.lock"
+        for cmd in (self.golden_args(), self.check_args()):
+            rc, s = self.run_cmd(*cmd, ctx=ctx)
+            self.assertEqual(rc, 2, s)
+            ev = s["steps"][-1]["evidence"]
+            self.assertIn("cannot create the lock directory", ev)
+            self.assertIn(str(blocker), ev)
+
     def test_a_symlink_state_dir_that_is_not_ours_is_refused(self):
         real_dir = self.tmp / "theirs"
         real_dir.mkdir(mode=0o700)
         link = self.tmp / "foreign"
         link.symlink_to(real_dir)
-        # the link's owner is "someone else" for the Ctx that reads it
-        with mock.patch.object(drv.os, "getuid", return_value=os.getuid() + 1):
+        # the link's owner is "someone else" for the Ctx that reads it (the caller's own
+        # identity stays real: a uid with no passwd entry would break the tart home lookup)
+        real_lstat = os.lstat
+
+        def foreign_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) == str(link):
+                fields = list(st)
+                fields[stat.ST_UID] = st.st_uid + 1
+                return os.stat_result(fields)
+            return st
+
+        with mock.patch.object(drv.os, "lstat", foreign_lstat):
             ctx = self.make_ctx(link, "20261121T000000Z-fo")
         self.assertIn("not you", ctx.state_dir_refusal)
         rc, s = self.run_cmd(*self.golden_args(), ctx=ctx)

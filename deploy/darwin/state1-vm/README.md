@@ -122,7 +122,9 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   same ownership and mode check (the path is resolved with `realpath` once, at startup, and
   a symlink to such a directory is the operator's choice; a missing one is made 0700, parents
   included; a path that is a file is refused, and so is a `--state-dir` that is itself a
-  symlink that points nowhere or is not yours: nothing is created through it); the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
+  symlink that points nowhere or is not yours: nothing is created through it; a link
+  planted after the path was resolved is not followed either). A lock directory that cannot be
+  made is a refusal (exit 2) naming it; the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
   usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
   this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees
   with this state dir's `golden.json` (`key_id`, `host_key`). Because the intent file is written
@@ -136,9 +138,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   owner. **The tart home** is resolved once, at startup, the way tart does it: `TART_HOME` if
   set (even empty, which tart takes as the current directory; made absolute with `realpath`),
   else `CFFIXED_USER_HOME` (set but empty is the current directory, as in Foundation), else
-  the passwd home, plus `/.tart`; `$HOME` is never consulted (tart ignores it). The driver exports that value as `TART_HOME` to every `tart` command it
+  the passwd home, plus `/.tart`; `$HOME` is never consulted (tart ignores it), except for a
+  uid with no passwd entry (a container), where Foundation falls back to it too. The driver exports that value as `TART_HOME` to every `tart` command it
   runs, so tart and the driver cannot disagree. The lock and the marker live under the passwd
-  home: one host-wide lock (see Guards), and one marker per tart home (named by the tart
+  home: one lock per account (see Guards), and one marker per tart home (named by the tart
   key), and a different `HOME`, a sandbox or `sudo -H` for the same user takes the same ones.
   The marker is keyed, the state dir is not: a state dir is not meant to be shared across
   tart homes (one `golden.json` can describe one golden), so use one `--state-dir` per tart
@@ -158,7 +161,9 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   `golden --rebuild` sweeps the kept build and builds afresh, and the run exits 1. The remaining unattended deletion is the case where the owner file already
   names this state dir (a final file that agrees with the record) but the usability test
   fails: that golden is ours and is replaced.
-  **Upgrade note:** a golden built before owner files existed (or whose owner file is the
+  **Upgrade note:** run `golden --rebuild` once after upgrading: an older driver's
+  `golden --rebuild` from another state dir can leave the new marker agreeing with this state
+  dir's record. A golden built before owner files existed (or whose owner file is the
   older unkeyed one) has none, so the first plain
   `golden` after upgrading exits 2 until one `golden --rebuild` writes it; `check` does not need
   the marker and still passes. (Letting a passing `check` write the missing marker is tracked as
@@ -198,7 +203,7 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
   licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
   `golden` is stricter: it needs the host to itself and refuses when any VM is running.
-- **One driver at a time per host** (`flock` on one fixed file,
+- **One driver at a time per account** (`flock` on one fixed file,
   `<passwd home>/.local/state/tendcf-state1-vm/driver.lock`, opened without following a
   symlink, whatever `--state-dir` and the tart home say; the path follows the passwd home, not
   `$HOME`, so a run under a different `HOME`, a sandbox or `sudo -H` takes the same lock, and

@@ -59,13 +59,23 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_IMAGE_JSON = HERE / "image.json"
 # The account's home from the passwd entry, never $HOME: tart itself (Foundation) ignores
 # $HOME, so a second $HOME of the same user must not mean a second lock (or marker).
-DEFAULT_STATE_DIR = (
-    Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "state" / "tendcf-state1-vm"
-)
-# One host-wide lock (DEFAULT_STATE_DIR/driver.lock, the name master uses) whatever
+
+
+def account_home(environ: dict[str, str] | None = None) -> str:
+    """The account's home from the passwd entry, never $HOME, like Foundation; $HOME (else
+    "/") only when this uid has no passwd entry (a container or a sandbox), where Foundation
+    also falls back to it."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return (os.environ if environ is None else environ).get("HOME") or "/"
+
+
+DEFAULT_STATE_DIR = Path(account_home()) / ".local" / "state" / "tendcf-state1-vm"
+# One lock per account (DEFAULT_STATE_DIR/driver.lock, the name master uses) whatever
 # --state-dir and the tart home say: the VM names (state1-golden-build, state1-check-*) are
 # global to a tart home and the state dirs are shared across tart homes, so one driver at a
-# time per host. Only the owner marker is keyed by tart home.
+# time per account. Only the owner marker is keyed by tart home.
 LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
@@ -231,7 +241,7 @@ def resolve_tart_home(environ: dict[str, str] | None = None) -> str:
         return os.path.realpath(raw)
     base = env.get("CFFIXED_USER_HOME")  # set but empty is the cwd, as in Foundation
     if base is None:
-        base = pwd.getpwuid(os.getuid()).pw_dir
+        base = account_home(env)
     return os.path.realpath(os.path.join(base, ".tart"))
 
 
@@ -284,11 +294,14 @@ class Ctx:
     state_dir_refusal: str = ""
 
     def __post_init__(self) -> None:
-        # a symlink given as the state dir that dangles, or is not ours, is refused (by
-        # check_state_dir, before anything is created) rather than followed
-        self.state_dir_refusal = state_dir_link_problem(Path(self.state_dir))
         # resolved once, at startup: a later retarget of a symlink or a chdir cannot move it
-        self.state_dir = Path(os.path.realpath(self.state_dir))
+        given = Path(self.state_dir)
+        self.state_dir = Path(os.path.realpath(given))
+        # a symlink given as the state dir that dangles, or is not ours, is refused (by
+        # check_state_dir, before anything is created) rather than followed. Judged after
+        # the realpath: a link planted before it is seen here, one planted after it is a
+        # name the resolved path no longer is (check_state_dir uses lstat)
+        self.state_dir_refusal = state_dir_link_problem(given)
         if not self.tart_home:
             self.tart_home = resolve_tart_home()
         if self.lock_path is None:
@@ -847,9 +860,14 @@ def write_landed(dest: Path, text: str, mode: int = 0o600) -> None:
 
 @contextlib.contextmanager
 def driver_lock(ctx: Ctx):
-    """One driver per host (one lock file, whatever --state-dir and the tart home say); never
-    follows a symlink at the path."""
-    ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    """One driver per account (one lock file under the account's passwd home, whatever
+    --state-dir and the tart home say); never follows a symlink at the path."""
+    try:
+        ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        raise Refusal(
+            f"cannot create the lock directory {ctx.lock_path.parent}: {e}"
+        ) from e
     # the owner marker beside the lock gates an unattended rebuild: nobody else may plant,
     # replace or delete it, so the directory is ours and not group or world writable
     try:
@@ -898,7 +916,7 @@ def check_state_dir(ctx: Ctx) -> None:
     finally:
         os.umask(old)
     try:
-        st = ctx.state_dir.stat()
+        st = ctx.state_dir.lstat()  # resolved already: a link here was planted since
     except OSError as e:
         raise Refusal(f"cannot inspect the state dir {ctx.state_dir}: {e}") from e
     if not stat.S_ISDIR(st.st_mode):
