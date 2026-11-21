@@ -531,12 +531,18 @@ class Base(unittest.TestCase):
         # the golden's own minted key, as `golden` would have left it
         pub, priv = drv.mint_keypair(self.ctx, self.golden_key_id)
         (self.ctx.state_dir / "golden.json").write_text(
-            json.dumps(
-                {"key_id": self.golden_key_id, "authorized_key": drv.fingerprint(pub)}
-            )
+            self.record_json(self.golden_key_id, drv.fingerprint(pub))
         )
         self.world.installed_blob = pub.split()[1]
         self.ident = priv  # the golden's private key (a path)
+
+    def record_json(self, key_id, authorized_key):
+        """A golden.json as `golden` writes it (the fields the driver reads back), host_key
+        agreeing with the pin make_golden writes."""
+        host_key = "ssh-ed25519 " + drv.fingerprint(f"ssh-ed25519 {NEW_BLOB}")
+        return json.dumps(
+            {"key_id": key_id, "authorized_key": authorized_key, "host_key": host_key}
+        )
 
     def key_dirs(self):
         root = self.ctx.state_dir / "keys"
@@ -1451,7 +1457,8 @@ class Golden(Base):
         ctx2 = self.make_ctx(self.ctx.state_dir, run_id="20261121T000000Z-second")
         rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)  # no --rebuild
         self.assertEqual(rc, 0, s)
-        self.assertIn("rebuilding it unattended", self.steps(s)["exists"]["evidence"])
+        self.exists_evidence = self.steps(s)["exists"]["evidence"]
+        self.assertIn("rebuilding it unattended", self.exists_evidence)
         self.assertEqual(len(self.world.tart_calls("clone")), 2)
         rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
         self.assertEqual(rec["key_id"], "20261121T000000Z-second")
@@ -1477,6 +1484,150 @@ class Golden(Base):
         rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
         self.assertEqual(rc, 0, s)
         self.assertEqual(len(self.world.tart_calls("clone")), 2)
+
+    def owner_file(self):
+        return self.ctx.lock_path.parent / f"golden-owner-{GOLDEN}.json"
+
+    def test_the_commit_writes_an_owner_marker_beside_the_driver_lock(self):
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        path = self.owner_file()
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        self.assertEqual(
+            json.loads(path.read_text()),
+            {
+                "golden": GOLDEN,
+                "state_dir": os.path.realpath(self.ctx.state_dir),
+                "key_id": self.ctx.run_id,
+                "host_key": rec["host_key"],
+            },
+        )
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        # atomic write: no temp file left beside it
+        self.assertEqual(
+            sorted(p.name for p in path.parent.iterdir()),
+            sorted(["driver.lock", path.name]),
+        )
+        # the record's host_key is the pin's fingerprint
+        pin = drv.kh_fingerprint(self.ctx.state_dir / "known_hosts")
+        self.assertEqual(rec["host_key"], f"ssh-ed25519 {pin}")
+
+    def test_two_state_dirs_only_the_owner_rebuilds_unasked(self):
+        self.run_cmd(*self.golden_args())  # state dir A owns the golden
+        dir_b = self.tmp / "stateB"
+        ctx_b = self.make_ctx(dir_b, run_id="20261121T000000Z-b")
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_b)
+        self.assertEqual(rc, 2)  # B has no record at all
+        self.assertIn("no record of it", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx_b)  # B takes it
+        self.assertEqual(rc, 0, s)
+        owner = json.loads(self.owner_file().read_text())
+        self.assertEqual(owner["state_dir"], os.path.realpath(dir_b))
+        self.assertEqual(owner["key_id"], "20261121T000000Z-b")
+        clones, deletes = (
+            len(self.world.tart_calls("clone")),
+            self.world.tart_calls("delete"),
+        )
+        self.assertEqual(clones, 2)
+        # A's record is stale (it describes the replaced golden), B's golden is valid: A
+        # must not rebuild over it
+        ctx_a2 = self.second_run_ctx("20261122T000000Z-a2")
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_a2)
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn(os.path.realpath(dir_b), ev)  # names the owner
+        self.assertIn("--rebuild", ev)
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
+        self.assertEqual(self.world.tart_calls("delete"), deletes)
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])  # nothing minted or swept
+        # the owner still says "nothing to do"
+        ctx_b2 = self.make_ctx(dir_b, run_id="20261122T000000Z-b2")
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_b2)
+        self.assertEqual(rc, 0, s)
+        self.assertIn("nothing to do", self.steps(s)["exists"]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones)
+
+    def test_a_golden_with_no_owner_file_is_never_replaced_unasked(self):
+        # a golden from before owner markers: its record and pin are fine, the marker is absent
+        self.run_cmd(*self.golden_args())
+        self.owner_file().unlink()
+        ctx2 = self.second_run_ctx()
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("no owner file", ev)
+        self.assertIn("--rebuild", ev)
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        self.assertEqual(self.world.tart_calls("delete"), [])
+        self.assertEqual(self.key_dirs(), [self.ctx.run_id])
+        # check does not need the marker: it only asks whether this state dir can log in
+        rc, s = self.run_cmd(*self.check_args(), ctx=ctx2)
+        self.assertEqual(rc, 0, s)
+        # asked for by name it replaces the golden and this state dir becomes its owner
+        rc, s = self.run_cmd(*self.golden_args("--rebuild"), ctx=ctx2)
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(
+            json.loads(self.owner_file().read_text())["key_id"], ctx2.run_id
+        )
+
+    def test_an_owner_file_that_disagrees_with_the_record_is_refused(self):
+        self.run_cmd(*self.golden_args())
+        good = self.owner_file().read_text()
+        ctx2 = self.second_run_ctx()
+        for what, mutate, want in [
+            ("key id", lambda o: o.update(key_id="other"), "did not all land"),
+            ("host key", lambda o: o.update(host_key="x"), "did not all land"),
+            ("golden", lambda o: o.update(golden="someone-else"), "someone-else"),
+        ]:
+            owner = json.loads(good)
+            mutate(owner)
+            self.owner_file().write_text(json.dumps(owner))
+            rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)
+            self.assertEqual(rc, 2, what)
+            self.assertIn(want, s["steps"][-1]["evidence"], what)
+        self.owner_file().write_text("not json")
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx2)
+        self.assertEqual(rc, 2)
+        self.assertIn("unreadable owner file", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        self.assertEqual(self.world.tart_calls("delete"), [])
+
+    def test_a_pin_that_disagrees_with_the_records_host_key_is_rebuilt_without_asking(
+        self,
+    ):
+        # a kill between the two commit writes: the new known_hosts landed, golden.json (and
+        # the owner marker, written after it) still describe the old golden
+        self.rebuilt_unattended(
+            lambda: (self.ctx.state_dir / "known_hosts").write_text(
+                f"{vmssh.HOST_ALIAS} ssh-ed25519 {OTHER_BLOB}\n"
+            )
+        )
+        self.assertIn("does not match the pin", self.exists_evidence)
+
+    def test_golden_usable_compares_the_records_host_key_with_the_pin(self):
+        self.run_cmd(*self.golden_args())
+        self.assertTrue(drv.golden_usable(self.ctx))
+        kh = self.ctx.state_dir / "known_hosts"
+        good = kh.read_text()
+        kh.write_text(f"{vmssh.HOST_ALIAS} ssh-ed25519 {OTHER_BLOB}\n")
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.golden_usable(self.ctx)
+        self.assertIn("does not match the pin", str(cm.exception))
+        rc, s = self.run_cmd(
+            *self.check_args()
+        )  # check refuses on it too, before a clone
+        self.assertEqual(rc, 2)
+        self.assertIn("does not match the pin", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), 1)
+        # a record with no host_key at all is no better
+        kh.write_text(good)
+        rec_path = self.ctx.state_dir / "golden.json"
+        rec = json.loads(rec_path.read_text())
+        del rec["host_key"]
+        rec_path.write_text(json.dumps(rec))
+        with self.assertRaises(drv.Refusal):
+            drv.golden_usable(self.ctx)
 
     def test_a_golden_whose_key_is_gone_is_rebuilt_without_asking(self):
         def damage():
@@ -1900,6 +2051,31 @@ class Check(Base):
         self.assertEqual(sorted(self.world.vms), [GOLDEN])
         self.assertIn(drv.CHECK_PREFIX + "old", self.steps(s)["preflight"]["evidence"])
 
+    def test_a_golden_this_state_dir_has_no_record_of_points_at_golden_rebuild(self):
+        # plain `golden` refuses such a golden, so the hint must name --rebuild
+        good_rec = (self.ctx.state_dir / "golden.json").read_text()
+        good_kh = (self.ctx.state_dir / "known_hosts").read_text()
+        (self.ctx.state_dir / "golden.json").unlink()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("no record of the golden", ev)
+        self.assertIn("run `golden --rebuild`", ev)
+        # another state dir's: no record and no pin either
+        (self.ctx.state_dir / "known_hosts").unlink()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("run `golden --rebuild`", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        # a state dir that has its record keeps the plain hint: `golden` rebuilds that itself
+        (self.ctx.state_dir / "golden.json").write_text(good_rec)
+        self.assertTrue(good_kh)  # (known_hosts stays missing)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        ev = s["steps"][-1]["evidence"]
+        self.assertIn("run `golden`", ev)
+        self.assertNotIn("--rebuild", ev)
+
     def test_refuses_without_golden_or_pinned_key_or_identity(self):
         del self.world.vms[GOLDEN]
         rc, s = self.run_cmd(*self.check_args())
@@ -1924,19 +2100,13 @@ class Check(Base):
         rec_path.unlink()
         refused("no usable golden record")
         # an id that tries to leave the keys directory
-        rec_path.write_text(
-            json.dumps({"key_id": "../../etc", "authorized_key": "SHA256:x"})
-        )
+        rec_path.write_text(self.record_json("../../etc", "SHA256:x"))
         refused("unsafe key id")
         # a record for a key that is not there
-        rec_path.write_text(
-            json.dumps({"key_id": "nope", "authorized_key": "SHA256:x"})
-        )
+        rec_path.write_text(self.record_json("nope", "SHA256:x"))
         refused("is missing")
         # the right key but a wrong fingerprint in the record
-        rec_path.write_text(
-            json.dumps({"key_id": self.golden_key_id, "authorized_key": "SHA256:wrong"})
-        )
+        rec_path.write_text(self.record_json(self.golden_key_id, "SHA256:wrong"))
         refused("does not belong to this golden")
         # a private key other users can read
         rec_path.write_text(good)
@@ -2023,7 +2193,7 @@ class Check(Base):
         kid = self.ctx.state_dir / "keys" / "linked-id"
         kid.symlink_to(elsewhere)
         (self.ctx.state_dir / "golden.json").write_text(
-            json.dumps({"key_id": "linked-id", "authorized_key": fp})
+            self.record_json("linked-id", fp)
         )
         rc, _ = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 2)

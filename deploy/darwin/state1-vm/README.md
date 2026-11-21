@@ -89,11 +89,25 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   `IdentityAgent=none` (also on the password-mode bootstrap and refusal-probe logins), so the
   operator's ssh-agent is never contacted. `ssh-keygen -y` runs with `-P ''` and no controlling
   terminal, so a passphrase-protected key is refused, never asked about. `check` and `golden`
-  share one usability test (pinned `known_hosts`, record, key). `golden` with a golden that this
-  state dir's record describes but `check` would refuse (key or pin missing or wrong) rebuilds
-  it, unattended, and says so in the `exists` step; a golden this state dir has **no record**
-  of (another `--state-dir`'s, or one from before records) is not replaced unasked: exit 2,
-  pass `--rebuild`. The one state that still needs a human is a `keys/` or `keys/<id>/`
+  share one usability test: `golden.json` parses, `known_hosts` pins our alias's ed25519 key,
+  that key is the record's `host_key` (a kill between the two commit writes, or a hand-moved
+  `.pending` file, leaves them disagreeing), and the recorded key passes the checks above.
+  `check` refuses (exit 2) on any of it; its hint is `golden --rebuild` when this state dir has
+  no record of the golden at all (plain `golden` refuses that), else `golden`. `golden`
+  adds an **owner marker** to the test of whether it may replace a golden unasked. The tart
+  golden is global to the host, the records are per `--state-dir`, so the commit writes
+  `golden-owner-<golden name>.json` beside the driver lock (atomic: temp file + rename, after
+  `golden.json`, so an agreeing marker proves every commit write landed). It names the golden,
+  the resolved state dir, `key_id` and `host_key`. `golden` with the golden present rebuilds
+  it unattended, or reports "nothing to do", **only** when the marker names this state dir and
+  agrees with this state dir's `golden.json`; then, if the usability test fails (key or pin
+  missing or wrong, `host_key` and pin disagreeing), it rebuilds and says so in the `exists`
+  step. Otherwise it exits 2 and replaces nothing: another `--state-dir`'s golden (the message
+  names the owner), a golden with **no record** here, a golden with **no owner file** (built
+  before markers existed, or a commit killed before its last write: treated as unowned), or a
+  marker that disagrees with the record. `golden --rebuild` always replaces it and makes this
+  state dir the owner. (`check` does not need the marker: it only asks whether this state dir
+  can log in.) The one state that still needs a human is a `keys/` or `keys/<id>/`
   directory with group or world access (or a symlink, or another owner): fix it with `chmod 700`
   or remove it. The driver never reads or offers anything in the operator's own `~/.ssh`.
 - **The bootstrap login** is the one password login, and no operator provides it: it is the

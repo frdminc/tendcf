@@ -1296,9 +1296,8 @@ def sweep_stale_keys(ctx: Ctx, keep: str) -> tuple[list[str], list[str]]:
     return gone, failed
 
 
-def golden_record(ctx: Ctx) -> tuple[str, str]:
-    """(key_id, authorized_key fingerprint) from this state dir's golden.json; Refusal if
-    there is no usable record."""
+def read_golden_record(ctx: Ctx) -> dict:
+    """This state dir's golden.json as a dict; Refusal if there is no usable record."""
     rec_path = ctx.state_dir / "golden.json"
     try:
         rec = json.loads(rec_path.read_text())
@@ -1307,18 +1306,114 @@ def golden_record(ctx: Ctx) -> tuple[str, str]:
         raise Refusal(f"{rec_path}: no usable golden record ({e!r})") from e
     if not isinstance(key_id, str) or not isinstance(want, str):
         raise Refusal(f"{rec_path}: key_id and authorized_key must be strings")
-    return key_id, want
+    return rec
+
+
+def golden_record(ctx: Ctx) -> tuple[str, str]:
+    """(key_id, authorized_key fingerprint) from this state dir's golden.json; Refusal if
+    there is no usable record."""
+    rec = read_golden_record(ctx)
+    return rec["key_id"], rec["authorized_key"]
+
+
+def owner_path(ctx: Ctx, golden: str) -> Path:
+    """The owner marker of one tart golden: beside the driver lock, not in a state dir. The
+    tart golden is global to the host and the lock is per host (whatever --state-dir says), so
+    the marker that ties the golden to one state dir lives where every state dir sees it."""
+    if not NAME_RE.fullmatch(golden):
+        raise Refusal(f"unsafe golden name {golden!r}")
+    return ctx.lock_path.parent / f"golden-owner-{golden}.json"
+
+
+def owner_state_dir(ctx: Ctx) -> str:
+    return os.path.realpath(ctx.state_dir)
+
+
+def write_owner(ctx: Ctx, golden: str, key_id: str, host_key: str | None) -> None:
+    """Name this state dir the owner of the golden just committed (atomic: temp + rename).
+    Written last in the commit, after golden.json: an owner file that agrees with the record
+    is the proof that every commit write landed."""
+    atomic_write(
+        owner_path(ctx, golden),
+        json.dumps(
+            {
+                "golden": golden,
+                "state_dir": owner_state_dir(ctx),
+                "key_id": key_id,
+                "host_key": host_key,
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+
+
+def owner_refusal(ctx: Ctx, golden: str) -> str:
+    """Empty when this state dir owns the golden, else why not (the text `golden` refuses with).
+    The owner file must exist, parse, and name this golden, this state dir (resolved), the
+    key id of golden.json and its host key. An owner file for another state dir, a missing
+    one (a golden from before owners were recorded, or a commit killed before its last
+    write) and one that disagrees with the record are all "not ours to replace unasked"."""
+    path = owner_path(ctx, golden)
+    hint = "pass --rebuild to replace it (this state dir then owns it)"
+    try:
+        owner = json.loads(path.read_text())
+        if not isinstance(owner, dict):
+            raise TypeError("not a JSON object")
+    except FileNotFoundError:
+        return (
+            f"{golden} has no owner file ({path}): it was built before owners were "
+            f"recorded, or its commit was killed before the last write; {hint}"
+        )
+    except (OSError, ValueError, TypeError) as e:
+        return f"{path}: unreadable owner file ({e!r}); {hint}"
+    here = owner_state_dir(ctx)
+    if owner.get("golden") != golden:
+        return f"{path} names golden {owner.get('golden')!r}, not {golden}; {hint}"
+    if owner.get("state_dir") != here:
+        return (
+            f"{golden} is owned by state dir {owner.get('state_dir')!r}, not this one "
+            f"({here}); replacing it from here would break that state dir's logins ({path}); "
+            f"{hint}"
+        )
+    rec = read_golden_record(ctx)
+    if owner.get("key_id") != rec["key_id"] or owner.get("host_key") != rec.get(
+        "host_key"
+    ):
+        return (
+            f"{path} names key {owner.get('key_id')!r} and host key "
+            f"{owner.get('host_key')!r}, golden.json names {rec['key_id']!r} and "
+            f"{rec.get('host_key')!r}: the commit's writes did not all land; {hint}"
+        )
+    return ""
 
 
 def golden_usable(ctx: Ctx) -> str:
-    """The one test of "this state dir can check its golden": the pinned known_hosts file
-    holds our alias's ed25519 key, and the record and key are usable (golden_identity).
-    Returns the private key path; Refusal otherwise. `check` refuses on it and `golden`
-    rebuilds on it, so the two never disagree."""
+    """The one test of "this state dir can check its golden": golden.json parses, the pinned
+    known_hosts file holds our alias's ed25519 key and that key is the record's `host_key`,
+    and the record's key is usable (golden_identity). Returns the private key path; Refusal
+    otherwise. `check` refuses on it and `golden` rebuilds on it, so the two never disagree.
+    (Whether this state dir may replace the golden is a separate test: owner_refusal.)"""
     kh = ctx.state_dir / "known_hosts"
-    if not kh.is_file() or kh_fingerprint(kh) is None:
+    try:
+        rec = read_golden_record(ctx)
+    except Refusal as e:
+        # plain `golden` refuses a golden this state dir has no record of
+        raise Refusal(
+            f"{e}; this state dir has no record of the golden (another --state-dir's, or "
+            "one from before records): run `golden --rebuild`"
+        ) from e
+    pinned = kh_fingerprint(kh) if kh.is_file() else None
+    if pinned is None:
         raise Refusal(
             f"{kh} is missing or has no pinned host key (written by golden); run `golden`"
+        )
+    if rec.get("host_key") != f"ssh-ed25519 {pinned}":
+        # golden.json and known_hosts are two writes: a kill between them (or a hand-moved
+        # .pending file) leaves one of them describing another golden
+        raise Refusal(
+            f"golden.json host_key {rec.get('host_key')!r} does not match the pin in {kh} "
+            f"(ssh-ed25519 {pinned}): the two commit writes did not both land; run `golden`"
         )
     return golden_identity(ctx)
 
@@ -1332,7 +1427,7 @@ def golden_identity(ctx: Ctx) -> str:
     try:
         key_id, want = golden_record(ctx)
     except Refusal as e:
-        raise Refusal(f"{e}; {again}") from e
+        raise Refusal(f"{e}; run `golden --rebuild` (no record to rebuild from)") from e
     priv, pub = key_paths(ctx, key_id)
     try:
         private_ok(priv)
@@ -1411,6 +1506,11 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "it may belong to another state dir or predate records: pass "
                             "--rebuild to replace it"
                         ) from e
+                    # A record is per state dir, the tart golden is global: only the state
+                    # dir the owner file names may rebuild or bless it unasked.
+                    not_owner = owner_refusal(ctx, golden)
+                    if not_owner:
+                        raise Refusal(not_owner)
                     try:
                         golden_usable(ctx)
                     except Refusal as e:
@@ -1429,7 +1529,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             "exists",
                             f"{golden} already exists",
                             "pass",
-                            "nothing to do; its record and key are usable; pass --rebuild to build it again",
+                            "nothing to do; this state dir owns it and its record, pin and key agree; pass --rebuild to build it again",
                         )
                         emit(summary, ctx, args.summary)
                         return 0
@@ -1676,6 +1776,8 @@ def cmd_golden(ctx: Ctx, args) -> int:
                         atomic_write(
                             ctx.state_dir / "golden.json", record + "\n", 0o644
                         )
+                        # last: the owner marker agrees with the record only if both landed
+                        write_owner(ctx, golden, key_id, state.get("hostkey"))  # type: ignore[arg-type]
                         # The replaced golden's key is of no use now: remove it (and the
                         # private keys of any other deleted golden).
                         try:
