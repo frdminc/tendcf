@@ -139,16 +139,15 @@ for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall 
     defaults write "$SU_PLIST" "$key" -bool false
     [ "$(defaults read "$SU_PLIST" "$key")" = 0 ] || die "$key did not read back as 0"
 done
-# Automatic checking is not a plain preference on macOS 27.2: a raw `defaults write` of
-# AutomaticCheckEnabled read back as 0 here, then the key was gone from the plist file and
-# `softwareupdate --schedule` still said "turned on" (issue 70 run 2). Ask softwareupdate itself,
-# and trust only its own answer.
-su_set=$(softwareupdate --schedule off 2>&1) || die "softwareupdate --schedule off failed: $su_set"
-su_out=$(softwareupdate --schedule 2>&1) || die "softwareupdate --schedule failed: $su_out"
-case $su_out in *"turned on"*) die "automatic update checking is still on: $su_out" ;; esac
-case $su_out in *"Automatic checking for updates is turned off"*) ;; *) die "softwareupdate --schedule did not say 'turned off': $su_out" ;; esac
+# Automatic *checking* cannot be turned off here (issue 70 addendum 4, macOS 27.2 unmanaged VM):
+# `softwareupdate --schedule off` changes nothing, softwareupdated drops a written
+# AutomaticCheckEnabled within about 30 s, Managed Preferences are ignored and SIP blocks stopping
+# softwareupdated. Only downloads and installs are enforced; the schedule is logged for information.
+su_rc=0
+su_out=$(softwareupdate --schedule 2>&1) || su_rc=$?
+[ "$su_rc" -eq 0 ] || die "softwareupdate --schedule failed (rc $su_rc): $su_out"
 defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
-log "automatic updates: off"
+log "automatic updates: download and install off; schedule (info, rc $su_rc): $(printf '%s' "$su_out" | tr '\n' ' ')"
 
 # 3. Gatekeeper on (the VM matches a real owner's Mac).
 spctl --global-enable 2>/dev/null || spctl --master-enable

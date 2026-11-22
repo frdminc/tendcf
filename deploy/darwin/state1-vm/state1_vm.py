@@ -99,8 +99,8 @@ SECURE_TOKEN_AFTER_RE = re.compile(
 MDUTIL_TRANSITIONING = "kMDConfigSearchLevelTransitioning"
 MDUTIL_SETTLE_TIMEOUT = 120.0
 MDUTIL_SETTLE_INTERVAL = 2.0
-UPDATES_OFF_LINE = "Automatic checking for updates is turned off"
-# the keys prep.sh writes with `defaults` (AutomaticCheckEnabled is not one of them)
+# the keys prep.sh writes with `defaults`; check 2h reads them all (AutomaticCheckEnabled is not read:
+# softwareupdated deletes it, issue 70 addendum 4)
 UPDATES_KEYS = (
     "AutomaticDownload",
     "AutomaticallyInstallMacOSUpdates",
@@ -1201,30 +1201,24 @@ def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
 
 
 def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
-    """Automatic update checking, download and install are off.
+    """Automatic update download and install are off.
 
-    The check is `softwareupdate --schedule`, which is what the system itself answers with:
-    exit 0, "turned off" present and "turned on" nowhere, in stdout and stderr together.
-    macOS 27.2 drops a raw `defaults write` of AutomaticCheckEnabled (issue 70 run 2: the key
-    was absent from the plist file while the schedule said "turned on"), so prep.sh no longer
-    writes it and its absence is not a failure; if it is present it must read 0. The four
-    keys prep.sh does write must read 0.
+    Pass = the four keys prep.sh writes (UPDATES_KEYS) read 0 and `sudo -n softwareupdate
+    --schedule` exits 0. The schedule text (stdout and stderr together) is evidence only and
+    never decides: automatic update *checking* cannot be turned off in an unmanaged macOS 27.2
+    VM (issue 70 addendum 4: `--schedule off` is a no-op, softwareupdated drops
+    AutomaticCheckEnabled about 30 s after a write, Managed Preferences are ignored, SIP blocks
+    stopping softwareupdated), so "turned on" is the expected answer and nothing here reads
+    AutomaticCheckEnabled.
     """
     r = rssh(ctx, t, ["sudo", "-n", "softwareupdate", "--schedule"])
     said = (r.stdout + "\n" + r.stderr).strip()
-    ok = r.rc == 0 and UPDATES_OFF_LINE in said and "turned on" not in said
-    ev = [f"schedule rc {r.rc}: {clip(said, 200)!r}"]
+    ok = r.rc == 0
+    ev = [f"schedule (info): rc {r.rc}: {clip(said, 200)!r}"]
     plist = "/Library/Preferences/com.apple.SoftwareUpdate"
-    for key in UPDATES_KEYS + ("AutomaticCheckEnabled",):
+    for key in UPDATES_KEYS:
         r = rssh(ctx, t, ["defaults", "read", plist, key])
         got = r.stdout.strip() or r.stderr.strip()
-        if (
-            key == "AutomaticCheckEnabled"
-            and r.rc != 0
-            and ("Could not find key" in r.stderr or "does not exist" in r.stderr)
-        ):
-            ev.append(f"{key}=absent")
-            continue
         ok &= r.rc == 0 and r.stdout.strip() == "0"
         ev.append(f"{key}={got}")
     return ok, " ".join(ev)

@@ -274,9 +274,10 @@ enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere
 2 s until 120 s of real time have passed, whatever mdutil's exit status (that status was never
 recorded); then a non-0 exit is fatal; then the answer must be volume headers (a line ending
 in `:`), each followed by exactly one `Indexing disabled.` line, with `/:` among them, and
-nothing else); automatic updates off (the four keys prep writes through `defaults`, and
-automatic checking through `softwareupdate --schedule off`, read back with `softwareupdate
---schedule`, which must say `Automatic checking for updates is turned off`); Gatekeeper on
+nothing else); automatic updates off (automatic download and install: the four keys prep writes
+through `defaults` must read back as 0; automatic *checking* is not touched, see "Known
+limitation" below; `softwareupdate --schedule` is run once, its text is logged for information
+only, and only a non-0 exit is fatal); Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
 with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
@@ -294,16 +295,39 @@ Recovery.
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
 | 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together. Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` among them, and nothing else (the same rule as `prep.sh`). Lines split on `\n` only, so a CR or form feed is never a line break. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
-| 2h | automatic updates off: `sudo -n softwareupdate --schedule` (stdout and stderr together) exits 0, says `Automatic checking for updates is turned off`, and says `turned on` nowhere; `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall` and `CriticalUpdateInstall` (the four keys `prep.sh` writes) read 0. `AutomaticCheckEnabled` absent is fine (macOS 27.2 drops it; see "observed (macOS 27.2 26B123)"); present, it must read 0 | live |
+| 2h | automatic download and install off: `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall` and `CriticalUpdateInstall` (the four keys `prep.sh` writes) each read 0 through `defaults read`, and `sudo -n softwareupdate --schedule` exits 0. The schedule text (stdout and stderr together) is evidence only, shown as `schedule (info): rc N: '...'`, and never decides: on macOS 27.2 it says `turned on` (see "Known limitation"). `AutomaticCheckEnabled` is not read (softwareupdated deletes it). A key that does not read 0, a read error or a non-0 schedule exit fails | live |
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
 | 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
 | 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (a passing 10a names 2g's own `polls=N waited=Ns` after the reboot, a value the driver returns, not text read back from the guest's output; it measures the post-reboot settle) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot, a value the driver returns, not text read back from the guest's output; it measures the post-reboot settle) | live |
 | 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
 | 11 | stop and delete the clone, always | live |
 | 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
+
+## Known limitation: automatic update checking stays on
+
+In an unmanaged macOS 27.2 VM, automatic update *checking* cannot be turned off, so the image
+promises automatic **download and install** off only (check 2h; operator ruling 2026-11-21).
+`softwareupdate --schedule` says `Automatic checking for updates is turned on` and `softwareupdate
+-l` keeps working. Addendum 4 (issue 70, four methods, each on a fresh clone of the golden, read
+at 0, 30 and 90 s and after a reboot; evidence `diag4-A..D.txt`) found:
+
+- **A, `softwareupdate --schedule off`:** exits 0, prints the unchanged status, and does not
+  touch the plist file (a no-op). Run 3's `golden --rebuild` died on exactly this read-back.
+- **B, `defaults write ... AutomaticCheckEnabled -bool false`:** reads back 0 and survives about
+  30 s; then `softwareupdated` rewrites the plist without the key (641 to 610 bytes). Neither
+  `killall cfprefsd` nor a kickstart helps (`launchctl kickstart` is refused while SIP is on, rc 150).
+- **C, a hand-written `/Library/Managed Preferences/com.apple.SoftwareUpdate.plist`:** ignored.
+  Apple removed the MDM `com.apple.SoftwareUpdate` payload in 27.0, and its replacement (DDM
+  software update settings) has no check key.
+- **D, `launchctl disable` plus `bootout` of `com.apple.softwareupdated`:** `bootout` is refused
+  while SIP is on (rc 150); the daemon stays running after a reboot and the schedule is unchanged.
+
+Untried: the System Settings "Check for updates" toggle in a GUI session. Issue 89 item 1 (the
+`--schedule off` output string and its persistence) is answered by this: it does nothing.
+The four download/install keys do persist across the golden's shutdown, a clone and a reboot.
 
 ## Open items for the renderer slice
 
@@ -348,9 +372,8 @@ Recovery.
     read it back as 0, but the golden's `com.apple.SoftwareUpdate.plist` had no such key
     afterwards (the other four keys were there), nothing on the clone rewrote the file (mtime
     unchanged over 300 s), and `softwareupdate --schedule` printed `Automatic checking for
-    updates is turned on`. So prep now calls `softwareupdate --schedule off` and 2h trusts only
-    that command's answer. Untested until the next `golden`: that `--schedule off` itself
-    persists.
+    updates is turned on`. PR 88's `softwareupdate --schedule off` did not work either (run 3,
+    addendum 4); see "Known limitation".
   - **`mdutil -s` can say `kMDConfigSearchLevelTransitioning`**, three volumes at once
     (`Error: unexpected indexing state.  kMDConfigSearchLevelTransitioning`), when read right
     after the check's reboot. A first boot of a clone never showed it (0 to 300 s after ssh

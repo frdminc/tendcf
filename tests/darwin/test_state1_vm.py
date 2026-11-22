@@ -61,6 +61,13 @@ MDUTIL_TRANSITIONING = (
 MDUTIL_ON = "/:\n\tIndexing enabled.\n"
 SU_OFF = "Automatic checking for updates is turned off\n"
 SU_ON = "Automatic checking for updates is turned on\n"
+# the keys prep.sh writes and check 2h reads (AutomaticCheckEnabled is neither)
+FOUR_KEYS = (
+    "AutomaticDownload",
+    "AutomaticallyInstallMacOSUpdates",
+    "ConfigDataInstall",
+    "CriticalUpdateInstall",
+)
 SECURE_TOKEN_AFTER = (
     "prep: secure token status (after): 2026-11-21 22:41:08.682 sysadminctl[422:2528] "
     "Secure token is ENABLED for user Managed via Tart \n"
@@ -135,7 +142,7 @@ class FakeWorld:
         self.mdutil_default = (0, MDUTIL_OFF)
         self.mdutil_calls = 0
         # `sudo -n softwareupdate --schedule` and the `defaults read` answers per key
-        self.su_schedule = (0, SU_OFF)
+        self.su_schedule = (0, SU_ON)  # the real guest: checking cannot be turned off
         self.su_outputs = []  # answers still to give before su_schedule
         self.defaults_values = {}  # key -> (rc, stdout, stderr)
         # what prep.sh logs after the rotation, and noise before the PREP-RESULT line
@@ -3143,99 +3150,95 @@ class Check(Base):
         self.assertEqual(st["10a"]["status"], "pass")
         self.assertIn("2g after the reboot: polls=4 waited=6s", st["10a"]["evidence"])
 
-    # -- 2h / 10a: automatic updates off, by what softwareupdate itself says
-    def test_2h_passes_on_turned_off_with_automaticcheckenabled_absent(self):
-        self.world.defaults_values["AutomaticCheckEnabled"] = (
-            1,
-            "",
-            "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.",
-        )
+    # -- 2h / 10a: automatic download and install are off; the schedule text is information only
+    def test_2h_passes_with_checking_on_and_the_four_keys_at_zero(self):
+        # what the real macOS 27.2 guest says: "turned on", and nothing can change that
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
         st = self.steps(s)["2h"]
         self.assertEqual(st["status"], "pass")
-        self.assertIn("Automatic checking for updates is turned off", st["evidence"])
-        for key in (
-            "AutomaticDownload",
-            "AutomaticallyInstallMacOSUpdates",
-            "ConfigDataInstall",
-            "CriticalUpdateInstall",
-        ):
+        self.assertIn("schedule (info): rc 0:", st["evidence"])
+        self.assertIn("turned on", st["evidence"])
+        for key in FOUR_KEYS:
             self.assertIn(f"{key}=0", st["evidence"])
-        self.assertIn("AutomaticCheckEnabled=absent", st["evidence"])
 
-    def test_2h_automaticcheckenabled_present_must_read_zero_and_other_errors_fail(
-        self,
-    ):
-        for name, answer, ok in (
-            ("present and 0", (0, "0\n", ""), True),
-            ("present and 1", (0, "1\n", ""), False),
-            ("other error", (1, "", "Operation not permitted"), False),
-        ):
-            with self.subTest(name):
-                self.world.defaults_values["AutomaticCheckEnabled"] = answer
-                rc, s = self.run_cmd(*self.check_args())
-                self.assertEqual(rc, 0 if ok else 1, s)
-                self.assertEqual(
-                    self.steps(s)["2h"]["status"], "pass" if ok else "fail", name
-                )
-        del self.world.defaults_values["AutomaticCheckEnabled"]
+    def test_2h_never_reads_automaticcheckenabled(self):
+        # softwareupdated deletes the key about 30 s after a write (addendum 4, method B)
+        self.world.defaults_values["AutomaticCheckEnabled"] = (0, "1\n", "")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)["2h"]
+        self.assertEqual(st["status"], "pass")
+        self.assertNotIn("AutomaticCheckEnabled", st["evidence"])
+        for argv in self.world.argvs(["defaults", "read"]):
+            self.assertNotIn("AutomaticCheckEnabled", argv)
 
-    def test_2h_reads_stdout_and_stderr_together(self):
-        for name, answer, ok in (
-            ("on on stderr", (0, SU_OFF, SU_ON), False),
-            ("off only on stderr", (0, "", SU_OFF), True),
-        ):
-            with self.subTest(name):
-                self.world.su_schedule = answer
-                rc, s = self.run_cmd(*self.check_args())
-                self.assertEqual(rc, 0 if ok else 1, s)
-                self.assertEqual(
-                    self.steps(s)["2h"]["status"], "pass" if ok else "fail", name
-                )
-
-    def test_2h_fails_unless_softwareupdate_says_automatic_checking_is_off(self):
-        cases = (
+    def test_2h_schedule_text_is_information_and_never_decides(self):
+        for name, answer in (
             ("turned on", (0, SU_ON)),
-            ("empty answer", (0, "")),
-            ("non-zero exit with the right words", (1, SU_OFF)),
+            ("turned off", (0, SU_OFF)),
+            ("empty", (0, "")),
             ("both words", (0, SU_OFF + SU_ON)),
             ("something else", (0, "Software Update is disabled\n")),
-        )
-        for name, answer in cases:
+            ("on on stderr", (0, SU_OFF, SU_ON)),
+        ):
             with self.subTest(name):
                 self.world.su_schedule = answer
                 rc, s = self.run_cmd(*self.check_args())
-                self.assertEqual(rc, 1, s)
-                st = self.steps(s)
-                self.assertEqual(st["2h"]["status"], "fail", name)
-                self.assertIn("schedule rc", st["2h"]["evidence"], name)
+                self.assertEqual(rc, 0, s)
+                st = self.steps(s)["2h"]
+                self.assertEqual(st["status"], "pass", name)
+                self.assertIn("schedule (info): rc 0:", st["evidence"], name)
 
-    def test_2h_needs_all_four_keys_prep_writes_at_zero(self):
-        for key in (
-            "AutomaticDownload",
-            "AutomaticallyInstallMacOSUpdates",
-            "ConfigDataInstall",
-            "CriticalUpdateInstall",
+    def test_2h_fails_when_the_schedule_command_fails(self):
+        for name, answer in (
+            ("exit 1 saying on", (1, SU_ON)),
+            ("exit 1 saying off", (1, SU_OFF)),
+            ("exit 1 empty", (1, "")),
+            ("timeout", (124, "")),
         ):
-            with self.subTest(key):
-                self.world.defaults_values[key] = (0, "1\n", "")
+            with self.subTest(name):
+                self.world.su_schedule = answer
                 rc, s = self.run_cmd(*self.check_args())
                 self.assertEqual(rc, 1, s)
                 st = self.steps(s)["2h"]
-                self.assertEqual(st["status"], "fail")
-                self.assertIn(f"{key}=1", st["evidence"])
+                self.assertEqual(st["status"], "fail", name)
+                self.assertIn(f"schedule (info): rc {answer[0]}:", st["evidence"])
 
-    def test_10a_reruns_2h_and_reports_a_schedule_that_turned_back_on(self):
-        # the golden says "off" at the first read; after the reboot it says "on"
+    def test_2h_needs_all_four_keys_prep_writes_at_zero(self):
+        for key in FOUR_KEYS:
+            for name, answer in (
+                ("reads 1", (0, "1\n", "")),
+                ("key missing", (1, "", f"Error: Could not find key '{key}'.")),
+                ("read error", (1, "", "Operation not permitted")),
+            ):
+                with self.subTest(key=key, case=name):
+                    self.world.defaults_values[key] = answer
+                    rc, s = self.run_cmd(*self.check_args())
+                    self.assertEqual(rc, 1, s)
+                    st = self.steps(s)["2h"]
+                    self.assertEqual(st["status"], "fail")
+                    self.assertIn(f"{key}=", st["evidence"])
+                    del self.world.defaults_values[key]
+
+    def test_10a_reruns_2h_with_the_same_rule(self):
+        # the schedule text changing between the two reads does not matter ...
         self.world.su_outputs = [(0, SU_OFF), (0, SU_ON)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["10a"]["status"], "pass")
+
+    def test_10a_fails_when_the_schedule_command_fails_after_the_reboot(self):
+        # ... but the command failing does
+        self.world.su_outputs = [(0, SU_ON), (1, "")]
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 1, s)
         st = self.steps(s)
         self.assertEqual(st["2h"]["status"], "pass")
         self.assertEqual(st["10a"]["status"], "fail")
-        self.assertIn("2h automatic updates off: schedule rc 0", st["10a"]["evidence"])
-        self.assertIn("turned on", st["10a"]["evidence"])
+        self.assertIn(
+            "2h automatic updates off: schedule (info): rc 1:", st["10a"]["evidence"]
+        )
 
     # -- PR 88 round r1: the order of the 2g rule, the per-volume rule, structured 10a note
     def test_2g_retries_transitioning_whatever_the_exit_status_was(self):
@@ -4572,61 +4575,65 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)
 
-    def test_prep_turns_automatic_update_checks_off_through_softwareupdate(self):
+    def test_prep_turns_automatic_downloads_and_installs_off_and_only_reads_the_schedule(
+        self,
+    ):
         text = self.text("prep.sh")
         loop = text[
             text.index("for key in ") : text.index("done", text.index("for key in "))
         ]
-        self.assertNotIn("AutomaticCheckEnabled", loop)  # macOS 27.2 drops that raw key
-        for key in (
-            "AutomaticDownload",
-            "AutomaticallyInstallMacOSUpdates",
-            "ConfigDataInstall",
-            "CriticalUpdateInstall",
-        ):
+        self.assertNotIn(
+            "AutomaticCheckEnabled", loop
+        )  # softwareupdated deletes that key
+        for key in FOUR_KEYS:
             self.assertIn(key, loop)
-        a = text.index("su_set=$(softwareupdate --schedule off")
-        b = text.index('is turned off"*)', a)
+        a = text.index("su_rc=0")
+        b = text.index('log "automatic updates:', a)
         snippet = text[a : text.index("\n", b) + 1]
         code = [ln for ln in snippet.split("\n") if ln and not ln.startswith("#")]
-        self.assertEqual(
-            len(code), 4, code
-        )  # set, read back, two case checks: nothing else
+        # read the schedule, die on a non-0 exit, the commerce key, the log line: nothing else
+        self.assertEqual(len(code), 5, code)
+        self.assertNotIn("--schedule off", "\n".join(code))
+        self.assertNotIn("turned off", "\n".join(code))
         self.assertNotIn("/usr/sbin/softwareupdate", snippet)
         fakes = {
-            # `--schedule off` -> rc SU_SET_RC; `--schedule` -> prints SU_OUT, rc SU_RC
-            "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; '
-            'if [ "$2" = off ]; then echo "set"; exit "${SU_SET_RC:-0}"; fi; '
-            'printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
+            # records its arguments; prints SU_OUT; exits SU_RC
+            "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
+            "defaults": 'echo "$*" >>"$SEQ/defaults-calls"\n',
         }
         seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-su-"))
         self.addCleanup(shutil.rmtree, seq, True)
         off = "Automatic checking for updates is turned off\n"
         on = "Automatic checking for updates is turned on\n"
         for name, env, want_rc, want_msg in (
-            ("off", {"SU_OUT": off}, 0, ""),
-            ("still on", {"SU_OUT": on}, 1, "still on"),
-            ("both words", {"SU_OUT": off + on}, 1, "still on"),
-            ("empty answer", {"SU_OUT": ""}, 1, "did not say 'turned off'"),
-            ("other words", {"SU_OUT": "disabled\n"}, 1, "did not say 'turned off'"),
-            (
-                "set fails",
-                {"SU_OUT": off, "SU_SET_RC": "1"},
-                1,
-                "--schedule off failed",
-            ),
-            ("read-back fails", {"SU_OUT": off, "SU_RC": "1"}, 1, "--schedule failed"),
+            ("turned on is the real answer", {"SU_OUT": on}, 0, "turned on"),
+            ("turned off", {"SU_OUT": off}, 0, "turned off"),
+            ("both words", {"SU_OUT": off + on}, 0, "turned on"),
+            ("empty answer", {"SU_OUT": ""}, 0, "schedule (info, rc 0):"),
+            ("other words", {"SU_OUT": "disabled\n"}, 0, "disabled"),
+            ("two lines are flattened", {"SU_OUT": "a\nb\n"}, 0, "a b"),
+            ("non-0 exit", {"SU_OUT": on, "SU_RC": "1"}, 1, "--schedule failed (rc 1)"),
         ):
             with self.subTest(name):
-                (seq / "su-calls").unlink(missing_ok=True)
-                r = self.run_snippet(snippet, fakes, {**env, "SEQ": str(seq)})
+                for f in seq.iterdir():
+                    f.unlink()
+                r = self.run_snippet(
+                    snippet, fakes, {**env, "SEQ": str(seq)}, links=("tr",)
+                )
                 self.assertEqual(r.returncode, want_rc, (r.stdout, r.stderr))
-                self.assertIn(want_msg, r.stderr)
-                # the fake, and only the fake, ran: --schedule off first, then the read-back
-                said = (seq / "su-calls").read_text().split("\n")
-                self.assertEqual(said[0], "--schedule off", name)
-        # it runs after the defaults loop and before Gatekeeper, and the old raw write is gone
-        self.assertLess(text.index("su_set=$("), text.index("# 3. Gatekeeper on"))
+                self.assertIn(want_msg, r.stdout + r.stderr)
+                # the fake, and only the fake, ran, exactly once, and never with `off`
+                self.assertEqual((seq / "su-calls").read_text(), "--schedule\n", name)
+                if want_rc == 0:
+                    self.assertEqual(
+                        (seq / "defaults-calls").read_text(),
+                        "write /Library/Preferences/com.apple.commerce AutoUpdate -bool false\n",
+                    )
+        # it runs after the defaults loop and before Gatekeeper
+        self.assertLess(text.index("su_rc=0"), text.index("# 3. Gatekeeper on"))
+        self.assertLess(
+            text.index("done", text.index("for key in ")), text.index("su_rc=0")
+        )
 
     def test_prep_records_the_secure_token_status_after_the_rotation(self):
         text = self.text("prep.sh")
