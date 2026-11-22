@@ -54,6 +54,12 @@ FW_ROOT = drv.FRAMEWORK_ROOT
 # `sshd -T` on macOS 27.2 (26B123, OpenSSH_10.5p1) prints CamelCase option names (observed on the
 # first real run, issue 70); stock OpenSSH prints them lowercase. Both must be accepted.
 MDUTIL_OFF = "/:\n\tIndexing disabled.\n/System/Volumes/Data:\n\tIndexing disabled.\n"
+# Full macOS 27.2 three-volume listing observed in issue 70 run 4.
+MDUTIL_OFF_3 = (
+    "/:\n\tIndexing disabled.\n"
+    "/System/Volumes/Data:\n\tIndexing disabled.\n"
+    "/System/Volumes/Preboot:\n\tIndexing disabled.\n"
+)
 MDUTIL_TRANSITIONING = (
     "/:\n\tError: unexpected indexing state.  kMDConfigSearchLevelTransitioning\n"
     "/System/Volumes/Data:\n\tError: unexpected indexing state.  kMDConfigSearchLevelTransitioning\n"
@@ -3269,12 +3275,32 @@ class Check(Base):
                                 f"{key}=rc {answer[0]} stderr ", st["evidence"]
                             )
                     elif not answer[1].strip() and answer[2].strip():
-                        # R5: a value read only from stderr is marked so it never reads as a pass
+                        # R5: a value read only from stderr is marked so the evidence says where it came from
                         self.assertIn(
                             f"{key}=stderr {answer[2].strip()!r}", st["evidence"]
                         )
                         self.assertNotIn(f"{key}=0", st["evidence"])
                     del self.world.defaults_values[key]
+
+    def test_2h_does_not_mark_stderr_when_stdout_also_has_a_value(self):
+        # T2 (kills F5/F7): when stdout has a value alongside stderr noise, stdout is shown
+        # without a stderr mark.
+        for rc_, prefix in ((0, ""), (1, "rc 1 ")):
+            with self.subTest(rc=rc_):
+                self.world.defaults_values["AutomaticDownload"] = (
+                    rc_,
+                    "1\n",
+                    "warning\n",
+                )
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, s)
+                ev = self.steps(s)["2h"]["evidence"]
+                self.assertEqual(self.steps(s)["2h"]["status"], "fail")
+                self.assertIn(f"AutomaticDownload={prefix}'1'", ev)
+                self.assertNotIn("AutomaticDownload=stderr", ev)
+                self.assertNotIn(f"AutomaticDownload={prefix}stderr", ev)
+                self.assertNotIn("warning", ev)
+        del self.world.defaults_values["AutomaticDownload"]
 
     def test_2h_splatenabled_is_one_of_the_keys(self):
         self.assertIn("SplatEnabled", drv.UPDATES_KEYS)
@@ -3391,6 +3417,11 @@ class Check(Base):
             ("no root volume", "/System/Volumes/Data:\n\tIndexing disabled.\n", "no / volume"),
             ("no Data volume", root, "no /System/Volumes/Data volume"),
             (
+                "similar Data path is not /System/Volumes/Data",
+                root + "/Volumes/Data:\n\tIndexing disabled.\n",
+                "no /System/Volumes/Data volume",
+            ),
+            (
                 "root and Preboot without Data volume",
                 root + "/System/Volumes/Preboot:\n\tIndexing disabled.\n",
                 "no /System/Volumes/Data volume",
@@ -3406,7 +3437,32 @@ class Check(Base):
                 "/:\r\tIndexing disabled.\r/System/Volumes/Data:\r\tIndexing disabled.\n",
                 "unexpected line",
             ),
-            ("a form feed is not a line break", root + "\x0c/Data:\n", "no status for \x0c/Data:"),
+            (
+                "CR-joined header hides an error status (H1)",
+                MDUTIL_OFF_3 + "/Volumes/X:\r\tError: unknown indexing state.\r/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "FF-joined header hides an error status (H1)",
+                MDUTIL_OFF_3 + "/Volumes/X:\x0c\tError: unknown indexing state.\x0c/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "VT inside header is unexpected",
+                MDUTIL_OFF_3 + "/Volumes/X:\x0b\tError: unknown indexing state.\x0b/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "NUL inside header is unexpected",
+                MDUTIL_OFF_3 + "/Volumes/X\x00:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "DEL inside header is unexpected",
+                MDUTIL_OFF_3 + "/Volumes/X\x7f:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            ("a form feed is not a line break", root + "\x0c/Data:\n", "unexpected line"),
         )  # fmt: skip
         for name, out, why in cases:
             with self.subTest(name):
@@ -3416,6 +3472,15 @@ class Check(Base):
                 st = self.steps(s)["2g"]
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn(why, st["evidence"], name)
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+
+    def test_2g_passes_on_the_real_three_volume_listing(self):
+        # T3/N4: the full macOS 27.2 listing observed in issue 70 run 4 passes 2g and 10a
+        self.world.mdutil_default = (0, MDUTIL_OFF_3)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["2g"]["status"], "pass")
+        self.assertEqual(self.steps(s)["10a"]["status"], "pass")
         self.world.mdutil_default = (0, MDUTIL_OFF)
 
     def test_2g_and_10a_read_mdutil_with_raw_newlines(self):
@@ -4173,7 +4238,7 @@ class RawNewlines(unittest.TestCase):
 
     def test_2g_matcher_on_real_runner_output(self):
         for raw in (True, False):
-            r = self.printf(MDUTIL_OFF, raw_newlines=raw)
+            r = self.printf(MDUTIL_OFF_3, raw_newlines=raw)
             self.assertIsNone(drv.mdutil_volumes_problem(r.stdout))
         for name, text in (
             ("CRLF", MDUTIL_OFF.replace("\n", "\r\n")),
@@ -4186,6 +4251,16 @@ class RawNewlines(unittest.TestCase):
             # default text mode would have translated CR/CRLF to LF and let it pass
             r_default = self.printf(text, raw_newlines=False)
             self.assertIsNone(drv.mdutil_volumes_problem(r_default.stdout), name)
+        # H1: CR-joined and FF-joined headers also fail on real raw runner output
+        for name, sep in (("CR-joined header", "\r"), ("FF-joined header", "\x0c")):
+            joined = (
+                MDUTIL_OFF_3
+                + f"/Volumes/X:{sep}\tError: unknown indexing state.{sep}/Volumes/Y:\n\tIndexing disabled.\n"
+            )
+            r_raw = self.printf(joined, raw_newlines=True)
+            prob = drv.mdutil_volumes_problem(r_raw.stdout)
+            self.assertIsNotNone(prob, name)
+            self.assertIn("unexpected line", prob, name)
 
 
 class DsclCodes(unittest.TestCase):
@@ -4456,7 +4531,9 @@ class GuestScripts(unittest.TestCase):
                 raw_bytes=True,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn(b"after", r.stdout)
+            decoded = r.stdout.decode("utf-8")
+            self.assertIn("before?after", decoded)
+            self.assertNotIn(b"\xff", r.stdout)
             self.assertNotIn(b"\r", r.stdout)
             self.assertNotIn(b"Illegal byte sequence", r.stderr)
 
@@ -4767,6 +4844,11 @@ class GuestScripts(unittest.TestCase):
             ("no root volume", "/System/Volumes/Data:\n\tIndexing disabled.\n", "no / volume listed"),
             ("no Data volume", root, "no /System/Volumes/Data volume listed"),
             (
+                "similar Data path is not /System/Volumes/Data",
+                root + "/Volumes/Data:\n\tIndexing disabled.\n",
+                "no /System/Volumes/Data volume listed",
+            ),
+            (
                 "root and Preboot without Data volume",
                 root + "/System/Volumes/Preboot:\n\tIndexing disabled.\n",
                 "no /System/Volumes/Data volume listed",
@@ -4777,6 +4859,26 @@ class GuestScripts(unittest.TestCase):
                 "/:\r\n\tIndexing disabled.\r\n/System/Volumes/Data:\r\n\tIndexing disabled.\r\n",
                 "unexpected line",
             ),
+            (
+                "CR-joined header hides an error status (H1)",
+                MDUTIL_OFF_3 + "/Volumes/X:\r\tError: unknown indexing state.\r/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "FF-joined header hides an error status (H1)",
+                MDUTIL_OFF_3 + "/Volumes/X:\x0c\tError: unknown indexing state.\x0c/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "VT inside header is unexpected",
+                MDUTIL_OFF_3 + "/Volumes/X:\x0b\tError: unknown indexing state.\x0b/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "DEL inside header is unexpected",
+                MDUTIL_OFF_3 + "/Volumes/X\x7f:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
         ):  # fmt: skip
             with self.subTest(name):
                 r = run([], out)
@@ -4784,6 +4886,8 @@ class GuestScripts(unittest.TestCase):
                 self.assertIn(why, r.stderr)
                 self.assertEqual(slept(), [])
         r = run([], MDUTIL_OFF)  # all volumes disabled passes
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run([], MDUTIL_OFF_3)  # T3/N4: full real 27.2 three-volume listing passes
         self.assertEqual(r.returncode, 0, r.stderr)
         r = run([], MDUTIL_OFF, rc="1")  # a failing mdutil dies, whatever it printed
         self.assertEqual(r.returncode, 1)
@@ -4877,7 +4981,9 @@ class GuestScripts(unittest.TestCase):
                 raw_bytes=True,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn(b"tail", r.stdout)
+            decoded = r.stdout.decode("utf-8")
+            self.assertIn("on?tail", decoded)
+            self.assertNotIn(b"\xff", r.stdout)
             self.assertNotIn(b"\r", r.stdout)
             self.assertNotIn(b"Illegal byte sequence", r.stderr)
             lines = [ln for ln in r.stdout.split(b"\n") if ln]
@@ -4893,12 +4999,34 @@ class GuestScripts(unittest.TestCase):
                 raw_bytes=True,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
+            r.stdout.decode("utf-8")
             prefix = (
                 b"prep: automatic download and install off; schedule (info, rc 0): "
             )
             self.assertTrue(r.stdout.startswith(prefix), r.stdout)
             payload = r.stdout.removeprefix(prefix).rstrip(b"\n")
-            self.assertEqual(len(payload), 200)
+            self.assertEqual(payload, b"?" * 200)
+        with self.subTest(
+            "multibyte character straddling byte 200 stays valid UTF-8 (N1)"
+        ):
+            su_bin = Path(tempfile.mkdtemp(prefix="tendcf-prep-subin-"))
+            self.addCleanup(shutil.rmtree, su_bin, True)
+            f = su_bin / "su.bin"
+            # byte 199 and 200 are the 2-byte UTF-8 sequence for é; cutting at 200 without
+            # replacing non-ASCII first would emit a lone 0xc3 lead byte.
+            f.write_bytes(b"a" * 199 + "é".encode() + b"TAIL")
+            r = run(
+                {"LC_ALL": "en_US.UTF-8", "SU_FILE": str(f)},
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r.stdout.decode("utf-8")  # strict UTF-8 decode must succeed
+            prefix = (
+                b"prep: automatic download and install off; schedule (info, rc 0): "
+            )
+            self.assertTrue(r.stdout.startswith(prefix), r.stdout)
+            payload = r.stdout.removeprefix(prefix).rstrip(b"\n")
+            self.assertEqual(payload, b"a" * 199 + b"?")
         with self.subTest("a non-0 schedule exit dies"):
             r = run({"SU_OUT": on, "SU_RC": "1"})
             self.assertEqual(r.returncode, 1)
@@ -4966,7 +5094,9 @@ class GuestScripts(unittest.TestCase):
                 raw_bytes=True,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn(b"after", r.stdout)
+            decoded = r.stdout.decode("utf-8")
+            self.assertIn("before?after", decoded)
+            self.assertNotIn(b"\xff", r.stdout)
             self.assertNotIn(b"\r", r.stdout)
             self.assertNotIn(b"Illegal byte sequence", r.stderr)
 

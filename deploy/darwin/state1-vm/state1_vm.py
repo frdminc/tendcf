@@ -1118,14 +1118,16 @@ def mdutil_volumes_problem(text: str) -> str | None:
 
     A header is a line with no leading blank that ends in ":"; a status line has a leading
     space or tab. The caller runs ssh with raw_newlines=True (no universal-newline translation)
-    and lines are split on "\\n" only with only spaces and tabs counting as blank, so a CR, a
-    form feed or any other separator is "unexpected", never a line of its own. prep.sh applies
-    the same rule with awk.
+    and lines are split on "\\n" only; any line holding a control character other than tab (CR,
+    FF, VT, NUL, other C0, or DEL) is rejected as unexpected before blank, header or status
+    matching. prep.sh applies the same rule with LC_ALL=C awk.
     """
     hdr: str | None = None
     seen = False
     headers: list[str] = []
     for ln in text.split("\n"):
+        if any((ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F for c in ln):
+            return f"unexpected line {ln!r}"
         if all(c in " \t" for c in ln):
             continue
         if ln[0] in " \t":
@@ -1163,14 +1165,14 @@ def _mdutil_done(
 def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
     """`mdutil -a -s` says indexing is off on every volume, after a bounded settle.
 
-    Runs ssh with raw_newlines=True so a lone CR or CRLF reaches mdutil_volumes_problem
-    untranslated instead of becoming a line break. Each poll, in this order: "Indexing enabled"
-    anywhere (stdout and stderr together) fails at once; kMDConfigSearchLevelTransitioning
-    anywhere is asked again every MDUTIL_SETTLE_INTERVAL seconds, whatever mdutil's exit status
-    was (it was never recorded), until MDUTIL_SETTLE_TIMEOUT seconds of real time have passed
-    (so about that plus one command); then a non-0 exit fails; then mdutil_volumes_problem must
-    find nothing. The evidence carries every poll's exit status, and the polls and seconds are
-    returned as values.
+    Runs ssh with raw_newlines=True so CR and CRLF reach mdutil_volumes_problem untranslated
+    and fail as unexpected lines (along with any other control character besides tab). Each
+    poll, in this order: "Indexing enabled" anywhere (stdout and stderr together) fails at once;
+    kMDConfigSearchLevelTransitioning anywhere is asked again every MDUTIL_SETTLE_INTERVAL
+    seconds, whatever mdutil's exit status was (it was never recorded), until
+    MDUTIL_SETTLE_TIMEOUT seconds of real time have passed (so about that plus one command);
+    then a non-0 exit fails; then mdutil_volumes_problem must find nothing. The evidence carries
+    every poll's exit status, and the polls and seconds are returned as values.
     """
     start = ctx.monotonic()
     polls = 0

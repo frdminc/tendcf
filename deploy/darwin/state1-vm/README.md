@@ -271,9 +271,11 @@ is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart 
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
 `after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back: `Indexing
 enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere is retried every
-2 s until 120 s of real time have passed or 65 polls (120 / 2 + 5 margin, so a backwards clock
-step cannot stretch the loop), whatever mdutil's exit status (that status was never
-recorded); then a non-0 exit is fatal; then the answer must be volume headers (a line ending
+2 s until 120 s of real time have passed or 65 polls (120 / 2 + 5 margin, which stops the loop
+after 65 polls — about 130 s plus mdutil's own time — if the clock steps backwards), whatever
+mdutil's exit status (that status was never
+recorded); then a non-0 exit is fatal; then any line holding a control character other than tab
+fails as unexpected, and the answer must be volume headers (a line ending
 in `:`), each followed by exactly one `Indexing disabled.` line, with `/:` and
 `/System/Volumes/Data:` among them, and
 nothing else); automatic download and install off (the five keys prep writes through `defaults`,
@@ -282,7 +284,8 @@ documented by Apple) included, must each read back as 0 with a 0
 exit; that softwareupdated obeys them is not observed; `com.apple.commerce AutoUpdate` is written
 but not read back; automatic *checking* is not touched, see "Known limitation" below;
 `softwareupdate --schedule` is run once, its text is logged for information only with CR and
-newline flattened and cut at 200 bytes under `LC_ALL=C`, and only a non-0 exit is fatal); Gatekeeper on
+newline flattened, bytes outside printable ASCII replaced with `?`, and cut at 200 bytes under
+`LC_ALL=C` so the cut cannot split a multibyte character, and only a non-0 exit is fatal); Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
 with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
@@ -299,7 +302,7 @@ Recovery.
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together, read untranslated (`raw_newlines=True`, no text mode). Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` and `/System/Volumes/Data:` among them, and nothing else (the same rule as `prep.sh`). Lines split on `\n` only, so a CR or form feed is never a line break. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
+| 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together, read untranslated (`raw_newlines=True`, no text mode). Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then any line holding a control character other than tab (CR, FF, VT, NUL, other C0, DEL) fails as unexpected, and the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` and `/System/Volumes/Data:` among them, and nothing else (the same rule as `prep.sh`). Lines split on `\n` only. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
 | 2h | automatic download and install keys off: the five keys `prep.sh` writes (`AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall`, `CriticalUpdateInstall`, `SplatEnabled`) each read 0 with exit 0 through `defaults read`, and `sudo -n softwareupdate --schedule` exits 0. The rc-0 rule only shows that softwareupdate still runs; it says nothing about updates being off. The schedule text (stdout and stderr together) is evidence only, shown as `schedule (info): rc N: '...'`, and never decides: on macOS 27.2 it says `turned on` (see "Known limitation"). A key that does not read 0, a read error or a non-0 exit fails; the evidence shows the exit status, marks a value read only from stderr (`Key=stderr '...'`), and clips each value. The keys persist; that softwareupdated obeys them is not observed. `AutomaticCheckEnabled` is not read, and neither is `com.apple.commerce AutoUpdate` (written only) | live |
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
