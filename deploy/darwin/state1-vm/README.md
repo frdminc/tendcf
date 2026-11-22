@@ -274,10 +274,12 @@ enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere
 2 s until 120 s of real time have passed, whatever mdutil's exit status (that status was never
 recorded); then a non-0 exit is fatal; then the answer must be volume headers (a line ending
 in `:`), each followed by exactly one `Indexing disabled.` line, with `/:` among them, and
-nothing else); automatic updates off (automatic download and install: the four keys prep writes
-through `defaults` must read back as 0; automatic *checking* is not touched, see "Known
-limitation" below; `softwareupdate --schedule` is run once, its text is logged for information
-only, and only a non-0 exit is fatal); Gatekeeper on
+nothing else); automatic download and install off (the five keys prep writes through `defaults`,
+`SplatEnabled` (Background Security Improvements) included, must each read back as 0 with a 0
+exit; that softwareupdated obeys them is not observed; `com.apple.commerce AutoUpdate` is written
+but not read back; automatic *checking* is not touched, see "Known limitation" below;
+`softwareupdate --schedule` is run once, its text is logged for information only with CR and
+newline flattened and cut at 200 characters, and only a non-0 exit is fatal); Gatekeeper on
 (`spctl --global-enable`); **Screen Sharing off** (`launchctl disable` + `bootout`, read back
 with `print-disabled`, nothing listening on tcp 5900 (a failing or silent `netstat` is fatal too): fatal, because the vanilla image has it
 on with the published admin password); a named list of unused launchd jobs disabled (read
@@ -295,7 +297,7 @@ Recovery.
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
 | 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together. Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` among them, and nothing else (the same rule as `prep.sh`). Lines split on `\n` only, so a CR or form feed is never a line break. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
-| 2h | automatic download and install off: `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall` and `CriticalUpdateInstall` (the four keys `prep.sh` writes) each read 0 through `defaults read`, and `sudo -n softwareupdate --schedule` exits 0. The schedule text (stdout and stderr together) is evidence only, shown as `schedule (info): rc N: '...'`, and never decides: on macOS 27.2 it says `turned on` (see "Known limitation"). `AutomaticCheckEnabled` is not read (softwareupdated deletes it). A key that does not read 0, a read error or a non-0 schedule exit fails | live |
+| 2h | automatic download and install keys off: the five keys `prep.sh` writes (`AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall`, `CriticalUpdateInstall`, `SplatEnabled`) each read 0 with exit 0 through `defaults read`, and `sudo -n softwareupdate --schedule` exits 0. The rc-0 rule only shows that softwareupdate still runs; it says nothing about updates being off. The schedule text (stdout and stderr together) is evidence only, shown as `schedule (info): rc N: '...'`, and never decides: on macOS 27.2 it says `turned on` (see "Known limitation"). A key that does not read 0, a read error or a non-0 exit fails; the evidence shows the exit status and clips each value. The keys persist; that softwareupdated obeys them is not observed. `AutomaticCheckEnabled` is not read, and neither is `com.apple.commerce AutoUpdate` (written only) | live |
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
@@ -308,26 +310,42 @@ Recovery.
 
 ## Known limitation: automatic update checking stays on
 
-In an unmanaged macOS 27.2 VM, automatic update *checking* cannot be turned off, so the image
-promises automatic **download and install** off only (check 2h; operator ruling 2026-11-21).
-`softwareupdate --schedule` says `Automatic checking for updates is turned on` and `softwareupdate
--l` keeps working. Addendum 4 (issue 70, four methods, each on a fresh clone of the golden, read
-at 0, 30 and 90 s and after a reboot; evidence `diag4-A..D.txt`) found:
+Operator ruling, 2026-11-21: "2h promises automatic download and install off only; checking stays
+on and is documented." On macOS 27.2 (26B123) four root-script methods did not turn automatic
+update *checking* off, so `softwareupdate --schedule` says `Automatic checking for updates is
+turned on`; `softwareupdate -l` keeps working. The System Settings "Check for updates" toggle in a
+GUI session is untried, and so is an MDM-managed Mac (Apple removed the MDM `com.apple.SoftwareUpdate`
+payload in 27.0, and the declarative software update settings have no check key). The evidence
+summary per method (addendum 4 of issue 70, each method on a fresh clone of the golden, read at 0,
+30 and 90 s and after a reboot, 24 snapshots in all) is in PR 90:
 
-- **A, `softwareupdate --schedule off`:** exits 0, prints the unchanged status, and does not
-  touch the plist file (a no-op). Run 3's `golden --rebuild` died on exactly this read-back.
-- **B, `defaults write ... AutomaticCheckEnabled -bool false`:** reads back 0 and survives about
-  30 s; then `softwareupdated` rewrites the plist without the key (641 to 610 bytes). Neither
-  `killall cfprefsd` nor a kickstart helps (`launchctl kickstart` is refused while SIP is on, rc 150).
-- **C, a hand-written `/Library/Managed Preferences/com.apple.SoftwareUpdate.plist`:** ignored.
-  Apple removed the MDM `com.apple.SoftwareUpdate` payload in 27.0, and its replacement (DDM
-  software update settings) has no check key.
-- **D, `launchctl disable` plus `bootout` of `com.apple.softwareupdated`:** `bootout` is refused
-  while SIP is on (rc 150); the daemon stays running after a reboot and the schedule is unchanged.
+- **A, `softwareupdate --schedule off`:** exits 0, prints the unchanged status, and does not touch
+  the plist file. Run 3's `golden --rebuild` died on exactly this read-back.
+- **B, `defaults write ... AutomaticCheckEnabled -bool false`:** reads back 0 and was still there
+  at 30 s; it was gone at the 90 s read, in one run. The plist was rewritten (641 to 610 bytes)
+  within about a second of the 30 s read's own `softwareupdate --schedule` call, so that call may
+  be the trigger rather than a timer. The writer is softwareupdated or cfprefsd on its behalf,
+  not proven which. `killall cfprefsd` ran; `launchctl kickstart` was refused (SIP, rc 150), so it
+  never ran.
+- **C, a hand-written `/Library/Managed Preferences/com.apple.SoftwareUpdate.plist`:** ignored by
+  `softwareupdate --schedule` and by a merged `defaults read`. The cause is unproven; the MDM
+  payload's removal in 27.0 is the likely one.
+- **D, `launchctl disable` plus `bootout` of `com.apple.softwareupdated`:** `bootout` was refused
+  (SIP, rc 150); `disable` was accepted (listed as disabled) but the daemon was still running after
+  a reboot, and the schedule was unchanged.
 
-Untried: the System Settings "Check for updates" toggle in a GUI session. Issue 89 item 1 (the
-`--schedule off` output string and its persistence) is answered by this: it does nothing.
-The four download/install keys do persist across the golden's shutdown, a clone and a reboot.
+What is shown for downloads and installs: `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`,
+`ConfigDataInstall` and `CriticalUpdateInstall` read 0 in all 24 snapshots, so they persist through
+the golden's shutdown, a clone and a reboot. `SplatEnabled` was `true` in those snapshots (the
+golden was built before prep wrote it); prep now writes it false (operator ruling 2026-11-21) and
+2h reads it. Not shown: that softwareupdated obeys any of these keys (an update, macOS 27.2.1, was on
+offer in every run and none was installed in the minutes observed), that `SplatEnabled` false
+persists, and anything about `com.apple.commerce AutoUpdate`, which prep writes but nothing reads
+back.
+
+Issue 89 item 1 (what `softwareupdate --schedule off` prints and whether it persists) is answered:
+on 27.2 it prints the unchanged status and changes nothing; the "turned off" read-back string was
+never observed.
 
 ## Open items for the renderer slice
 

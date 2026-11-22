@@ -2,7 +2,7 @@
 # State 1 macOS VM image prep (issue 70 answers 1-3, slice A).
 # Runs as root inside the guest, streamed there and run as one file by `state1_vm.py golden`:
 #     sudo -n /bin/sh prep.sh
-# The only changes to the pinned vanilla image: Spotlight off, automatic updates off, a
+# The only changes to the pinned vanilla image: Spotlight off, automatic download and install off, a
 # named list of unused launchd jobs disabled, Gatekeeper on, Screen Sharing off, key-only SSH
 # login (with fresh host keys, printed as PREP-HOSTKEY for the driver to pin), and a random
 # console password for admin that is never stored (PREP-CONSOLE-PW). No SIP change, no
@@ -134,20 +134,25 @@ mdutil_bad=$(printf '%s\n' "$mdutil_out" | awk '
 [ -z "$mdutil_bad" ] || die "mdutil -a -s: $mdutil_bad: $mdutil_out"
 log "spotlight: off ($mdutil_polls poll(s), $(($(date +%s) - mdutil_start)) s elapsed)"
 
-# 2. Automatic updates off (softwareupdate itself stays usable).
-for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall; do
+# 2. Automatic download and install off (softwareupdate itself stays usable; checking stays on).
+for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall SplatEnabled; do
     defaults write "$SU_PLIST" "$key" -bool false
-    [ "$(defaults read "$SU_PLIST" "$key")" = 0 ] || die "$key did not read back as 0"
+    su_val=$(defaults read "$SU_PLIST" "$key") || die "defaults read $key failed"
+    [ "$su_val" = 0 ] || die "$key did not read back as 0"
 done
-# Automatic *checking* cannot be turned off here (issue 70 addendum 4, macOS 27.2 unmanaged VM):
-# `softwareupdate --schedule off` changes nothing, softwareupdated drops a written
-# AutomaticCheckEnabled within about 30 s, Managed Preferences are ignored and SIP blocks stopping
-# softwareupdated. Only downloads and installs are enforced; the schedule is logged for information.
+# These keys are written and read back as 0 (and persisted across a reboot, issue 70 addendum 4,
+# PR 90); nobody observed softwareupdated obeying them. SplatEnabled is Background Security
+# Improvements (operator ruling 2026-11-21). Automatic *checking* stays on: four root-script
+# methods did not turn it off on macOS 27.2 (`softwareupdate --schedule off` changed nothing; a
+# written AutomaticCheckEnabled was gone between 30 and 90 s in one run; a hand-written Managed
+# Preferences plist was ignored; kickstart and bootout were refused by SIP), and the System
+# Settings toggle is untried. The schedule is logged for information only.
 su_rc=0
 su_out=$(softwareupdate --schedule 2>&1) || su_rc=$?
 [ "$su_rc" -eq 0 ] || die "softwareupdate --schedule failed (rc $su_rc): $su_out"
+# written, not read back: nothing observed that this key reads 0 on the guest
 defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
-log "automatic updates: download and install off; schedule (info, rc $su_rc): $(printf '%s' "$su_out" | tr '\n' ' ')"
+log "automatic download and install off; schedule (info, rc $su_rc): $(printf '%s' "$su_out" | tr '\r\n' '  ' | cut -c1-200)"
 
 # 3. Gatekeeper on (the VM matches a real owner's Mac).
 spctl --global-enable 2>/dev/null || spctl --master-enable
@@ -269,7 +274,7 @@ printf '%s\n' "$auth_out" | grep -q -- '-14090' || die "dscl -authonly admin adm
 log "console password: rotated to a random value that is not stored"
 # Evidence for issue 78: does the admin account still hold its Secure Token after the rotation?
 # (status only; the driver carries this line into g6's evidence)
-log "secure token status (after): $(sysadminctl -secureTokenStatus admin 2>&1 | tr '\n' ' ')"
+log "secure token status (after): $(sysadminctl -secureTokenStatus admin 2>&1 | tr '\r\n' '  ')"
 
 snapshot after
 log "wrote after snapshot to $SNAP/after"

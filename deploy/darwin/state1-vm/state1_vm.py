@@ -99,13 +99,15 @@ SECURE_TOKEN_AFTER_RE = re.compile(
 MDUTIL_TRANSITIONING = "kMDConfigSearchLevelTransitioning"
 MDUTIL_SETTLE_TIMEOUT = 120.0
 MDUTIL_SETTLE_INTERVAL = 2.0
-# the keys prep.sh writes with `defaults`; check 2h reads them all (AutomaticCheckEnabled is not read:
-# softwareupdated deletes it, issue 70 addendum 4)
+# the keys prep.sh writes with `defaults`; check 2h reads them all. AutomaticCheckEnabled is not
+# read: a written one was gone between 30 and 90 s in one run (issue 70 addendum 4, PR 90).
+# SplatEnabled is Background Security Improvements (operator ruling 2026-11-21).
 UPDATES_KEYS = (
     "AutomaticDownload",
     "AutomaticallyInstallMacOSUpdates",
     "ConfigDataInstall",
     "CriticalUpdateInstall",
+    "SplatEnabled",
 )
 HOSTKEY_LINE_RE = re.compile(
     r"^PREP-HOSTKEY (ssh-ed25519) ([A-Za-z0-9+/]+={0,2})\s*$", re.MULTILINE
@@ -1201,15 +1203,15 @@ def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
 
 
 def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
-    """Automatic update download and install are off.
+    """Automatic download and install keys read 0; `softwareupdate` still runs.
 
-    Pass = the four keys prep.sh writes (UPDATES_KEYS) read 0 and `sudo -n softwareupdate
-    --schedule` exits 0. The schedule text (stdout and stderr together) is evidence only and
-    never decides: automatic update *checking* cannot be turned off in an unmanaged macOS 27.2
-    VM (issue 70 addendum 4: `--schedule off` is a no-op, softwareupdated drops
-    AutomaticCheckEnabled about 30 s after a write, Managed Preferences are ignored, SIP blocks
-    stopping softwareupdated), so "turned on" is the expected answer and nothing here reads
-    AutomaticCheckEnabled.
+    Pass = every key prep.sh writes (UPDATES_KEYS) reads 0 with exit 0, and `sudo -n
+    softwareupdate --schedule` exits 0. The keys are preferences that persist; nobody observed
+    softwareupdated obeying them. The schedule rc only shows the command still runs. Its text
+    (stdout and stderr together) is evidence only and never decides: automatic update checking
+    stays on (issue 70 addendum 4, PR 90: four root-script methods did not turn it off, the
+    System Settings toggle is untried), so "turned on" is the expected answer. Nothing here
+    reads AutomaticCheckEnabled.
     """
     r = rssh(ctx, t, ["sudo", "-n", "softwareupdate", "--schedule"])
     said = (r.stdout + "\n" + r.stderr).strip()
@@ -1218,9 +1220,13 @@ def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
     plist = "/Library/Preferences/com.apple.SoftwareUpdate"
     for key in UPDATES_KEYS:
         r = rssh(ctx, t, ["defaults", "read", plist, key])
-        got = r.stdout.strip() or r.stderr.strip()
-        ok &= r.rc == 0 and r.stdout.strip() == "0"
-        ev.append(f"{key}={got}")
+        good = r.rc == 0 and r.stdout.strip() == "0"
+        ok &= good
+        if good:
+            ev.append(f"{key}=0")
+        else:
+            got = clip(r.stdout.strip() or r.stderr.strip(), 80)
+            ev.append(f"{key}=rc {r.rc} {got!r}" if r.rc else f"{key}={got!r}")
     return ok, " ".join(ev)
 
 
@@ -1293,7 +1299,7 @@ def persistent_assertions(
         facts["mdutil"] = md
 
     ok_2h, ev_2h = updates_off(ctx, t)
-    out.append(("2h", "automatic updates off", ok_2h, ev_2h))
+    out.append(("2h", "automatic download and install off", ok_2h, ev_2h))
 
     fw, py = python_paths(image)
     r = rssh(ctx, t, [py, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
@@ -2280,11 +2286,18 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     out = run_guest_script(
                         ctx, boot_target(identity=identity), script, [], "prep"
                     )
-                    m = re.search(r"^PREP-RESULT .*$", out, re.MULTILINE)
-                    if not m:
+                    results = re.findall(r"^PREP-RESULT .*$", out, re.MULTILINE)
+                    if not results:
                         raise StepFail(
                             "prep.sh printed no PREP-RESULT line: " + clip(out, 400)
                         )
+                    # prep.sh prints its own last; a guest-command line that looks like one
+                    # (a lone CR becomes a line break in text mode) comes earlier. Evidence only.
+                    result = results[-1] + (
+                        f" [{len(results)} PREP-RESULT lines in the prep output; last shown]"
+                        if len(results) > 1
+                        else ""
+                    )
                     state["prep_hostkey"] = parse_prep_hostkey(out)
                     if len(CONSOLE_PW_LINE_RE.findall(out)) != 1:
                         raise StepFail(
@@ -2302,7 +2315,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             f" [{len(st)} such lines in the prep output; first shown]"
                         )
                     return (
-                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {m[0]}; "
+                        f"prep.sh sha256 {sha256_text(script.read_text())[:16]}; {result}; "
                         f"{token}"
                     )
 

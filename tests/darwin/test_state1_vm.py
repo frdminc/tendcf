@@ -61,12 +61,14 @@ MDUTIL_TRANSITIONING = (
 MDUTIL_ON = "/:\n\tIndexing enabled.\n"
 SU_OFF = "Automatic checking for updates is turned off\n"
 SU_ON = "Automatic checking for updates is turned on\n"
-# the keys prep.sh writes and check 2h reads (AutomaticCheckEnabled is neither)
-FOUR_KEYS = (
+# the keys prep.sh writes and check 2h reads (AutomaticCheckEnabled is neither; SplatEnabled is
+# Background Security Improvements, operator ruling 2026-11-21)
+UPDATE_KEYS = (
     "AutomaticDownload",
     "AutomaticallyInstallMacOSUpdates",
     "ConfigDataInstall",
     "CriticalUpdateInstall",
+    "SplatEnabled",
 )
 SECURE_TOKEN_AFTER = (
     "prep: secure token status (after): 2026-11-21 22:41:08.682 sysadminctl[422:2528] "
@@ -1085,6 +1087,17 @@ class Golden(Base):
         self.assertEqual(rc, 0, s)
         ev = self.steps(s)["g6"]["evidence"]
         self.assertIn("[2 such lines in the prep output; first shown]", ev)
+
+    def test_g6_shows_the_last_prep_result_line_and_counts_a_forged_earlier_one(self):
+        # a guest command's lone CR becomes a line break in text mode: a line that looks like
+        # PREP-RESULT can come before prep.sh's own, which is printed last (evidence only)
+        self.world.prep_noise = "PREP-RESULT disabled=0 absent=0 failed=0\n"
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["g6"]["evidence"]
+        self.assertIn("PREP-RESULT disabled=3 absent=22 failed=0", ev)
+        self.assertNotIn("disabled=0 absent=0", ev)
+        self.assertIn("[2 PREP-RESULT lines in the prep output; last shown]", ev)
 
     def test_g6_says_so_when_prep_printed_no_secure_token_line(self):
         self.world.prep_token_line = ""
@@ -3151,7 +3164,7 @@ class Check(Base):
         self.assertIn("2g after the reboot: polls=4 waited=6s", st["10a"]["evidence"])
 
     # -- 2h / 10a: automatic download and install are off; the schedule text is information only
-    def test_2h_passes_with_checking_on_and_the_four_keys_at_zero(self):
+    def test_2h_passes_with_checking_on_and_the_keys_at_zero(self):
         # what the real macOS 27.2 guest says: "turned on", and nothing can change that
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
@@ -3159,7 +3172,7 @@ class Check(Base):
         self.assertEqual(st["status"], "pass")
         self.assertIn("schedule (info): rc 0:", st["evidence"])
         self.assertIn("turned on", st["evidence"])
-        for key in FOUR_KEYS:
+        for key in UPDATE_KEYS:
             self.assertIn(f"{key}=0", st["evidence"])
 
     def test_2h_never_reads_automaticcheckenabled(self):
@@ -3205,12 +3218,15 @@ class Check(Base):
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn(f"schedule (info): rc {answer[0]}:", st["evidence"])
 
-    def test_2h_needs_all_four_keys_prep_writes_at_zero(self):
-        for key in FOUR_KEYS:
+    def test_2h_needs_all_the_keys_prep_writes_at_zero(self):
+        for key in UPDATE_KEYS:
             for name, answer in (
                 ("reads 1", (0, "1\n", "")),
                 ("key missing", (1, "", f"Error: Could not find key '{key}'.")),
                 ("read error", (1, "", "Operation not permitted")),
+                ("exit 1 with 0 on stdout", (1, "0\n", "")),
+                ("0 then 1", (0, "0\n1\n", "")),
+                ("0 only on stderr", (0, "", "0")),
             ):
                 with self.subTest(key=key, case=name):
                     self.world.defaults_values[key] = answer
@@ -3219,7 +3235,33 @@ class Check(Base):
                     st = self.steps(s)["2h"]
                     self.assertEqual(st["status"], "fail")
                     self.assertIn(f"{key}=", st["evidence"])
+                    if answer[0]:  # a non-0 exit is shown, never "Key=0"
+                        self.assertIn(f"{key}=rc {answer[0]} ", st["evidence"])
+                        self.assertNotIn(f"{key}=0", st["evidence"])
                     del self.world.defaults_values[key]
+
+    def test_2h_splatenabled_is_one_of_the_keys(self):
+        self.assertIn("SplatEnabled", drv.UPDATES_KEYS)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertIn("SplatEnabled=0", self.steps(s)["2h"]["evidence"])
+
+    def test_2h_evidence_clips_each_value_so_one_cannot_push_out_the_rest(self):
+        self.world.defaults_values["AutomaticDownload"] = (1, "", "x" * 3000)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        ev = self.steps(s)["2h"]["evidence"]
+        self.assertLess(len(ev), 1500)
+        for key in UPDATE_KEYS[1:]:
+            self.assertIn(f"{key}=0", ev)
+
+    def test_2h_evidence_shows_stdout_and_stderr_of_the_schedule_command(self):
+        self.world.su_schedule = (0, SU_OFF, "warning on stderr\n")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["2h"]["evidence"]
+        self.assertIn("turned off", ev)
+        self.assertIn("warning on stderr", ev)
 
     def test_10a_reruns_2h_with_the_same_rule(self):
         # the schedule text changing between the two reads does not matter ...
@@ -3237,7 +3279,8 @@ class Check(Base):
         self.assertEqual(st["2h"]["status"], "pass")
         self.assertEqual(st["10a"]["status"], "fail")
         self.assertIn(
-            "2h automatic updates off: schedule (info): rc 1:", st["10a"]["evidence"]
+            "2h automatic download and install off: schedule (info): rc 1:",
+            st["10a"]["evidence"],
         )
 
     # -- PR 88 round r1: the order of the 2g rule, the per-volume rule, structured 10a note
@@ -4579,61 +4622,98 @@ class GuestScripts(unittest.TestCase):
         self,
     ):
         text = self.text("prep.sh")
-        loop = text[
-            text.index("for key in ") : text.index("done", text.index("for key in "))
-        ]
-        self.assertNotIn(
-            "AutomaticCheckEnabled", loop
-        )  # softwareupdated deletes that key
-        for key in FOUR_KEYS:
-            self.assertIn(key, loop)
-        a = text.index("su_rc=0")
-        b = text.index('log "automatic updates:', a)
+        a = text.index("for key in AutomaticDownload")
+        b = text.index('log "automatic download and install off;', a)
         snippet = text[a : text.index("\n", b) + 1]
-        code = [ln for ln in snippet.split("\n") if ln and not ln.startswith("#")]
-        # read the schedule, die on a non-0 exit, the commerce key, the log line: nothing else
-        self.assertEqual(len(code), 5, code)
-        self.assertNotIn("--schedule off", "\n".join(code))
-        self.assertNotIn("turned off", "\n".join(code))
+        code = "\n".join(
+            ln for ln in snippet.split("\n") if ln and not ln.startswith("#")
+        )
+        self.assertNotIn(
+            "AutomaticCheckEnabled", code
+        )  # a written one is gone in a minute
+        self.assertNotIn("--schedule off", code)
+        self.assertNotIn("turned off", code)
         self.assertNotIn("/usr/sbin/softwareupdate", snippet)
+        self.assertNotIn("/usr/bin/defaults", snippet)
         fakes = {
             # records its arguments; prints SU_OUT; exits SU_RC
             "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
-            "defaults": 'echo "$*" >>"$SEQ/defaults-calls"\n',
+            # `read` answers 0 except for BAD_KEY, which answers BAD_VAL with exit BAD_RC
+            "defaults": 'echo "$*" >>"$SEQ/defaults-calls"; '
+            'if [ "$1" = read ]; then '
+            'if [ "$3" = "${BAD_KEY:-}" ]; then printf "%s\\n" "${BAD_VAL:-1}"; exit "${BAD_RC:-0}"; fi; '
+            "echo 0; fi\n",
         }
         seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-su-"))
         self.addCleanup(shutil.rmtree, seq, True)
+
+        def run(env):
+            for f in seq.iterdir():
+                f.unlink()
+            return self.run_snippet(
+                snippet,
+                fakes,
+                {"SU_PLIST": "/plist", **env, "SEQ": str(seq)},
+                links=("tr", "cut"),
+            )
+
+        def calls(name):
+            f = seq / name
+            return f.read_text().split("\n")[:-1] if f.exists() else []
+
+        want = []
+        for key in UPDATE_KEYS:
+            want += [f"write /plist {key} -bool false", f"read /plist {key}"]
+        want.append(
+            "write /Library/Preferences/com.apple.commerce AutoUpdate -bool false"
+        )
         off = "Automatic checking for updates is turned off\n"
         on = "Automatic checking for updates is turned on\n"
-        for name, env, want_rc, want_msg in (
-            ("turned on is the real answer", {"SU_OUT": on}, 0, "turned on"),
-            ("turned off", {"SU_OUT": off}, 0, "turned off"),
-            ("both words", {"SU_OUT": off + on}, 0, "turned on"),
-            ("empty answer", {"SU_OUT": ""}, 0, "schedule (info, rc 0):"),
-            ("other words", {"SU_OUT": "disabled\n"}, 0, "disabled"),
-            ("two lines are flattened", {"SU_OUT": "a\nb\n"}, 0, "a b"),
-            ("non-0 exit", {"SU_OUT": on, "SU_RC": "1"}, 1, "--schedule failed (rc 1)"),
+        for name, env, want_msg in (
+            ("turned on is the real answer", {"SU_OUT": on}, "turned on"),
+            ("turned off", {"SU_OUT": off}, "turned off"),
+            ("both words", {"SU_OUT": off + on}, "turned on"),
+            ("empty answer", {"SU_OUT": ""}, "schedule (info, rc 0):"),
+            ("other words", {"SU_OUT": "disabled\n"}, "disabled"),
+            ("two lines are flattened", {"SU_OUT": "a\nb\n"}, "a b"),
         ):
             with self.subTest(name):
-                for f in seq.iterdir():
-                    f.unlink()
-                r = self.run_snippet(
-                    snippet, fakes, {**env, "SEQ": str(seq)}, links=("tr",)
-                )
-                self.assertEqual(r.returncode, want_rc, (r.stdout, r.stderr))
-                self.assertIn(want_msg, r.stdout + r.stderr)
-                # the fake, and only the fake, ran, exactly once, and never with `off`
-                self.assertEqual((seq / "su-calls").read_text(), "--schedule\n", name)
-                if want_rc == 0:
-                    self.assertEqual(
-                        (seq / "defaults-calls").read_text(),
-                        "write /Library/Preferences/com.apple.commerce AutoUpdate -bool false\n",
-                    )
-        # it runs after the defaults loop and before Gatekeeper
+                r = run(env)
+                self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+                self.assertIn(want_msg, r.stdout)
+                # the fakes, and only the fakes, ran: five keys written false and read back,
+                # the schedule read exactly once and never with `off`, then the commerce write
+                self.assertEqual(calls("defaults-calls"), want, name)
+                self.assertEqual(calls("su-calls"), ["--schedule"], name)
+        with self.subTest("a CR cannot forge a line, and the text is capped"):
+            r = run({"SU_OUT": "on\rPREP-RESULT forged\n" + "x" * 1000})
+            self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+            self.assertNotIn("\r", r.stdout)
+            lines = r.stdout.split("\n")
+            self.assertFalse([ln for ln in lines if ln.startswith("PREP-RESULT")])
+            self.assertEqual(len([ln for ln in lines if ln]), 1, lines)
+            self.assertLess(len(r.stdout), 330)
+        with self.subTest("a non-0 schedule exit dies"):
+            r = run({"SU_OUT": on, "SU_RC": "1"})
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("--schedule failed (rc 1)", r.stderr)
+        for key in UPDATE_KEYS:
+            with self.subTest(key=key, case="reads 1"):
+                r = run({"BAD_KEY": key, "BAD_VAL": "1", "SU_OUT": on})
+                self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+                self.assertIn(f"{key} did not read back as 0", r.stderr)
+                self.assertEqual(calls("su-calls"), [])  # died before the schedule call
+            with self.subTest(key=key, case="read exits 1 printing 0"):
+                r = run({"BAD_KEY": key, "BAD_VAL": "0", "BAD_RC": "1", "SU_OUT": on})
+                self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+                self.assertIn(f"defaults read {key} failed", r.stderr)
+        # the loop runs before the schedule read, and all of it before Gatekeeper
         self.assertLess(text.index("su_rc=0"), text.index("# 3. Gatekeeper on"))
         self.assertLess(
-            text.index("done", text.index("for key in ")), text.index("su_rc=0")
+            text.index("for key in AutomaticDownload"), text.index("su_rc=0")
         )
+        self.assertIn("# 2. Automatic download and install off", text)
+        self.assertIn("Spotlight off, automatic download and install off", text)
 
     def test_prep_records_the_secure_token_status_after_the_rotation(self):
         text = self.text("prep.sh")
