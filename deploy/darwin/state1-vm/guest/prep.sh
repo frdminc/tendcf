@@ -82,7 +82,7 @@ if [ ! -d "$SNAP/before" ]; then
     log "wrote before snapshot to $SNAP/before"
     # Evidence for the first real run: does the vanilla admin hold a Secure Token? (status only;
     # this script changes nothing about it)
-    log "secure token status (before): $(tr '\n' ' ' <"$SNAP/before/securetoken.txt" 2>/dev/null)"
+    log "secure token status (before): $(LC_ALL=C tr '\r\n' '  ' <"$SNAP/before/securetoken.txt" 2>/dev/null | LC_ALL=C tr -c ' -~' '?')"
 else
     log "before snapshot already present, keeping it"
 fi
@@ -91,11 +91,18 @@ fi
 mdutil -a -i off >/dev/null 2>&1 || true
 # mdutil -s answers kMDConfigSearchLevelTransitioning while a volume is still changing state
 # after the command above (macOS 27.2 after a reboot, issue 70 run 2): ask again every 2 s until
-# 120 s of real time have passed. Order, every poll: "Indexing enabled" anywhere is fatal; then
-# Transitioning anywhere is retried whatever mdutil's exit status was (that status was never
-# recorded); then a non-0 exit is fatal; then the whole answer must be volume headers (a line
-# ending in ":"), each followed by exactly one "Indexing disabled." line, "/:" among them.
+# 120 s of real time have passed or 65 polls (deadline / interval + 5 margin, stopping the loop
+# after 65 polls — about 130 s plus mdutil's own time — if the clock steps backwards). Order,
+# every poll: "Indexing enabled" anywhere is fatal; then Transitioning anywhere is retried
+# whatever mdutil's exit status was (that status was never recorded); then a non-0 exit is fatal;
+# then any line holding a control character other than tab fails as unexpected (except NUL,
+# which /bin/sh command substitution drops before awk sees it; check 2g/10a still rejects NUL),
+# and the whole answer must be volume headers (a line ending in ":"), each followed by exactly
+# one "Indexing disabled." line, "/:" and "/System/Volumes/Data:" among them.
 mdutil_start=$(date +%s)
+mdutil_deadline=120
+mdutil_interval=2
+mdutil_max_polls=$((mdutil_deadline / mdutil_interval + 5))
 mdutil_polls=0
 while :; do
     mdutil_polls=$((mdutil_polls + 1))
@@ -104,12 +111,15 @@ while :; do
     case $mdutil_out in *"Indexing enabled"*) die "Spotlight indexing is still enabled (rc $mdutil_rc): $mdutil_out" ;; esac
     case $mdutil_out in *kMDConfigSearchLevelTransitioning*) ;; *) break ;; esac
     mdutil_waited=$(($(date +%s) - mdutil_start))
-    [ "$mdutil_waited" -lt 120 ] || die "mdutil -a -s still transitioning after $mdutil_waited s, $mdutil_polls poll(s) (rc $mdutil_rc): $mdutil_out"
-    sleep 2
+    if [ "$mdutil_waited" -ge "$mdutil_deadline" ] || [ "$mdutil_polls" -ge "$mdutil_max_polls" ]; then
+        die "mdutil -a -s still transitioning after $mdutil_waited s, $mdutil_polls poll(s) (rc $mdutil_rc): $mdutil_out"
+    fi
+    sleep "$mdutil_interval"
 done
 [ "$mdutil_rc" -eq 0 ] || die "mdutil -a -s failed (rc $mdutil_rc): $mdutil_out"
-mdutil_bad=$(printf '%s\n' "$mdutil_out" | awk '
+mdutil_bad=$(printf '%s\n' "$mdutil_out" | LC_ALL=C awk '
     function fail(msg) { if (!bad) print msg; bad = 1 }
+    { t = $0; gsub(/\t/, "", t); if (t ~ /[[:cntrl:]]/) { fail("unexpected line: " $0); next } }
     /^[ \t]*$/ { next }
     /^[ \t]/ {
         line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
@@ -123,6 +133,7 @@ mdutil_bad=$(printf '%s\n' "$mdutil_out" | awk '
         if (hdr != "" && !seen) fail("no status for " hdr)
         hdr = $0; seen = 0; headers++
         if (hdr == "/:") root = 1
+        if (hdr == "/System/Volumes/Data:") data = 1
         next
     }
     { fail("unexpected line: " $0) }
@@ -130,6 +141,7 @@ mdutil_bad=$(printf '%s\n' "$mdutil_out" | awk '
         if (hdr != "" && !seen) fail("no status for " hdr)
         if (headers == 0) fail("no volume listed")
         else if (!root) fail("no / volume listed")
+        else if (!data) fail("no /System/Volumes/Data volume listed")
     }')
 [ -z "$mdutil_bad" ] || die "mdutil -a -s: $mdutil_bad: $mdutil_out"
 log "spotlight: off ($mdutil_polls poll(s), $(($(date +%s) - mdutil_start)) s elapsed)"
@@ -141,18 +153,21 @@ for key in AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall 
     [ "$su_val" = 0 ] || die "$key did not read back as 0"
 done
 # These keys are written and read back as 0 (and persisted across a reboot, issue 70 addendum 4,
-# PR 90); nobody observed softwareupdated obeying them. SplatEnabled is Background Security
-# Improvements (operator ruling 2026-11-21). Automatic *checking* stays on: four root-script
+# PR 90, and run 4 for SplatEnabled); nobody observed softwareupdated obeying them. SplatEnabled
+# is believed to be the Background Security Improvements switch (inferred, not documented by Apple;
+# operator ruling 2026-11-21). Automatic *checking* stays on: four root-script
 # methods did not turn it off on macOS 27.2 (`softwareupdate --schedule off` changed nothing; a
 # written AutomaticCheckEnabled was gone between 30 and 90 s in one run; a hand-written Managed
 # Preferences plist was ignored; kickstart and bootout were refused by SIP), and the System
-# Settings toggle is untried. The schedule is logged for information only.
+# Settings toggle is untried. The schedule is logged for information only (CR/LF flattened, bytes
+# outside printable ASCII replaced with ?, and cut to 200 bytes under LC_ALL=C so the cut never
+# splits a multibyte character).
 su_rc=0
 su_out=$(softwareupdate --schedule 2>&1) || su_rc=$?
 [ "$su_rc" -eq 0 ] || die "softwareupdate --schedule failed (rc $su_rc): $su_out"
 # written, not read back: nothing observed that this key reads 0 on the guest
 defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false
-log "automatic download and install off; schedule (info, rc $su_rc): $(printf '%s' "$su_out" | tr '\r\n' '  ' | cut -c1-200)"
+log "automatic download and install off; schedule (info, rc $su_rc): $(printf '%s' "$su_out" | LC_ALL=C tr '\r\n' '  ' | LC_ALL=C tr -c ' -~' '?' | LC_ALL=C cut -c1-200)"
 
 # 3. Gatekeeper on (the VM matches a real owner's Mac).
 spctl --global-enable 2>/dev/null || spctl --master-enable
@@ -274,7 +289,7 @@ printf '%s\n' "$auth_out" | grep -q -- '-14090' || die "dscl -authonly admin adm
 log "console password: rotated to a random value that is not stored"
 # Evidence for issue 78: does the admin account still hold its Secure Token after the rotation?
 # (status only; the driver carries this line into g6's evidence)
-log "secure token status (after): $(sysadminctl -secureTokenStatus admin 2>&1 | tr '\r\n' '  ')"
+log "secure token status (after): $(sysadminctl -secureTokenStatus admin 2>&1 | LC_ALL=C tr '\r\n' '  ' | LC_ALL=C tr -c ' -~' '?')"
 
 snapshot after
 log "wrote after snapshot to $SNAP/after"
