@@ -4771,12 +4771,17 @@ class GuestScripts(unittest.TestCase):
             "date": 'cat "$SEQ/clock"\n',
         }
 
-        def run(outs, last, rc="0", cost="0", backstep=""):
+        def run(
+            outs, last, rc="0", cost="0", backstep="", extra_env=None, raw_bytes=False
+        ):
             for f in seq.iterdir():
                 f.unlink()
             for i, o in enumerate(outs, 1):
                 (seq / f"out.{i}").write_text(o)
-            (seq / "out.last").write_text(last)
+            if isinstance(last, bytes):
+                (seq / "out.last").write_bytes(last)
+            else:
+                (seq / "out.last").write_text(last)
             (seq / "clock").write_text("1000\n")
             return self.run_snippet(
                 snippet,
@@ -4786,8 +4791,10 @@ class GuestScripts(unittest.TestCase):
                     "MDUTIL_RC": rc,
                     "MDUTIL_COST": cost,
                     "BACKSTEP": backstep,
+                    **(extra_env or {}),
                 },
                 links=("awk", "cat"),
+                raw_bytes=raw_bytes,
             )
 
         def slept():
@@ -4889,6 +4896,28 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         r = run([], MDUTIL_OFF_3)  # T3/N4: full real 27.2 three-volume listing passes
         self.assertEqual(r.returncode, 0, r.stderr)
+        # A1 / R2-2: pin LC_ALL=C on awk under a UTF-8 locale (plain awk fails U+0085 as
+        # [[:cntrl:]] and aborts with exit 2 on an invalid UTF-8 byte)
+        for name, out, raw_bytes in (
+            (
+                "U+0085 in extra volume under UTF-8 locale",
+                MDUTIL_OFF_3 + "/Volumes/X\u0085Y:\n\tIndexing disabled.\n",
+                False,
+            ),
+            (
+                "invalid UTF-8 byte in extra volume under UTF-8 locale",
+                MDUTIL_OFF_3.encode() + b"/Volumes/X\xffY:\n\tIndexing disabled.\n",
+                True,
+            ),
+        ):
+            with self.subTest(name):
+                r = run(
+                    [],
+                    out,
+                    extra_env={"LC_ALL": "en_US.UTF-8"},
+                    raw_bytes=raw_bytes,
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
         r = run([], MDUTIL_OFF, rc="1")  # a failing mdutil dies, whatever it printed
         self.assertEqual(r.returncode, 1)
         self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)

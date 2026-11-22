@@ -95,9 +95,10 @@ mdutil -a -i off >/dev/null 2>&1 || true
 # after 65 polls — about 130 s plus mdutil's own time — if the clock steps backwards). Order,
 # every poll: "Indexing enabled" anywhere is fatal; then Transitioning anywhere is retried
 # whatever mdutil's exit status was (that status was never recorded); then a non-0 exit is fatal;
-# then any line holding a control character other than tab fails as unexpected, and the whole
-# answer must be volume headers (a line ending in ":"), each followed by exactly one "Indexing
-# disabled." line, "/:" and "/System/Volumes/Data:" among them.
+# then any line holding a control character other than tab fails as unexpected (except NUL,
+# which /bin/sh command substitution drops before awk sees it; check 2g/10a still rejects NUL),
+# and the whole answer must be volume headers (a line ending in ":"), each followed by exactly
+# one "Indexing disabled." line, "/:" and "/System/Volumes/Data:" among them.
 mdutil_start=$(date +%s)
 mdutil_deadline=120
 mdutil_interval=2

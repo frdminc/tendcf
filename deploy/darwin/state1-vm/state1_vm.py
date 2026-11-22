@@ -1120,7 +1120,8 @@ def mdutil_volumes_problem(text: str) -> str | None:
     space or tab. The caller runs ssh with raw_newlines=True (no universal-newline translation)
     and lines are split on "\\n" only; any line holding a control character other than tab (CR,
     FF, VT, NUL, other C0, or DEL) is rejected as unexpected before blank, header or status
-    matching. prep.sh applies the same rule with LC_ALL=C awk.
+    matching. prep.sh applies the same rule with LC_ALL=C awk except for NUL, which its shell
+    command substitution drops before awk sees it (check 2g/10a still rejects NUL).
     """
     hdr: str | None = None
     seen = False
