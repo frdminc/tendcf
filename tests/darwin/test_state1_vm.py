@@ -62,7 +62,8 @@ MDUTIL_ON = "/:\n\tIndexing enabled.\n"
 SU_OFF = "Automatic checking for updates is turned off\n"
 SU_ON = "Automatic checking for updates is turned on\n"
 # the keys prep.sh writes and check 2h reads (AutomaticCheckEnabled is neither; SplatEnabled is
-# Background Security Improvements, operator ruling 2026-11-21)
+# believed to be Background Security Improvements — inferred, not documented by Apple; operator
+# ruling 2026-11-21)
 UPDATE_KEYS = (
     "AutomaticDownload",
     "AutomaticallyInstallMacOSUpdates",
@@ -143,6 +144,7 @@ class FakeWorld:
         self.mdutil_outputs = []
         self.mdutil_default = (0, MDUTIL_OFF)
         self.mdutil_calls = 0
+        self.mdutil_raw_newlines = []  # the raw_newlines flag of each mdutil -a -s call
         # `sudo -n softwareupdate --schedule` and the `defaults read` answers per key
         self.su_schedule = (0, SU_ON)  # the real guest: checking cannot be turned off
         self.su_outputs = []  # answers still to give before su_schedule
@@ -421,13 +423,37 @@ class FakeWorld:
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             self.mdutil_calls += 1
-            return drv.Result(
+            self.mdutil_raw_newlines.append(self._raw_newlines)
+            raw_res = drv.Result(
                 *(
                     self.mdutil_outputs.pop(0)
                     if self.mdutil_outputs
                     else self.mdutil_default
                 )
             )
+            # Run CR-bearing stdout/stderr through the real runner's decode (like sshd above),
+            # so omitting raw_newlines=True translates CR/CRLF to LF as in production.
+            out_s = (
+                drv.RealRunner()
+                .run(
+                    ["/usr/bin/printf", "%s", raw_res.stdout],
+                    raw_newlines=self._raw_newlines,
+                )
+                .stdout
+                if "\r" in raw_res.stdout
+                else raw_res.stdout
+            )
+            err_s = (
+                drv.RealRunner()
+                .run(
+                    ["/usr/bin/printf", "%s", raw_res.stderr],
+                    raw_newlines=self._raw_newlines,
+                )
+                .stdout
+                if "\r" in raw_res.stderr
+                else raw_res.stderr
+            )
+            return drv.Result(raw_res.rc, out_s, err_s, raw_res.timed_out)
         if r == ["sudo", "-n", "softwareupdate", "--schedule"]:
             return drv.Result(
                 *(self.su_outputs.pop(0) if self.su_outputs else self.su_schedule)
@@ -3238,6 +3264,16 @@ class Check(Base):
                     if answer[0]:  # a non-0 exit is shown, never "Key=0"
                         self.assertIn(f"{key}=rc {answer[0]} ", st["evidence"])
                         self.assertNotIn(f"{key}=0", st["evidence"])
+                        if not answer[1].strip() and answer[2].strip():
+                            self.assertIn(
+                                f"{key}=rc {answer[0]} stderr ", st["evidence"]
+                            )
+                    elif not answer[1].strip() and answer[2].strip():
+                        # R5: a value read only from stderr is marked so it never reads as a pass
+                        self.assertIn(
+                            f"{key}=stderr {answer[2].strip()!r}", st["evidence"]
+                        )
+                        self.assertNotIn(f"{key}=0", st["evidence"])
                     del self.world.defaults_values[key]
 
     def test_2h_splatenabled_is_one_of_the_keys(self):
@@ -3254,6 +3290,26 @@ class Check(Base):
         self.assertLess(len(ev), 1500)
         for key in UPDATE_KEYS[1:]:
             self.assertIn(f"{key}=0", ev)
+
+    def test_2h_schedule_evidence_clips_at_200_and_escapes_control_chars(self):
+        # M10: schedule text is clipped at 200 chars so long output cannot crowd out the keys
+        self.world.su_schedule = (0, "s" * 500)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["2h"]["evidence"]
+        self.assertIn("[+300 chars]", ev)
+        self.assertNotIn("s" * 250, ev)
+        for key in UPDATE_KEYS:
+            self.assertIn(f"{key}=0", ev)
+        # M11: !r escapes control characters and quotes the schedule text
+        self.world.su_schedule = (0, "turned on\r\x1b[31mred\nline2")
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["2h"]["evidence"]
+        self.assertNotIn("\r", ev)
+        self.assertNotIn("\n", ev)
+        self.assertNotIn("\x1b", ev)
+        self.assertIn("schedule (info): rc 0: 'turned on\\r\\x1b[31mred\\nline2'", ev)
 
     def test_2h_evidence_shows_stdout_and_stderr_of_the_schedule_command(self):
         self.world.su_schedule = (0, SU_OFF, "warning on stderr\n")
@@ -3333,8 +3389,23 @@ class Check(Base):
                 "unexpected line",
             ),
             ("no root volume", "/System/Volumes/Data:\n\tIndexing disabled.\n", "no / volume"),
+            ("no Data volume", root, "no /System/Volumes/Data volume"),
+            (
+                "root and Preboot without Data volume",
+                root + "/System/Volumes/Preboot:\n\tIndexing disabled.\n",
+                "no /System/Volumes/Data volume",
+            ),
             ("status before any volume", "\tIndexing disabled.\n" + root, "status before any volume"),
-            ("a CR is not a line break", "/:\r\n\tIndexing disabled.\r\n", "unexpected line"),
+            (
+                "a CR is not a line break (CRLF)",
+                "/:\r\n\tIndexing disabled.\r\n/System/Volumes/Data:\r\n\tIndexing disabled.\r\n",
+                "unexpected line",
+            ),
+            (
+                "a lone CR is not a line break",
+                "/:\r\tIndexing disabled.\r/System/Volumes/Data:\r\tIndexing disabled.\n",
+                "unexpected line",
+            ),
             ("a form feed is not a line break", root + "\x0c/Data:\n", "no status for \x0c/Data:"),
         )  # fmt: skip
         for name, out, why in cases:
@@ -3345,6 +3416,20 @@ class Check(Base):
                 st = self.steps(s)["2g"]
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn(why, st["evidence"], name)
+        self.world.mdutil_default = (0, MDUTIL_OFF)
+
+    def test_2g_and_10a_read_mdutil_with_raw_newlines(self):
+        # Issue 89 item 2 (F8/A9): both 2g and 10a pass raw_newlines=True to rssh, so a CR
+        # on stdout or stderr reaches mdutil_volumes_problem untranslated.
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.world.mdutil_raw_newlines, [True, True])
+        crlf = MDUTIL_OFF.replace("\n", "\r\n")
+        self.world.mdutil_default = (0, "", crlf)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["2g"]["status"], "fail")
+        self.assertIn("unexpected line", self.steps(s)["2g"]["evidence"])
         self.world.mdutil_default = (0, MDUTIL_OFF)
 
     def test_2g_reads_stderr_too(self):
@@ -4086,6 +4171,22 @@ class RawNewlines(unittest.TestCase):
         ok, _ = drv.sshd_key_only(self.printf(smuggled))
         self.assertTrue(ok, "the default decode turns the CR into a newline")
 
+    def test_2g_matcher_on_real_runner_output(self):
+        for raw in (True, False):
+            r = self.printf(MDUTIL_OFF, raw_newlines=raw)
+            self.assertIsNone(drv.mdutil_volumes_problem(r.stdout))
+        for name, text in (
+            ("CRLF", MDUTIL_OFF.replace("\n", "\r\n")),
+            ("lone CR", MDUTIL_OFF.replace("\n", "\r")),
+        ):
+            r_raw = self.printf(text, raw_newlines=True)
+            prob = drv.mdutil_volumes_problem(r_raw.stdout)
+            self.assertIsNotNone(prob, name)
+            self.assertIn("unexpected line", prob, name)
+            # default text mode would have translated CR/CRLF to LF and let it pass
+            r_default = self.printf(text, raw_newlines=False)
+            self.assertIsNone(drv.mdutil_volumes_problem(r_default.stdout), name)
+
 
 class DsclCodes(unittest.TestCase):
     def test_only_the_exact_wrong_password_result_is_accepted(self):
@@ -4318,6 +4419,46 @@ class GuestScripts(unittest.TestCase):
         self.assertNotIn("sysadminctl -resetPasswordFor", text)  # status only
         self.assertNotIn("-secureTokenOn", text)
         self.assertNotIn("-secureTokenOff", text)
+        # R2-1 / R4 / R5: slice line 85 and prove CR+LF flattening and LC_ALL=C survival
+        a = text.index('log "secure token status (before):')
+        snippet = text[a : text.index("\n", a) + 1]
+        snap = Path(tempfile.mkdtemp(prefix="tendcf-prep-st-before-"))
+        self.addCleanup(shutil.rmtree, snap, True)
+        (snap / "before").mkdir()
+        st_file = snap / "before" / "securetoken.txt"
+        with self.subTest("CR and LF flattened, cannot forge after line"):
+            st_file.write_bytes(
+                b"Secure token is ENABLED\rprep: secure token status (after): FORGED\nline2\n"
+            )
+            r = self.run_snippet(
+                snippet,
+                {},
+                {"SNAP": str(snap), "LC_ALL": "en_US.UTF-8"},
+                links=("tr",),
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn(b"\r", r.stdout)
+            lines = [ln for ln in r.stdout.split(b"\n") if ln]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertFalse(
+                any(
+                    ln.startswith(b"prep: secure token status (after):") for ln in lines
+                )
+            )
+        with self.subTest("invalid UTF-8 under UTF-8 locale does not truncate"):
+            st_file.write_bytes(b"before\xffafter\r\n")
+            r = self.run_snippet(
+                snippet,
+                {},
+                {"SNAP": str(snap), "LC_ALL": "en_US.UTF-8"},
+                links=("tr",),
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(b"after", r.stdout)
+            self.assertNotIn(b"\r", r.stdout)
+            self.assertNotIn(b"Illegal byte sequence", r.stderr)
 
     def test_prep_console_password_is_random_verified_and_never_printed(self):
         text = self.text("prep.sh")
@@ -4507,7 +4648,7 @@ class GuestScripts(unittest.TestCase):
         f.chmod(0o755)
         return d
 
-    def run_snippet(self, snippet, fakes, env=None, links=()):
+    def run_snippet(self, snippet, fakes, env=None, links=(), *, raw_bytes=False):
         """Run a slice of prep.sh with only fake tools on PATH (plus the named host tools,
         symlinked into the fake directory): the host's own tools cannot be reached."""
         d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
@@ -4525,7 +4666,7 @@ class GuestScripts(unittest.TestCase):
         return subprocess.run(
             ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
             capture_output=True,
-            text=True,
+            text=not raw_bytes,
             check=False,
             env={"PATH": str(d), **(env or {})},
         )
@@ -4541,16 +4682,19 @@ class GuestScripts(unittest.TestCase):
         self.addCleanup(shutil.rmtree, seq, True)
         fakes = {
             # the Nth call prints $SEQ/out.N (else out.last) and costs MDUTIL_COST seconds of
-            # the fake clock; sleep advances it; date prints it; the exit status is MDUTIL_RC
+            # the fake clock; if BACKSTEP is set, call 2 steps the clock backwards by that many
+            # seconds; sleep advances it; date prints it; the exit status is MDUTIL_RC
             "mdutil": 'D=$SEQ; n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n + 1)); '
             'echo "$n" >"$D/n"; echo "$n" >>"$D/calls"; f="$D/out.$n"; [ -f "$f" ] || f="$D/out.last"; '
-            'c=$(cat "$D/clock"); echo $((c + ${MDUTIL_COST:-0})) >"$D/clock"; '
+            'c=$(cat "$D/clock"); '
+            'if [ -n "${BACKSTEP:-}" ] && [ "$n" -eq 2 ]; then c=$((c - BACKSTEP)); fi; '
+            'echo $((c + ${MDUTIL_COST:-0})) >"$D/clock"; '
             'cat "$f"; exit "${MDUTIL_RC:-0}"\n',
             "sleep": 'c=$(cat "$SEQ/clock"); echo $((c + $1)) >"$SEQ/clock"; echo "$1" >>"$SEQ/slept"\n',
             "date": 'cat "$SEQ/clock"\n',
         }
 
-        def run(outs, last, rc="0", cost="0"):
+        def run(outs, last, rc="0", cost="0", backstep=""):
             for f in seq.iterdir():
                 f.unlink()
             for i, o in enumerate(outs, 1):
@@ -4560,7 +4704,12 @@ class GuestScripts(unittest.TestCase):
             return self.run_snippet(
                 snippet,
                 fakes,
-                {"SEQ": str(seq), "MDUTIL_RC": rc, "MDUTIL_COST": cost},
+                {
+                    "SEQ": str(seq),
+                    "MDUTIL_RC": rc,
+                    "MDUTIL_COST": cost,
+                    "BACKSTEP": backstep,
+                },
                 links=("awk", "cat"),
             )
 
@@ -4591,6 +4740,13 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("still transitioning after", r.stderr)
         self.assertLess(calls(), 10)
+        # F9/A10: a backwards wall-clock step cannot stretch the loop past the poll-count cap
+        r = run([], MDUTIL_TRANSITIONING, backstep="600")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still transitioning after", r.stderr)
+        self.assertIn("65 poll(s)", r.stderr)
+        self.assertEqual(calls(), 65)
+        self.assertEqual(len(slept()), 64)
         # enabled is never retried into a pass, before or after a Transitioning poll
         for outs in ([MDUTIL_ON], [MDUTIL_TRANSITIONING]):
             r = run(outs, MDUTIL_ON)
@@ -4600,12 +4756,27 @@ class GuestScripts(unittest.TestCase):
         root = "/:\n\tIndexing disabled.\n"
         for name, out, why in (
             ("header with no status", root + "/System/Volumes/Data:\n", "no status for"),
+            (
+                "header with no status, then another volume",
+                root + "/System/Volumes/Data:\n/System/Volumes/Preboot:\n\tIndexing disabled.\n",
+                "no status for /System/Volumes/Data:",
+            ),
             ("status ending in a colon", root + "/Data:\n\tIndexing state:\n", "unexpected line"),
             ("two statuses", root + "\tIndexing disabled.\n", "two statuses for /:"),
             ("disabled and an unknown error", root + "/Data:\n\tError: unknown indexing state.\n", "unexpected line"),
-            ("no root volume", "/Data:\n\tIndexing disabled.\n", "no / volume listed"),
+            ("no root volume", "/System/Volumes/Data:\n\tIndexing disabled.\n", "no / volume listed"),
+            ("no Data volume", root, "no /System/Volumes/Data volume listed"),
+            (
+                "root and Preboot without Data volume",
+                root + "/System/Volumes/Preboot:\n\tIndexing disabled.\n",
+                "no /System/Volumes/Data volume listed",
+            ),
             ("empty", "", "no volume listed"),
-            ("a CR is not a line break", "/:\r\n\tIndexing disabled.\r\n", "unexpected line"),
+            (
+                "a CR is not a line break",
+                "/:\r\n\tIndexing disabled.\r\n/System/Volumes/Data:\r\n\tIndexing disabled.\r\n",
+                "unexpected line",
+            ),
         ):  # fmt: skip
             with self.subTest(name):
                 r = run([], out)
@@ -4636,8 +4807,10 @@ class GuestScripts(unittest.TestCase):
         self.assertNotIn("/usr/sbin/softwareupdate", snippet)
         self.assertNotIn("/usr/bin/defaults", snippet)
         fakes = {
-            # records its arguments; prints SU_OUT; exits SU_RC
-            "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; printf "%s" "$SU_OUT"; exit "${SU_RC:-0}"\n',
+            # records its arguments; prints SU_FILE (if set) or SU_OUT; exits SU_RC
+            "softwareupdate": 'echo "$*" >>"$SEQ/su-calls"; '
+            'if [ -n "${SU_FILE:-}" ]; then cat "$SU_FILE"; else printf "%s" "$SU_OUT"; fi; '
+            'exit "${SU_RC:-0}"\n',
             # `read` answers 0 except for BAD_KEY, which answers BAD_VAL with exit BAD_RC
             "defaults": 'echo "$*" >>"$SEQ/defaults-calls"; '
             'if [ "$1" = read ]; then '
@@ -4647,14 +4820,15 @@ class GuestScripts(unittest.TestCase):
         seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-su-"))
         self.addCleanup(shutil.rmtree, seq, True)
 
-        def run(env):
+        def run(env, *, raw_bytes=False):
             for f in seq.iterdir():
                 f.unlink()
             return self.run_snippet(
                 snippet,
                 fakes,
                 {"SU_PLIST": "/plist", **env, "SEQ": str(seq)},
-                links=("tr", "cut"),
+                links=("tr", "cut", "cat"),
+                raw_bytes=raw_bytes,
             )
 
         def calls(name):
@@ -4693,6 +4867,38 @@ class GuestScripts(unittest.TestCase):
             self.assertFalse([ln for ln in lines if ln.startswith("PREP-RESULT")])
             self.assertEqual(len([ln for ln in lines if ln]), 1, lines)
             self.assertLess(len(r.stdout), 330)
+        with self.subTest("invalid UTF-8 under UTF-8 locale does not truncate"):
+            su_bin = Path(tempfile.mkdtemp(prefix="tendcf-prep-subin-"))
+            self.addCleanup(shutil.rmtree, su_bin, True)
+            f = su_bin / "su.bin"
+            f.write_bytes(b"on\xfftail\rPREP-RESULT forged\n")
+            r = run(
+                {"LC_ALL": "en_US.UTF-8", "SU_FILE": str(f)},
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(b"tail", r.stdout)
+            self.assertNotIn(b"\r", r.stdout)
+            self.assertNotIn(b"Illegal byte sequence", r.stderr)
+            lines = [ln for ln in r.stdout.split(b"\n") if ln]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertFalse(any(ln.startswith(b"PREP-RESULT") for ln in lines))
+        with self.subTest("cut caps schedule text at 200 bytes under LC_ALL=C"):
+            su_bin = Path(tempfile.mkdtemp(prefix="tendcf-prep-subin-"))
+            self.addCleanup(shutil.rmtree, su_bin, True)
+            f = su_bin / "su.bin"
+            f.write_bytes("é".encode() * 120)  # 240 bytes, 120 chars
+            r = run(
+                {"LC_ALL": "en_US.UTF-8", "SU_FILE": str(f)},
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            prefix = (
+                b"prep: automatic download and install off; schedule (info, rc 0): "
+            )
+            self.assertTrue(r.stdout.startswith(prefix), r.stdout)
+            payload = r.stdout.removeprefix(prefix).rstrip(b"\n")
+            self.assertEqual(len(payload), 200)
         with self.subTest("a non-0 schedule exit dies"):
             r = run({"SU_OUT": on, "SU_RC": "1"})
             self.assertEqual(r.returncode, 1)
@@ -4727,6 +4933,42 @@ class GuestScripts(unittest.TestCase):
         )
         self.assertNotIn("-resetPasswordFor", text)  # status only
         self.assertNotIn("-secureTokenOn", text)
+        # P12 / R2-2 / R5: slice line 277 and prove CR+LF flattening and LC_ALL=C survival
+        a = text.index('log "secure token status (after):')
+        snippet = text[a : text.index("\n", a) + 1]
+        tmp = Path(tempfile.mkdtemp(prefix="tendcf-prep-st-after-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        st_file = tmp / "st.bin"
+        fakes = {"sysadminctl": 'cat "$ST_FILE"\n'}
+        with self.subTest("CR and LF flattened, cannot forge PREP-RESULT"):
+            st_file.write_bytes(
+                b"Secure token is ENABLED\rPREP-RESULT forged\nsecond\n"
+            )
+            r = self.run_snippet(
+                snippet,
+                fakes,
+                {"ST_FILE": str(st_file), "LC_ALL": "en_US.UTF-8"},
+                links=("tr", "cat"),
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn(b"\r", r.stdout)
+            lines = [ln for ln in r.stdout.split(b"\n") if ln]
+            self.assertEqual(len(lines), 1, lines)
+            self.assertFalse(any(ln.startswith(b"PREP-RESULT") for ln in lines))
+        with self.subTest("invalid UTF-8 under UTF-8 locale does not truncate"):
+            st_file.write_bytes(b"before\xffafter\r\n")
+            r = self.run_snippet(
+                snippet,
+                fakes,
+                {"ST_FILE": str(st_file), "LC_ALL": "en_US.UTF-8"},
+                links=("tr", "cat"),
+                raw_bytes=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(b"after", r.stdout)
+            self.assertNotIn(b"\r", r.stdout)
+            self.assertNotIn(b"Illegal byte sequence", r.stderr)
 
     def test_prep_prints_the_host_key_from_inside_the_session(self):
         text = self.text("prep.sh")

@@ -101,7 +101,8 @@ MDUTIL_SETTLE_TIMEOUT = 120.0
 MDUTIL_SETTLE_INTERVAL = 2.0
 # the keys prep.sh writes with `defaults`; check 2h reads them all. AutomaticCheckEnabled is not
 # read: a written one was gone between 30 and 90 s in one run (issue 70 addendum 4, PR 90).
-# SplatEnabled is Background Security Improvements (operator ruling 2026-11-21).
+# SplatEnabled is believed to be the Background Security Improvements switch (inferred, not
+# documented by Apple; operator ruling 2026-11-21).
 UPDATES_KEYS = (
     "AutomaticDownload",
     "AutomaticallyInstallMacOSUpdates",
@@ -1112,12 +1113,14 @@ class Mdutil(NamedTuple):
 
 def mdutil_volumes_problem(text: str) -> str | None:
     """None if `mdutil -a -s` output is only volume headers, each followed by exactly one
-    `Indexing disabled.` line, with `/:` among the headers; else what is wrong.
+    `Indexing disabled.` line, with `/:` and `/System/Volumes/Data:` among the headers; else
+    what is wrong.
 
     A header is a line with no leading blank that ends in ":"; a status line has a leading
-    space or tab. Lines are split on "\n" only and only spaces and tabs count as blank, so a
-    CR, a form feed or any other separator is "unexpected", never a line of its own.
-    prep.sh applies the same rule with awk.
+    space or tab. The caller runs ssh with raw_newlines=True (no universal-newline translation)
+    and lines are split on "\\n" only with only spaces and tabs counting as blank, so a CR, a
+    form feed or any other separator is "unexpected", never a line of its own. prep.sh applies
+    the same rule with awk.
     """
     hdr: str | None = None
     seen = False
@@ -1146,6 +1149,8 @@ def mdutil_volumes_problem(text: str) -> str | None:
         return "no volume listed"
     if "/:" not in headers:
         return "no / volume listed"
+    if "/System/Volumes/Data:" not in headers:
+        return "no /System/Volumes/Data volume listed"
     return None
 
 
@@ -1158,21 +1163,31 @@ def _mdutil_done(
 def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
     """`mdutil -a -s` says indexing is off on every volume, after a bounded settle.
 
-    Each poll, in this order: "Indexing enabled" anywhere (stdout and stderr together) fails
-    at once; kMDConfigSearchLevelTransitioning anywhere is asked again every
-    MDUTIL_SETTLE_INTERVAL seconds, whatever mdutil's exit status was (it was never recorded),
-    until MDUTIL_SETTLE_TIMEOUT seconds of real time have passed (so about that plus one
-    command); then a non-0 exit fails; then mdutil_volumes_problem must find nothing. The
-    evidence carries every poll's exit status, and the polls and seconds are returned as values.
+    Runs ssh with raw_newlines=True so a lone CR or CRLF reaches mdutil_volumes_problem
+    untranslated instead of becoming a line break. Each poll, in this order: "Indexing enabled"
+    anywhere (stdout and stderr together) fails at once; kMDConfigSearchLevelTransitioning
+    anywhere is asked again every MDUTIL_SETTLE_INTERVAL seconds, whatever mdutil's exit status
+    was (it was never recorded), until MDUTIL_SETTLE_TIMEOUT seconds of real time have passed
+    (so about that plus one command); then a non-0 exit fails; then mdutil_volumes_problem must
+    find nothing. The evidence carries every poll's exit status, and the polls and seconds are
+    returned as values.
     """
     start = ctx.monotonic()
     polls = 0
     rcs: list[int] = []
     while True:
-        r = rssh(ctx, t, ["sudo", "-n", "mdutil", "-a", "-s"])
+        r = rssh(
+            ctx,
+            t,
+            ["sudo", "-n", "mdutil", "-a", "-s"],
+            raw_newlines=True,  # mdutil's bytes untranslated: see mdutil_volumes_problem
+        )
         polls += 1
         rcs.append(r.rc)
         waited = ctx.monotonic() - start
+        # Stderr is merged into the same volume-list check, so any non-volume stderr text
+        # fails 2g on purpose (fail closed; real mdutil on macOS 27.2 printed nothing to
+        # stderr on a pass).
         text = r.stdout
         if r.stderr:
             text += ("" if text.endswith("\n") or not text else "\n") + r.stderr
@@ -1225,8 +1240,12 @@ def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
         if good:
             ev.append(f"{key}=0")
         else:
-            got = clip(r.stdout.strip() or r.stderr.strip(), 80)
-            ev.append(f"{key}=rc {r.rc} {got!r}" if r.rc else f"{key}={got!r}")
+            out, err = r.stdout.strip(), r.stderr.strip()
+            src = "stderr " if not out and err else ""
+            got = clip(out or err, 80)
+            ev.append(
+                f"{key}=rc {r.rc} {src}{got!r}" if r.rc else f"{key}={src}{got!r}"
+            )
     return ok, " ".join(ev)
 
 
