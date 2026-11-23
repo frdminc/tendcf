@@ -87,13 +87,43 @@ data=""      # set by init_paths
 stage_dir=""
 changed=0
 upgrade_needs_execd_restart=0
+upgrade_rollback_armed=0
+upgrade_backup_prefix=""
+upgrade_staged_tree=""
+upgrade_moved_var=0
+upgrade_was_loaded=0
 
 die() { echo "tendcf-install: $*" >&2; exit 1; }
 say() { echo "tendcf-install: $*"; }
 
 cleanup_stage() {
+    if [ "$upgrade_rollback_armed" -eq 1 ]; then
+        if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
+            local failed_prefix="$prefix.failed.$$"
+            /bin/rm -rf "$failed_prefix" || true
+            if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+                /bin/mv "$prefix" "$failed_prefix" || true
+            fi
+            if [ "$upgrade_moved_var" -eq 1 ] && [ ! -e "$upgrade_backup_prefix/var" ]; then
+                if [ -d "$failed_prefix/var" ]; then
+                    /bin/mv "$failed_prefix/var" "$upgrade_backup_prefix/var" || true
+                elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/var" ]; then
+                    /bin/mv "$upgrade_staged_tree/var" "$upgrade_backup_prefix/var" || true
+                fi
+            fi
+            if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
+                /bin/mv "$upgrade_backup_prefix" "$prefix" || true
+            fi
+            /bin/rm -rf "$failed_prefix" || true
+        fi
+        if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
+            /bin/launchctl bootstrap system "$plist_path" >/dev/null 2>&1 || true
+        fi
+        echo "tendcf-install: rolled back failed upgrade to previous $prefix" >&2
+        upgrade_rollback_armed=0
+    fi
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
-        /bin/rm -rf "$stage_dir"
+        /bin/rm -rf "$stage_dir" || true
     fi
 }
 trap cleanup_stage EXIT
@@ -816,46 +846,40 @@ install_tarball() {
     if [ ! -e "$prefix" ]; then
         /bin/mv "$staged_tree" "$prefix"
     else
-        # Upgrade in place: stop running cf-execd first, preserve $prefix/var (if
-        # it is a real directory, never a symlink), and roll back on any failure.
+        # Upgrade in place: fail fast if $prefix/var is a symlink BEFORE touching
+        # any running cf-execd, then arm the EXIT-trap rollback across the swap
+        # and all post-swap cmd_install steps (backup_prefix is deleted only in
+        # cmd_install after every post-upgrade step and enable_execd succeed).
+        if [ -L "$prefix/var" ]; then
+            die "existing $prefix/var is a symlink; refusing upgrade"
+        fi
         local was_loaded=0
         if execd_is_loaded; then
             was_loaded=1
+            upgrade_was_loaded=1
+            upgrade_rollback_armed=1
             /bin/launchctl bootout "system/$label" || die "launchctl bootout system/$label failed before upgrade"
             wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
         fi
         local backup_prefix="$prefix.old.$$"
         /bin/rm -rf "$backup_prefix"
         /bin/mv "$prefix" "$backup_prefix" || die "failed to move existing $prefix aside for upgrade"
-        local moved_var=0 swap_ok=1
+        upgrade_backup_prefix="$backup_prefix"
+        upgrade_staged_tree="$staged_tree"
+        upgrade_rollback_armed=1
+        # Belt-and-suspenders check after move (concurrent symlink swap): EXIT trap
+        # restores $upgrade_backup_prefix -> $prefix and restarts org.tendcf.execd.
         if [ -L "$backup_prefix/var" ]; then
-            /bin/mv "$backup_prefix" "$prefix" || true
             die "existing $prefix/var is a symlink; refusing upgrade"
         fi
         if [ -d "$backup_prefix/var" ]; then
             /bin/rm -rf "${staged_tree:?}/var"
-            if /bin/mv "$backup_prefix/var" "$staged_tree/var"; then
-                moved_var=1
-            else
-                swap_ok=0
-            fi
+            /bin/mv "$backup_prefix/var" "$staged_tree/var" \
+                || die "failed to preserve $prefix/var during upgrade"
+            upgrade_moved_var=1
         fi
-        if [ "$swap_ok" -eq 1 ]; then
-            if ! /bin/mv "$staged_tree" "$prefix"; then
-                swap_ok=0
-            fi
-        fi
-        if [ "$swap_ok" -ne 1 ]; then
-            if [ "$moved_var" -eq 1 ] && [ -d "$staged_tree/var" ] && [ ! -e "$backup_prefix/var" ]; then
-                /bin/mv "$staged_tree/var" "$backup_prefix/var" || true
-            fi
-            /bin/mv "$backup_prefix" "$prefix" || true
-            if [ "$was_loaded" -eq 1 ] && [ -f "$plist_path" ]; then
-                /bin/launchctl bootstrap system "$plist_path" >/dev/null 2>&1 || true
-            fi
-            die "failed to install new tree at $prefix; previous tree restored"
-        fi
-        /bin/rm -rf "$backup_prefix"
+        /bin/mv "$staged_tree" "$prefix" \
+            || die "failed to install new tree at $prefix"
         if [ "$was_loaded" -eq 1 ]; then
             upgrade_needs_execd_restart=1
         fi
@@ -1262,6 +1286,21 @@ enable_execd() {
     fi
 }
 
+prevalidate_install_inputs() {
+    local datafile="$1"
+    [ ! -L "$policy_src" ] && [ -d "$policy_src" ] \
+        || die "policy-src must be a real directory (not a symlink): $policy_src"
+    [ -f "$policy_src/tendcf_services.cf" ] && [ ! -L "$policy_src/tendcf_services.cf" ] \
+        || die "no regular tendcf_services.cf at $policy_src (use --policy-src DIR)"
+    local bad_src
+    bad_src="$(/usr/bin/find "$policy_src" ! -type f ! -type d -print -quit)"
+    [ -z "$bad_src" ] || die "refusing non-regular/non-directory entry in policy-src: $bad_src"
+    if [ -n "$datafile" ]; then
+        [ ! -L "$datafile" ] && [ -f "$datafile" ] \
+            || die "data file must be a regular non-symlink file: $datafile"
+    fi
+}
+
 cmd_install() {
     local tarball="" sha256_file="" datafile="" do_enable=0
     while [ $# -gt 0 ]; do
@@ -1277,6 +1316,8 @@ cmd_install() {
     if [ -n "$sha256_file" ] && [ -z "$tarball" ]; then
         die "install: --sha256 requires --tarball"
     fi
+    # Fail fast on bad --policy-src or --data before booting out org.tendcf.execd.
+    prevalidate_install_inputs "$datafile"
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
             sha256_file="${tarball}.sha256"
@@ -1296,6 +1337,16 @@ cmd_install() {
             say "restarted: $label after upgrade"
         fi
     fi
+    # All post-upgrade steps and daemon restart succeeded; disarm rollback and
+    # remove the pre-upgrade backup tree.
+    upgrade_rollback_armed=0
+    if [ -n "$upgrade_backup_prefix" ]; then
+        /bin/rm -rf "$upgrade_backup_prefix"
+        upgrade_backup_prefix=""
+    fi
+    upgrade_staged_tree=""
+    upgrade_moved_var=0
+    upgrade_was_loaded=0
     if [ "$changed" -eq 0 ]; then
         say "no change ($("$cf_agent" --version | /usr/bin/sed -n 1p))"
     else
