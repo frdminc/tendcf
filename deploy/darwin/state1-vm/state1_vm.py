@@ -31,6 +31,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -43,6 +44,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -57,7 +59,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vmssh
 
 HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[2]
 DEFAULT_IMAGE_JSON = HERE / "image.json"
+DARWIN_INSTALLER = REPO_ROOT / "deploy" / "darwin" / "tendcf-install.sh"
+POLICY_DIR = REPO_ROOT / "policy"
+DARWIN_CANARY_DIR = REPO_ROOT / "deploy" / "darwin" / "canary"
+FORK_PIN_JSON = REPO_ROOT / "overlay" / "fork.json"
+CANARY_LABEL = "com.tendcf.canary.main"
+EXECD_LABEL = "org.tendcf.execd"
+CANARY_GOLDEN = (
+    REPO_ROOT
+    / "tests"
+    / "policy"
+    / "golden"
+    / "launchd"
+    / "system"
+    / f"{CANARY_LABEL}.plist"
+)
+CANARY_PLIST = f"/Library/LaunchDaemons/{CANARY_LABEL}.plist"
+EXECD_PLIST = f"/Library/LaunchDaemons/{EXECD_LABEL}.plist"
+TENDCF_PREFIX = "/opt/tendcf"
+CANARY_PROG = "/bin/sleep"
+CANARY_ARG = "86400"
+CANARY_DRIFT_ARG = "99999"
+EXECD_PROG = "/opt/tendcf/bin/cf-execd"
+GH_REPO = "frdminc/tendcf"
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
+SHA256_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64})[ \t]+\*?([^\s]+)$")
+GUEST_STAGE_RE = re.compile(r"^/var/tmp/tendcf-stage\.[A-Za-z0-9._-]+$")
+STAGE_UPLOAD_SH = (
+    "set -eu; umask 077; d=$(mktemp -d /var/tmp/tendcf-stage.XXXXXX); "
+    'tar -xzf - -C "$d"; printf "%s\\n" "$d"'
+)
 # The account's home from the passwd entry, never $HOME: tart itself (Foundation) ignores
 # $HOME, so a second $HOME of the same user must not mean a second lock (or marker).
 
@@ -133,12 +166,18 @@ RUN_SCRIPT_SH = (
     "trap 'rm -f \"$f\"' EXIT; trap 'exit 129' HUP INT TERM; "
     'cat > "$f" || exit 1; sudo -n /bin/sh "$f" "$@"'
 )
-# Is the root-owned tree root:wheel and free of group/world write? Prints offenders only.
+# Is the root-owned tree root:wheel and free of group/world write, SUID/SGID, and ACLs? Prints offenders only.
 TREE_CHECK_SH = (
     'test -d "$1" || exit 1; '
     'find "$1" \\( ! -user root -o ! -group wheel \\) -print | head -n 5; '
-    'find "$1" ! -type l \\( -perm -020 -o -perm -002 \\) -print | head -n 5'
+    'find "$1" ! -type l \\( -perm -020 -o -perm -002 -o -perm -4000 -o -perm -2000 \\) -print | head -n 5; '
+    'ls -lRe "$1" | awk \'/^ [0-9]+: / { print "ACL:" $0; exit }\''
 )
+# Same as TREE_CHECK_SH plus rejects any non-regular/non-directory entry (e.g. symlinks under inputs/).
+TREE_CHECK_NO_LINKS_SH = (
+    TREE_CHECK_SH + '; find "$1" ! -type f ! -type d -print | head -n 5'
+)
+WORKDIR_RE = re.compile(r"^/opt/tendcf/[A-Za-z0-9._/-]+$")
 
 
 class Refusal(Exception):
@@ -193,6 +232,7 @@ class RealRunner:
         argv: list[str],
         *,
         input_text: str | None = None,
+        input_bytes: bytes | None = None,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
         log_path: Path | None = None,
@@ -202,18 +242,25 @@ class RealRunner:
         """raw_newlines: no text mode, so no universal-newline translation (it turns a lone
         CR or CRLF into "\\n"): bytes in, stdout/stderr decoded as UTF-8 with errors="replace".
         Opt-in; the default is unchanged for every other caller."""
+        if input_text is not None and input_bytes is not None:
+            raise ValueError("pass either input_text or input_bytes, not both")
         out = open(log_path, "ab") if log_path else None  # noqa: SIM115
-        raw = raw_newlines and out is None
+        raw = raw_newlines or input_bytes is not None
+        payload: bytes | str | None
+        if input_bytes is not None:
+            payload = input_bytes
+        elif raw and input_text is not None:
+            payload = input_text.encode("utf-8")
+        else:
+            payload = input_text
         try:
             cp = subprocess.run(
                 argv,
-                input=input_text.encode("utf-8")
-                if raw and input_text is not None
-                else input_text,
-                stdin=None if input_text is not None else subprocess.DEVNULL,
+                input=payload,
+                stdin=None if payload is not None else subprocess.DEVNULL,
                 stdout=out if out else subprocess.PIPE,
                 stderr=subprocess.STDOUT if out else subprocess.PIPE,
-                text=(input_text is not None or out is None) and not raw,
+                text=(payload is not None or out is None) and not raw,
                 env=env,
                 timeout=timeout,
                 check=False,
@@ -666,12 +713,15 @@ def rssh(
     argv: list[str],
     *,
     input_text: str | None = None,
+    input_bytes: bytes | None = None,
     timeout: float = 120,
     raw_newlines: bool = False,
 ) -> Result:
-    kw = (
-        {"raw_newlines": True} if raw_newlines else {}
-    )  # opt-in; other callers unchanged
+    kw: dict[str, object] = {}
+    if raw_newlines:
+        kw["raw_newlines"] = True
+    if input_bytes is not None:
+        kw["input_bytes"] = input_bytes
     return ctx.run(
         vmssh.ssh_argv(t, argv),
         input_text=input_text,
@@ -1043,22 +1093,32 @@ def ancestors_of(path: str) -> list[str]:
 
 
 def check_root_owned(
-    ctx: Ctx, t: vmssh.Target, path: str, *, tree: bool = False
+    ctx: Ctx,
+    t: vmssh.Target,
+    path: str,
+    *,
+    tree: bool = False,
+    as_root: bool = False,
+    no_symlinks: bool = False,
 ) -> tuple[bool, str]:
     """Step 3's rule on one path; with tree=True on everything under it as well.
 
     Every ancestor up to / must also be owned by root and not group/world writable: a
     writable parent lets its owner group rename the checked directory aside and put another
     tree in its place (python.org leaves Python.framework/Versions root:admin 775).
+    as_root=True prefixes stat/find with `sudo -n` so trees containing 0700 root-only
+    subdirectories (such as /opt/tendcf/var/libntech/{ppkeys,data}) are walked without
+    Permission denied errors on stderr.
     """
-    r = rssh(ctx, t, ["stat", "-f", "%Su:%Sg %Lp", path])
+    pfx = ["sudo", "-n"] if as_root else []
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%Su:%Sg %Lp", path])
     m = re.fullmatch(r"(\S+):(\S+) ([0-7]+)", r.stdout.strip())
     if r.rc != 0 or not m:
         return False, f"stat {path} failed (rc {r.rc}): {clip(r.stderr, 200)}"
     ok = perm_ok(m[1], m[2], m[3])
     ev = f"{path} {m[1]}:{m[2]} {m[3]}"
     parents = ancestors_of(path)
-    r = rssh(ctx, t, ["stat", "-f", "%N %Su:%Sg %Lp", *parents])
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%N %Su:%Sg %Lp", *parents])
     rows = [ln.rsplit(" ", 2) for ln in r.stdout.strip().splitlines()]
     seen = {}
     for row in rows:
@@ -1085,7 +1145,8 @@ def check_root_owned(
         else f"; ancestors not root-owned or writable (rc {r.rc}): {clip(', '.join(bad_parents) or r.stderr, 300)}"
     )
     if tree:
-        r = rssh(ctx, t, ["/bin/sh", "-c", TREE_CHECK_SH, "sh", path])
+        tree_sh = TREE_CHECK_NO_LINKS_SH if no_symlinks else TREE_CHECK_SH
+        r = rssh(ctx, t, [*pfx, "/bin/sh", "-c", tree_sh, "sh", path])
         offenders = r.stdout.strip()
         tree_ok = r.rc == 0 and not offenders and not r.stderr.strip()
         ok = ok and tree_ok
@@ -1437,6 +1498,306 @@ def refused_password_login(ctx: Ctx, ip: str, known_hosts: str) -> str:
             + clip(r.stderr, 300)
         )
     return "password login refused, methods offered: " + ",".join(sorted(offered))
+
+
+# ---------------------------------------------------------------- renderer / launchd checks
+
+
+def verify_local_tarball(tarball: Path, sha256_path: Path) -> str:
+    """Verify a local PR 95 tarball against its .sha256 file before cloning a VM."""
+    if not tarball.is_file():
+        raise Refusal(f"tarball not found: {tarball}")
+    if not sha256_path.is_file():
+        raise Refusal(f"sha256 file not found: {sha256_path}")
+    try:
+        lines = [ln.strip() for ln in sha256_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refusal(f"cannot read sha256 file {sha256_path}: {e}") from e
+    if len(lines) != 1:
+        raise Refusal(
+            f"sha256 file {sha256_path} must contain exactly one line (found {len(lines)})"
+        )
+    m = SHA256_LINE_RE.fullmatch(lines[0])
+    if not m:
+        raise Refusal(f"sha256 file {sha256_path} is not a valid sha256 line")
+    expected = m.group(1).lower()
+    named = Path(m.group(2)).name
+    if named != tarball.name:
+        raise Refusal(
+            f"sha256 file {sha256_path} names {named!r}, expected {tarball.name!r}"
+        )
+    h = hashlib.sha256()
+    try:
+        with tarball.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError as e:
+        raise Refusal(f"cannot read tarball {tarball}: {e}") from e
+    actual = h.hexdigest()
+    if actual != expected:
+        raise Refusal(
+            f"tarball sha256 mismatch for {tarball.name}: expected {expected}, got {actual}"
+        )
+    return actual
+
+
+def read_fork_core_sha(pin_path: Path = FORK_PIN_JSON) -> str:
+    """Read the 40-char core commit SHA from overlay/fork.json."""
+    try:
+        doc = json.loads(pin_path.read_text(encoding="utf-8"))
+        core = doc["core"]["commit"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        raise Refusal(f"{pin_path}: cannot read fork core sha: {e}") from e
+    if not isinstance(core, str) or not re.fullmatch(r"[0-9a-f]{40}", core):
+        raise Refusal(f"{pin_path}: bad core sha: {core!r}")
+    return core
+
+
+def verify_artifact_run_provenance(ctx: Ctx, run_id: str) -> None:
+    """Confirm the GitHub Actions run belongs to frdminc/tendcf's macOS fork build, not a fork PR."""
+    r = ctx.run(
+        ["gh", "api", f"repos/{GH_REPO}/actions/runs/{run_id}"],
+        timeout=60,
+    )
+    if r.rc != 0:
+        raise ToolError(
+            f"gh api run provenance check for {run_id} failed (rc {r.rc}): "
+            f"{clip(r.stderr or r.stdout, 300)}"
+        )
+    try:
+        meta = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise ToolError(f"gh api run {run_id} returned non-JSON: {e}") from e
+    if not isinstance(meta, dict):
+        raise ToolError(f"gh api run {run_id} did not return a JSON object")
+    head_repo = ((meta.get("head_repository") or {}).get("full_name") or "").strip()
+    if head_repo != GH_REPO:
+        raise Refusal(
+            f"artifact run {run_id} head_repository is {head_repo!r}, expected {GH_REPO!r}"
+        )
+    event = str(meta.get("event") or "")
+    if event in ("pull_request", "pull_request_target") or not event:
+        raise Refusal(
+            f"artifact run {run_id} has disallowed event {event!r} (refusing PR runs)"
+        )
+    wf_name = str(meta.get("name") or "")
+    wf_path = str(meta.get("path") or "")
+    if wf_name != "macOS fork build" and not wf_path.endswith("/macos-fork-build.yml"):
+        raise Refusal(
+            f"artifact run {run_id} is from unexpected workflow {wf_name!r} ({wf_path!r})"
+        )
+
+
+def download_artifact_run(
+    ctx: Ctx, run_id: str, dest: Path
+) -> tuple[Path, Path, str]:
+    """Verify provenance, download the PR 95 macOS fork tarball + .sha256, and verify sha256."""
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise Refusal(f"--artifact-run must be a numeric GitHub run id, got {run_id!r}")
+    verify_artifact_run_provenance(ctx, run_id)
+    core = read_fork_core_sha()
+    artifact_name = f"tendcf-fork-macos-arm64-{core}"
+    dest.mkdir(parents=True, exist_ok=True)
+    r = ctx.run(
+        [
+            "gh",
+            "run",
+            "download",
+            run_id,
+            "-R",
+            GH_REPO,
+            "-n",
+            artifact_name,
+            "-D",
+            str(dest),
+        ],
+        timeout=600,
+    )
+    if r.rc != 0:
+        raise ToolError(
+            f"gh run download {run_id} ({artifact_name}) failed (rc {r.rc}): "
+            f"{clip(r.stderr or r.stdout, 300)}"
+        )
+    tarball = dest / f"{artifact_name}.tar.gz"
+    sha_path = dest / f"{artifact_name}.tar.gz.sha256"
+    digest = verify_local_tarball(tarball, sha_path)
+    return tarball, sha_path, digest
+
+
+def build_stage_bundle(tarball: Path, sha_path: Path) -> bytes:
+    """Pack installer, policy tree, darwin canary data, tarball and .sha256 into an in-memory tar.gz."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        def add_file(src: Path, arcname: str, mode: int) -> None:
+            data = src.read_bytes()
+            ti = tarfile.TarInfo(name=arcname)
+            ti.size = len(data)
+            ti.mode = mode
+            ti.uid = 0
+            ti.gid = 0
+            ti.uname = "root"
+            ti.gname = "wheel"
+            ti.mtime = 0
+            tf.addfile(ti, io.BytesIO(data))
+
+        add_file(DARWIN_INSTALLER, "tendcf-install.sh", 0o755)
+        add_file(tarball, f"artifact/{tarball.name}", 0o644)
+        add_file(sha_path, f"artifact/{sha_path.name}", 0o644)
+        for p in sorted(POLICY_DIR.rglob("*")):
+            if p.is_file():
+                rel = p.relative_to(POLICY_DIR).as_posix()
+                add_file(p, f"policy/{rel}", 0o644)
+        add_file(
+            DARWIN_CANARY_DIR / "host_specific.json",
+            "canary/host_specific.json",
+            0o644,
+        )
+        add_file(
+            DARWIN_CANARY_DIR / "host_specific-absent.json",
+            "canary/host_specific-absent.json",
+            0o644,
+        )
+    return buf.getvalue()
+
+
+def stage_renderer_bundle(
+    ctx: Ctx, t: vmssh.Target, tarball: Path, sha_path: Path
+) -> str:
+    """Stream the installer + artifact + policy + canary bundle into a fresh guest temp dir."""
+    bundle = build_stage_bundle(tarball, sha_path)
+    r = rssh(
+        ctx,
+        t,
+        ["/bin/sh", "-c", STAGE_UPLOAD_SH],
+        input_bytes=bundle,
+        timeout=300,
+    )
+    guest_dir = r.stdout.strip()
+    if r.rc != 0 or not GUEST_STAGE_RE.fullmatch(guest_dir):
+        raise StepFail(
+            f"failed to stage installer bundle in guest (rc {r.rc}): "
+            f"{clip(r.stderr or r.stdout, 300)}"
+        )
+    return guest_dir
+
+
+def parse_launchctl_print(text: str) -> dict[str, object]:
+    """Extract state, program, pid, path and arguments from `launchctl print system/<label>`."""
+    info: dict[str, object] = {
+        "state": None,
+        "program": None,
+        "pid": None,
+        "path": None,
+        "arguments": [],
+    }
+    in_args = False
+    args: list[str] = []
+    for raw in text.splitlines():
+        if in_args:
+            if raw == "\t}":
+                in_args = False
+                continue
+            s = raw.strip()
+            if s:
+                args.append(s)
+            continue
+        if raw == "\targuments = {":
+            in_args = True
+            continue
+        m = re.match(r"^\t(state|program|path) = (.+)$", raw)
+        if m:
+            info[m.group(1)] = m.group(2).strip()
+            continue
+        m_pid = re.match(r"^\tpid = (\d+)$", raw)
+        if m_pid:
+            info["pid"] = int(m_pid.group(1))
+    info["arguments"] = args
+    return info
+
+
+def check_execd_running(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
+    """Verify org.tendcf.execd is loaded in system domain, running, and owned by root."""
+    r = rssh(ctx, t, ["sudo", "-n", "/bin/launchctl", "print", f"system/{EXECD_LABEL}"])
+    if r.rc != 0:
+        return (
+            False,
+            f"launchctl print system/{EXECD_LABEL} failed (rc {r.rc}): {clip(r.stderr or r.stdout, 200)}",
+        )
+    info = parse_launchctl_print(r.stdout)
+    pid = info["pid"]
+    if info["program"] != EXECD_PROG:
+        return (
+            False,
+            f"{EXECD_LABEL} program is {info['program']!r}, expected {EXECD_PROG!r}",
+        )
+    if info["state"] != "running" or not isinstance(pid, int):
+        return (
+            False,
+            f"{EXECD_LABEL} not running (state={info['state']!r}, pid={pid!r})",
+        )
+    ps = rssh(ctx, t, ["ps", "-o", "user=,comm=", "-p", str(pid)])
+    line = ps.stdout.strip()
+    parts = line.split(None, 1)
+    if ps.rc != 0 or len(parts) != 2:
+        return (
+            False,
+            f"ps -p {pid} failed (rc {ps.rc}): {clip(ps.stderr or ps.stdout, 200)}",
+        )
+    user, comm = parts[0], parts[1].strip()
+    if user != "root" or Path(comm).name != "cf-execd":
+        return (
+            False,
+            f"{EXECD_LABEL} pid {pid} is user={user!r} comm={comm!r}, expected root / cf-execd",
+        )
+    return True, f"{EXECD_LABEL} loaded, state=running, pid={pid}, user=root, comm={comm}"
+
+
+def guest_file_sha256(ctx: Ctx, t: vmssh.Target, path: str) -> str:
+    r = rssh(ctx, t, ["sudo", "-n", "/usr/bin/shasum", "-a", "256", path])
+    parts = r.stdout.strip().split()
+    if r.rc != 0 or not parts or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+        raise StepFail(
+            f"shasum {path} failed (rc {r.rc}): {clip(r.stderr or r.stdout, 200)}"
+        )
+    return parts[0].lower()
+
+
+def check_plist_perms_and_lint(
+    ctx: Ctx, t: vmssh.Target, path: str, *, check_no_backup: bool = False
+) -> str:
+    r = rssh(
+        ctx,
+        t,
+        [
+            "sudo",
+            "-n",
+            "/bin/sh",
+            "-c",
+            'test -f "$1" && ! test -L "$1" && /usr/bin/stat -f "%Su:%Sg %Lp" "$1"',
+            "sh",
+            path,
+        ],
+    )
+    meta = r.stdout.strip()
+    if r.rc != 0 or meta != "root:wheel 644":
+        raise StepFail(
+            f"{path} must be a regular file root:wheel 644 (rc {r.rc}, got {meta!r}): "
+            f"{clip(r.stderr, 200)}"
+        )
+    lint = rssh(ctx, t, ["sudo", "-n", "/usr/bin/plutil", "-lint", path])
+    if lint.rc != 0:
+        raise StepFail(
+            f"plutil -lint {path} failed (rc {lint.rc}): {clip(lint.stderr or lint.stdout, 200)}"
+        )
+    if check_no_backup:
+        bk = rssh(
+            ctx,
+            t,
+            ["sudo", "-n", "/bin/sh", "-c", '! test -e "$1.cf-before-edit"', "sh", path],
+        )
+        if bk.rc != 0:
+            raise StepFail(f"unexpected backup file {path}.cf-before-edit present")
+    return f"{path} {meta}, plutil -lint OK"
 
 
 # ---------------------------------------------------------------- commands
@@ -2830,6 +3191,48 @@ def cmd_check(ctx: Ctx, args) -> int:
     rc = 1
     cloned = False  # the clone may exist: set before the call, cleanup handles "absent"
     refusal = ""
+
+    # Validate renderer artifact CLI arguments before acquiring the lock or cloning a VM.
+    tarball_arg: Path | None = getattr(args, "tarball", None)
+    sha256_arg: Path | None = getattr(args, "sha256", None)
+    artifact_run: str | None = getattr(args, "artifact_run", None)
+    golden_plist_path: Path = getattr(args, "golden", CANARY_GOLDEN)
+    if tarball_arg is not None and artifact_run is not None:
+        return refuse(summary, ctx, args, "pass either --tarball or --artifact-run, not both")
+    if sha256_arg is not None and tarball_arg is None:
+        return refuse(summary, ctx, args, "--sha256 requires --tarball")
+    has_artifact = tarball_arg is not None or artifact_run is not None
+    artifact_tmpdir: Path | None = None
+    resolved_tarball: Path | None = None
+    resolved_sha: Path | None = None
+    golden_bytes: bytes = b""
+    if has_artifact:
+        for req_label, req_path in (
+            ("darwin installer", DARWIN_INSTALLER),
+            ("policy file", POLICY_DIR / "tendcf_services.cf"),
+            ("darwin canary data", DARWIN_CANARY_DIR / "host_specific.json"),
+            ("darwin canary tombstone", DARWIN_CANARY_DIR / "host_specific-absent.json"),
+            ("committed canary golden", golden_plist_path),
+        ):
+            if not req_path.is_file():
+                return refuse(summary, ctx, args, f"missing {req_label}: {req_path}")
+        golden_bytes = golden_plist_path.read_bytes()
+        if tarball_arg is not None:
+            sha_path = sha256_arg or Path(str(tarball_arg) + ".sha256")
+            try:
+                digest = verify_local_tarball(tarball_arg, sha_path)
+            except Refusal as e:
+                return refuse(summary, ctx, args, str(e))
+            resolved_tarball, resolved_sha = tarball_arg, sha_path
+            summary.extra["artifact_sha256"] = digest
+        elif artifact_run is not None and not RUN_ID_RE.fullmatch(artifact_run):
+            return refuse(
+                summary,
+                ctx,
+                args,
+                f"--artifact-run must be a numeric GitHub run id, got {artifact_run!r}",
+            )
+
     try:
         with driver_lock(ctx), signals_to_exception():
             try:
@@ -2851,6 +3254,15 @@ def cmd_check(ctx: Ctx, args) -> int:
                     summary.add("owner", "owner file", "pass", owner_note)
                 identity = golden_usable(ctx, golden)
                 assert_vm_cap(ctx)
+                if artifact_run is not None:
+                    artifact_tmpdir = Path(
+                        tempfile.mkdtemp(dir=ctx.state_dir, prefix="artifact-")
+                    )
+                    resolved_tarball, resolved_sha, digest = download_artifact_run(
+                        ctx, artifact_run, artifact_tmpdir
+                    )
+                    summary.extra["artifact_run"] = artifact_run
+                    summary.extra["artifact_sha256"] = digest
                 summary.add(
                     "preflight",
                     "golden present, host key pinned, stale clones swept, VM cap",
@@ -2897,16 +3309,567 @@ def cmd_check(ctx: Ctx, args) -> int:
                     fatal=False,
                 )
 
-                summary.add(
-                    "3",
-                    "install path ownership and permissions (root:wheel, not group/world writable)",
-                    "skip",
-                    "needs the renderer slice: there is no tendcf build or install command yet. The assertion (perm_ok, check_root_owned with tree=True) is live and is applied to the Python framework in 2i.",
-                )
-                for sid in ("4", "5", "6", "7", "8", "9"):
+                guest_stage = ""
+                workdir = ""
+                installed = False
+                if not has_artifact:
+                    skip_msg = "no artifact supplied (pass --tarball FILE or --artifact-run RUN_ID)"
                     summary.add(
-                        sid, f"checklist step {sid}", "skip", "SKIP: renderer slice"
+                        "3",
+                        "install tendcf and verify root:wheel ownership on binary tree and policy dir",
+                        "skip",
+                        skip_msg,
                     )
+                    for sid in ("4", "5", "6", "7", "8", "9", "9a"):
+                        summary.add(sid, f"checklist step {sid}", "skip", f"SKIP: {skip_msg}")
+                else:
+                    assert resolved_tarball is not None and resolved_sha is not None
+                    tar_name = resolved_tarball.name
+                    sha_name = resolved_sha.name
+                    golden_sha = hashlib.sha256(golden_bytes).hexdigest()
+                    golden_text = golden_bytes.decode("utf-8")
+
+                    def step3_install() -> str:
+                        nonlocal guest_stage, workdir
+                        guest_stage = stage_renderer_bundle(
+                            ctx, t, resolved_tarball, resolved_sha
+                        )
+                        installer = f"{guest_stage}/tendcf-install.sh"
+                        r = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                installer,
+                                "install",
+                                "--tarball",
+                                f"{guest_stage}/artifact/{tar_name}",
+                                "--sha256",
+                                f"{guest_stage}/artifact/{sha_name}",
+                                "--policy-src",
+                                f"{guest_stage}/policy",
+                                "--data",
+                                f"{guest_stage}/canary/host_specific.json",
+                            ],
+                            timeout=300,
+                        )
+                        if r.rc != 0:
+                            raise StepFail(
+                                f"tendcf-install.sh install failed (rc {r.rc}): "
+                                f"{clip(r.stderr or r.stdout, 400)}"
+                            )
+                        wd_r = rssh(ctx, t, ["sudo", "-n", installer, "workdir"])
+                        wd = wd_r.stdout.strip()
+                        if (
+                            wd_r.rc != 0
+                            or not WORKDIR_RE.fullmatch(wd)
+                            or ".." in wd.split("/")
+                        ):
+                            raise StepFail(
+                                f"bad workdir from installer (rc {wd_r.rc}): {wd!r}"
+                            )
+                        workdir = wd
+                        ok_tree, ev_tree = check_root_owned(
+                            ctx, t, TENDCF_PREFIX, tree=True, as_root=True
+                        )
+                        if not ok_tree:
+                            raise StepFail(f"binary tree ownership failed: {ev_tree}")
+                        ok_pol, ev_pol = check_root_owned(
+                            ctx,
+                            t,
+                            f"{workdir}/inputs",
+                            tree=True,
+                            as_root=True,
+                            no_symlinks=True,
+                        )
+                        if not ok_pol:
+                            raise StepFail(f"policy dir ownership failed: {ev_pol}")
+                        data_st = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                "/usr/bin/stat",
+                                "-f",
+                                "%Su:%Sg %Lp",
+                                f"{workdir}/data/host_specific.json",
+                            ],
+                        )
+                        if data_st.rc != 0 or data_st.stdout.strip() != "root:wheel 600":
+                            raise StepFail(
+                                f"CMDB data must be root:wheel 600 (rc {data_st.rc}, got {data_st.stdout.strip()!r})"
+                            )
+                        q = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                "/usr/bin/find",
+                                TENDCF_PREFIX,
+                                "!",
+                                "-type",
+                                "s",
+                                "-exec",
+                                "/usr/bin/xattr",
+                                "-s",
+                                "{}",
+                                "+",
+                            ],
+                        )
+                        if q.rc != 0:
+                            raise StepFail(
+                                f"xattr check on {TENDCF_PREFIX} failed (rc {q.rc}): {clip(q.stderr or q.stdout, 200)}"
+                            )
+                        if "com.apple.quarantine" in q.stdout:
+                            raise StepFail(
+                                f"com.apple.quarantine still present under {TENDCF_PREFIX}"
+                            )
+                        return f"{ev_tree}; {ev_pol}; data root:wheel 600; no quarantine"
+
+                    installed = run_step(
+                        summary,
+                        "3",
+                        "install tendcf and verify root:wheel ownership on binary tree and policy dir",
+                        step3_install,
+                        fatal=False,
+                    )
+
+                    if not installed:
+                        for sid in ("4", "5", "6", "7", "8", "9", "9a"):
+                            summary.add(
+                                sid,
+                                f"checklist step {sid}",
+                                "skip",
+                                "not run: step 3 failed",
+                            )
+                    else:
+                        installer = f"{guest_stage}/tendcf-install.sh"
+
+                        def step4_render() -> str:
+                            r = rssh(
+                                ctx, t, ["sudo", "-n", installer, "run-once"], timeout=180
+                            )
+                            if r.rc != 0:
+                                raise StepFail(
+                                    f"run-once failed (rc {r.rc}): {clip(r.stderr or r.stdout, 400)}"
+                                )
+                            ev = check_plist_perms_and_lint(
+                                ctx, t, CANARY_PLIST, check_no_backup=True
+                            )
+                            return f"run-once rc 0; {ev}; no .cf-before-edit backup"
+
+                        def step5_golden() -> str:
+                            r = rssh(
+                                ctx,
+                                t,
+                                ["sudo", "-n", "/bin/cat", CANARY_PLIST],
+                                raw_newlines=True,
+                            )
+                            if r.rc != 0:
+                                raise StepFail(
+                                    f"cannot read {CANARY_PLIST} (rc {r.rc}): {clip(r.stderr, 200)}"
+                                )
+                            guest_sha = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            if r.stdout != golden_text or guest_sha != golden_sha:
+                                raise StepFail(
+                                    f"rendered {CANARY_PLIST} differs from committed golden "
+                                    f"(guest sha256={guest_sha}, golden sha256={golden_sha})"
+                                )
+                            return (
+                                f"byte-identical to {golden_plist_path.name} "
+                                f"({len(golden_bytes)} bytes, sha256={golden_sha})"
+                            )
+
+                        def step6_launchctl() -> str:
+                            p1 = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "print",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if p1.rc != 0:
+                                raise StepFail(
+                                    f"launchctl print system/{CANARY_LABEL} failed (rc {p1.rc}): "
+                                    f"{clip(p1.stderr or p1.stdout, 300)}"
+                                )
+                            info1 = parse_launchctl_print(p1.stdout)
+                            want_args = [CANARY_PROG, CANARY_ARG]
+                            if (
+                                info1["program"] != CANARY_PROG
+                                or info1["arguments"] != want_args
+                                or not isinstance(info1["pid"], int)
+                            ):
+                                raise StepFail(
+                                    f"unexpected launchctl print before kickstart: {info1!r}"
+                                )
+                            pid_before = info1["pid"]
+                            ks = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "kickstart",
+                                    "-k",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if ks.rc != 0:
+                                raise StepFail(
+                                    f"launchctl kickstart -k failed (rc {ks.rc}): "
+                                    f"{clip(ks.stderr or ks.stdout, 300)}"
+                                )
+                            last_info: dict[str, object] = {}
+
+                            def restarted() -> bool:
+                                nonlocal last_info
+                                p2 = rssh(
+                                    ctx,
+                                    t,
+                                    [
+                                        "sudo",
+                                        "-n",
+                                        "/bin/launchctl",
+                                        "print",
+                                        f"system/{CANARY_LABEL}",
+                                    ],
+                                )
+                                if p2.rc != 0:
+                                    return False
+                                last_info = parse_launchctl_print(p2.stdout)
+                                pid2 = last_info["pid"]
+                                return (
+                                    last_info["state"] == "running"
+                                    and isinstance(pid2, int)
+                                    and pid2 != pid_before
+                                )
+
+                            if not wait_until(ctx, restarted, 10.0, 0.5):
+                                raise StepFail(
+                                    f"kickstart -k did not replace running process "
+                                    f"(before pid={pid_before}, after={last_info!r})"
+                                )
+                            pid_after = last_info["pid"]
+                            assert isinstance(pid_after, int)
+                            return (
+                                f"program={CANARY_PROG} args={want_args} "
+                                f"kickstart -k pid {pid_before} -> {pid_after}"
+                            )
+
+                        def step7_idempotency() -> str:
+                            sha_before = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            p_before = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "print",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if p_before.rc != 0:
+                                raise StepFail(f"launchctl print before re-run failed (rc {p_before.rc})")
+                            pid_before = parse_launchctl_print(p_before.stdout)["pid"]
+
+                            r = rssh(
+                                ctx, t, ["sudo", "-n", installer, "run-once"], timeout=180
+                            )
+                            if r.rc != 0:
+                                raise StepFail(
+                                    f"idempotent run-once failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+                                )
+                            if any(
+                                tok in r.stdout
+                                for tok in (
+                                    "bootout",
+                                    "bootstrap",
+                                    "Updated rendering",
+                                    "Created file",
+                                )
+                            ):
+                                raise StepFail(
+                                    f"idempotent run-once reported unexpected repair: {clip(r.stdout, 300)}"
+                                )
+                            sha_after = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            if sha_after != sha_before:
+                                raise StepFail(
+                                    f"plist sha256 changed on re-run ({sha_before} -> {sha_after})"
+                                )
+                            p_after = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "print",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if p_after.rc != 0:
+                                raise StepFail(f"launchctl print after re-run failed (rc {p_after.rc})")
+                            pid_after = parse_launchctl_print(p_after.stdout)["pid"]
+                            if pid_before is None or pid_after != pid_before:
+                                raise StepFail(
+                                    f"idempotent re-run reloaded daemon (pid {pid_before} -> {pid_after})"
+                                )
+                            ri = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    installer,
+                                    "install",
+                                    "--tarball",
+                                    f"{guest_stage}/artifact/{tar_name}",
+                                    "--sha256",
+                                    f"{guest_stage}/artifact/{sha_name}",
+                                    "--policy-src",
+                                    f"{guest_stage}/policy",
+                                    "--data",
+                                    f"{guest_stage}/canary/host_specific.json",
+                                ],
+                                timeout=300,
+                            )
+                            if ri.rc != 0 or "tendcf-install: no change" not in ri.stdout:
+                                raise StepFail(
+                                    f"installer re-run was not a no-op (rc {ri.rc}): "
+                                    f"{clip(ri.stdout + ri.stderr, 300)}"
+                                )
+                            return (
+                                f"run-once no change (sha256={sha_after}, pid={pid_after} unchanged); "
+                                "installer re-run: no change"
+                            )
+
+                        def step8_drift() -> str:
+                            p_before = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "print",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if p_before.rc != 0:
+                                raise StepFail(f"launchctl print before drift failed (rc {p_before.rc})")
+                            pid_before = parse_launchctl_print(p_before.stdout)["pid"]
+
+                            mut = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/usr/bin/plutil",
+                                    "-replace",
+                                    "ProgramArguments.1",
+                                    "-string",
+                                    CANARY_DRIFT_ARG,
+                                    CANARY_PLIST,
+                                ],
+                            )
+                            if mut.rc != 0:
+                                raise StepFail(
+                                    f"failed to inject drift (rc {mut.rc}): {clip(mut.stderr or mut.stdout, 200)}"
+                                )
+                            drifted_sha = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            if drifted_sha == golden_sha:
+                                raise StepFail("drift injection did not change plist sha256")
+
+                            r = rssh(
+                                ctx, t, ["sudo", "-n", installer, "run-once"], timeout=180
+                            )
+                            if r.rc != 0:
+                                raise StepFail(
+                                    f"drift repair run-once failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+                                )
+                            repaired = rssh(
+                                ctx,
+                                t,
+                                ["sudo", "-n", "/bin/cat", CANARY_PLIST],
+                                raw_newlines=True,
+                            )
+                            repaired_sha = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            if repaired.rc != 0 or repaired.stdout != golden_text or repaired_sha != golden_sha:
+                                raise StepFail(
+                                    f"drift was not repaired to golden (sha256={repaired_sha}, want={golden_sha})"
+                                )
+                            check_plist_perms_and_lint(
+                                ctx, t, CANARY_PLIST, check_no_backup=True
+                            )
+                            want_args = [CANARY_PROG, CANARY_ARG]
+                            info_after: dict[str, object] = {}
+
+                            def reloaded() -> bool:
+                                nonlocal info_after
+                                p_after = rssh(
+                                    ctx,
+                                    t,
+                                    [
+                                        "sudo",
+                                        "-n",
+                                        "/bin/launchctl",
+                                        "print",
+                                        f"system/{CANARY_LABEL}",
+                                    ],
+                                )
+                                if p_after.rc != 0:
+                                    return False
+                                info_after = parse_launchctl_print(p_after.stdout)
+                                pid_a = info_after["pid"]
+                                return (
+                                    info_after["arguments"] == want_args
+                                    and info_after["state"] == "running"
+                                    and isinstance(pid_a, int)
+                                    and pid_a != pid_before
+                                )
+
+                            if not wait_until(ctx, reloaded, 10.0, 0.5):
+                                raise StepFail(
+                                    f"drift repair did not reload repaired service "
+                                    f"(before pid={pid_before}, after={info_after!r})"
+                                )
+                            pid_after = info_after["pid"]
+                            return (
+                                f"drifted sha256={drifted_sha[:12]} repaired to golden; "
+                                f"reloaded pid {pid_before} -> {pid_after}; args={want_args}"
+                            )
+
+                        def step9_nonroot_negatives() -> str:
+                            sha_before = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            nr_inst = rssh(ctx, t, [installer, "run-once"])
+                            if nr_inst.rc == 0:
+                                raise StepFail("non-root installer run-once exited 0 (must refuse)")
+                            nr_agent = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "env",
+                                    f"CFENGINE_TEST_OVERRIDE_WORKDIR={workdir}",
+                                    f"{TENDCF_PREFIX}/bin/cf-agent",
+                                    "-K",
+                                    "-f",
+                                    f"{workdir}/inputs/promises.cf",
+                                ],
+                            )
+                            sha_after = guest_file_sha256(ctx, t, CANARY_PLIST)
+                            if sha_after != sha_before:
+                                raise StepFail("non-root cf-agent altered root-owned plist")
+                            nr_out = nr_agent.stdout + nr_agent.stderr
+                            if nr_agent.rc == 0 and not any(
+                                tok in nr_out
+                                for tok in (
+                                    "Permission denied",
+                                    "CMDB cross-check failed",
+                                    "refused",
+                                )
+                            ):
+                                raise StepFail(
+                                    f"non-root cf-agent exited 0 without refusal: {clip(nr_out, 200)}"
+                                )
+                            nr_boot = rssh(
+                                ctx,
+                                t,
+                                ["/bin/launchctl", "bootstrap", "system", CANARY_PLIST],
+                            )
+                            if nr_boot.rc == 0:
+                                raise StepFail(
+                                    "non-root launchctl bootstrap system exited 0 (must fail)"
+                                )
+                            return (
+                                f"non-root installer rc={nr_inst.rc}; "
+                                f"non-root cf-agent rc={nr_agent.rc} (plist unchanged); "
+                                f"non-root bootstrap system rc={nr_boot.rc}"
+                            )
+
+                        def step9a_execd() -> str:
+                            e1 = rssh(ctx, t, ["sudo", "-n", installer, "enable"])
+                            if e1.rc != 0:
+                                raise StepFail(
+                                    f"installer enable failed (rc {e1.rc}): {clip(e1.stderr or e1.stdout, 300)}"
+                                )
+                            e2 = rssh(ctx, t, ["sudo", "-n", installer, "enable"])
+                            if e2.rc != 0 or "tendcf-install: no change" not in e2.stdout:
+                                raise StepFail(
+                                    f"installer enable re-run was not a no-op (rc {e2.rc}): "
+                                    f"{clip(e2.stdout + e2.stderr, 300)}"
+                                )
+                            plist_ev = check_plist_perms_and_lint(ctx, t, EXECD_PLIST)
+                            last_ev = ""
+
+                            def execd_up() -> bool:
+                                nonlocal last_ev
+                                ok_ex, last_ev = check_execd_running(ctx, t)
+                                return ok_ex
+
+                            if not wait_until(ctx, execd_up, 15.0, 0.5):
+                                raise StepFail(last_ev)
+                            return f"{plist_ev}; {last_ev}; enable re-run: no change"
+
+                        run_step(
+                            summary,
+                            "4",
+                            "render as root: plist root:wheel 0644, plutil -lint, no backup",
+                            step4_render,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "5",
+                            "rendered plist byte-identical to committed golden",
+                            step5_golden,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "6",
+                            "launchctl print shows expected program/args; kickstart -k restarts daemon",
+                            step6_launchctl,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "7",
+                            "idempotent re-run: no change, plist hash and pid unchanged",
+                            step7_idempotency,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "8",
+                            "drift repair: one-key edit repaired to golden and reloaded",
+                            step8_drift,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "9",
+                            "non-root negatives: installer, cf-agent and launchctl bootstrap system fail",
+                            step9_nonroot_negatives,
+                            fatal=False,
+                        )
+                        run_step(
+                            summary,
+                            "9a",
+                            "root cf-execd LaunchDaemon (org.tendcf.execd) enabled, loaded, running as root",
+                            step9a_execd,
+                            fatal=False,
+                        )
 
                 def boot_session(target: vmssh.Target, timeout: float) -> str:
                     r = rssh(
@@ -2965,9 +3928,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                         f"kern.bootsessionuuid changed; ssh back at {state_t['t'].ip}"  # type: ignore[attr-defined]
                     )
 
-                if run_step(
+                reboot_ok = run_step(
                     summary, "10", "reboot; ssh comes back", reboot, fatal=False
-                ):
+                )
+                if reboot_ok:
                     t = state["t"]  # type: ignore[assignment]
                     facts: dict = {}
                     after = persistent_assertions(ctx, image, t, facts)
@@ -2989,18 +3953,196 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "skip",
                         "not run: step 10 failed",
                     )
-                summary.add(
-                    "10b",
-                    "launchctl print system/<label> loads from disk at boot",
-                    "skip",
-                    "SKIP: renderer slice (there is no daemon to print yet)",
-                )
-                summary.add(
-                    "11a",
-                    "bootout and remove the installed daemon; launchctl print then fails",
-                    "skip",
-                    "SKIP: renderer slice (nothing is installed to bootout or remove yet; step 11's stop and delete below is live)",
-                )
+
+                if not has_artifact:
+                    skip_msg = "no artifact supplied (pass --tarball FILE or --artifact-run RUN_ID)"
+                    summary.add(
+                        "10b",
+                        "launchctl print system/<label> loads from disk at boot (canary and org.tendcf.execd)",
+                        "skip",
+                        f"SKIP: {skip_msg}",
+                    )
+                    summary.add(
+                        "11a",
+                        "bootout and remove installed daemons; launchctl print then fails",
+                        "skip",
+                        f"SKIP: {skip_msg}",
+                    )
+                elif not installed:
+                    summary.add(
+                        "10b",
+                        "launchctl print system/<label> loads from disk at boot (canary and org.tendcf.execd)",
+                        "skip",
+                        "not run: step 3 failed",
+                    )
+                    summary.add(
+                        "11a",
+                        "bootout and remove installed daemons; launchctl print then fails",
+                        "skip",
+                        "not run: step 3 failed",
+                    )
+                elif not reboot_ok:
+                    summary.add(
+                        "10b",
+                        "launchctl print system/<label> loads from disk at boot (canary and org.tendcf.execd)",
+                        "skip",
+                        "not run: step 10 failed",
+                    )
+                    summary.add(
+                        "11a",
+                        "bootout and remove installed daemons; launchctl print then fails",
+                        "skip",
+                        "not run: step 10 failed",
+                    )
+                else:
+                    def step10b_post_reboot() -> str:
+                        want_args = [CANARY_PROG, CANARY_ARG]
+                        ic: dict[str, object] = {}
+                        last_c_err = ""
+
+                        def canary_up() -> bool:
+                            nonlocal ic, last_c_err
+                            pc = rssh(
+                                ctx,
+                                t,
+                                [
+                                    "sudo",
+                                    "-n",
+                                    "/bin/launchctl",
+                                    "print",
+                                    f"system/{CANARY_LABEL}",
+                                ],
+                            )
+                            if pc.rc != 0:
+                                last_c_err = (
+                                    f"post-reboot launchctl print system/{CANARY_LABEL} failed "
+                                    f"(rc {pc.rc}): {clip(pc.stderr or pc.stdout, 300)}"
+                                )
+                                return False
+                            ic = parse_launchctl_print(pc.stdout)
+                            if (
+                                ic["program"] != CANARY_PROG
+                                or ic["arguments"] != want_args
+                                or ic["state"] != "running"
+                            ):
+                                last_c_err = f"post-reboot {CANARY_LABEL} unexpected state: {ic!r}"
+                                return False
+                            return True
+
+                        if not wait_until(ctx, canary_up, 15.0, 0.5):
+                            raise StepFail(last_c_err)
+
+                        last_ex_ev = ""
+
+                        def execd_up() -> bool:
+                            nonlocal last_ex_ev
+                            ok_ex, last_ex_ev = check_execd_running(ctx, t)
+                            return ok_ex
+
+                        if not wait_until(ctx, execd_up, 15.0, 0.5):
+                            raise StepFail(f"post-reboot {last_ex_ev}")
+                        return (
+                            f"{CANARY_LABEL} loaded at boot (state=running, pid={ic['pid']}); "
+                            f"{last_ex_ev}"
+                        )
+
+                    def step11a_teardown() -> str:
+                        installer = f"{guest_stage}/tendcf-install.sh"
+                        d_r = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                installer,
+                                "data",
+                                f"{guest_stage}/canary/host_specific-absent.json",
+                            ],
+                        )
+                        if d_r.rc != 0:
+                            raise StepFail(
+                                f"tombstone data install failed (rc {d_r.rc}): "
+                                f"{clip(d_r.stderr or d_r.stdout, 300)}"
+                            )
+                        ro = rssh(
+                            ctx, t, ["sudo", "-n", installer, "run-once"], timeout=180
+                        )
+                        if ro.rc != 0:
+                            raise StepFail(
+                                f"tombstone run-once failed (rc {ro.rc}): "
+                                f"{clip(ro.stderr or ro.stdout, 300)}"
+                            )
+                        gone_c = rssh(
+                            ctx,
+                            t,
+                            ["sudo", "-n", "/bin/sh", "-c", '! test -e "$1"', "sh", CANARY_PLIST],
+                        )
+                        if gone_c.rc != 0:
+                            raise StepFail(f"{CANARY_PLIST} still exists after tombstone")
+                        pr_c = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                "/bin/launchctl",
+                                "print",
+                                f"system/{CANARY_LABEL}",
+                            ],
+                        )
+                        if pr_c.rc == 0:
+                            raise StepFail(
+                                f"launchctl print system/{CANARY_LABEL} still exits 0 after teardown"
+                            )
+
+                        dis = rssh(ctx, t, ["sudo", "-n", installer, "disable"])
+                        if dis.rc != 0:
+                            raise StepFail(
+                                f"installer disable failed (rc {dis.rc}): "
+                                f"{clip(dis.stderr or dis.stdout, 300)}"
+                            )
+                        gone_e = rssh(
+                            ctx,
+                            t,
+                            ["sudo", "-n", "/bin/sh", "-c", '! test -e "$1"', "sh", EXECD_PLIST],
+                        )
+                        if gone_e.rc != 0:
+                            raise StepFail(f"{EXECD_PLIST} still exists after disable")
+                        pr_e = rssh(
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                "/bin/launchctl",
+                                "print",
+                                f"system/{EXECD_LABEL}",
+                            ],
+                        )
+                        if pr_e.rc == 0:
+                            raise StepFail(
+                                f"launchctl print system/{EXECD_LABEL} still exits 0 after disable"
+                            )
+                        rssh(ctx, t, ["/bin/rm", "-rf", guest_stage])
+                        return (
+                            f"{CANARY_LABEL} torn down (plist removed, print rc={pr_c.rc}); "
+                            f"{EXECD_LABEL} disabled (plist removed, print rc={pr_e.rc})"
+                        )
+
+                    run_step(
+                        summary,
+                        "10b",
+                        "launchctl print system/<label> loads from disk at boot (canary and org.tendcf.execd)",
+                        step10b_post_reboot,
+                        fatal=False,
+                    )
+                    run_step(
+                        summary,
+                        "11a",
+                        "bootout and remove installed daemons; launchctl print then fails",
+                        step11a_teardown,
+                        fatal=False,
+                    )
                 rc = 0
             except Refusal as e:
                 refusal = str(e)
@@ -3019,6 +4161,8 @@ def cmd_check(ctx: Ctx, args) -> int:
                 rc = 130
             finally:
                 with signals_ignored():
+                    if artifact_tmpdir is not None:
+                        shutil.rmtree(artifact_tmpdir, ignore_errors=True)
                     try:
                         if cloned:
                             ev = remove_vm(ctx, clone, vm.proc)
@@ -3088,8 +4232,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="leave the half-built VM for inspection (swept on the next run)",
     )
-    sub.add_parser(
+    c = sub.add_parser(
         "check", help="clone state1-golden, run the checklist, delete the clone"
+    )
+    c.add_argument(
+        "--tarball",
+        type=Path,
+        help="local PR 95 macOS fork tarball to install and test (runs steps 3-9, 9a, 10b, 11a live)",
+    )
+    c.add_argument(
+        "--sha256",
+        type=Path,
+        help="sha256 file for --tarball (default: <tarball>.sha256)",
+    )
+    c.add_argument(
+        "--artifact-run",
+        help="GitHub Actions run id of macOS fork build to download via gh and test",
+    )
+    c.add_argument(
+        "--golden",
+        type=Path,
+        default=CANARY_GOLDEN,
+        help="committed per-domain golden plist to byte-compare against in step 5",
     )
     return ap
 

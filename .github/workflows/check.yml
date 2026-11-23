@@ -41,13 +41,16 @@ jobs:
       - name: Cross-reference lint
         run: bin/xref_lint.py
 
-      # The canary goal files (deploy/linux/canary/) are what a live host is
-      # first given: schema-valid canonical bytes that pass the goal-file
-      # cross-entry rules, and CMDB data byte-identical to their projection.
+      # The canary goal files (deploy/{linux,darwin}/canary/) are what a live
+      # host is first given: schema-valid canonical bytes that pass the
+      # goal-file cross-entry rules, and CMDB data byte-identical to their
+      # projection (plus the darwin committed launchd golden).
       - name: Canary goal files
-        run: deploy/linux/canary/check.py
+        run: |
+          deploy/linux/canary/check.py
+          deploy/darwin/canary/check.py
       - name: Installer shell lint
-        run: shellcheck deploy/linux/tendcf-install.sh tests/deploy/linux-install.sh tests/deploy/bare-host-libs.sh tests/policy/run.sh deploy/darwin/state1-vm/guest/*.sh
+        run: shellcheck deploy/linux/tendcf-install.sh deploy/darwin/tendcf-install.sh tests/deploy/linux-install.sh tests/deploy/bare-host-libs.sh tests/policy/run.sh deploy/darwin/state1-vm/guest/*.sh
 
       # State 1 macOS VM harness (deploy/darwin/state1-vm/, issue 70): the driver,
       # ssh wrapper and guest-script checks run against a fake tart and ssh, so

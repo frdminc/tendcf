@@ -30,7 +30,9 @@ directory (or by path); the lead runs real passes through `bgrun`.
 python3 state1_vm.py resolve                         # registry digest of the tag; no tart, no pull
 python3 state1_vm.py pull                            # ~30 GB: its own job, so load-watch admits it alone
 python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo)
-python3 state1_vm.py check                           # clone, check, reboot, delete; JSON on stdout
+python3 state1_vm.py check                           # image-only check (skips steps 3-9/9a/10b/11a)
+python3 state1_vm.py check --tarball FILE            # full check with a local PR 95 tarball + .sha256
+python3 state1_vm.py check --artifact-run RUN_ID     # full check downloading the PR 95 artifact via gh
 ```
 
 Neither `golden` nor `check` takes a key or asks for anything: no key argument, no password
@@ -308,12 +310,13 @@ Recovery.
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
-| 3 | install path ownership and permissions of the tendcf build | **skip: needs the renderer slice** (the assertion `check_root_owned(..., tree=True)` is live: `root:wheel`, no group/world write, whole tree, and every ancestor up to `/` root-owned and not group/world writable; 2i applies it to `/Library/Frameworks/Python.framework`) |
-| 4-9 | render as root, golden-render comparison, bootstrap and print, idempotency, drift repair, non-root negatives | **SKIP: renderer slice** |
+| 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
+| 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
+| 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
 | 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot, a value the driver returns, not text read back from the guest's output; it measures the post-reboot settle) | live |
-| 10b | `launchctl print system/<label>` loads from disk at boot | **skip: renderer slice** |
+| 10b | post-reboot `launchctl print` for `com.tendcf.canary.main` and `org.tendcf.execd` (loaded from disk at boot; `org.tendcf.execd` running as `root`) | live (with `--tarball` or `--artifact-run`) |
 | 11 | stop and delete the clone, always | live |
-| 11a | bootout and remove the installed daemon; `launchctl print` then fails | **skip: renderer slice** (nothing is installed yet; only the stop-and-delete half of step 11 exists) |
+| 11a | canary tombstone teardown (`data` + `run-once`, plist removed, `launchctl print` fails) and `org.tendcf.execd` `disable` (plist removed, `launchctl print` fails) before step 11 | live (with `--tarball` or `--artifact-run`) |
 
 ## Known limitation: automatic update checking stays on
 
@@ -358,18 +361,13 @@ Issue 89 item 1 (what `softwareupdate --schedule off` prints and whether it pers
 on 27.2 it prints the unchanged status and changes nothing; the "turned off" read-back string was
 never observed.
 
-## Open items for the renderer slice
+## Status errata: renderer slice hooks
 
-1. Steps 4-9 are skip results, not omissions: the render/install command (answer 6) and the
-   golden render step 5 compares against are defined when the launchd renderer lands.
-   `check` needs a hook to install the build under test (copy the artifact in, run the render
-   command as root with `sudo -n`) between steps 2 and 10.
-2. Step 3 needs the tendcf install path list; call `check_root_owned(ctx, target, path)` for
-   each of the binary and the policy directory.
-3. Step 10b needs the daemon label; add `launchctl print system/<label>` to the post-reboot
-   assertions.
-4. Step 11a (bootout, remove, confirm `launchctl print` fails) needs the installed daemon;
-   it runs before the stop-and-delete that step 11 already does.
+Items 1-3 below are now wired into `state1_vm.py check` when `--tarball FILE` (with `.sha256`) or `--artifact-run RUN_ID` is passed (unit-tested against the fake target in `tests/darwin/test_state1_vm.py`; live VM execution still waits for the djbclark-ade lead's go-ahead):
+
+1. Steps 3 and 4-9: `check` stages the PR 95 tarball, `.sha256`, `deploy/darwin/tendcf-install.sh`, `policy/`, and `deploy/darwin/canary/` into the guest over pinned SSH, installs as root, checks `/opt/tendcf` and `<workdir>/inputs` with `check_root_owned(..., tree=True)`, renders `com.tendcf.canary.main`, byte-compares against `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, exercises `launchctl print`/`kickstart -k`, idempotency, drift repair, non-root negatives, and `org.tendcf.execd` (step `9a`).
+2. Step 10b: verifies both `com.tendcf.canary.main` and `org.tendcf.execd` load from disk after reboot (`org.tendcf.execd` running as `root`).
+3. Step 11a: applies the canary tombstone (`host_specific-absent.json` + `run-once`), runs `tendcf-install.sh disable` for `org.tendcf.execd`, and confirms `launchctl print` fails for both before step 11 deletes the clone.
 
 ## Things not yet verified, and what the real runs observed (2026-11-21)
 
