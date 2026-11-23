@@ -92,13 +92,26 @@ upgrade_backup_prefix=""
 upgrade_staged_tree=""
 upgrade_moved_var=0
 upgrade_was_loaded=0
+upgrade_snapshot_taken=0
+upgrade_saved_workdir=""
+upgrade_saved_inputs=0
+upgrade_saved_data=0
 
 die() { echo "tendcf-install: $*" >&2; exit 1; }
 say() { echo "tendcf-install: $*"; }
 
+bootout_execd() {
+    /bin/launchctl bootout "system/$label"
+}
+
 cleanup_stage() {
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
+        local restored_prefix=0
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
+            if execd_is_loaded; then
+                bootout_execd >/dev/null 2>&1 || true
+                wait_execd_unloaded || true
+            fi
             local failed_prefix="$prefix.failed.$$"
             /bin/rm -rf "$failed_prefix" || true
             if [ -e "$prefix" ] || [ -L "$prefix" ]; then
@@ -112,14 +125,40 @@ cleanup_stage() {
                 fi
             fi
             if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
-                /bin/mv "$upgrade_backup_prefix" "$prefix" || true
+                if /bin/mv "$upgrade_backup_prefix" "$prefix"; then
+                    restored_prefix=1
+                fi
             fi
-            /bin/rm -rf "$failed_prefix" || true
+            if [ "$upgrade_moved_var" -eq 0 ] || [ ! -e "$failed_prefix/var" ]; then
+                /bin/rm -rf "$failed_prefix" || true
+            fi
+            if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ]; then
+                if [ "$upgrade_saved_inputs" -eq 1 ] && [ -d "$stage_dir/upgrade-var-backup/inputs" ]; then
+                    /bin/rm -rf "$upgrade_saved_workdir/inputs" || true
+                    /bin/mv "$stage_dir/upgrade-var-backup/inputs" "$upgrade_saved_workdir/inputs" || true
+                fi
+                if [ "$upgrade_saved_data" -eq 1 ] && [ -f "$stage_dir/upgrade-var-backup/host_specific.json" ]; then
+                    /bin/mkdir -p "$upgrade_saved_workdir/data" || true
+                    if /bin/cp -p "$stage_dir/upgrade-var-backup/host_specific.json" \
+                        "$upgrade_saved_workdir/data/host_specific.json.rollback.$$"; then
+                        /bin/mv -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
+                            "$upgrade_saved_workdir/data/host_specific.json" || true
+                        /bin/chmod 0600 "$upgrade_saved_workdir/data/host_specific.json" || true
+                        /usr/sbin/chown root:wheel "$upgrade_saved_workdir/data/host_specific.json" 2>/dev/null || true
+                    fi
+                elif [ "$upgrade_saved_data" -eq 0 ] && [ -e "$upgrade_saved_workdir/data/host_specific.json" ]; then
+                    /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" || true
+                fi
+            fi
         fi
         if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
-            /bin/launchctl bootstrap system "$plist_path" >/dev/null 2>&1 || true
+            bootstrap_execd_with_retry >/dev/null 2>&1 || true
         fi
-        echo "tendcf-install: rolled back failed upgrade to previous $prefix" >&2
+        if [ "$restored_prefix" -eq 1 ]; then
+            echo "tendcf-install: rolled back failed upgrade to previous $prefix" >&2
+        elif [ "$upgrade_was_loaded" -eq 1 ]; then
+            echo "tendcf-install: restarted $label after aborted upgrade" >&2
+        fi
         upgrade_rollback_armed=0
     fi
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
@@ -337,8 +376,8 @@ validate_tree_symlinks_ok() {
     canon_root="$(cd "$tree_root" 2>/dev/null && pwd -P)" || return 1
     make_stage
     list_file="$stage_dir/symlinks.$$.txt"
-    /usr/bin/find "$canon_root" -type l -print > "$list_file" || return 1
-    while IFS= read -r sl; do
+    /usr/bin/find "$canon_root" -type l -print0 > "$list_file" || return 1
+    while IFS= read -r -d '' sl; do
         [ -n "$sl" ] || continue
         if ! resolve_symlink_in_tree_ok "$canon_root" "$logical_root" "$sl"; then
             rc=1
@@ -366,38 +405,99 @@ resolve_realpath_ok() {
     printf '%s/%s\n' "$dir" "$(/usr/bin/basename "$p")"
 }
 
+# Resolve a candidate binary up to 16 symlink hops, verifying every hop's
+# parent ancestors are root-owned + go-w + ACL-free and every symlink itself
+# is uid 0 and not go-w, and verifying the final regular file is uid 0,
+# not go-w, not SUID/SGID, and ACL-free. Prints the canonical path on success.
+resolve_safe_binary_ok() {
+    local p="$1" hops=0 target dir real_p meta uid mode mode_oct
+    [ -e "$p" ] || return 1
+    while [ -L "$p" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 16 ] || return 1
+        check_ancestors_ok "$p" || return 1
+        meta="$(/usr/bin/stat -f '%u %Lp' "$p" 2>/dev/null)" || return 1
+        read -r uid mode <<< "$meta"
+        [ "$uid" = 0 ] || return 1
+        mode_oct=$((8#$mode))
+        [ $((mode_oct & 8#022)) -eq 0 ] || return 1
+        target="$(/usr/bin/readlink "$p")" || return 1
+        case "$target" in
+            /*) p="$target" ;;
+            *) p="$(/usr/bin/dirname "$p")/$target" ;;
+        esac
+    done
+    [ -f "$p" ] && [ ! -L "$p" ] || return 1
+    dir="$(cd "$(/usr/bin/dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    real_p="$dir/$(/usr/bin/basename "$p")"
+    [ -f "$real_p" ] && [ ! -L "$real_p" ] || return 1
+    check_ancestors_ok "$real_p" || return 1
+    meta="$(/usr/bin/stat -f '%u %Lp' "$real_p" 2>/dev/null)" || return 1
+    read -r uid mode <<< "$meta"
+    [ "$uid" = 0 ] || return 1
+    mode_oct=$((8#$mode))
+    [ $((mode_oct & 8#6022)) -eq 0 ] || return 1
+    if has_acl_path "$real_p"; then
+        return 1
+    fi
+    printf '%s\n' "$real_p"
+}
+
+# Locate a directly verified, root-owned otool binary (NEVER the /usr/bin/otool
+# xcrun shim, which delegates to an active user-owned Xcode.app on dev hosts).
+find_safe_otool() {
+    local dev_dir cand real_otool
+    local cands=(/Library/Developer/CommandLineTools/usr/bin/otool)
+    dev_dir="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
+    if [ -n "$dev_dir" ]; then
+        cands+=(
+            "$dev_dir/usr/bin/otool"
+            "$dev_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin/otool"
+        )
+    fi
+    for cand in "${cands[@]}"; do
+        [ -x "$cand" ] || continue
+        check_ancestors_ok "$cand" || continue
+        real_otool="$(resolve_safe_binary_ok "$cand")" || continue
+        if "$real_otool" -L /bin/ls >/dev/null 2>&1; then
+            printf '%s\n' "$real_otool"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Verify a candidate Python 3 interpreter is safe to execute as root:
 # ancestors up to / are root-owned + go-w + ACL-free, resolved binary is
 # root-owned + go-w + ACL-free + no SUID/SGID, and its enclosing framework/tree
 # is root-owned + go-w + ACL-free + no escaping symlinks.
 verify_python_candidate_ok() {
-    local cand="$1" real_py meta owner mode mode_oct fw_root dev_dir py_root
+    local cand="$1" real_py fw_root dev_dir py_root
     [ -x "$cand" ] || return 1
     check_ancestors_ok "$cand" || return 1
-    real_py="$(resolve_realpath_ok "$cand")" || return 1
-    [ -f "$real_py" ] && [ ! -L "$real_py" ] || return 1
-    check_ancestors_ok "$real_py" || return 1
-    meta="$(/usr/bin/stat -f '%Su %Lp' "$real_py" 2>/dev/null)" || return 1
-    read -r owner mode <<< "$meta"
-    [ "$owner" = root ] || return 1
-    mode_oct=$((8#$mode))
-    [ $((mode_oct & 8#6022)) -eq 0 ] || return 1
-    if has_acl_path "$real_py"; then
-        return 1
-    fi
+    real_py="$(resolve_safe_binary_ok "$cand")" || return 1
     case "$real_py" in
         /Library/Frameworks/Python.framework/*)
             fw_root=/Library/Frameworks/Python.framework
             check_ancestors_ok "$fw_root" || return 1
             root_tree_safe_ok "$fw_root" || return 1
             ;;
+        /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/*)
+            fw_root=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework
+            check_ancestors_ok "$fw_root" || return 1
+            root_tree_safe_ok "$fw_root" || return 1
+            ;;
         /usr/bin/python3)
             dev_dir="$(/usr/bin/xcode-select -p 2>/dev/null)" || return 1
-            [ -d "$dev_dir" ] || return 1
+            [ -d "$dev_dir" ] && [ ! -L "$dev_dir" ] || return 1
+            check_ancestors_ok "$dev_dir" || return 1
+            check_ancestor_dir_ok "$dev_dir" || return 1
             py_root="$dev_dir/Library/Frameworks/Python3.framework"
-            if [ -d "$py_root" ]; then
+            if [ -d "$py_root" ] && [ ! -L "$py_root" ]; then
                 check_ancestors_ok "$py_root" || return 1
                 root_tree_safe_ok "$py_root" || return 1
+            else
+                return 1
             fi
             ;;
         *)
@@ -414,7 +514,8 @@ find_real_python() {
     for cand in \
         /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
         /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
-        /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14; do
+        /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 \
+        /Library/Developer/CommandLineTools/usr/bin/python3; do
         if verify_python_candidate_ok "$cand"; then
             echo "$cand"
             return 0
@@ -440,9 +541,9 @@ check_macho_path_syntax() {
 }
 
 # Verify Mach-O load paths, LC_RPATH, LC_DYLD_ENVIRONMENT, LC_LOAD_DYLINKER, and
-# code signatures across ALL files under TREE_ROOT. Uses otool when Xcode CLT is
-# present; otherwise parses Mach-O load commands directly with isolated stdlib
-# Python (`-I`) verified root-owned (so vanilla macOS without CLT works).
+# code signatures across ALL files under TREE_ROOT. Uses a directly verified
+# root-owned otool when present; otherwise parses Mach-O load commands directly
+# with isolated stdlib Python (`-I`) verified root-owned (so vanilla macOS works).
 verify_macho_tree() {
     local tree_root="$1"
     local canon_root
@@ -455,19 +556,21 @@ verify_macho_tree() {
             || die "required binary missing or symlink: $canon_root/bin/$req_name"
     done
 
-    local has_otool=0 py=""
-    if /usr/bin/xcode-select -p >/dev/null 2>&1 && /usr/bin/otool -L "$canon_root/bin/cf-agent" >/dev/null 2>&1; then
-        has_otool=1
-    else
-        py="$(find_real_python)" || die "cannot verify Mach-O dependencies: neither Xcode CLT (otool) nor verified root-owned Python 3 found"
+    # Create stage_dir in the main shell BEFORE command-substitution subshells
+    # (find_safe_otool / find_real_python) so no subshell leaks a /var/tmp dir.
+    make_stage
+
+    local otool_bin="" py=""
+    otool_bin="$(find_safe_otool || true)"
+    if [ -z "$otool_bin" ]; then
+        py="$(find_real_python)" || die "cannot verify Mach-O dependencies: neither verified root-owned otool nor verified root-owned Python 3 found"
     fi
 
-    make_stage
     local files_list="$stage_dir/tree-files.$$.txt"
-    /usr/bin/find "$canon_root" -type f -print > "$files_list" || die "find failed scanning $canon_root"
+    /usr/bin/find "$canon_root" -type f -print0 > "$files_list" || die "find failed scanning $canon_root"
 
     local machos=() f file_out
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
         file_out="$(/usr/bin/file -b "$f")" || die "file(1) failed on $f"
         case "$file_out" in
@@ -495,9 +598,9 @@ verify_macho_tree() {
             /bin/rm -f "$macho_set_file"
             die "codesign verification failed for $bin"
         fi
-        if [ "$has_otool" -eq 1 ]; then
-            otool_L="$(/usr/bin/otool -L "$bin")" || die "otool -L failed on $bin"
-            otool_l="$(/usr/bin/otool -l "$bin")" || die "otool -l failed on $bin"
+        if [ -n "$otool_bin" ]; then
+            otool_L="$("$otool_bin" -L "$bin")" || die "otool -L failed on $bin"
+            otool_l="$("$otool_bin" -l "$bin")" || die "otool -l failed on $bin"
 
             libs_list="$(printf '%s\n' "$otool_L" | /usr/bin/awk 'NR > 1 && /^\t/ { sub(/^\t/, ""); sub(/ \(compatibility version [0-9.]+, current version [0-9.]+\)$/, ""); print }')"
             while IFS= read -r lib; do
@@ -546,7 +649,7 @@ verify_macho_tree() {
     done
     /bin/rm -f "$macho_set_file"
 
-    if [ "$has_otool" -eq 0 ]; then
+    if [ -z "$otool_bin" ]; then
         "$py" -I - "$prefix" "$canon_root" "${machos[@]}" <<'PY'
 import pathlib
 import struct
@@ -817,8 +920,15 @@ install_tarball() {
     [ -d "$staged_tree" ] || die "tarball did not extract a tendcf/ directory"
     [ ! -L "$staged_tree" ] || die "tarball extracted a symlink at tendcf"
 
-    # Reject any non-(file|dir|symlink) or hardlinked file after extraction.
-    local bad_ent
+    # Reject any non-(file|dir|symlink), hardlinked file, or filename containing
+    # a newline/control character after extraction (guards against bsdtar escaping).
+    local bad_ent ents_list="$stage_dir/extracted-ents.$$.txt"
+    /usr/bin/find "$staged_tree" -print0 > "$ents_list" || die "find failed scanning $staged_tree"
+    if [ "$(LC_ALL=C /usr/bin/tr -cd '\001-\037\177' < "$ents_list" | /usr/bin/wc -c | /usr/bin/tr -d ' ')" != 0 ]; then
+        /bin/rm -f "$ents_list"
+        die "refusing extracted entry containing newline or control character"
+    fi
+    /bin/rm -f "$ents_list"
     bad_ent="$(/usr/bin/find "$staged_tree" ! -type f ! -type d ! -type l -print -quit)"
     [ -z "$bad_ent" ] || die "refusing non-regular extracted entry: $bad_ent"
     bad_ent="$(/usr/bin/find "$staged_tree" -type f -links +1 -print -quit)"
@@ -829,11 +939,12 @@ install_tarball() {
         die "refusing escaping or cyclic symlink in extracted archive"
     fi
 
-    # Clear quarantine, ACLs, flags; enforce root:wheel and strip SUID/SGID/go-w,
-    # then verify Mach-O + codesign BEFORE placing the tree at /opt/tendcf.
+    # Clear quarantine, flags (before ACLs/modes so uchg/schg cannot block chmod),
+    # ACLs; enforce root:wheel and strip SUID/SGID/go-w, then verify Mach-O +
+    # codesign BEFORE placing the tree at /opt/tendcf.
     /usr/bin/xattr -drs com.apple.quarantine "$staged_tree"
-    /bin/chmod -RN "$staged_tree" 2>/dev/null || true
     /usr/bin/chflags -R 0 "$staged_tree"
+    /bin/chmod -RN "$staged_tree" 2>/dev/null || true
     /usr/sbin/chown -hR root:wheel "$staged_tree"
     /bin/chmod -R a-s,go-w "$staged_tree"
     verify_macho_tree "$staged_tree"
@@ -963,10 +1074,11 @@ check_tree() {
     [ -x "$cf_execd" ] && [ ! -L "$cf_execd" ] || die "$cf_execd missing"
 
     if ! tree_is_clean "$prefix"; then
-        /bin/chmod -RN "$prefix" 2>/dev/null || true
         /usr/bin/chflags -R 0 "$prefix"
+        /bin/chmod -RN "$prefix" 2>/dev/null || true
         /usr/sbin/chown -hR root:wheel "$prefix"
         /bin/chmod -R a-s,go-w "$prefix"
+        tree_is_clean "$prefix" || die "$prefix still failed root:wheel / mode / ACL check after repair"
         changed=1
     fi
     # Fail closed if xattr fails; skip Unix domain sockets (-type s, e.g.
@@ -1067,8 +1179,8 @@ place_policy() {
     [ -z "$bad_new" ] || die "refusing non-regular/non-directory entry in staged policy: $bad_new"
 
     /usr/bin/xattr -drs com.apple.quarantine "$staged_pol"
-    /bin/chmod -RN "$staged_pol" 2>/dev/null || true
     /usr/bin/chflags -R 0 "$staged_pol"
+    /bin/chmod -RN "$staged_pol" 2>/dev/null || true
     /usr/sbin/chown -hR root:wheel "$staged_pol"
     /bin/chmod -R a-s,go-w "$staged_pol"
 
@@ -1326,6 +1438,24 @@ cmd_install() {
     fi
     check_tree
     init_paths
+    if [ "$upgrade_rollback_armed" -eq 1 ]; then
+        make_stage
+        local var_bak="$stage_dir/upgrade-var-backup"
+        /bin/rm -rf "$var_bak"
+        /usr/bin/install -d -m 0700 -o root -g wheel "$var_bak"
+        upgrade_saved_workdir="$workdir"
+        upgrade_saved_inputs=0
+        upgrade_saved_data=0
+        if [ -d "$workdir/inputs" ] && [ ! -L "$workdir/inputs" ]; then
+            /bin/cp -pRP "$workdir/inputs" "$var_bak/inputs"
+            upgrade_saved_inputs=1
+        fi
+        if [ -f "$workdir/data/host_specific.json" ] && [ ! -L "$workdir/data/host_specific.json" ]; then
+            /bin/cp -p "$workdir/data/host_specific.json" "$var_bak/host_specific.json"
+            upgrade_saved_data=1
+        fi
+        upgrade_snapshot_taken=1
+    fi
     lay_out
     place_policy
     if [ -n "$datafile" ]; then
@@ -1347,6 +1477,10 @@ cmd_install() {
     upgrade_staged_tree=""
     upgrade_moved_var=0
     upgrade_was_loaded=0
+    upgrade_snapshot_taken=0
+    upgrade_saved_workdir=""
+    upgrade_saved_inputs=0
+    upgrade_saved_data=0
     if [ "$changed" -eq 0 ]; then
         say "no change ($("$cf_agent" --version | /usr/bin/sed -n 1p))"
     else
