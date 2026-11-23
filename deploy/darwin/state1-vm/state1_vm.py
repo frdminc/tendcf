@@ -1170,6 +1170,7 @@ class Mdutil(NamedTuple):
     evidence: str
     polls: int
     waited: float
+    listing: str = ""
 
 
 def mdutil_volumes_problem(text: str) -> str | None:
@@ -1177,12 +1178,12 @@ def mdutil_volumes_problem(text: str) -> str | None:
     `Indexing disabled.` line, with `/:` and `/System/Volumes/Data:` among the headers; else
     what is wrong.
 
-    A header is a line with no leading blank that ends in ":"; a status line has a leading
-    space or tab. The caller runs ssh with raw_newlines=True (no universal-newline translation)
-    and lines are split on "\\n" only; any line holding a control character other than tab (CR,
-    FF, VT, NUL, other C0, or DEL) is rejected as unexpected before blank, header or status
-    matching. prep.sh applies the same rule with LC_ALL=C awk except for NUL, which its shell
-    command substitution drops before awk sees it (check 2g/10a still rejects NUL).
+    A header is a line starting with "/", ending in ":", and containing no tab (so no leading
+    blank either); a status line has a leading space or tab. The caller runs ssh with
+    raw_newlines=True (no universal-newline translation) and lines are split on "\\n" only; any
+    line holding a control character other than tab (CR, FF, VT, NUL, other C0, or DEL) is
+    rejected as unexpected before blank, header or status matching. prep.sh applies the same
+    rule (including NUL, via a temp file + LC_ALL=C tr before LC_ALL=C awk).
     """
     hdr: str | None = None
     seen = False
@@ -1200,7 +1201,7 @@ def mdutil_volumes_problem(text: str) -> str | None:
             if seen:
                 return f"two statuses for {hdr}"
             seen = True
-        elif ln.endswith(":"):
+        elif ln.startswith("/") and ln.endswith(":") and "\t" not in ln:
             if hdr is not None and not seen:
                 return f"no status for {hdr}"
             hdr, seen = ln, False
@@ -1221,7 +1222,8 @@ def mdutil_volumes_problem(text: str) -> str | None:
 def _mdutil_done(
     ok: bool, text: str, why: str, note: str, polls: int, waited: float
 ) -> Mdutil:
-    return Mdutil(ok, f"{clip(text.strip(), 300)}{why}; {note}", polls, waited)
+    clipped = clip(text, 300)
+    return Mdutil(ok, f"{clipped}{why}; {note}", polls, waited, clipped)
 
 
 def mdutil_off(ctx: Ctx, t: vmssh.Target) -> Mdutil:
@@ -3944,7 +3946,8 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "fail" if bad else "pass",
                         "; ".join(bad)
                         or "2a-2e, 2g-2l re-checked (2g after the reboot: "
-                        f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s)",
+                        f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s; "
+                        f"listing: {facts['mdutil'].listing!r})",
                     )
                 else:
                     summary.add(

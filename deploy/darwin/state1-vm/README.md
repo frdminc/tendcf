@@ -271,15 +271,17 @@ is halted with `shutdown -h now` and `tart run` exits by itself (a forced `tart 
 
 `prep.sh` (guest, root, idempotent, `set -eu`): snapshots `launchctl` state and the disabled
 lists to `/var/db/tendcf-state1-prep/snapshots/before` (once) before touching anything, and
-`after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back: `Indexing
-enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere is retried every
-2 s until 120 s of real time have passed or 65 polls (120 / 2 + 5 margin, which stops the loop
+`after` at the end; Spotlight off (`mdutil -a -i off`, then `mdutil -a -s` read back via a
+`mktemp` file preserving exit status and NUL bytes, mapped `\000` -> `\001` with `LC_ALL=C tr`:
+`Indexing enabled` anywhere is fatal at once; `kMDConfigSearchLevelTransitioning` anywhere is
+retried every 2 s until 120 s (tracked via `$SECONDS` in macOS `/bin/sh` = bash 3.2, with
+printed elapsed seconds clamped at `>= 0`) or 65 polls (120 / 2 + 5 margin, which stops the loop
 after 65 polls — about 130 s plus mdutil's own time — if the clock steps backwards), whatever
 mdutil's exit status (that status was never
 recorded); then a non-0 exit is fatal; then any line holding a control character other than tab
-fails as unexpected (except NUL, which its `/bin/sh` command substitution drops before `awk`
-sees it; check 2g/10a still rejects NUL), and the answer must be volume headers (a line ending
-in `:`), each followed by exactly one `Indexing disabled.` line, with `/:` and
+(NUL included, via the `\001` mapping) fails as unexpected, and the answer must be volume
+headers (a line starting with `/`, ending in `:`, and containing no tab), each followed by
+exactly one `Indexing disabled.` line, with `/:` and
 `/System/Volumes/Data:` among them, and
 nothing else); automatic download and install off (the five keys prep writes through `defaults`,
 `SplatEnabled` (believed to be the Background Security Improvements switch: inferred, not
@@ -305,7 +307,7 @@ Recovery.
 | 1 | the clone boots headless, `tart ip --wait` answers, key login works on the pinned host key | live |
 | 2a-2c | `sw_vers` is 27.x; SIP enabled; `sudo -n sh -c 'id -u'` is 0 | live |
 | 2d-2f | Gatekeeper enabled; sshd effective config key-only; password login refused from the host | live |
-| 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together, read untranslated (`raw_newlines=True`, no text mode). Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then any line holding a control character other than tab (CR, FF, VT, NUL, other C0, DEL) fails as unexpected, and the answer must be volume headers (a line ending in `:`), each followed by exactly one `Indexing disabled.` line, `/:` and `/System/Volumes/Data:` among them, and nothing else (`prep.sh` applies the same rule except for NUL, which its shell drops before `awk` sees it; check 2g/10a still rejects NUL). Lines split on `\n` only. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
+| 2g | Spotlight indexing off: `sudo -n mdutil -a -s`, stdout and stderr together, read untranslated (`raw_newlines=True`, no text mode). Per poll: `Indexing enabled` anywhere fails at once; `kMDConfigSearchLevelTransitioning` anywhere is asked again every 2 s whatever the exit status, for about 120 s plus one command (the driver counts real time between polls); then a non-0 exit fails; then any line holding a control character other than tab (CR, FF, VT, NUL, other C0, DEL) fails as unexpected, and the answer must be volume headers (a line starting with `/`, ending in `:`, and containing no tab), each followed by exactly one `Indexing disabled.` line, `/:` and `/System/Volumes/Data:` among them, and nothing else (`prep.sh` applies the same rule including NUL, via a `mktemp` file + `LC_ALL=C tr` before `LC_ALL=C awk`). Lines split on `\n` only. The evidence carries every poll's exit status and ends `polls=N waited=Ns` | live |
 | 2h | automatic download and install keys off: the five keys `prep.sh` writes (`AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `ConfigDataInstall`, `CriticalUpdateInstall`, `SplatEnabled`) each read 0 with exit 0 through `defaults read`, and `sudo -n softwareupdate --schedule` exits 0. The rc-0 rule only shows that softwareupdate still runs; it says nothing about updates being off. The schedule text (stdout and stderr together) is evidence only, shown as `schedule (info): rc N: '...'`, and never decides: on macOS 27.2 it says `turned on` (see "Known limitation"). A key that does not read 0, a read error or a non-0 exit fails; the evidence shows the exit status, marks a value read only from stderr (`Key=stderr '...'`), and clips each value. The keys persist; that softwareupdated obeys them is not observed. `AutomaticCheckEnabled` is not read, and neither is `com.apple.commerce AutoUpdate` (written only) | live |
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
@@ -313,7 +315,7 @@ Recovery.
 | 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
 | 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
 | 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot, a value the driver returns, not text read back from the guest's output; it measures the post-reboot settle) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
 | 10b | post-reboot `launchctl print` for `com.tendcf.canary.main` and `org.tendcf.execd` (loaded from disk at boot; `org.tendcf.execd` running as `root`) | live (with `--tarball` or `--artifact-run`) |
 | 11 | stop and delete the clone, always | live |
 | 11a | canary tombstone teardown (`data` + `run-once`, plist removed, `launchctl print` fails) and `org.tendcf.execd` `disable` (plist removed, `launchctl print` fails) before step 11 | live (with `--tarball` or `--artifact-run`) |
