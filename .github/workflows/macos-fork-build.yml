@@ -40,10 +40,20 @@ jobs:
     env:
       PREFIX: /opt/tendcf
       MACOSX_DEPLOYMENT_TARGET: "26.0"
+      # Fleet floor: oldest macOS release the artifact must load on.
+      # Do not bump this to "latest" while older fleet hosts remain supported.
       TARGET_MACOS_MAX_MINOS: "27.2"
       SELECTED_RUNNER: ${{ inputs.runner || 'macos-26' }}
+      # Pinned OpenSSL 3.5 LTS source release (built with --prefix=/opt/tendcf
+      # and --openssldir=/opt/tendcf/etc/ssl so OPENSSLDIR/ENGINESDIR/MODULESDIR
+      # never point into user-writable /opt/homebrew).
+      OPENSSL_VERSION: "3.5.9"
+      OPENSSL_URL: "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
+      OPENSSL_SHA256: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Runner identity
         id: env
@@ -79,7 +89,8 @@ jobs:
         run: |
           set -euo pipefail
           t0="$(date +%s)"
-          brew install lmdb automake openssl@3 pcre2 autoconf libtool librsync libyaml
+          # OpenSSL 3 is built from checksum-pinned source below, not Homebrew.
+          brew install lmdb automake pcre2 autoconf libtool librsync libyaml
           command -v libtool automake autoconf
           libtool -V | sed -n 1p
           automake --version | sed -n 1p
@@ -96,7 +107,10 @@ jobs:
           import json
           import os
           import pathlib
+          import re
           import subprocess
+
+          SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
           pin_path = pathlib.Path("overlay/fork.json")
           pin_bytes = pin_path.read_bytes()
@@ -106,13 +120,16 @@ jobs:
           libntech_repo = pin["libntech"]["repo"]
           pin_sha256 = hashlib.sha256(pin_bytes).hexdigest()
 
+          if not SHA40.fullmatch(core_sha):
+              raise ValueError(f"invalid core commit sha in overlay/fork.json: {core_sha!r}")
+
           core_dir = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core"
 
           def git(args, cwd=None):
               subprocess.run(["git", *args], cwd=cwd, check=True, timeout=600)
 
           git(["init", "-q", str(core_dir)])
-          git(["-C", str(core_dir), "remote", "add", "origin", core_repo])
+          git(["-C", str(core_dir), "remote", "add", "--", "origin", core_repo])
           git(["-C", str(core_dir), "fetch", "-q", "--depth", "1", "origin", core_sha])
           git(["-C", str(core_dir), "checkout", "-q", "FETCH_HEAD"])
 
@@ -124,9 +141,12 @@ jobs:
           libntech_sha = subprocess.check_output(
               ["git", "-C", str(core_dir), "rev-parse", "HEAD:libntech"], text=True
           ).strip()
+          if not SHA40.fullmatch(libntech_sha):
+              raise ValueError(f"invalid libntech submodule sha: {libntech_sha!r}")
+
           libntech_dir = core_dir / "libntech"
           git(["init", "-q", str(libntech_dir)])
-          git(["-C", str(libntech_dir), "remote", "add", "origin", libntech_repo])
+          git(["-C", str(libntech_dir), "remote", "add", "--", "origin", libntech_repo])
           git(["-C", str(libntech_dir), "fetch", "-q", "--depth", "1", "origin", libntech_sha])
           git(["-C", str(libntech_dir), "checkout", "-q", "FETCH_HEAD"])
 
@@ -146,7 +166,44 @@ jobs:
 
       - name: Build prefix
         shell: bash
-        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$PREFIX"
+        run: |
+          set -euo pipefail
+          umask 022
+          if [ -e "$PREFIX" ] && [ -n "$(ls -A "$PREFIX" 2>/dev/null || true)" ]; then
+            echo "error: $PREFIX already exists and is non-empty" >&2
+            exit 1
+          fi
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$PREFIX"
+
+      - name: Build OpenSSL 3 from checksum-pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          t0="$(date +%s)"
+          src_root="$RUNNER_TEMP/openssl-build"
+          mkdir -p "$src_root"
+          tarball="$src_root/openssl-${OPENSSL_VERSION}.tar.gz"
+          curl --fail --silent --show-error --location --max-time 600 \
+            -o "$tarball" "$OPENSSL_URL"
+          printf '%s  %s\n' "$OPENSSL_SHA256" "$tarball" | shasum -a 256 -c -
+          tar -xzf "$tarball" -C "$src_root"
+          cd "$src_root/openssl-${OPENSSL_VERSION}"
+          # Keep $RUNNER_TEMP out of CFLAGS (crypto/buildinf.h records CFLAGS);
+          # pass -oso_prefix via LDFLAGS so debug maps contain no runner paths.
+          runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+          export LDFLAGS="-Wl,-headerpad_max_install_names -Wl,-oso_prefix,${runner_temp_real}/ -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          ./Configure darwin64-arm64-cc \
+            --prefix="$PREFIX" \
+            --openssldir="$PREFIX/etc/ssl" \
+            -mmacosx-version-min="${MACOSX_DEPLOYMENT_TARGET}" \
+            shared \
+            no-tests
+          make -j"$(sysctl -n hw.ncpu)" build_sw
+          make install_sw
+          mkdir -p "$PREFIX/etc/ssl"
+          "$PREFIX/bin/openssl" version -a
+          echo "openssl build seconds: $(( $(date +%s) - t0 ))"
 
       - name: Configure and build
         shell: bash
@@ -154,13 +211,16 @@ jobs:
           CORE_DIR: ${{ steps.pin.outputs.core_dir }}
         run: |
           set -euo pipefail
+          umask 022
           t0="$(date +%s)"
           cd "$CORE_DIR"
           b() { brew --prefix "$1"; }
-          export LDFLAGS="-Wl,-headerpad_max_install_names -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
-          export CFLAGS="-Wall -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          runner_temp_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$RUNNER_TEMP")"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export LDFLAGS="-Wl,-headerpad_max_install_names -Wl,-oso_prefix,${runner_temp_real}/ -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CFLAGS="-Wall -ffile-prefix-map=${runner_temp_real}=/src -ffile-prefix-map=${RUNNER_TEMP}=/src -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
           ./autogen.sh --enable-debug --prefix="$PREFIX" \
-            --with-openssl="$(b openssl@3)" \
+            --with-openssl="$PREFIX" \
             --with-pcre2="$(b pcre2)" \
             --with-lmdb="$(b lmdb)" \
             --with-librsync="$(b librsync)" \
@@ -179,10 +239,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           import pathlib
+          import posixpath
           import shutil
           import stat
           import subprocess
@@ -193,14 +256,25 @@ jobs:
           prefix_str = str(prefix) + "/"
 
           ALLOWED_SYSTEM = ("/usr/lib/", "/System/Library/")
+          FAT_MAGICS = {
+              b"\xca\xfe\xba\xbe",
+              b"\xbe\xba\xfe\xca",
+              b"\xca\xfe\xba\xbf",
+              b"\xbf\xba\xfe\xca",
+          }
           MACHO_MAGICS = {
               b"\xcf\xfa\xed\xfe",
               b"\xfe\xed\xfa\xcf",
               b"\xce\xfa\xed\xfe",
               b"\xfe\xed\xfa\xce",
-              b"\xca\xfe\xba\xbe",
-              b"\xbe\xba\xfe\xca",
+              *FAT_MAGICS,
           }
+
+          def has_traversal(p: str) -> bool:
+              if posixpath.normpath(p) != p:
+                  return True
+              parts = pathlib.PurePosixPath(p).parts
+              return ".." in parts or "." in parts
 
           def is_macho(path: pathlib.Path) -> bool:
               if path.is_symlink() or not path.is_file():
@@ -212,7 +286,7 @@ jobs:
                   return False
               if magic not in MACHO_MAGICS:
                   return False
-              if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+              if magic in FAT_MAGICS:
                   r = subprocess.run(["otool", "-h", str(path)], capture_output=True, text=True)
                   return r.returncode == 0 and "Mach header" in r.stdout
               return True
@@ -242,6 +316,8 @@ jobs:
               return install_id, deps, rpaths
 
           def is_allowed_unchanged(dep: str) -> bool:
+              if has_traversal(dep):
+                  return False
               return dep.startswith(ALLOWED_SYSTEM) or dep.startswith(prefix_str)
 
           def resolve_dep(dep: str, orig_path: pathlib.Path, orig_rpaths: list[str]) -> pathlib.Path:
@@ -260,6 +336,10 @@ jobs:
                       if cand.exists():
                           return cand.resolve()
               elif dep.startswith("/"):
+                  if has_traversal(dep):
+                      raise RuntimeError(
+                          f"refusing unnormalized/traversal dependency {dep!r} referenced by {orig_path}"
+                      )
                   cand = pathlib.Path(dep)
                   if cand.exists():
                       return cand.resolve()
@@ -310,11 +390,11 @@ jobs:
                   real_to_bundled[real_dep] = dest
                   orig_source[dest] = real_dep
                   orig_rpaths_map[dest] = dep_rpaths
-                  bundled_records.append({"name": dest_name, "source": str(real_dep)})
+                  bundled_records.append({"name": dest_name, "source": str(real_dep), "dest": str(dest)})
                   queue.append(dest)
                   print(f"bundled: {real_dep} -> {dest}")
 
-          # Rewrite install IDs, non-system dependency paths, and external LC_RPATHs.
+          # Rewrite install IDs, non-system dependency paths, and strip ALL LC_RPATHs.
           all_macho = find_all_macho()
           for macho in all_macho:
               mode = macho.stat().st_mode
@@ -338,9 +418,11 @@ jobs:
                       args.extend(["-change", dep, new_dep])
                       seen_changes.add((dep, new_dep))
 
+              seen_rpaths = set()
               for rp in rpaths:
-                  if not rp.startswith(prefix_str) and rp != str(prefix):
+                  if rp not in seen_rpaths:
                       args.extend(["-delete_rpath", rp])
+                      seen_rpaths.add(rp)
 
               if args:
                   subprocess.run(["install_name_tool", *args, str(macho)], check=True)
@@ -352,13 +434,19 @@ jobs:
                   check=True,
               )
 
+          # Record post-rewrite, post-sign SHA-256 for every bundled dylib.
+          for rec in bundled_records:
+              dest_path = pathlib.Path(rec.pop("dest"))
+              rec["sha256"] = hashlib.sha256(dest_path.read_bytes()).hexdigest()
+
           bundled_records.sort(key=lambda r: r["name"])
           out_path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bundled-libs.json"
           out_path.write_text(json.dumps(bundled_records, indent=2) + "\n", encoding="utf-8")
           print(f"bundled {len(bundled_records)} libraries, re-signed {len(all_macho)} Mach-O files")
           PY
+          sudo chmod -R go-w,a-s "$PREFIX"
 
-      - name: Verify Mach-O linkage (otool -L), deployment target, and signatures
+      - name: Verify Mach-O linkage (otool -L), embedded paths, modes, and signatures
         id: verify
         shell: bash
         run: |
@@ -366,7 +454,9 @@ jobs:
           python3 - <<'PY'
           import os
           import pathlib
+          import posixpath
           import re
+          import stat
           import subprocess
           import sys
 
@@ -378,15 +468,26 @@ jobs:
           def parse_ver(v: str) -> tuple[int, ...]:
               return tuple(int(part) for part in v.split("."))
 
+          def has_traversal(p: str) -> bool:
+              if posixpath.normpath(p) != p:
+                  return True
+              parts = pathlib.PurePosixPath(p).parts
+              return ".." in parts or "." in parts
+
           max_allowed = parse_ver(max_allowed_str)
 
+          FAT_MAGICS = {
+              b"\xca\xfe\xba\xbe",
+              b"\xbe\xba\xfe\xca",
+              b"\xca\xfe\xba\xbf",
+              b"\xbf\xba\xfe\xca",
+          }
           MACHO_MAGICS = {
               b"\xcf\xfa\xed\xfe",
               b"\xfe\xed\xfa\xcf",
               b"\xce\xfa\xed\xfe",
               b"\xfe\xed\xfa\xce",
-              b"\xca\xfe\xba\xbe",
-              b"\xbe\xba\xfe\xca",
+              *FAT_MAGICS,
           }
 
           def is_macho(path: pathlib.Path) -> bool:
@@ -399,44 +500,71 @@ jobs:
                   return False
               if magic not in MACHO_MAGICS:
                   return False
-              if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+              if magic in FAT_MAGICS:
                   r = subprocess.run(["otool", "-h", str(path)], capture_output=True, text=True)
                   return r.returncode == 0 and "Mach header" in r.stdout
               return True
 
           errors = []
           macho_files = []
+
+          def audit_mode(entry: pathlib.Path):
+              st = os.lstat(entry)
+              mode = st.st_mode
+              if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                  errors.append(f"forbidden special file under prefix: {entry} (mode={oct(mode)})")
+              if mode & 0o6022:
+                  errors.append(f"forbidden mode bits (go-w/a-s violated): {entry} (mode={oct(stat.S_IMODE(mode))})")
+
+          def audit_symlink(link: pathlib.Path):
+              target = os.readlink(link)
+              if target.startswith("/"):
+                  errors.append(f"forbidden absolute symlink under prefix: {link} -> {target}")
+              resolved = link.resolve()
+              if not resolved.exists():
+                  errors.append(f"dangling symlink under prefix: {link} -> {target}")
+              elif not resolved.is_relative_to(prefix):
+                  errors.append(f"escaping symlink under prefix: {link} -> {target} ({resolved})")
+
+          audit_mode(prefix)
           for root, dirs, files in os.walk(prefix, followlinks=False):
               for name in sorted(dirs):
                   d = pathlib.Path(root) / name
                   if d.is_symlink():
-                      target = os.readlink(d)
-                      resolved = d.resolve()
-                      if str(resolved).startswith(("/opt/homebrew/", "/usr/local/")):
-                          errors.append(f"forbidden directory symlink target: {d} -> {target} ({resolved})")
-                      elif not resolved.exists():
-                          errors.append(f"dangling directory symlink: {d} -> {target}")
+                      audit_symlink(d)
+                  else:
+                      audit_mode(d)
               for name in sorted(files):
                   p = pathlib.Path(root) / name
                   if p.is_symlink():
-                      target = os.readlink(p)
-                      resolved = p.resolve()
-                      if str(resolved).startswith(("/opt/homebrew/", "/usr/local/")):
-                          errors.append(f"forbidden symlink target: {p} -> {target} ({resolved})")
-                      elif not resolved.exists():
-                          errors.append(f"dangling symlink: {p} -> {target}")
-                  elif is_macho(p):
-                      macho_files.append(p)
+                      audit_symlink(p)
+                  else:
+                      audit_mode(p)
+                      if is_macho(p):
+                          macho_files.append(p)
 
+          macho_files_set = {p.resolve() for p in macho_files}
           required_bins = [
               prefix / "bin/cf-agent",
               prefix / "bin/cf-execd",
               prefix / "bin/cf-promises",
               prefix / "bin/cf-key",
+              prefix / "lib/libcrypto.3.dylib",
+              prefix / "lib/libssl.3.dylib",
           ]
           for req in required_bins:
               if req not in macho_files:
-                  errors.append(f"missing expected Mach-O binary: {req}")
+                  errors.append(f"missing expected Mach-O binary/library: {req}")
+
+          runner_temp_raw = os.environ["RUNNER_TEMP"]
+          runner_temp_real = str(pathlib.Path(runner_temp_raw).resolve())
+          forbidden_bytes = [
+              b"/opt/homebrew/",
+              b"/usr/local/",
+              runner_temp_raw.encode("utf-8"),
+          ]
+          if runner_temp_real != runner_temp_raw:
+              forbidden_bytes.append(runner_temp_real.encode("utf-8"))
 
           max_seen_minos = (0, 0)
           max_seen_minos_str = "0.0"
@@ -455,26 +583,55 @@ jobs:
                   if not stripped:
                       continue
                   dep = re.sub(r"\s+\(compatibility version .*\)$", "", stripped)
+                  if has_traversal(dep):
+                      errors.append(f"{macho}: forbidden unnormalized/traversal dependency: {dep}")
+                      continue
                   if not dep.startswith(allowed_prefixes):
                       errors.append(f"{macho}: forbidden link outside allowed prefixes: {dep}")
-                  elif dep.startswith(prefix_str) and not pathlib.Path(dep).exists():
-                      errors.append(f"{macho}: linked in-prefix library does not exist: {dep}")
+                  elif dep.startswith(prefix_str):
+                      dep_path = pathlib.Path(dep)
+                      if not dep_path.exists():
+                          errors.append(f"{macho}: linked in-prefix library does not exist: {dep}")
+                      else:
+                          dep_resolved = dep_path.resolve()
+                          if not dep_resolved.is_relative_to(prefix):
+                              errors.append(f"{macho}: linked in-prefix library escapes prefix: {dep} -> {dep_resolved}")
+                          elif dep_resolved not in macho_files_set:
+                              errors.append(f"{macho}: linked in-prefix target is not a verified Mach-O: {dep} -> {dep_resolved}")
 
               otool_l = subprocess.check_output(["otool", "-l", str(macho)], text=True)
               current_cmd = None
+              bv_platform = None
+              bv_minos = None
               minos_list = []
+
+              def flush_bv():
+                  nonlocal bv_platform, bv_minos
+                  if current_cmd == "LC_BUILD_VERSION":
+                      if bv_platform not in ("1", "MACOS"):
+                          errors.append(
+                              f"{macho}: LC_BUILD_VERSION platform must be macOS (1/MACOS), got {bv_platform!r}"
+                          )
+                      if bv_minos is not None:
+                          minos_list.append(bv_minos)
+                  bv_platform = None
+                  bv_minos = None
+
               for raw in otool_l.splitlines():
                   line = raw.strip()
                   if line.startswith("cmd "):
+                      flush_bv()
                       current_cmd = line.split()[1]
                   elif current_cmd == "LC_RPATH" and line.startswith("path "):
                       rp = line[len("path "):].split(" (offset ", 1)[0]
-                      if not rp.startswith(prefix_str) and rp != str(prefix):
-                          errors.append(f"{macho}: forbidden LC_RPATH: {rp}")
+                      errors.append(f"{macho}: forbidden LC_RPATH (all RPATHs must be stripped): {rp}")
+                  elif current_cmd == "LC_BUILD_VERSION" and line.startswith("platform "):
+                      bv_platform = line.split()[1]
                   elif current_cmd == "LC_BUILD_VERSION" and line.startswith("minos "):
-                      minos_list.append(line.split()[1])
+                      bv_minos = line.split()[1]
                   elif current_cmd == "LC_VERSION_MIN_MACOSX" and line.startswith("version "):
                       minos_list.append(line.split()[1])
+              flush_bv()
 
               if not minos_list:
                   errors.append(f"{macho}: no LC_BUILD_VERSION/LC_VERSION_MIN_MACOSX minos found")
@@ -487,6 +644,18 @@ jobs:
                           max_seen_minos = pv
                           max_seen_minos_str = minos
                   print(f"  [meta] archs={','.join(archs)} minos={','.join(minos_list)}")
+
+              # Raw bytes audit: fail if any Mach-O embeds /opt/homebrew/, /usr/local/, or RUNNER_TEMP.
+              raw_bytes = macho.read_bytes()
+              for pat in forbidden_bytes:
+                  pos = raw_bytes.find(pat)
+                  if pos != -1:
+                      end = raw_bytes.find(b"\x00", pos)
+                      sample = raw_bytes[pos:end if (end != -1 and end - pos < 200) else pos + 120]
+                      errors.append(
+                          f"{macho}: forbidden embedded path {pat.decode('utf-8')!r}: "
+                          f"{sample.decode('latin1', 'replace')!r}"
+                      )
 
               cs = subprocess.run(
                   ["codesign", "--verify", "--strict", str(macho)],
@@ -509,6 +678,7 @@ jobs:
           print(
               f"\notool-check: PASS ({len(macho_files)} Mach-O files verified, "
               f"all links within /usr/lib, /System/Library, /opt/tendcf; "
+              f"0 LC_RPATH; 0 forbidden embedded paths; modes go-w/a-s clean; "
               f"max minos {max_seen_minos_str} <= {max_allowed_str})"
           )
           PY
@@ -533,6 +703,7 @@ jobs:
             echo
             echo "- core: \`$FORK_SHA\` ($RUNNER_OS $RUNNER_ARCH, runner \`$SELECTED_RUNNER\` / \`$RUNNER_NAME\`)"
             echo "- libntech: \`$LIBNTECH_SHA\`"
+            echo "- OpenSSL: \`$OPENSSL_VERSION\` (source sha256 \`$OPENSSL_SHA256\`, openssldir \`$PREFIX/etc/ssl\`)"
             echo "- macOS: \`$MACOS_VERSION\` (\`$MACOS_BUILD\`), Xcode: \`$XCODE_VERSION\`"
             echo "- \`$cf_ver\`"
             echo "- Mach-O check: $MACHO_COUNT files verified, max minos \`$MAX_MINOS\` <= \`$TARGET_MACOS_MAX_MINOS\`"
@@ -571,6 +742,7 @@ jobs:
           MAX_MINOS: ${{ steps.verify.outputs.max_minos }}
         run: |
           set -euo pipefail
+          umask 022
           dist_dir="$RUNNER_TEMP/dist"
           mkdir -p "$dist_dir" "$PREFIX/share/tendcf"
 
@@ -605,6 +777,12 @@ jobs:
               "xcode_version": os.environ["XCODE_VERSION"],
               "macosx_deployment_target": os.environ["MACOSX_DEPLOYMENT_TARGET"],
               "prefix": os.environ["PREFIX"],
+              "openssl": {
+                  "version": os.environ["OPENSSL_VERSION"],
+                  "url": os.environ["OPENSSL_URL"],
+                  "sha256": os.environ["OPENSSL_SHA256"],
+                  "openssldir": f"{os.environ['PREFIX']}/etc/ssl",
+              },
               "cf_agent_version": os.environ["CF_AGENT_VERSION"],
               "macho_count": int(os.environ["MACHO_COUNT"]),
               "max_minos": os.environ["MAX_MINOS"],
@@ -619,8 +797,13 @@ jobs:
           rev_path.write_text(json.dumps(rev, indent=2) + "\n", encoding="utf-8")
           PY
 
+          sudo chmod -R go-w,a-s "$PREFIX"
+
           COPYFILE_DISABLE=1 tar \
             --no-xattrs \
+            --no-acls \
+            --no-fflags \
+            --no-mac-metadata \
             --uid 0 --gid 0 --uname root --gname wheel \
             -C /opt -czf "$dist_dir/$tarball" tendcf
 
@@ -679,6 +862,8 @@ jobs:
         if: failure()
         with:
           name: macos-fork-build-config-log
-          path: ${{ runner.temp }}/core/config.log
+          path: |
+            ${{ runner.temp }}/core/config.log
+            ${{ runner.temp }}/core/libntech/config.log
           if-no-files-found: ignore
           retention-days: 14
