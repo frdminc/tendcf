@@ -1,0 +1,684 @@
+name: macOS fork build
+
+# Manually dispatched build of the CFEngine fork pinned in overlay/fork.json,
+# self-contained under /opt/tendcf for bare macOS 27.2 Apple Silicon hosts
+# (no Homebrew, no Xcode Command Line Tools).
+#
+# Operator ruling (djbclark, 2026-11-23, frdminc/tendcf#70 comment
+# #issuecomment-7088755642 item 3): "1. GitHub-hosted, WarpBuild switch" —
+# manually dispatched only (never a PR check, never on push to master),
+# defaulting to a free GitHub-hosted macOS arm64 runner with a dispatch input
+# to switch the same job to WarpBuild.
+#
+# Runner labels (checked 2026-11-22 against
+# https://docs.github.com/en/actions/reference/runners/github-hosted-runners):
+#   - macos-26: explicit GitHub-hosted macOS arm64 label (3 M1 vCPU, 7 GB RAM;
+#     currently the target of macos-latest; avoids the moving -latest alias).
+#   - warp-macos-26-arm64-12x: WarpBuild arm64 label proven in spike/macos-check8-warp
+#     (commit 299f219, run 43602684071).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: >-
+          macOS arm64 runner label (GitHub-hosted default; WarpBuild switch).
+        type: choice
+        required: true
+        default: macos-26
+        options:
+          - macos-26
+          - warp-macos-26-arm64-12x
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 90
+    env:
+      PREFIX: /opt/tendcf
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
+      TARGET_MACOS_MAX_MINOS: "27.2"
+      SELECTED_RUNNER: ${{ inputs.runner || 'macos-26' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner identity
+        id: env
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          if [ "$arch" != "arm64" ]; then
+            echo "error: expected arm64 runner, got $arch" >&2
+            exit 1
+          fi
+          macos_version="$(sw_vers -productVersion)"
+          macos_build="$(sw_vers -buildVersion)"
+          xcode_version="$(xcodebuild -version | paste -sd ' ' -)"
+          echo "selected_runner=$SELECTED_RUNNER runner_name=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+          echo "image: ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          uname -a
+          sw_vers
+          echo "xcode: $xcode_version"
+          xcode-select -p
+          clang --version | sed -n '1,2p'
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          python3 --version
+          brew --version | sed -n 1p
+          {
+            echo "macos_version=$macos_version"
+            echo "macos_build=$macos_build"
+            echo "xcode_version=$xcode_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build dependencies (Homebrew)
+        shell: bash
+        run: |
+          set -euo pipefail
+          t0="$(date +%s)"
+          brew install lmdb automake openssl@3 pcre2 autoconf libtool librsync libyaml
+          command -v libtool automake autoconf
+          libtool -V | sed -n 1p
+          automake --version | sed -n 1p
+          autoconf --version | sed -n 1p
+          echo "deps seconds: $(( $(date +%s) - t0 ))"
+
+      - name: Fetch the fork at the pinned commit
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          pin_path = pathlib.Path("overlay/fork.json")
+          pin_bytes = pin_path.read_bytes()
+          pin = json.loads(pin_bytes.decode("utf-8"))
+          core_repo = pin["core"]["repo"]
+          core_sha = pin["core"]["commit"]
+          libntech_repo = pin["libntech"]["repo"]
+          pin_sha256 = hashlib.sha256(pin_bytes).hexdigest()
+
+          core_dir = pathlib.Path(os.environ["RUNNER_TEMP"]) / "core"
+
+          def git(args, cwd=None):
+              subprocess.run(["git", *args], cwd=cwd, check=True, timeout=600)
+
+          git(["init", "-q", str(core_dir)])
+          git(["-C", str(core_dir), "remote", "add", "origin", core_repo])
+          git(["-C", str(core_dir), "fetch", "-q", "--depth", "1", "origin", core_sha])
+          git(["-C", str(core_dir), "checkout", "-q", "FETCH_HEAD"])
+
+          got_core = subprocess.check_output(
+              ["git", "-C", str(core_dir), "rev-parse", "HEAD"], text=True
+          ).strip()
+          assert got_core == core_sha, f"core HEAD {got_core} != pin {core_sha}"
+
+          libntech_sha = subprocess.check_output(
+              ["git", "-C", str(core_dir), "rev-parse", "HEAD:libntech"], text=True
+          ).strip()
+          libntech_dir = core_dir / "libntech"
+          git(["init", "-q", str(libntech_dir)])
+          git(["-C", str(libntech_dir), "remote", "add", "origin", libntech_repo])
+          git(["-C", str(libntech_dir), "fetch", "-q", "--depth", "1", "origin", libntech_sha])
+          git(["-C", str(libntech_dir), "checkout", "-q", "FETCH_HEAD"])
+
+          got_libntech = subprocess.check_output(
+              ["git", "-C", str(libntech_dir), "rev-parse", "HEAD"], text=True
+          ).strip()
+          assert got_libntech == libntech_sha, f"libntech HEAD {got_libntech} != {libntech_sha}"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"core={core_sha}\n")
+              fh.write(f"libntech={libntech_sha}\n")
+              fh.write(f"core_dir={core_dir}\n")
+              fh.write(f"overlay_pin_sha256={pin_sha256}\n")
+
+          print(f"build-fork: core {core_sha}, libntech {libntech_sha} (from {libntech_repo})")
+          PY
+
+      - name: Build prefix
+        shell: bash
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$PREFIX"
+
+      - name: Configure and build
+        shell: bash
+        env:
+          CORE_DIR: ${{ steps.pin.outputs.core_dir }}
+        run: |
+          set -euo pipefail
+          t0="$(date +%s)"
+          cd "$CORE_DIR"
+          b() { brew --prefix "$1"; }
+          export LDFLAGS="-Wl,-headerpad_max_install_names -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          export CFLAGS="-Wall -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+          ./autogen.sh --enable-debug --prefix="$PREFIX" \
+            --with-openssl="$(b openssl@3)" \
+            --with-pcre2="$(b pcre2)" \
+            --with-lmdb="$(b lmdb)" \
+            --with-librsync="$(b librsync)" \
+            --with-libyaml="$(b libyaml)"
+          t1="$(date +%s)"
+          make -j"$(sysctl -n hw.ncpu)" CFLAGS="$CFLAGS"
+          t2="$(date +%s)"
+          make install
+          t3="$(date +%s)"
+          echo "configure seconds: $((t1 - t0))"
+          echo "make seconds: $((t2 - t1))"
+          echo "install seconds: $((t3 - t2))"
+          echo "build total seconds (configure+make+install): $((t3 - t0))"
+
+      - name: Bundle non-system dylibs into /opt/tendcf/lib and ad-hoc sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import stat
+          import subprocess
+
+          prefix = pathlib.Path(os.environ["PREFIX"]).resolve()
+          lib_dir = prefix / "lib"
+          lib_dir.mkdir(parents=True, exist_ok=True)
+          prefix_str = str(prefix) + "/"
+
+          ALLOWED_SYSTEM = ("/usr/lib/", "/System/Library/")
+          MACHO_MAGICS = {
+              b"\xcf\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xcf",
+              b"\xce\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xce",
+              b"\xca\xfe\xba\xbe",
+              b"\xbe\xba\xfe\xca",
+          }
+
+          def is_macho(path: pathlib.Path) -> bool:
+              if path.is_symlink() or not path.is_file():
+                  return False
+              try:
+                  with path.open("rb") as fh:
+                      magic = fh.read(4)
+              except OSError:
+                  return False
+              if magic not in MACHO_MAGICS:
+                  return False
+              if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                  r = subprocess.run(["otool", "-h", str(path)], capture_output=True, text=True)
+                  return r.returncode == 0 and "Mach header" in r.stdout
+              return True
+
+          def parse_load_commands(path: pathlib.Path):
+              out = subprocess.check_output(["otool", "-l", str(path)], text=True)
+              install_id = None
+              deps = []
+              rpaths = []
+              current_cmd = None
+              for raw in out.splitlines():
+                  line = raw.strip()
+                  if line.startswith("cmd "):
+                      current_cmd = line.split()[1]
+                  elif current_cmd == "LC_ID_DYLIB" and line.startswith("name "):
+                      install_id = line[len("name "):].split(" (offset ", 1)[0]
+                  elif current_cmd in (
+                      "LC_LOAD_DYLIB",
+                      "LC_LOAD_WEAK_DYLIB",
+                      "LC_REEXPORT_DYLIB",
+                      "LC_LAZY_LOAD_DYLIB",
+                      "LC_LOAD_UPWARD_DYLIB",
+                  ) and line.startswith("name "):
+                      deps.append(line[len("name "):].split(" (offset ", 1)[0])
+                  elif current_cmd == "LC_RPATH" and line.startswith("path "):
+                      rpaths.append(line[len("path "):].split(" (offset ", 1)[0])
+              return install_id, deps, rpaths
+
+          def is_allowed_unchanged(dep: str) -> bool:
+              return dep.startswith(ALLOWED_SYSTEM) or dep.startswith(prefix_str)
+
+          def resolve_dep(dep: str, orig_path: pathlib.Path, orig_rpaths: list[str]) -> pathlib.Path:
+              if dep.startswith("@loader_path/"):
+                  cand = orig_path.parent / dep[len("@loader_path/"):]
+                  if cand.exists():
+                      return cand.resolve()
+              elif dep.startswith("@rpath/"):
+                  rel = dep[len("@rpath/"):]
+                  for rp in orig_rpaths:
+                      if rp.startswith("@loader_path"):
+                          base = orig_path.parent / rp[len("@loader_path"):].lstrip("/")
+                      else:
+                          base = pathlib.Path(rp)
+                      cand = base / rel
+                      if cand.exists():
+                          return cand.resolve()
+              elif dep.startswith("/"):
+                  cand = pathlib.Path(dep)
+                  if cand.exists():
+                      return cand.resolve()
+              raise RuntimeError(f"cannot resolve dependency {dep!r} referenced by {orig_path}")
+
+          def find_all_macho() -> list[pathlib.Path]:
+              found = []
+              for root, _, files in os.walk(prefix, followlinks=False):
+                  for name in sorted(files):
+                      p = pathlib.Path(root) / name
+                      if is_macho(p):
+                          found.append(p)
+              return sorted(found)
+
+          # Track original source path for every file (in-prefix builds map to themselves;
+          # bundled copies map to the resolved external dylib they were copied from).
+          orig_source: dict[pathlib.Path, pathlib.Path] = {}
+          orig_rpaths_map: dict[pathlib.Path, list[str]] = {}
+          real_to_bundled: dict[pathlib.Path, pathlib.Path] = {}
+          bundled_records: list[dict[str, str]] = []
+
+          queue = find_all_macho()
+          for p in queue:
+              orig_source[p] = p
+              _, _, rps = parse_load_commands(p)
+              orig_rpaths_map[p] = rps
+
+          idx = 0
+          while idx < len(queue):
+              macho = queue[idx]
+              idx += 1
+              _, deps, _ = parse_load_commands(macho)
+              for dep in deps:
+                  if is_allowed_unchanged(dep):
+                      continue
+                  real_dep = resolve_dep(dep, orig_source[macho], orig_rpaths_map[macho])
+                  if real_dep in real_to_bundled:
+                      continue
+                  dep_id, _, dep_rpaths = parse_load_commands(real_dep)
+                  dest_name = pathlib.Path(dep_id).name if dep_id else pathlib.Path(dep).name
+                  dest = lib_dir / dest_name
+                  if dest.exists():
+                      raise RuntimeError(
+                          f"collision bundling {real_dep} -> {dest} (already exists)"
+                      )
+                  shutil.copy2(real_dep, dest)
+                  dest.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+                  real_to_bundled[real_dep] = dest
+                  orig_source[dest] = real_dep
+                  orig_rpaths_map[dest] = dep_rpaths
+                  bundled_records.append({"name": dest_name, "source": str(real_dep)})
+                  queue.append(dest)
+                  print(f"bundled: {real_dep} -> {dest}")
+
+          # Rewrite install IDs, non-system dependency paths, and external LC_RPATHs.
+          all_macho = find_all_macho()
+          for macho in all_macho:
+              mode = macho.stat().st_mode
+              if not (mode & stat.S_IWUSR):
+                  macho.chmod(mode | stat.S_IWUSR)
+
+              install_id, deps, rpaths = parse_load_commands(macho)
+              args = []
+              if install_id is not None:
+                  want_id = str(macho)
+                  if install_id != want_id:
+                      args.extend(["-id", want_id])
+
+              seen_changes = set()
+              for dep in deps:
+                  if is_allowed_unchanged(dep):
+                      continue
+                  real_dep = resolve_dep(dep, orig_source[macho], orig_rpaths_map[macho])
+                  new_dep = str(real_to_bundled[real_dep])
+                  if (dep, new_dep) not in seen_changes:
+                      args.extend(["-change", dep, new_dep])
+                      seen_changes.add((dep, new_dep))
+
+              for rp in rpaths:
+                  if not rp.startswith(prefix_str) and rp != str(prefix):
+                      args.extend(["-delete_rpath", rp])
+
+              if args:
+                  subprocess.run(["install_name_tool", *args, str(macho)], check=True)
+
+              # Re-sign every Mach-O file ad-hoc (required on Apple Silicon after
+              # install_name_tool invalidates any linker-generated ad-hoc signature).
+              subprocess.run(
+                  ["codesign", "--force", "--sign", "-", "--timestamp=none", str(macho)],
+                  check=True,
+              )
+
+          bundled_records.sort(key=lambda r: r["name"])
+          out_path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bundled-libs.json"
+          out_path.write_text(json.dumps(bundled_records, indent=2) + "\n", encoding="utf-8")
+          print(f"bundled {len(bundled_records)} libraries, re-signed {len(all_macho)} Mach-O files")
+          PY
+
+      - name: Verify Mach-O linkage (otool -L), deployment target, and signatures
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          prefix = pathlib.Path(os.environ["PREFIX"]).resolve()
+          prefix_str = str(prefix) + "/"
+          allowed_prefixes = ("/usr/lib/", "/System/Library/", prefix_str)
+          max_allowed_str = os.environ["TARGET_MACOS_MAX_MINOS"]
+
+          def parse_ver(v: str) -> tuple[int, ...]:
+              return tuple(int(part) for part in v.split("."))
+
+          max_allowed = parse_ver(max_allowed_str)
+
+          MACHO_MAGICS = {
+              b"\xcf\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xcf",
+              b"\xce\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xce",
+              b"\xca\xfe\xba\xbe",
+              b"\xbe\xba\xfe\xca",
+          }
+
+          def is_macho(path: pathlib.Path) -> bool:
+              if path.is_symlink() or not path.is_file():
+                  return False
+              try:
+                  with path.open("rb") as fh:
+                      magic = fh.read(4)
+              except OSError:
+                  return False
+              if magic not in MACHO_MAGICS:
+                  return False
+              if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                  r = subprocess.run(["otool", "-h", str(path)], capture_output=True, text=True)
+                  return r.returncode == 0 and "Mach header" in r.stdout
+              return True
+
+          errors = []
+          macho_files = []
+          for root, dirs, files in os.walk(prefix, followlinks=False):
+              for name in sorted(dirs):
+                  d = pathlib.Path(root) / name
+                  if d.is_symlink():
+                      target = os.readlink(d)
+                      resolved = d.resolve()
+                      if str(resolved).startswith(("/opt/homebrew/", "/usr/local/")):
+                          errors.append(f"forbidden directory symlink target: {d} -> {target} ({resolved})")
+                      elif not resolved.exists():
+                          errors.append(f"dangling directory symlink: {d} -> {target}")
+              for name in sorted(files):
+                  p = pathlib.Path(root) / name
+                  if p.is_symlink():
+                      target = os.readlink(p)
+                      resolved = p.resolve()
+                      if str(resolved).startswith(("/opt/homebrew/", "/usr/local/")):
+                          errors.append(f"forbidden symlink target: {p} -> {target} ({resolved})")
+                      elif not resolved.exists():
+                          errors.append(f"dangling symlink: {p} -> {target}")
+                  elif is_macho(p):
+                      macho_files.append(p)
+
+          required_bins = [
+              prefix / "bin/cf-agent",
+              prefix / "bin/cf-execd",
+              prefix / "bin/cf-promises",
+              prefix / "bin/cf-key",
+          ]
+          for req in required_bins:
+              if req not in macho_files:
+                  errors.append(f"missing expected Mach-O binary: {req}")
+
+          max_seen_minos = (0, 0)
+          max_seen_minos_str = "0.0"
+
+          for macho in macho_files:
+              archs = subprocess.check_output(["lipo", "-archs", str(macho)], text=True).split()
+              if "arm64" not in archs:
+                  errors.append(f"{macho}: missing arm64 slice (archs={archs})")
+
+              otool_L = subprocess.check_output(["otool", "-L", str(macho)], text=True)
+              print(otool_L.rstrip())
+              for line in otool_L.splitlines():
+                  if not line.startswith("\t"):
+                      continue
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  dep = re.sub(r"\s+\(compatibility version .*\)$", "", stripped)
+                  if not dep.startswith(allowed_prefixes):
+                      errors.append(f"{macho}: forbidden link outside allowed prefixes: {dep}")
+                  elif dep.startswith(prefix_str) and not pathlib.Path(dep).exists():
+                      errors.append(f"{macho}: linked in-prefix library does not exist: {dep}")
+
+              otool_l = subprocess.check_output(["otool", "-l", str(macho)], text=True)
+              current_cmd = None
+              minos_list = []
+              for raw in otool_l.splitlines():
+                  line = raw.strip()
+                  if line.startswith("cmd "):
+                      current_cmd = line.split()[1]
+                  elif current_cmd == "LC_RPATH" and line.startswith("path "):
+                      rp = line[len("path "):].split(" (offset ", 1)[0]
+                      if not rp.startswith(prefix_str) and rp != str(prefix):
+                          errors.append(f"{macho}: forbidden LC_RPATH: {rp}")
+                  elif current_cmd == "LC_BUILD_VERSION" and line.startswith("minos "):
+                      minos_list.append(line.split()[1])
+                  elif current_cmd == "LC_VERSION_MIN_MACOSX" and line.startswith("version "):
+                      minos_list.append(line.split()[1])
+
+              if not minos_list:
+                  errors.append(f"{macho}: no LC_BUILD_VERSION/LC_VERSION_MIN_MACOSX minos found")
+              else:
+                  for minos in minos_list:
+                      pv = parse_ver(minos)
+                      if pv > max_allowed:
+                          errors.append(f"{macho}: minos {minos} exceeds target macOS {max_allowed_str}")
+                      if pv > max_seen_minos:
+                          max_seen_minos = pv
+                          max_seen_minos_str = minos
+                  print(f"  [meta] archs={','.join(archs)} minos={','.join(minos_list)}")
+
+              cs = subprocess.run(
+                  ["codesign", "--verify", "--strict", str(macho)],
+                  capture_output=True,
+                  text=True,
+              )
+              if cs.returncode != 0:
+                  errors.append(f"{macho}: codesign verify failed: {cs.stderr.strip()}")
+
+          if errors:
+              print("\notool-check: FAIL", file=sys.stderr)
+              for e in errors:
+                  print(f"  ERROR: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"macho_count={len(macho_files)}\n")
+              fh.write(f"max_minos={max_seen_minos_str}\n")
+
+          print(
+              f"\notool-check: PASS ({len(macho_files)} Mach-O files verified, "
+              f"all links within /usr/lib, /System/Library, /opt/tendcf; "
+              f"max minos {max_seen_minos_str} <= {max_allowed_str})"
+          )
+          PY
+
+      - name: Record the revision
+        id: rev
+        shell: bash
+        env:
+          FORK_SHA: ${{ steps.pin.outputs.core }}
+          LIBNTECH_SHA: ${{ steps.pin.outputs.libntech }}
+          MACOS_VERSION: ${{ steps.env.outputs.macos_version }}
+          MACOS_BUILD: ${{ steps.env.outputs.macos_build }}
+          XCODE_VERSION: ${{ steps.env.outputs.xcode_version }}
+          MACHO_COUNT: ${{ steps.verify.outputs.macho_count }}
+          MAX_MINOS: ${{ steps.verify.outputs.max_minos }}
+        run: |
+          set -euo pipefail
+          cf_ver="$("$PREFIX/bin/cf-agent" --version | sed -n 1p)"
+          echo "cf_agent_version=$cf_ver" >> "$GITHUB_OUTPUT"
+          {
+            echo "### CFEngine fork build (macOS arm64)"
+            echo
+            echo "- core: \`$FORK_SHA\` ($RUNNER_OS $RUNNER_ARCH, runner \`$SELECTED_RUNNER\` / \`$RUNNER_NAME\`)"
+            echo "- libntech: \`$LIBNTECH_SHA\`"
+            echo "- macOS: \`$MACOS_VERSION\` (\`$MACOS_BUILD\`), Xcode: \`$XCODE_VERSION\`"
+            echo "- \`$cf_ver\`"
+            echo "- Mach-O check: $MACHO_COUNT files verified, max minos \`$MAX_MINOS\` <= \`$TARGET_MACOS_MAX_MINOS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          "$PREFIX/bin/cf-agent" -V
+          "$PREFIX/bin/cf-agent" --version
+
+      - name: Generic-bundle tests (tests/policy/run.sh)
+        shell: bash
+        env:
+          TENDCF_REQUIRE_FORK_LOADER: "1"
+        run: |
+          # No TENDCF_TEST_SYSTEMD / TENDCF_TEST_NIXOS_SHAPE: Linux-only.
+          t0="$(date +%s)"
+          set +e
+          tests/policy/run.sh --bindir "$PREFIX/bin" > "$RUNNER_TEMP/run-sh.log" 2>&1
+          rc=$?
+          set -e
+          t1="$(date +%s)"
+          cat "$RUNNER_TEMP/run-sh.log"
+          echo "run.sh exit=$rc seconds=$((t1 - t0))"
+          echo "run.sh exit=$rc seconds=$((t1 - t0))" >> "$RUNNER_TEMP/run-sh.log"
+          exit "$rc"
+
+      - name: Package tarball, sha256, and manifest
+        shell: bash
+        env:
+          FORK_SHA: ${{ steps.pin.outputs.core }}
+          LIBNTECH_SHA: ${{ steps.pin.outputs.libntech }}
+          OVERLAY_PIN_SHA256: ${{ steps.pin.outputs.overlay_pin_sha256 }}
+          MACOS_VERSION: ${{ steps.env.outputs.macos_version }}
+          MACOS_BUILD: ${{ steps.env.outputs.macos_build }}
+          XCODE_VERSION: ${{ steps.env.outputs.xcode_version }}
+          CF_AGENT_VERSION: ${{ steps.rev.outputs.cf_agent_version }}
+          MACHO_COUNT: ${{ steps.verify.outputs.macho_count }}
+          MAX_MINOS: ${{ steps.verify.outputs.max_minos }}
+        run: |
+          set -euo pipefail
+          dist_dir="$RUNNER_TEMP/dist"
+          mkdir -p "$dist_dir" "$PREFIX/share/tendcf"
+
+          tarball="tendcf-fork-macos-arm64-${FORK_SHA}.tar.gz"
+          sha_file="${tarball}.sha256"
+          manifest_file="tendcf-fork-macos-arm64-${FORK_SHA}.manifest.json"
+
+          # Stamp provenance inside the prefix before archiving (cannot include the
+          # tarball's own sha256 inside the archive itself).
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          pin = json.loads(pathlib.Path("overlay/fork.json").read_text(encoding="utf-8"))
+          bundled = json.loads(
+              (pathlib.Path(os.environ["RUNNER_TEMP"]) / "bundled-libs.json").read_text(encoding="utf-8")
+          )
+          rev = {
+              "schema": "tendcf-macos-fork-revision/1",
+              "fork_sha": os.environ["FORK_SHA"],
+              "libntech_sha": os.environ["LIBNTECH_SHA"],
+              "overlay_pin": pin,
+              "overlay_fork_json_sha256": os.environ["OVERLAY_PIN_SHA256"],
+              "tendcf_commit": os.environ["GITHUB_SHA"],
+              "runner_label": os.environ["SELECTED_RUNNER"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "macos_version": os.environ["MACOS_VERSION"],
+              "macos_build": os.environ["MACOS_BUILD"],
+              "xcode_version": os.environ["XCODE_VERSION"],
+              "macosx_deployment_target": os.environ["MACOSX_DEPLOYMENT_TARGET"],
+              "prefix": os.environ["PREFIX"],
+              "cf_agent_version": os.environ["CF_AGENT_VERSION"],
+              "macho_count": int(os.environ["MACHO_COUNT"]),
+              "max_minos": os.environ["MAX_MINOS"],
+              "bundled_libraries": bundled,
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "github_run_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              ),
+          }
+          rev_path = pathlib.Path(os.environ["PREFIX"]) / "share/tendcf/REVISION.json"
+          rev_path.write_text(json.dumps(rev, indent=2) + "\n", encoding="utf-8")
+          PY
+
+          COPYFILE_DISABLE=1 tar \
+            --no-xattrs \
+            --uid 0 --gid 0 --uname root --gname wheel \
+            -C /opt -czf "$dist_dir/$tarball" tendcf
+
+          (
+            cd "$dist_dir"
+            shasum -a 256 "$tarball" > "$sha_file"
+            shasum -a 256 -c "$sha_file"
+          )
+
+          tarball_sha256="$(awk '{print $1}' "$dist_dir/$sha_file")"
+          TARBALL="$tarball" TARBALL_SHA256="$tarball_sha256" MANIFEST_PATH="$dist_dir/$manifest_file" \
+            python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          rev_path = pathlib.Path(os.environ["PREFIX"]) / "share/tendcf/REVISION.json"
+          manifest = json.loads(rev_path.read_text(encoding="utf-8"))
+          manifest["schema"] = "tendcf-macos-fork-build/1"
+          manifest["tarball"] = os.environ["TARBALL"]
+          manifest["tarball_sha256"] = os.environ["TARBALL_SHA256"]
+          pathlib.Path(os.environ["MANIFEST_PATH"]).write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+          echo "=== sha256 ==="
+          cat "$dist_dir/$sha_file"
+          echo "=== manifest ==="
+          cat "$dist_dir/$manifest_file"
+          ls -lh "$dist_dir"
+          {
+            echo "- tarball: \`$tarball\`"
+            echo "- sha256: \`$tarball_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tendcf-fork-macos-arm64-${{ steps.pin.outputs.core }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload run.sh log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-fork-build-run-sh-log
+          path: ${{ runner.temp }}/run-sh.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload config.log on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: macos-fork-build-config-log
+          path: ${{ runner.temp }}/core/config.log
+          if-no-files-found: ignore
+          retention-days: 14
