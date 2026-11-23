@@ -5522,7 +5522,7 @@ class CheckRenderer(Base):
         self.sha_file.write_text(f"{digest}  {self.tarball.name}\n", encoding="utf-8")
 
     def tarball_args(self, *extra):
-        return self.check_args("--tarball", str(self.tarball), *extra)
+        return ["check", "--tarball", str(self.tarball), *extra]
 
     def test_full_happy_path_with_tarball_runs_every_step_live(self):
         rc, s = self.run_cmd(*self.tarball_args())
@@ -5547,7 +5547,7 @@ class CheckRenderer(Base):
         self.assertEqual(sorted(self.world.vms), [GOLDEN])
 
     def test_artifact_run_downloads_verifies_and_passes(self):
-        rc, s = self.run_cmd(*self.check_args("--artifact-run", "45093070656"))
+        rc, s = self.run_cmd("check", "--artifact-run", "45093070656")
         self.assertEqual(rc, 0, s)
         self.assertTrue(s["ok"])
         self.assertEqual(s["artifact_run"], "45093070656")
@@ -5559,10 +5559,10 @@ class CheckRenderer(Base):
 
     def test_refuses_bad_artifact_arguments_before_cloning(self):
         cases = (
-            ("both tarball and artifact-run", self.check_args("--tarball", str(self.tarball), "--artifact-run", "12345")),
-            ("sha256 without tarball", self.check_args("--sha256", str(self.sha_file))),
-            ("non-numeric artifact-run", self.check_args("--artifact-run", "abc123")),
-            ("missing tarball", self.check_args("--tarball", str(self.tmp / "missing.tar.gz"))),
+            ("both tarball and artifact-run", ["check", "--tarball", str(self.tarball), "--artifact-run", "12345"]),
+            ("sha256 without tarball", ["check", "--sha256", str(self.sha_file)]),
+            ("non-numeric artifact-run", ["check", "--artifact-run", "abc123"]),
+            ("missing tarball", ["check", "--tarball", str(self.tmp / "missing.tar.gz")]),
         )
         for name, argv in cases:
             with self.subTest(name):
@@ -5584,7 +5584,7 @@ class CheckRenderer(Base):
 
     def test_gh_download_failure_reports_error_without_cloning(self):
         self.world.gh_fail = True
-        rc, s = self.run_cmd(*self.check_args("--artifact-run", "45093070656"))
+        rc, s = self.run_cmd("check", "--artifact-run", "45093070656")
         self.assertEqual(rc, 1, s)
         self.assertEqual(self.steps(s)["error"]["status"], "fail")
         self.assertEqual(self.world.tart_calls("clone"), [])
