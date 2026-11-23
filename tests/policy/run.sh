@@ -466,6 +466,7 @@ else
 fi
 
 echo "# 5m. launchd adapter, per-domain system golden and lifecycle (C-policy-03/04/05)"
+plutil_lint() { plutil -lint "$1" >/dev/null; }
 golden_sys_dir="$repo/tests/policy/golden/launchd/system"
 for svc in com.tendcf.demo.main com.tendcf.demo.second; do
     gplist="$golden_sys_dir/$svc.plist"
@@ -486,7 +487,7 @@ assert doc["KeepAlive"] is expected_ka, f"KeepAlive={doc.get('KeepAlive')!r}"
 PYEOF
     if command -v plutil >/dev/null 2>&1; then
         check "launchd golden passes plutil -lint: system/$svc.plist" \
-            plutil -lint "$gplist" >/dev/null
+            plutil_lint "$gplist"
     else
         platform_skip "plutil not available on $(uname)" \
             "launchd golden passes plutil -lint: system/$svc.plist"
@@ -496,13 +497,18 @@ done
 # Override safety (every platform): a CMDB host_specific.json trying to preset
 # tendcf_services_apply's bundle parameters or service_ids through production
 # entry.cf (tendcf_services) must be refused and actuate nothing.
+# Note: tendcf_cmdb's own refusal lines legitimately quote the rejected key
+# name `default:tendcf_services_apply.launchctl_bin` (containing `launchctl`),
+# so no_actuation is checked against all non-crosscheck lines.
 cp "$repo/tests/policy/fixtures/cmdb-launchd-override-preset.json" "$work/data/host_specific.json"
 out="$work/launchd-override-preset.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "launchd override preset: policy completed" policy_completed "$out"
 check "launchd override preset: refusal reported" refusal_reported "$out"
 check "launchd override preset: foreign variable reported" foreign_var_reported "$out"
 check "launchd override preset: refusal reported once" refusal_once "$out"
-check "launchd override preset: nothing actuated" no_actuation "$out"
+check "launchd override preset: nothing actuated" \
+    bash -c "! grep -v '^R: tendcf: CMDB cross-check:' '$out' | grep -Eq \"Executing|Created file|launchctl|systemctl|tendcf: (service|interlock) '\""
 check "launchd override preset: no file created at preset path" test ! -e /tmp/evil-launchd
 
 if [ "$(uname)" = Darwin ]; then
@@ -627,7 +633,7 @@ EOF
         check "launchd first render: $svc.plist byte-identical to committed golden" \
             cmp -s "$golden_sys_dir/$svc.plist" "$p"
         check "launchd first render: $svc.plist passes plutil -lint" \
-            plutil -lint "$p" >/dev/null
+            plutil_lint "$p"
         check "launchd first render: $svc.plist mode is 0644" \
             bash -c "[ \"\$(stat -f '%Lp' '$p')\" = 644 ]"
         check "launchd first render: $svc.plist owner:group is $test_user:$test_group" \
