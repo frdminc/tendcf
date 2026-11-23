@@ -487,9 +487,20 @@ class FakeWorld:
         if r[:3] == ["/bin/sh", "-c", drv.STAGE_UPLOAD_SH]:
             self.stage_bundles.append(self._input_bytes)
             return drv.Result(0, self.guest_stage_dir + "\n")
-        if r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH]:
-            path = r[4]
+        if r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH] or r[:5] == [
+            "sudo",
+            "-n",
+            "/bin/sh",
+            "-c",
+            drv.TREE_CHECK_SH,
+        ]:
+            is_root = r[0] == "sudo"
+            path = r[6] if is_root else r[4]
             if path == drv.TENDCF_PREFIX:
+                if not is_root:
+                    return drv.Result(
+                        0, "", "find: /opt/tendcf/var/libntech/ppkeys: Permission denied\n"
+                    )
                 return drv.Result(0, f"{path}/bin/cf-agent\n" if self.tendcf_tree_bad else "")
             if path == f"{self.workdir}/inputs":
                 return drv.Result(0, f"{path}/promises.cf\n" if self.policy_tree_bad else "")
@@ -514,7 +525,7 @@ class FakeWorld:
             return drv.Result(1, "", "Bootstrap failed: 1: Operation not permitted\n")
         if r == ["sudo", "-n", "/usr/bin/stat", "-f", "%Su:%Sg %Lp", f"{self.workdir}/data/host_specific.json"]:
             return drv.Result(0, self.data_mode + "\n")
-        if r == ["/usr/bin/xattr", "-rs", drv.TENDCF_PREFIX]:
+        if r == ["sudo", "-n", "/usr/bin/xattr", "-rs", drv.TENDCF_PREFIX]:
             return drv.Result(
                 0,
                 f"{drv.TENDCF_PREFIX}/bin/cf-agent: com.apple.quarantine\n"
@@ -700,16 +711,30 @@ class FakeWorld:
             return drv.Result(0, "0\n")
         if r[0].endswith("python3.14"):
             return drv.Result(0, "3.14.10\n")
-        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"]:
+        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"] or r[:5] == [
+            "sudo",
+            "-n",
+            "stat",
+            "-f",
+            "%N %Su:%Sg %Lp",
+        ]:
+            paths = r[5:] if r[0] == "sudo" else r[3:]
             return drv.Result(
                 0,
                 "".join(
                     f"{p} {self.stat_overrides.get(p, FW_PYTHON_FIXED)}\n"
-                    for p in r[3:]
+                    for p in paths
                 ),
             )
-        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"]:
-            if r[3] in (drv.TENDCF_PREFIX, f"{self.workdir}/inputs"):
+        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"] or r[:5] == [
+            "sudo",
+            "-n",
+            "stat",
+            "-f",
+            "%Su:%Sg %Lp",
+        ]:
+            target_p = r[5] if r[0] == "sudo" else r[3]
+            if target_p in (drv.TENDCF_PREFIX, f"{self.workdir}/inputs"):
                 return drv.Result(0, FW_PYTHON_FIXED + "\n")
             return drv.Result(0, self.fw_owner + "\n")
         if r[:3] == ["sysctl", "-n", "kern.bootsessionuuid"]:

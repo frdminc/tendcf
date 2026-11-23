@@ -1087,22 +1087,31 @@ def ancestors_of(path: str) -> list[str]:
 
 
 def check_root_owned(
-    ctx: Ctx, t: vmssh.Target, path: str, *, tree: bool = False
+    ctx: Ctx,
+    t: vmssh.Target,
+    path: str,
+    *,
+    tree: bool = False,
+    as_root: bool = False,
 ) -> tuple[bool, str]:
     """Step 3's rule on one path; with tree=True on everything under it as well.
 
     Every ancestor up to / must also be owned by root and not group/world writable: a
     writable parent lets its owner group rename the checked directory aside and put another
     tree in its place (python.org leaves Python.framework/Versions root:admin 775).
+    as_root=True prefixes stat/find with `sudo -n` so trees containing 0700 root-only
+    subdirectories (such as /opt/tendcf/var/libntech/{ppkeys,data}) are walked without
+    Permission denied errors on stderr.
     """
-    r = rssh(ctx, t, ["stat", "-f", "%Su:%Sg %Lp", path])
+    pfx = ["sudo", "-n"] if as_root else []
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%Su:%Sg %Lp", path])
     m = re.fullmatch(r"(\S+):(\S+) ([0-7]+)", r.stdout.strip())
     if r.rc != 0 or not m:
         return False, f"stat {path} failed (rc {r.rc}): {clip(r.stderr, 200)}"
     ok = perm_ok(m[1], m[2], m[3])
     ev = f"{path} {m[1]}:{m[2]} {m[3]}"
     parents = ancestors_of(path)
-    r = rssh(ctx, t, ["stat", "-f", "%N %Su:%Sg %Lp", *parents])
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%N %Su:%Sg %Lp", *parents])
     rows = [ln.rsplit(" ", 2) for ln in r.stdout.strip().splitlines()]
     seen = {}
     for row in rows:
@@ -1129,7 +1138,7 @@ def check_root_owned(
         else f"; ancestors not root-owned or writable (rc {r.rc}): {clip(', '.join(bad_parents) or r.stderr, 300)}"
     )
     if tree:
-        r = rssh(ctx, t, ["/bin/sh", "-c", TREE_CHECK_SH, "sh", path])
+        r = rssh(ctx, t, [*pfx, "/bin/sh", "-c", TREE_CHECK_SH, "sh", path])
         offenders = r.stdout.strip()
         tree_ok = r.rc == 0 and not offenders and not r.stderr.strip()
         ok = ok and tree_ok
@@ -3316,12 +3325,12 @@ def cmd_check(ctx: Ctx, args) -> int:
                             )
                         workdir = wd
                         ok_tree, ev_tree = check_root_owned(
-                            ctx, t, TENDCF_PREFIX, tree=True
+                            ctx, t, TENDCF_PREFIX, tree=True, as_root=True
                         )
                         if not ok_tree:
                             raise StepFail(f"binary tree ownership failed: {ev_tree}")
                         ok_pol, ev_pol = check_root_owned(
-                            ctx, t, f"{workdir}/inputs", tree=True
+                            ctx, t, f"{workdir}/inputs", tree=True, as_root=True
                         )
                         if not ok_pol:
                             raise StepFail(f"policy dir ownership failed: {ev_pol}")
@@ -3341,7 +3350,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                             raise StepFail(
                                 f"CMDB data must be root:wheel 600 (rc {data_st.rc}, got {data_st.stdout.strip()!r})"
                             )
-                        q = rssh(ctx, t, ["/usr/bin/xattr", "-rs", TENDCF_PREFIX])
+                        q = rssh(
+                            ctx, t, ["sudo", "-n", "/usr/bin/xattr", "-rs", TENDCF_PREFIX]
+                        )
                         if "com.apple.quarantine" in q.stdout:
                             raise StepFail(
                                 f"com.apple.quarantine still present under {TENDCF_PREFIX}"
@@ -3448,32 +3459,38 @@ def cmd_check(ctx: Ctx, args) -> int:
                                     f"launchctl kickstart -k failed (rc {ks.rc}): "
                                     f"{clip(ks.stderr or ks.stdout, 300)}"
                                 )
-                            p2 = rssh(
-                                ctx,
-                                t,
-                                [
-                                    "sudo",
-                                    "-n",
-                                    "/bin/launchctl",
-                                    "print",
-                                    f"system/{CANARY_LABEL}",
-                                ],
-                            )
-                            if p2.rc != 0:
-                                raise StepFail(
-                                    f"launchctl print after kickstart failed (rc {p2.rc})"
+                            last_info: dict[str, object] = {}
+
+                            def restarted() -> bool:
+                                nonlocal last_info
+                                p2 = rssh(
+                                    ctx,
+                                    t,
+                                    [
+                                        "sudo",
+                                        "-n",
+                                        "/bin/launchctl",
+                                        "print",
+                                        f"system/{CANARY_LABEL}",
+                                    ],
                                 )
-                            info2 = parse_launchctl_print(p2.stdout)
-                            pid_after = info2["pid"]
-                            if (
-                                info2["state"] != "running"
-                                or not isinstance(pid_after, int)
-                                or pid_after == pid_before
-                            ):
+                                if p2.rc != 0:
+                                    return False
+                                last_info = parse_launchctl_print(p2.stdout)
+                                pid2 = last_info["pid"]
+                                return (
+                                    last_info["state"] == "running"
+                                    and isinstance(pid2, int)
+                                    and pid2 != pid_before
+                                )
+
+                            if not wait_until(ctx, restarted, 10.0, 0.5):
                                 raise StepFail(
                                     f"kickstart -k did not replace running process "
-                                    f"(before pid={pid_before}, after={info2!r})"
+                                    f"(before pid={pid_before}, after={last_info!r})"
                                 )
+                            pid_after = last_info["pid"]
+                            assert isinstance(pid_after, int)
                             canary_pid = pid_after
                             return (
                                 f"program={CANARY_PROG} args={want_args} "
@@ -3627,32 +3644,39 @@ def cmd_check(ctx: Ctx, args) -> int:
                             check_plist_perms_and_lint(
                                 ctx, t, CANARY_PLIST, check_no_backup=True
                             )
-                            p_after = rssh(
-                                ctx,
-                                t,
-                                [
-                                    "sudo",
-                                    "-n",
-                                    "/bin/launchctl",
-                                    "print",
-                                    f"system/{CANARY_LABEL}",
-                                ],
-                            )
-                            if p_after.rc != 0:
-                                raise StepFail(f"launchctl print after drift repair failed (rc {p_after.rc})")
-                            info_after = parse_launchctl_print(p_after.stdout)
-                            pid_after = info_after["pid"]
                             want_args = [CANARY_PROG, CANARY_ARG]
-                            if (
-                                info_after["arguments"] != want_args
-                                or info_after["state"] != "running"
-                                or not isinstance(pid_after, int)
-                                or pid_after == pid_before
-                            ):
+                            info_after: dict[str, object] = {}
+
+                            def reloaded() -> bool:
+                                nonlocal info_after
+                                p_after = rssh(
+                                    ctx,
+                                    t,
+                                    [
+                                        "sudo",
+                                        "-n",
+                                        "/bin/launchctl",
+                                        "print",
+                                        f"system/{CANARY_LABEL}",
+                                    ],
+                                )
+                                if p_after.rc != 0:
+                                    return False
+                                info_after = parse_launchctl_print(p_after.stdout)
+                                pid_a = info_after["pid"]
+                                return (
+                                    info_after["arguments"] == want_args
+                                    and info_after["state"] == "running"
+                                    and isinstance(pid_a, int)
+                                    and pid_a != pid_before
+                                )
+
+                            if not wait_until(ctx, reloaded, 10.0, 0.5):
                                 raise StepFail(
                                     f"drift repair did not reload repaired service "
                                     f"(before pid={pid_before}, after={info_after!r})"
                                 )
+                            pid_after = info_after["pid"]
                             return (
                                 f"drifted sha256={drifted_sha[:12]} repaired to golden; "
                                 f"reloaded pid {pid_before} -> {pid_after}; args={want_args}"
