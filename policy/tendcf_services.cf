@@ -60,6 +60,38 @@
 #     reload after removal. State probes are snapshots (see the classes
 #     section), so one run converges and the next does nothing.
 #
+# launchd adapter (darwin system domain; C-policy-03, C-policy-04, C-policy-05,
+# issue 70 steps 4, 7 and 8):
+#   - production entry point `tendcf_services` binds the adapter to literal
+#     ("/Library/LaunchDaemons", "/bin/launchctl", "root", "wheel") via
+#     `usebundle => tendcf_services_apply(...)`. No goal file, host_specific.json,
+#     def.json, environment variable or -D class can override those paths or
+#     ownership in production; only a separate policy file calling
+#     `tendcf_services_apply(...)` directly (tests/policy/run.sh's non-root
+#     harness) can pass scratch paths;
+#   - plists are rendered from templates/launchd.plist.mustache with mode 0644,
+#     root:wheel ownership and edit_defaults => tendcf_no_backup (no
+#     `.cf-before-edit` backup left in /Library/LaunchDaemons; C-policy-05);
+#   - loaded-state probe is `launchctl print system/<label>` via returnszero()
+#     (cached pre-run snapshot). launchctl(1) EXIT STATUS defines only 0
+#     (success) vs non-zero (an error code decodable by `launchctl error`, not
+#     a closed per-subcommand table), and `print` warns its output is NOT API;
+#     empirically macOS returns 113 ("Could not find specified service") when
+#     unloaded. We classify solely by exit 0 vs non-zero and never parse output;
+#   - actuation (C-policy-03): bootstrap when not loaded; bootout
+#     `system/<label>` then bootstrap only when the files promise repaired the
+#     plist; nothing when unchanged and loaded; failed render or failed bootout
+#     halts later steps and reports;
+#   - tombstone gate (C-policy-04): requires explicit `state == "absent"`, a
+#     valid launchd label id, and `isplain` (regular file only — symlinks,
+#     dangling links and directories are refused and reported with no launchctl
+#     call). When loaded, `bootout system/<label>` runs first and delete runs in
+#     pass 2 only if bootout exits 0; when already absent on disk, nothing runs.
+#     Limit: `isplain` does not distinguish a tendcf-rendered regular plist from
+#     a third-party regular plist; enforcing unit-writer prefix ownership
+#     on-device requires tendcf-validate before projection (projecting
+#     unit-writer would reverse P-1).
+#
 # CMDB cross-check (`tendcf_cmdb`, proposal 2026-11-03 section 13, option 3,
 # operator ruling Q10 2026-11-02). Everything above assumes CFEngine's loader
 # installed what host_specific.json says. Nothing promises that for every
@@ -604,9 +636,27 @@ bundle agent tendcf_interlocks
 
 bundle agent tendcf_services
 {
+  methods:
+      # Production entry point: binds the launchd adapter to its fixed system
+      # paths and ownership as literal bundle arguments. No goal file, CMDB
+      # projection (host_specific.json), augments file (def.json), environment
+      # variable or -D class can override them. Only a separate policy file
+      # (tests/policy/run.sh's non-root harness) that calls
+      # tendcf_services_apply(...) directly can supply scratch paths.
+      "services"
+        usebundle => tendcf_services_apply("/Library/LaunchDaemons",
+                                           "/bin/launchctl",
+                                           "root",
+                                           "wheel"),
+        ifvarclass => "!tendcf_cmdb_refused";
+}
+
+bundle agent tendcf_services_apply(launchd_dir, launchctl_bin, launchd_owner, launchd_group)
+{
   vars:
       # Empty under a CMDB mismatch, see tendcf_interlocks and `tendcf_cmdb`
-      # (set explicitly for the same reason as there).
+      # (set explicitly for the same reason as there, so even a direct call to
+      # tendcf_services_apply fails closed under tendcf_cmdb_refused).
       "service_ids"
         slist => getindices("data:variables.tendcf_service"),
         ifvarclass => "!tendcf_cmdb_refused";
@@ -654,6 +704,10 @@ bundle agent tendcf_services
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
                               "present");
 
+      "service_$(service_canon[$(service_ids)])_absent"
+        expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
+                              "absent");
+
       # Bundle-scoped blast radius: named by the interlock's OWN bundle
       # tag, not by which service references it, so N interlocks sharing
       # one tag OR together with no join against the service list.
@@ -672,6 +726,27 @@ bundle agent tendcf_services
       # and handed to a launchctl that is not there). A later adapter adds
       # its own `service_*_supported` disjunct; nothing here is removed.
       #
+      # launchd host guard: darwin with an absolute, real (non-symlink) daemon
+      # directory and an absolute, executable launchctl binary. Operand order
+      # is load-bearing (same reason as systemd below).
+      "tendcf_launchd_dir_abs"
+        expression => regcmp("/.*", "$(launchd_dir)");
+
+      "tendcf_launchd_dir_ok"
+        expression => isdir("$(launchd_dir)");
+
+      "tendcf_launchd_dir_link"
+        expression => islink("$(launchd_dir)");
+
+      "tendcf_launchctl_abs"
+        expression => regcmp("/.*", "$(launchctl_bin)");
+
+      "tendcf_launchctl_exec"
+        expression => isexecutable("$(launchctl_bin)");
+
+      "tendcf_launchd_host"
+        expression => "darwin.tendcf_launchd_dir_abs.tendcf_launchd_dir_ok.!tendcf_launchd_dir_link.tendcf_launchctl_abs.tendcf_launchctl_exec";
+
       # "Booted by systemd" is sd_booted(3): /run/systemd/system is a
       # directory. A Linux container or chroot without it has a systemctl
       # binary that cannot reach a manager, so it counts as no host.
@@ -707,17 +782,29 @@ bundle agent tendcf_services
       "tendcf_systemd_host"
         expression => "linux.tendcf_systemd_booted.tendcf_systemd_units_writable";
 
+      # Re-enforce the schema's service-id alphabet (goal-file.schema.json
+      # $defs/service_map propertyNames: ^[A-Za-z0-9][A-Za-z0-9@._-]*$, <=128)
+      # on the launchd path so a projection that skipped the schema cannot
+      # traverse out of launchd_dir (via `/`) or inject spaces/quotes into
+      # the returnszero() probe command string.
+      "service_$(service_canon[$(service_ids)])_launchd_id_valid"
+        expression => and(regcmp("[A-Za-z0-9][A-Za-z0-9@._-]*", "$(service_ids)"),
+                          islessthan(string_length("$(service_ids)"), 129));
+
       "service_$(service_canon[$(service_ids)])_launchd"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "launchd");
 
       "service_$(service_canon[$(service_ids)])_systemd"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "systemd");
 
+      "service_$(service_canon[$(service_ids)])_launchd_supported"
+        expression => "service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.tendcf_launchd_host";
+
       "service_$(service_canon[$(service_ids)])_systemd_supported"
         expression => "service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_host";
 
       "service_$(service_canon[$(service_ids)])_supported"
-        expression => "service_$(service_canon[$(service_ids)])_launchd.darwin|service_$(service_canon[$(service_ids)])_systemd_supported";
+        expression => "service_$(service_canon[$(service_ids)])_launchd_supported|service_$(service_canon[$(service_ids)])_systemd_supported";
 
       "service_$(service_canon[$(service_ids)])_refused"
         expression => "service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_supported";
@@ -728,12 +815,70 @@ bundle agent tendcf_services
       "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"
         expression => "tendcf_systemd_units_elsewhere.!service_$(service_canon[$(service_ids)])_present";
 
+      # launchd path-type snapshot (C-policy-04, plus symlink safety on
+      # present): `isplain` is true only for a regular file and does not
+      # follow symlinks. Evaluated only on a valid launchd host and valid id.
+      "service_$(service_canon[$(service_ids)])_plist_plain"
+        expression => isplain("$(launchd_dir)/$(service_ids).plist"),
+        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid";
+
+      "service_$(service_canon[$(service_ids)])_plist_exists"
+        expression => fileexists("$(launchd_dir)/$(service_ids).plist"),
+        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid";
+
+      "service_$(service_canon[$(service_ids)])_plist_linked"
+        expression => islink("$(launchd_dir)/$(service_ids).plist"),
+        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid";
+
+      "service_$(service_canon[$(service_ids)])_plist_nonregular"
+        expression => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.(service_$(service_canon[$(service_ids)])_plist_exists|service_$(service_canon[$(service_ids)])_plist_linked).!service_$(service_canon[$(service_ids)])_plist_plain";
+
+      # launchd present actuation gate: flavour+host+id match, interlock bundle
+      # met, and target path is either absent or a regular file (never a
+      # symlink or directory).
+      "service_$(service_canon[$(service_ids)])_launchd_go"
+        expression => "service_$(service_canon[$(service_ids)])_launchd_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).!service_$(service_canon[$(service_ids)])_plist_nonregular";
+
+      "service_$(service_canon[$(service_ids)])_launchd_present_nonregular"
+        expression => "service_$(service_canon[$(service_ids)])_launchd_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).service_$(service_canon[$(service_ids)])_plist_nonregular";
+
+      # launchd tombstone gate (C-policy-04): explicit state == "absent", valid
+      # label id, and a regular plist file at launchd_dir/<id>.plist. Symlinks
+      # (Homebrew, nix-darwin, vendor links), dangling links and directories
+      # are refused and reported with no launchctl call; absent paths are a
+      # silent no-op. Same caveat as systemd below: `isplain` does not prove
+      # tendcf wrote the regular file; unit-writer prefix ownership is checked
+      # by lint/validator before projection.
+      "service_$(service_canon[$(service_ids)])_launchd_teardown"
+        expression => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.service_$(service_canon[$(service_ids)])_plist_plain";
+
+      "service_$(service_canon[$(service_ids)])_launchd_teardown_refused"
+        expression => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.service_$(service_canon[$(service_ids)])_plist_nonregular";
+
+      "service_$(service_canon[$(service_ids)])_launchd_tombstone_bad_id"
+        expression => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_launchd_id_valid";
+
+      # Pre-run snapshot of whether launchd has this label loaded in the system
+      # domain (C-policy-03). returnszero() is cached for the whole run (same
+      # idiom as systemd below), so pass 2 keeps the pre-run state and never
+      # re-triggers a reload after bootstrap.
+      #
+      # launchctl(1) EXIT STATUS defines only 0 (success) vs non-zero (error
+      # code decodable via `launchctl error <code>`); `print` explicitly warns
+      # its output is NOT API. Empirically macOS returns 113 ("Could not find
+      # specified service") when unloaded. We classify strictly on exit 0 vs
+      # non-zero and never parse stdout/stderr.
+      "service_$(service_canon[$(service_ids)])_launchd_loaded"
+        expression => returnszero("$(launchctl_bin) print system/$(service_ids)", "noshell"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go|service_$(service_canon[$(service_ids)])_launchd_teardown";
+
       # systemd actuation gate: the entry's own interlock bundle is met.
       "service_$(service_canon[$(service_ids)])_systemd_go"
         expression => "service_$(service_canon[$(service_ids)])_systemd_supported.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
 
       # `enabled` is the boot symlink (systemctl enable/disable); a present
-      # service is started either way, as launchd's load -w starts it.
+      # service is started either way, as launchd's bootstrap starts it when
+      # RunAtLoad is true.
       "service_$(service_canon[$(service_ids)])_enabled"
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][unit][systemd][enabled])", "true");
 
@@ -787,13 +932,23 @@ bundle agent tendcf_services
         expression => "tendcf_systemd_host.!service_$(service_canon[$(service_ids)])_present.(service_$(service_canon[$(service_ids)])_unit_exists|service_$(service_canon[$(service_ids)])_unit_linked).!service_$(service_canon[$(service_ids)])_unit_plain";
 
   files:
-      "/Library/LaunchDaemons/$(service_ids).plist"
+      # launchd plist render (C-policy-05, C-policy-03): mode 0644, root:wheel
+      # in production, no `.cf-before-edit` backup left in /Library/LaunchDaemons,
+      # and outcome classes so bootout+bootstrap runs only on repair and nothing
+      # runs if rendering or setting permissions fails.
+      "$(launchd_dir)/$(service_ids).plist"
         create => "true",
+        perms => tendcf_plist_perms("$(launchd_owner)", "$(launchd_group)"),
+        edit_defaults => tendcf_no_backup,
         edit_template => "$(this.promise_dirname)/templates/launchd.plist.mustache",
         template_method => "mustache",
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)"}'),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd.darwin.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+        classes => tendcf_plist_rendered(
+          "service_$(service_canon[$(service_ids)])_plist_changed",
+          "service_$(service_canon[$(service_ids)])_plist_ready",
+          "service_$(service_canon[$(service_ids)])_plist_failed"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go";
 
       "/etc/systemd/system/$(service_ids)"
         create => "true",
@@ -806,15 +961,15 @@ bundle agent tendcf_services
         classes => tendcf_unit_rendered("service_$(service_canon[$(service_ids)])_unit_changed"),
         ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go";
 
-      # A tombstone names no flavour; the launchd adapter owns its cleanup
-      # on darwin and nothing can exist to clean elsewhere. This path has no
-      # existence or type gate, by design: a plist is a plain file whoever
-      # wrote it, so `isplain` would not tell ours from another writer's. Its
-      # only guard is the lint (a tombstone must fall under a cfengine
-      # unit-writer prefix; schema_lint.py, cases 129-131).
-      "/Library/LaunchDaemons/$(service_ids).plist"
-        delete => tendcf_tidy,
-        ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
+      # launchd tombstone delete (C-policy-04): gated on a regular plist file
+      # (`_launchd_teardown`). When loaded, removal waits for pass 2 after
+      # `launchctl bootout system/<label>` exits 0 (`_launchd_torn_down`);
+      # when not loaded, the stale regular plist is removed directly. If
+      # bootout fails, `_launchd_torn_down` stays undefined and the plist is
+      # left on disk.
+      "$(launchd_dir)/$(service_ids).plist"
+        delete => tendcf_file_delete,
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_teardown.(!service_$(service_canon[$(service_ids)])_launchd_loaded|service_$(service_canon[$(service_ids)])_launchd_torn_down)";
 
       # Removal waits for the teardown command below (pass 2), because
       # `systemctl disable` needs the unit file still in place.
@@ -824,13 +979,42 @@ bundle agent tendcf_services
         ifvarclass => "service_$(service_canon[$(service_ids)])_torn_down";
 
   commands:
-      "/bin/launchctl"
-        arglist => { "load", "-w", "/Library/LaunchDaemons/$(service_ids).plist" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd.darwin.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+      # launchd (C-policy-03). The files section ran first in this pass, so a
+      # rendered plist is on disk with 0644 and expected ownership before
+      # launchd is called. Only exit 0 is treated as success (launchctl(1)
+      # EXIT STATUS).
+      #
+      # 1. Reload on drift/repair: already loaded AND plist was repaired ->
+      #    bootout system/<label> first; bootstrap below runs only if bootout
+      #    exits 0.
+      "$(launchctl_bin)"
+        arglist => { "bootout", "system/$(service_ids)" },
+        contain => tendcf_noshell,
+        classes => tendcf_launchd_cmd(
+          "service_$(service_canon[$(service_ids)])_launchd_booted_out",
+          "service_$(service_canon[$(service_ids)])_launchd_bootout_failed"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.service_$(service_canon[$(service_ids)])_plist_ready.!service_$(service_canon[$(service_ids)])_plist_failed.service_$(service_canon[$(service_ids)])_launchd_loaded.service_$(service_canon[$(service_ids)])_plist_changed.!service_$(service_canon[$(service_ids)])_launchd_booted_out.!service_$(service_canon[$(service_ids)])_launchd_bootout_failed";
 
-      "/bin/launchctl"
-        arglist => { "unload", "/Library/LaunchDaemons/$(service_ids).plist" },
-        ifvarclass => "darwin.!service_$(service_canon[$(service_ids)])_present";
+      # 2. Load: not loaded before the run, OR just booted out after a repair.
+      #    When unchanged and loaded, neither condition holds and no write
+      #    launchctl call runs.
+      "$(launchctl_bin)"
+        arglist => { "bootstrap", "system", "$(launchd_dir)/$(service_ids).plist" },
+        contain => tendcf_noshell,
+        classes => tendcf_launchd_cmd(
+          "service_$(service_canon[$(service_ids)])_launchd_bootstrapped",
+          "service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.service_$(service_canon[$(service_ids)])_plist_ready.!service_$(service_canon[$(service_ids)])_plist_failed.(!service_$(service_canon[$(service_ids)])_launchd_loaded|service_$(service_canon[$(service_ids)])_launchd_booted_out).!service_$(service_canon[$(service_ids)])_launchd_bootstrapped.!service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed";
+
+      # 3. Tombstone teardown (C-policy-04): regular plist exists and job is
+      #    loaded -> bootout first; pass 2 deletes the plist only on exit 0.
+      "$(launchctl_bin)"
+        arglist => { "bootout", "system/$(service_ids)" },
+        contain => tendcf_noshell,
+        classes => tendcf_launchd_cmd(
+          "service_$(service_canon[$(service_ids)])_launchd_torn_down",
+          "service_$(service_canon[$(service_ids)])_launchd_teardown_failed"),
+        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_teardown.service_$(service_canon[$(service_ids)])_launchd_loaded.!service_$(service_canon[$(service_ids)])_launchd_torn_down.!service_$(service_canon[$(service_ids)])_launchd_teardown_failed";
 
       # systemd. The files section ran first in this pass, so a rendered
       # unit is on disk before the manager is told about it.
@@ -870,17 +1054,49 @@ bundle agent tendcf_services
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
         "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
 
-      "service_$(service_canon[$(service_ids)])_refused.!(service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere)"::
+      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.!service_$(service_canon[$(service_ids)])_launchd_id_valid"::
+        "tendcf: launchd service refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
+
+      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.!tendcf_launchd_host"::
+        "tendcf: service '$(service_ids)' refused: $(launchd_dir) is not a real directory or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
+
+      "service_$(service_canon[$(service_ids)])_refused.!(service_$(service_canon[$(service_ids)])_launchd.!service_$(service_canon[$(service_ids)])_launchd_id_valid).!(service_$(service_canon[$(service_ids)])_launchd.darwin.!tendcf_launchd_host).!(service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere)"::
         "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 
       "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere"::
         "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
+
+      "service_$(service_canon[$(service_ids)])_launchd_present_nonregular"::
+        "tendcf: service '$(service_ids)' refused: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter writes only a regular plist";
+
+      "service_$(service_canon[$(service_ids)])_plist_failed"::
+        "tendcf: service '$(service_ids)' failed: could not render or set permissions on $(launchd_dir)/$(service_ids).plist; launchctl not run";
+
+      "service_$(service_canon[$(service_ids)])_launchd_bootout_failed"::
+        "tendcf: service '$(service_ids)' failed: launchctl bootout system/$(service_ids) exited non-zero; bootstrap not run";
+
+      "service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed"::
+        "tendcf: service '$(service_ids)' failed: launchctl bootstrap system $(launchd_dir)/$(service_ids).plist exited non-zero";
+
+      "service_$(service_canon[$(service_ids)])_launchd_teardown_refused"::
+        "tendcf: service '$(service_ids)' tombstone not actuated: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter removes only a file it could have rendered";
+
+      "service_$(service_canon[$(service_ids)])_launchd_teardown_failed"::
+        "tendcf: service '$(service_ids)' tombstone failed: launchctl bootout system/$(service_ids) exited non-zero; plist left in place";
+
+      "service_$(service_canon[$(service_ids)])_launchd_tombstone_bad_id"::
+        "tendcf: launchd tombstone refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
 
       "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"::
         "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
 
       "service_$(service_canon[$(service_ids)])_teardown_refused"::
         "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system/$(service_ids) is not a regular file (an alias, mask, dangling link or directory); this adapter removes only a file it could have rendered";
+}
+
+body contain tendcf_noshell
+{
+      useshell => "noshell";
 }
 
 body contain tendcf_interlock_contain(timeout)
@@ -899,10 +1115,39 @@ body edit_defaults tendcf_no_backup
       edit_backup => "false";
 }
 
+body perms tendcf_plist_perms(owner, group)
+{
+      mode   => "0644";
+      owners => { "$(owner)" };
+      groups => { "$(group)" };
+      rxdirs => "false";
+}
+
 body perms tendcf_unit_perms
 {
       mode => "0644";
       rxdirs => "false";
+}
+
+body classes tendcf_plist_rendered(changed_class, ready_class, failed_class)
+{
+      scope            => "bundle";
+      promise_kept     => { "$(ready_class)" };
+      promise_repaired => { "$(changed_class)", "$(ready_class)" };
+      repair_failed    => { "$(failed_class)" };
+      repair_denied    => { "$(failed_class)" };
+      repair_timeout   => { "$(failed_class)" };
+      cancel_notkept   => { "$(ready_class)" };
+}
+
+body classes tendcf_launchd_cmd(ok_class, fail_class)
+{
+      scope                => "bundle";
+      repaired_returncodes => { "0" };
+      promise_repaired     => { "$(ok_class)" };
+      repair_failed        => { "$(fail_class)" };
+      repair_denied        => { "$(fail_class)" };
+      repair_timeout       => { "$(fail_class)" };
 }
 
 body classes tendcf_unit_rendered(class)
@@ -924,6 +1169,12 @@ body classes tendcf_command_done(class)
       repaired_returncodes => { "0" };
       promise_kept         => { "$(class)" };
       promise_repaired     => { "$(class)" };
+}
+
+body delete tendcf_file_delete
+{
+      dirlinks => "keep";
+      rmdirs   => "false";
 }
 
 body delete tendcf_tidy

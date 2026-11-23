@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Generic-bundle tests for policy/tendcf_services.cf against a real cf-agent.
 #
-# Nothing here touches launchd or /Library/LaunchDaemons. Two kinds of
+# Nothing here touches real launchd (/bin/launchctl) or /Library/LaunchDaemons:
+# check 5m exercises the darwin launchd adapter against a scratch directory and
+# an argv-recording launchctl stub without root. Two kinds of
 # assertion hold only with the pinned fork's all-or-nothing, strict-parse loader
 # (overlay/fork.json), and go through fork_only():
 #   - loader assertions: its log strings, the duplicate-variable message, "this
@@ -70,8 +72,27 @@
 #      two present launchd services. launchd exists only on darwin, so a
 #      Linux host must refuse both, write nothing under /Library and run no
 #      launchctl. This is the wrong-platform actuation the Opus review
-#      ranked highest (F1). Skipped on Darwin, where the same fixture is the
-#      real render path and needs root.
+#      ranked highest (F1). On Darwin this prints an explicit counted SKIP.
+#  5m. launchd adapter, per-domain system golden and lifecycle (C-policy-03,
+#      C-policy-04, C-policy-05, issue 70 steps 4, 7 and 8): cross-platform
+#      checks validate the committed per-domain golden plists
+#      (tests/policy/golden/launchd/system/<id>.plist) with Python plistlib,
+#      run `plutil -lint` where plutil exists (explicit counted SKIP where not),
+#      and prove that a CMDB preset targeting tendcf_services_apply's override
+#      parameters is refused on every host. On Darwin, a non-root harness
+#      invokes tendcf_services_apply() against a scratch daemon directory and
+#      an argv-recording launchctl stub (never touching /Library or real
+#      /bin/launchctl) for: first render (byte-identical to golden, plutil
+#      -lint, mode 0644, no .cf-before-edit backup, bootstrap), unchanged
+#      re-run (plist hash unchanged, zero launchctl write calls), one-key drift
+#      (repaired to golden, no backup, bootout then bootstrap for drifted
+#      service only), perms drift (0600 -> 0644, reload), failed bootout and
+#      failed bootstrap (fail-closed, reported), present symlink refusal,
+#      tombstone (bootout strictly before delete, second run zero launchctl
+#      calls, failed bootout keeps plist, unloaded regular plist deleted,
+#      C-policy-04 non-regular files refused with zero launchctl calls),
+#      bad-id refusal, and CMDB refusal on direct tendcf_services_apply calls.
+#      On non-Darwin the darwin lifecycle checks print explicit counted SKIPs.
 #   6. systemd adapter, enforce mode. Where the host is not booted by
 #      systemd (Darwin, a container), a systemd entry must be refused and
 #      nothing run. On a systemd host the full lifecycle runs against the
@@ -257,10 +278,15 @@ check() {  # check NAME COND...
 # into a failure, so CI cannot pass by skipping.
 fork_loader=unknown
 skipped=0
+platform_skipped=0
 fork_only() {  # fork_only NAME COND...
     if [ "$fork_loader" = 1 ]; then check "$@"; return 0; fi
     echo "SKIP (loader not all-or-nothing): $1"
     skipped=$((skipped + 1))
+}
+platform_skip() {  # platform_skip REASON NAME
+    echo "SKIP ($1): $2"
+    platform_skipped=$((platform_skipped + 1))
 }
 
 # The cross-check's report. "refusing to actuate anything" is the summary line
@@ -434,7 +460,369 @@ if [ "$(uname)" != Darwin ]; then
     check "no launchctl invocation" \
         bash -c "! grep -q launchctl '$out'"
 else
-    echo "# 5. host guard: skipped on Darwin (launchd fixture is the real render path there)"
+    echo "# 5. host guard: non-Darwin launchd refusal"
+    platform_skip "host is Darwin; launchd is native here" \
+        "host guard: launchd entries refused on non-Darwin"
+fi
+
+echo "# 5m. launchd adapter, per-domain system golden and lifecycle (C-policy-03/04/05)"
+golden_sys_dir="$repo/tests/policy/golden/launchd/system"
+for svc in com.tendcf.demo.main com.tendcf.demo.second; do
+    gplist="$golden_sys_dir/$svc.plist"
+    check "launchd golden exists: system/$svc.plist" test -f "$gplist"
+    check "launchd golden parses as valid plist (plistlib): system/$svc.plist" \
+        python3 - "$gplist" "$svc" <<'PYEOF'
+import plistlib, sys
+path, svc = sys.argv[1], sys.argv[2]
+with open(path, "rb") as f:
+    doc = plistlib.load(f)
+assert doc["Label"] == svc, f"Label={doc.get('Label')!r}"
+assert isinstance(doc["ProgramArguments"], list) and len(doc["ProgramArguments"]) == 2
+assert doc["UserName"] == "nobody"
+assert doc["WorkingDirectory"] == "/"
+assert doc["RunAtLoad"] is True
+expected_ka = (svc == "com.tendcf.demo.main")
+assert doc["KeepAlive"] is expected_ka, f"KeepAlive={doc.get('KeepAlive')!r}"
+PYEOF
+    if command -v plutil >/dev/null 2>&1; then
+        check "launchd golden passes plutil -lint: system/$svc.plist" \
+            plutil -lint "$gplist" >/dev/null
+    else
+        platform_skip "plutil not available on $(uname)" \
+            "launchd golden passes plutil -lint: system/$svc.plist"
+    fi
+done
+
+# Override safety (every platform): a CMDB host_specific.json trying to preset
+# tendcf_services_apply's bundle parameters or service_ids through production
+# entry.cf (tendcf_services) must be refused and actuate nothing.
+cp "$repo/tests/policy/fixtures/cmdb-launchd-override-preset.json" "$work/data/host_specific.json"
+out="$work/launchd-override-preset.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "launchd override preset: refusal reported" refusal_reported "$out"
+check "launchd override preset: foreign variable reported" foreign_var_reported "$out"
+check "launchd override preset: refusal reported once" refusal_once "$out"
+check "launchd override preset: nothing actuated" no_actuation "$out"
+check "launchd override preset: no file created at preset path" test ! -e /tmp/evil-launchd
+
+if [ "$(uname)" = Darwin ]; then
+    launchd_daemons="$work/launchd-daemons"
+    launchctl_state="$work/launchd-loaded"
+    launchctl_log="$work/launchctl.log"
+    launchctl_mode="$work/launchctl.mode"
+    launchctl_stub="$work/launchctl-stub"
+    mkdir -p "$launchd_daemons" "$launchctl_state"
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    {
+        printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+        printf 'log=%q\nstate=%q\ndaemons=%q\nmode_file=%q\n' \
+            "$launchctl_log" "$launchctl_state" "$launchd_daemons" "$launchctl_mode"
+        cat <<'STUBEOF'
+if [ $# -gt 0 ]; then
+    printf '%s' "$1" >> "$log"
+    for arg in "${@:2}"; do
+        printf '\t%s' "$arg" >> "$log"
+    done
+    printf '\n' >> "$log"
+fi
+mode="normal"
+if [ -f "$mode_file" ]; then
+    mode="$(cat "$mode_file")"
+fi
+sub="${1:-}"
+case "$sub" in
+    print)
+        target="${2:-}"
+        case "$target" in
+            system/*) label="${target#system/}" ;;
+            *) exit 64 ;;
+        esac
+        if [ -f "$state/$label" ]; then exit 0; else exit 113; fi
+        ;;
+    bootstrap)
+        [ "${2:-}" = "system" ] || exit 64
+        plist="${3:-}"
+        [ -f "$plist" ] || exit 2
+        if [ "$mode" = "fail-bootstrap" ]; then exit 5; fi
+        label="$(basename "$plist" .plist)"
+        : > "$state/$label"
+        exit 0
+        ;;
+    bootout)
+        target="${2:-}"
+        case "$target" in
+            system/*) label="${target#system/}" ;;
+            *) exit 64 ;;
+        esac
+        if [ "$mode" = "fail-bootout" ]; then exit 5; fi
+        if [ -f "$daemons/$label.plist" ]; then
+            : > "$state/$label.had_plist"
+        fi
+        rm -f "$state/$label"
+        exit 0
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+STUBEOF
+    } > "$launchctl_stub"
+    chmod 700 "$launchctl_stub"
+
+    test_user="$(id -un)"
+    test_group="$(id -gn)"
+    cat > "$work/inputs/launchd-harness.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_harness", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_harness
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group");
+}
+EOF
+    cat > "$work/inputs/launchd-sim-harness.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/tests/policy/sim-loader.cf", "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_harness", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_harness
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group");
+}
+EOF
+
+    launchd_run() {  # launchd_run FIXTURE OUT [MODE]
+        local fx="$1" outf="$2" mode="${3:-normal}"
+        : > "$launchctl_log"
+        printf '%s\n' "$mode" > "$launchctl_mode"
+        cp "$repo/tests/policy/fixtures/$fx" "$work/data/host_specific.json"
+        "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$outf" 2>&1 || true
+    }
+
+    # 5m.0 Direct tendcf_services_apply fails closed under tendcf_cmdb_refused.
+    : > "$launchctl_log"
+    cp "$repo/tests/policy/fixtures/launchd-present.json" "$work/data/host_specific.json"
+    "$cf_agent" -K -I --no-host-specific-data -D sim_service -f "$work/inputs/launchd-sim-harness.cf" >"$work/launchd-sim-refused.out" 2>&1 || true
+    check "launchd direct apply under CMDB refusal: reported" refusal_reported "$work/launchd-sim-refused.out"
+    check "launchd direct apply under CMDB refusal: no plist rendered" test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
+    check "launchd direct apply under CMDB refusal: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # 5m.1 First render (unloaded -> render, perms 0644, no backup, golden match, plutil, bootstrap).
+    launchd_run launchd-present.json "$work/launchd-first.out"
+    check "launchd first render: policy completed" policy_completed "$work/launchd-first.out"
+    for svc in com.tendcf.demo.main com.tendcf.demo.second; do
+        p="$launchd_daemons/$svc.plist"
+        if [ -n "${TENDCF_DUMP_LAUNCHD_PLISTS_DIR:-}" ] && [ -f "$p" ]; then
+            mkdir -p "$TENDCF_DUMP_LAUNCHD_PLISTS_DIR"
+            cp "$p" "$TENDCF_DUMP_LAUNCHD_PLISTS_DIR/$svc.plist"
+        fi
+        check "launchd first render: $svc.plist byte-identical to committed golden" \
+            cmp -s "$golden_sys_dir/$svc.plist" "$p"
+        check "launchd first render: $svc.plist passes plutil -lint" \
+            plutil -lint "$p" >/dev/null
+        check "launchd first render: $svc.plist mode is 0644" \
+            bash -c "[ \"\$(stat -f '%Lp' '$p')\" = 644 ]"
+        check "launchd first render: $svc.plist owner:group is $test_user:$test_group" \
+            bash -c "[ \"\$(stat -f '%Su:%Sg' '$p')\" = '$test_user:$test_group' ]"
+        check "launchd first render: probed via launchctl print system/$svc" \
+            grep -qxF "$(printf 'print\tsystem/%s' "$svc")" "$launchctl_log"
+        check "launchd first render: bootstrapped via launchctl bootstrap system $svc.plist" \
+            grep -qxF "$(printf 'bootstrap\tsystem\t%s' "$p")" "$launchctl_log"
+    done
+    check "launchd first render: no bootout call on initial load" \
+        bash -c "! grep -q '^bootout' '$launchctl_log'"
+    check "launchd first render: no .cf-before-edit backup left" \
+        bash -c "[ -z \"\$(find '$launchd_daemons' -name '*.cf-before-edit')\" ]"
+
+    # 5m.2 Unchanged re-run (loaded, unchanged -> hash unchanged, zero launchctl write calls).
+    hash_main_1="$(shasum -a 256 "$launchd_daemons/com.tendcf.demo.main.plist" | awk '{print $1}')"
+    hash_second_1="$(shasum -a 256 "$launchd_daemons/com.tendcf.demo.second.plist" | awk '{print $1}')"
+    launchd_run launchd-present.json "$work/launchd-unchanged.out"
+    hash_main_2="$(shasum -a 256 "$launchd_daemons/com.tendcf.demo.main.plist" | awk '{print $1}')"
+    hash_second_2="$(shasum -a 256 "$launchd_daemons/com.tendcf.demo.second.plist" | awk '{print $1}')"
+    check "launchd unchanged re-run: main plist hash unchanged" test "$hash_main_1" = "$hash_main_2"
+    check "launchd unchanged re-run: second plist hash unchanged" test "$hash_second_1" = "$hash_second_2"
+    check "launchd unchanged re-run: print probe ran for main" \
+        grep -qxF "$(printf 'print\tsystem/com.tendcf.demo.main')" "$launchctl_log"
+    check "launchd unchanged re-run: zero launchctl write calls (no bootstrap or bootout)" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)\b' '$launchctl_log'"
+    check "launchd unchanged re-run: no .cf-before-edit backup left" \
+        bash -c "[ -z \"\$(find '$launchd_daemons' -name '*.cf-before-edit')\" ]"
+
+    # 5m.3 One-key drift on main only -> main repaired to golden, no backup, bootout before bootstrap; second untouched.
+    python3 - "$launchd_daemons/com.tendcf.demo.main.plist" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+assert "<string>1</string>" in txt
+p.write_text(txt.replace("<string>1</string>", "<string>99</string>", 1))
+PYEOF
+    launchd_run launchd-present.json "$work/launchd-drift.out"
+    check "launchd one-key drift: main repaired byte-identical to golden" \
+        cmp -s "$golden_sys_dir/com.tendcf.demo.main.plist" "$launchd_daemons/com.tendcf.demo.main.plist"
+    check "launchd one-key drift: no .cf-before-edit backup left" \
+        bash -c "[ -z \"\$(find '$launchd_daemons' -name '*.cf-before-edit')\" ]"
+    check "launchd one-key drift: main bootout ran strictly before bootstrap" \
+        python3 - "$launchctl_log" "$launchd_daemons/com.tendcf.demo.main.plist" <<'PYEOF'
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+bo = "bootout\tsystem/com.tendcf.demo.main"
+bs = f"bootstrap\tsystem\t{sys.argv[2]}"
+assert lines.count(bo) == 1, f"bootout count != 1: {lines}"
+assert lines.count(bs) == 1, f"bootstrap count != 1: {lines}"
+assert lines.index(bo) < lines.index(bs), f"bootout not before bootstrap: {lines}"
+PYEOF
+    check "launchd one-key drift: untouched sibling second got no bootout or bootstrap" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)\t.*com\.tendcf\.demo\.second' '$launchctl_log'"
+
+    # 5m.4 Perms drift (0600 -> repaired to 0644, reloaded, no backup).
+    chmod 0600 "$launchd_daemons/com.tendcf.demo.main.plist"
+    launchd_run launchd-present.json "$work/launchd-perms.out"
+    check "launchd perms drift: mode repaired to 0644" \
+        bash -c "[ \"\$(stat -f '%Lp' '$launchd_daemons/com.tendcf.demo.main.plist')\" = 644 ]"
+    check "launchd perms drift: bootout + bootstrap ran for main" \
+        python3 - "$launchctl_log" "$launchd_daemons/com.tendcf.demo.main.plist" <<'PYEOF'
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+bo = "bootout\tsystem/com.tendcf.demo.main"
+bs = f"bootstrap\tsystem\t{sys.argv[2]}"
+assert bo in lines and bs in lines and lines.index(bo) < lines.index(bs), lines
+PYEOF
+    check "launchd perms drift: no .cf-before-edit backup left" \
+        bash -c "[ -z \"\$(find '$launchd_daemons' -name '*.cf-before-edit')\" ]"
+
+    launchd_log_count() {  # launchd_log_count EXACT-LINE EXPECTED-COUNT
+        local c
+        c="$(grep -cxF "$1" "$launchctl_log" || true)"
+        [ "$c" = "$2" ]
+    }
+
+    # 5m.5 Failed bootout on drift -> fail-closed (no bootstrap, failure reported).
+    python3 - "$launchd_daemons/com.tendcf.demo.main.plist" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+p.write_text(p.read_text().replace("<string>1</string>", "<string>77</string>", 1))
+PYEOF
+    launchd_run launchd-present.json "$work/launchd-fail-bootout.out" fail-bootout
+    check "launchd failed bootout: failure reported" \
+        grep -q "tendcf: service 'com.tendcf.demo.main' failed: launchctl bootout system/com.tendcf.demo.main exited non-zero; bootstrap not run" "$work/launchd-fail-bootout.out"
+    check "launchd failed bootout: bootout attempted once" \
+        launchd_log_count "$(printf 'bootout\tsystem/com.tendcf.demo.main')" 1
+    check "launchd failed bootout: bootstrap NOT run" \
+        bash -c "! grep -q '^bootstrap' '$launchctl_log'"
+
+    # 5m.6 Failed bootstrap when unloaded -> failure reported (only attempted once).
+    rm -f "$launchctl_state/com.tendcf.demo.main"
+    launchd_run launchd-present.json "$work/launchd-fail-bootstrap.out" fail-bootstrap
+    check "launchd failed bootstrap: failure reported" \
+        grep -q "tendcf: service 'com.tendcf.demo.main' failed: launchctl bootstrap system .*com.tendcf.demo.main.plist exited non-zero" "$work/launchd-fail-bootstrap.out"
+    check "launchd failed bootstrap: bootstrap attempted once" \
+        launchd_log_count "$(printf 'bootstrap\tsystem\t%s' "$launchd_daemons/com.tendcf.demo.main.plist")" 1
+    : > "$launchctl_state/com.tendcf.demo.main"
+
+    # 5m.7 Tombstone when bootout fails -> plist preserved on disk (fail-closed), failure reported.
+    launchd_run launchd-absent.json "$work/launchd-tomb-fail.out" fail-bootout
+    check "launchd tombstone failed bootout: failure reported" \
+        grep -q "tendcf: service 'com.tendcf.demo.main' tombstone failed: launchctl bootout system/com.tendcf.demo.main exited non-zero; plist left in place" "$work/launchd-tomb-fail.out"
+    check "launchd tombstone failed bootout: plist left in place" \
+        test -f "$launchd_daemons/com.tendcf.demo.main.plist"
+
+    # 5m.8 Tombstone when loaded -> bootout runs strictly BEFORE delete, then plist removed; sibling untouched.
+    rm -f "$launchctl_state/com.tendcf.demo.main.had_plist"
+    launchd_run launchd-absent.json "$work/launchd-tomb.out"
+    check "launchd tombstone: bootout ran for main" \
+        grep -qxF "$(printf 'bootout\tsystem/com.tendcf.demo.main')" "$launchctl_log"
+    check "launchd tombstone: plist still existed when bootout ran (bootout before delete)" \
+        test -f "$launchctl_state/com.tendcf.demo.main.had_plist"
+    check "launchd tombstone: plist removed after bootout" \
+        test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
+    check "launchd tombstone: sibling second.plist left in place" \
+        test -f "$launchd_daemons/com.tendcf.demo.second.plist"
+
+    # 5m.9 Second tombstone run (plist already absent) -> zero launchctl calls (not even print).
+    launchd_run launchd-absent.json "$work/launchd-tomb2.out"
+    check "launchd second tombstone run: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # 5m.10 Tombstone on unloaded regular plist -> deleted without calling bootout.
+    cp "$golden_sys_dir/com.tendcf.demo.main.plist" "$launchd_daemons/com.tendcf.demo.main.plist"
+    rm -f "$launchctl_state/com.tendcf.demo.main"
+    launchd_run launchd-absent.json "$work/launchd-tomb-unloaded.out"
+    check "launchd unloaded tombstone: no bootout call" \
+        bash -c "! grep -q '^bootout' '$launchctl_log'"
+    check "launchd unloaded tombstone: stale regular plist deleted" \
+        test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
+
+    # 5m.11 Tombstone gate (C-policy-04): symlink, dangling link, directory refused with zero launchctl calls.
+    sym_target="$work/launchd-symlink-target.plist"
+    printf 'sentinel\n' > "$sym_target"
+    ln -s "$sym_target" "$launchd_daemons/com.tendcf.demo.symlink.plist"
+    ln -s /nonexistent/tendcf-launchd "$launchd_daemons/com.tendcf.demo.dangling.plist"
+    mkdir -p "$launchd_daemons/com.tendcf.demo.dir.plist"
+    launchd_run launchd-absent-links.json "$work/launchd-tomb-links.out"
+    for kind in symlink dangling dir; do
+        check "launchd tombstone non-regular ($kind): refused and reported" \
+            grep -q "tendcf: service 'com.tendcf.demo.$kind' tombstone not actuated: .*com.tendcf.demo.$kind.plist is not a regular file" "$work/launchd-tomb-links.out"
+    done
+    check "launchd tombstone non-regular: zero launchctl calls (not even print)" \
+        test ! -s "$launchctl_log"
+    check "launchd tombstone non-regular: symlink preserved" \
+        bash -c "[ \"\$(readlink '$launchd_daemons/com.tendcf.demo.symlink.plist')\" = '$sym_target' ]"
+    check "launchd tombstone non-regular: symlink target untouched" \
+        grep -qxF "sentinel" "$sym_target"
+    check "launchd tombstone non-regular: dangling link preserved" \
+        bash -c "[ \"\$(readlink '$launchd_daemons/com.tendcf.demo.dangling.plist')\" = /nonexistent/tendcf-launchd ]"
+    check "launchd tombstone non-regular: directory preserved" \
+        test -d "$launchd_daemons/com.tendcf.demo.dir.plist"
+
+    # 5m.12 Present service targeting a symlink -> refused, symlink and target untouched, zero launchctl calls for it.
+    present_target="$work/launchd-present-sym-target.plist"
+    printf 'untouched\n' > "$present_target"
+    ln -s "$present_target" "$launchd_daemons/com.tendcf.demo.main.plist"
+    launchd_run launchd-present.json "$work/launchd-present-sym.out"
+    check "launchd present on symlink: refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.demo.main' refused: .*com.tendcf.demo.main.plist is not a regular file" "$work/launchd-present-sym.out"
+    check "launchd present on symlink: symlink target untouched" \
+        grep -qxF "untouched" "$present_target"
+    check "launchd present on symlink: no launchctl call for main" \
+        bash -c "! grep -q 'com\.tendcf\.demo\.main' '$launchctl_log'"
+    rm -f "$launchd_daemons/com.tendcf.demo.main.plist"
+
+    # 5m.13 Invalid service id (path traversal / spaces) -> refused, zero launchctl calls, nothing written outside daemons.
+    cat > "$work/data/host_specific.json" <<'EOF'
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"../escaped":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"../escaped-tomb":{"state":"absent"}}}}
+EOF
+    : > "$launchctl_log"
+    printf 'keep\n' > "$work/escaped-tomb.plist"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-bad-id.out" 2>&1 || true
+    check "launchd invalid present id: refused and reported" \
+        grep -q "tendcf: launchd service refused: id is not a valid launchd label" "$work/launchd-bad-id.out"
+    check "launchd invalid tombstone id: refused and reported" \
+        grep -q "tendcf: launchd tombstone refused: id is not a valid launchd label" "$work/launchd-bad-id.out"
+    check "launchd invalid id: no file created outside launchd_dir" \
+        test ! -e "$work/escaped.plist"
+    check "launchd invalid id: file outside launchd_dir not deleted" \
+        test -f "$work/escaped-tomb.plist"
+    check "launchd invalid id: zero launchctl calls" \
+        test ! -s "$launchctl_log"
+else
+    for name in \
+        "launchd first render: byte-identical to committed golden, perms 0644, no backup, bootstrap" \
+        "launchd unchanged re-run: plist hash unchanged, zero launchctl write calls" \
+        "launchd one-key drift: repaired to golden, bootout before bootstrap, sibling untouched" \
+        "launchd perms drift: mode repaired to 0644, reloaded" \
+        "launchd failed bootout/bootstrap: fail-closed and reported" \
+        "launchd tombstone: bootout before delete, second run no-op, failed bootout preserves plist, C-policy-04 non-regular refusal" \
+        "launchd present symlink and invalid id refusals"; do
+        platform_skip "not Darwin ($(uname)); launchd adapter requires darwin class" "$name"
+    done
 fi
 
 echo "# 6. systemd adapter"
@@ -1249,6 +1637,7 @@ check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_ac
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
+             launchd-override-preset launchd-sim-refused launchd-first launchd-unchanged launchd-drift launchd-perms launchd-fail-bootout launchd-fail-bootstrap launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-links launchd-present-sym launchd-bad-id \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
@@ -1263,5 +1652,8 @@ fi
 echo
 if [ "$skipped" != 0 ]; then
     echo "NOTE: $skipped assertion(s) skipped (loader not all-or-nothing); see the SKIP lines"
+fi
+if [ "$platform_skipped" != 0 ]; then
+    echo "NOTE: $platform_skipped assertion(s) skipped (platform/tool unavailable); see the SKIP lines"
 fi
 echo "all policy tests passed"
