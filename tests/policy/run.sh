@@ -706,6 +706,35 @@ EOF
         cp "$repo/tests/policy/fixtures/$fx" "$work/data/host_specific.json"
         "$cf_agent" -n -K -I -f "$work/inputs/launchd-harness.cf" >"$outf" 2>&1 || true
     }
+    launchd_run_dry_file() {  # launchd_run_dry_file ABS-FIXTURE-PATH OUT [MODE]
+        local fx="$1" outf="$2" mode="${3:-normal}"
+        : > "$launchctl_log"
+        printf '%s\n' "$mode" > "$launchctl_mode"
+        cp "$fx" "$work/data/host_specific.json"
+        "$cf_agent" -n -K -I -f "$work/inputs/launchd-harness.cf" >"$outf" 2>&1 || true
+    }
+    dry_policy_completed() {
+        # Under `cf-agent -n`, `reports:` emits `warning: Need to repair reports promise: ...`
+        # instead of `R: ...`.
+        grep -q 'Need to repair reports promise: tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services' "$1"
+    }
+    no_failed_reports() {
+        # Matches both normal (`R: tendcf: service ... failed:`) and dry-run
+        # (`warning: Need to repair reports promise: tendcf: service ... failed:`) forms.
+        ! grep -q 'tendcf: service .* failed:' "$1"
+    }
+    # No-interlock copy of launchd-present.json for `-n` dry-run checks: under `-n`,
+    # `tendcf_interlocks` intentionally does NOT execute pre_action commands (they
+    # could mutate the host), which blocks interlock-gated bundles before reaching
+    # launchd files:/commands:. Generating a no-interlock fixture exercises the
+    # launchd files: and commands: dry-run preview paths directly.
+    launchd_present_no_interlock="$work/launchd-present-no-interlock.json"
+    python3 - "$repo/tests/policy/fixtures/launchd-present.json" "$launchd_present_no_interlock" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc))
+PYEOF
     no_cf_edit_files() {
         [ -z "$(find "$launchd_daemons" -name '*.cf-*-edit')" ]
     }
@@ -723,17 +752,29 @@ EOF
     check "launchd direct apply under CMDB refusal: no plist rendered" test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
     check "launchd direct apply under CMDB refusal: zero launchctl calls" test ! -s "$launchctl_log"
 
-    # 5m.15a Dry-run (-n) on missing plists: zero failed reports, zero files written, zero launchctl write calls, Would execute previewed.
-    launchd_run_dry launchd-present.json "$work/launchd-dry-missing.out"
-    check "launchd dry-run (missing): policy completed" policy_completed "$work/launchd-dry-missing.out"
-    check "launchd dry-run (missing): zero failed report lines" \
-        bash -c "! grep -q 'tendcf: service .* failed:' '$work/launchd-dry-missing.out'"
+    # 5m.15a-interlock Dry-run (-n) with interlock-gated fixture: pre_action does not run, bundle safely refused, zero failed reports, zero mutations.
+    launchd_run_dry launchd-present.json "$work/launchd-dry-interlock.out"
+    check "launchd dry-run (interlock-gated): policy completed" dry_policy_completed "$work/launchd-dry-interlock.out"
+    check "launchd dry-run (interlock-gated): pre_action previewed without running" \
+        grep -q "Would execute script '/usr/bin/true'" "$work/launchd-dry-interlock.out"
+    check "launchd dry-run (interlock-gated): bundle safely refused" \
+        grep -q "interlock 'demo-check' not satisfied, bundle 'demo' refused" "$work/launchd-dry-interlock.out"
+    check "launchd dry-run (interlock-gated): zero failed report lines" no_failed_reports "$work/launchd-dry-interlock.out"
+    check "launchd dry-run (interlock-gated): no plist created on disk" test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
+    check "launchd dry-run (interlock-gated): zero launchctl calls" test ! -s "$launchctl_log"
+
+    # 5m.15a Dry-run (-n) on missing plists (no-interlock fixture): zero failed reports, zero files written, zero launchctl write calls, bootstrap previewed.
+    launchd_run_dry_file "$launchd_present_no_interlock" "$work/launchd-dry-missing.out"
+    check "launchd dry-run (missing): policy completed" dry_policy_completed "$work/launchd-dry-missing.out"
+    check "launchd dry-run (missing): zero failed report lines" no_failed_reports "$work/launchd-dry-missing.out"
     check "launchd dry-run (missing): no plist created on disk" \
         test ! -e "$launchd_daemons/com.tendcf.demo.main.plist"
     check "launchd dry-run (missing): zero launchctl write calls" \
         bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
     check "launchd dry-run (missing): bootstrap previewed via Would execute" \
         grep -q "Would execute script .*bootstrap system .*com.tendcf.demo.main.plist" "$work/launchd-dry-missing.out"
+    check "launchd dry-run (missing): no bootout previewed for unloaded service" \
+        bash -c "! grep -q 'Would execute script .*bootout' '$work/launchd-dry-missing.out'"
 
     # 5m.14 Render/write failure (read-only daemons dir, Neon MH2 + Adv #3): plist_failed reported, zero launchctl write calls, zero 0-byte plist left.
     chmod 500 "$launchd_daemons"
@@ -786,16 +827,16 @@ EOF
         bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
     check "launchd unchanged re-run: no .cf-*-edit backup/temp left" no_cf_edit_files
 
-    # 5m.15b Dry-run (-n) on converged loaded plists: zero failed lines, zero Would execute, zero write calls.
-    launchd_run_dry launchd-present.json "$work/launchd-dry-converged.out"
-    check "launchd dry-run (converged): zero failed report lines" \
-        bash -c "! grep -q 'tendcf: service .* failed:' '$work/launchd-dry-converged.out'"
+    # 5m.15b Dry-run (-n) on converged loaded plists (no-interlock fixture): zero failed lines, zero Would execute, zero write calls.
+    launchd_run_dry_file "$launchd_present_no_interlock" "$work/launchd-dry-converged.out"
+    check "launchd dry-run (converged): policy completed" dry_policy_completed "$work/launchd-dry-converged.out"
+    check "launchd dry-run (converged): zero failed report lines" no_failed_reports "$work/launchd-dry-converged.out"
     check "launchd dry-run (converged): zero Would execute previews" \
         bash -c "! grep -q 'Would execute script .*launchctl' '$work/launchd-dry-converged.out'"
     check "launchd dry-run (converged): zero launchctl write calls" \
         bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
 
-    # 5m.15c Dry-run (-n) on drifted loaded plist: zero failed lines, plist stays drifted, zero write calls, bootout+bootstrap previewed.
+    # 5m.15c Dry-run (-n) on drifted loaded plist (no-interlock fixture): zero failed lines, plist stays drifted, zero write calls, bootout+bootstrap previewed for drifted service only.
     python3 - "$launchd_daemons/com.tendcf.demo.main.plist" <<'PYEOF'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
@@ -803,9 +844,9 @@ txt = p.read_text()
 assert "<string>1</string>" in txt
 p.write_text(txt.replace("<string>1</string>", "<string>99</string>", 1))
 PYEOF
-    launchd_run_dry launchd-present.json "$work/launchd-dry-drift.out"
-    check "launchd dry-run (drifted): zero failed report lines" \
-        bash -c "! grep -q 'tendcf: service .* failed:' '$work/launchd-dry-drift.out'"
+    launchd_run_dry_file "$launchd_present_no_interlock" "$work/launchd-dry-drift.out"
+    check "launchd dry-run (drifted): policy completed" dry_policy_completed "$work/launchd-dry-drift.out"
+    check "launchd dry-run (drifted): zero failed report lines" no_failed_reports "$work/launchd-dry-drift.out"
     check "launchd dry-run (drifted): drifted plist untouched on disk" \
         grep -q '<string>99</string>' "$launchd_daemons/com.tendcf.demo.main.plist"
     check "launchd dry-run (drifted): zero launchctl write calls" \
@@ -814,6 +855,8 @@ PYEOF
         grep -q "Would execute script .*bootout system/com.tendcf.demo.main" "$work/launchd-dry-drift.out"
     check "launchd dry-run (drifted): bootstrap previewed via Would execute" \
         grep -q "Would execute script .*bootstrap system .*com.tendcf.demo.main.plist" "$work/launchd-dry-drift.out"
+    check "launchd dry-run (drifted): untouched sibling second not previewed" \
+        bash -c "! grep -q 'Would execute script .*com\.tendcf\.demo\.second' '$work/launchd-dry-drift.out'"
 
     # 5m.3 One-key drift on main only -> main repaired to golden, no backup, bootout before bootstrap; second untouched.
     launchd_run launchd-present.json "$work/launchd-drift.out"
@@ -2003,7 +2046,7 @@ check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_ac
 
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
-             launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
+             launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
