@@ -547,7 +547,20 @@ class FakeWorld:
             return drv.Result(1, "", "Bootstrap failed: 1: Operation not permitted\n")
         if r == ["sudo", "-n", "/usr/bin/stat", "-f", "%Su:%Sg %Lp", f"{self.workdir}/data/host_specific.json"]:
             return drv.Result(0, self.data_mode + "\n")
-        if r == ["sudo", "-n", "/usr/bin/xattr", "-rs", drv.TENDCF_PREFIX]:
+        if r == [
+            "sudo",
+            "-n",
+            "/usr/bin/find",
+            drv.TENDCF_PREFIX,
+            "!",
+            "-type",
+            "s",
+            "-exec",
+            "/usr/bin/xattr",
+            "-s",
+            "{}",
+            "+",
+        ]:
             if self.xattr_fail:
                 return drv.Result(1, "", "xattr: operation not permitted\n")
             return drv.Result(
@@ -5796,6 +5809,8 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
         self.assertIn("LC_DYLD_ENVIRONMENT", text)
         self.assertIn("LC_LOAD_DYLINKER", text)
         self.assertIn("com.apple.quarantine", text)
+        self.assertIn('! -type s -exec /usr/bin/xattr -s {} +', text)
+        self.assertNotIn("/usr/bin/xattr -rs", text)
         self.assertIn("plutil -lint", text)
         self.assertIn("launchctl print", text)
         self.assertIn("org.tendcf.execd", text)

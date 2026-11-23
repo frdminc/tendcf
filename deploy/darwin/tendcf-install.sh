@@ -945,11 +945,28 @@ check_tree() {
         /bin/chmod -R a-s,go-w "$prefix"
         changed=1
     fi
-    # Fail closed if xattr fails; clear any stray quarantine xattr on the installed tree.
+    # Fail closed if xattr fails; skip Unix domain sockets (-type s, e.g.
+    # cf-execd's var/libntech/state/cf-execd.sockets/runagent.socket where
+    # macOS xattr fails with Errno 102 EOPNOTSUPP). Clear stray quarantine
+    # only on entries that carry it so xattr -ds never fails with No such xattr.
     local xattr_out
-    xattr_out="$(/usr/bin/xattr -rs "$prefix")" || die "xattr -rs $prefix failed"
+    xattr_out="$(/usr/bin/find "$prefix" ! -type s -exec /usr/bin/xattr -s {} +)" \
+        || die "xattr check on $prefix failed"
     if printf '%s\n' "$xattr_out" | /usr/bin/awk '/com\.apple\.quarantine/ { found=1 } END { exit !found }'; then
-        /usr/bin/xattr -drs com.apple.quarantine "$prefix"
+        make_stage
+        local xattr_list="$stage_dir/xattr-paths.$$.txt" xattr_p xattr_a xattr_rc=0
+        /usr/bin/find "$prefix" ! -type s -print0 > "$xattr_list" \
+            || die "find failed listing $prefix for quarantine cleanup"
+        while IFS= read -r -d '' xattr_p; do
+            xattr_a="$(/usr/bin/xattr -s "$xattr_p")" || { xattr_rc=1; break; }
+            case "$xattr_a" in
+                *com.apple.quarantine*)
+                    /usr/bin/xattr -ds com.apple.quarantine "$xattr_p" || { xattr_rc=1; break; }
+                    ;;
+            esac
+        done < "$xattr_list"
+        /bin/rm -f "$xattr_list"
+        [ "$xattr_rc" -eq 0 ] || die "failed to clear com.apple.quarantine under $prefix"
         changed=1
     fi
     verify_macho_tree "$prefix"

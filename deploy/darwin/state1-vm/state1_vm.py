@@ -3402,11 +3402,26 @@ def cmd_check(ctx: Ctx, args) -> int:
                                 f"CMDB data must be root:wheel 600 (rc {data_st.rc}, got {data_st.stdout.strip()!r})"
                             )
                         q = rssh(
-                            ctx, t, ["sudo", "-n", "/usr/bin/xattr", "-rs", TENDCF_PREFIX]
+                            ctx,
+                            t,
+                            [
+                                "sudo",
+                                "-n",
+                                "/usr/bin/find",
+                                TENDCF_PREFIX,
+                                "!",
+                                "-type",
+                                "s",
+                                "-exec",
+                                "/usr/bin/xattr",
+                                "-s",
+                                "{}",
+                                "+",
+                            ],
                         )
                         if q.rc != 0:
                             raise StepFail(
-                                f"xattr -rs {TENDCF_PREFIX} failed (rc {q.rc}): {clip(q.stderr or q.stdout, 200)}"
+                                f"xattr check on {TENDCF_PREFIX} failed (rc {q.rc}): {clip(q.stderr or q.stdout, 200)}"
                             )
                         if "com.apple.quarantine" in q.stdout:
                             raise StepFail(
