@@ -185,11 +185,20 @@ class FakeWorld:
         self.no_tty_calls = []
         # renderer / darwin installer simulation (steps 3-9, 9a, 10b, 11a)
         self.gh_fail = False
+        self.gh_api_fail = False
+        self.gh_run_meta = {
+            "head_repository": {"full_name": drv.GH_REPO},
+            "event": "push",
+            "name": "macOS fork build",
+            "path": ".github/workflows/macos-fork-build.yml",
+            "head_branch": "spike/macos-fork-build",
+        }
         self.gh_tarball_bytes = b"fake-tarball-payload"
         self.gh_bad_sha = False
         self.stage_bundles = []  # raw tar.gz bytes uploaded to guest
         self.guest_stage_dir = "/var/tmp/tendcf-stage.abc123"
         self.workdir = "/opt/tendcf/var/libntech"
+        self.workdir_override = None
         self.install_count = 0
         self.enable_count = 0
         self.install_fail = False
@@ -198,6 +207,7 @@ class FakeWorld:
         self.policy_tree_bad = False
         self.data_mode = "root:wheel 600"
         self.quarantine_left = False
+        self.xattr_fail = False
         self.run_once_fail = False
         self.run_once_rerun_repairs = False
         self.run_once_rerun_reloads = False
@@ -219,6 +229,7 @@ class FakeWorld:
         self.canary_lost_after_reboot = False
         self.nonroot_installer_succeeds = False
         self.nonroot_cfagent_mutates = False
+        self.nonroot_cfagent_rc0_no_refusal = False
         self.nonroot_bootstrap_succeeds = False
         self.execd_enable_fail = False
         self.execd_enable_rerun_changes = False
@@ -288,6 +299,10 @@ class FakeWorld:
         raise AssertionError(f"unexpected command {argv}")
 
     def _gh(self, a):
+        if a[:1] == ["api"] and len(a) == 2 and a[1].startswith(f"repos/{drv.GH_REPO}/actions/runs/"):
+            if self.gh_api_fail:
+                return drv.Result(1, "", "gh: HTTP 404 Not Found")
+            return drv.Result(0, json.dumps(self.gh_run_meta))
         if a[:2] == ["run", "download"]:
             if self.gh_fail:
                 return drv.Result(1, "", "gh: artifact not found")
@@ -487,13 +502,11 @@ class FakeWorld:
         if r[:3] == ["/bin/sh", "-c", drv.STAGE_UPLOAD_SH]:
             self.stage_bundles.append(self._input_bytes)
             return drv.Result(0, self.guest_stage_dir + "\n")
-        if r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH] or r[:5] == [
-            "sudo",
-            "-n",
-            "/bin/sh",
-            "-c",
-            drv.TREE_CHECK_SH,
-        ]:
+        if (
+            r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH]
+            or r[:5] == ["sudo", "-n", "/bin/sh", "-c", drv.TREE_CHECK_SH]
+            or r[:5] == ["sudo", "-n", "/bin/sh", "-c", drv.TREE_CHECK_NO_LINKS_SH]
+        ):
             is_root = r[0] == "sudo"
             path = r[6] if is_root else r[4]
             if path == drv.TENDCF_PREFIX:
@@ -514,10 +527,19 @@ class FakeWorld:
             if self.nonroot_installer_succeeds:
                 return drv.Result(0, "ok\n")
             return drv.Result(1, "", "tendcf-install: run as root\n")
-        if r == [f"{drv.TENDCF_PREFIX}/bin/cf-agent", "-K", "-f", f"{self.workdir}/inputs/promises.cf"]:
+        if r == [
+            "env",
+            f"CFENGINE_TEST_OVERRIDE_WORKDIR={self.workdir}",
+            f"{drv.TENDCF_PREFIX}/bin/cf-agent",
+            "-K",
+            "-f",
+            f"{self.workdir}/inputs/promises.cf",
+        ]:
             if self.nonroot_cfagent_mutates:
                 self.canary_plist_bytes = self.canary_plist_bytes + "<!-- mutated -->\n"
                 return drv.Result(0, "")
+            if self.nonroot_cfagent_rc0_no_refusal:
+                return drv.Result(0, "R: tendcf: benign status line\n")
             return drv.Result(1, "", "error: permission denied\n")
         if r == ["/bin/launchctl", "bootstrap", "system", drv.CANARY_PLIST]:
             if self.nonroot_bootstrap_succeeds:
@@ -526,6 +548,8 @@ class FakeWorld:
         if r == ["sudo", "-n", "/usr/bin/stat", "-f", "%Su:%Sg %Lp", f"{self.workdir}/data/host_specific.json"]:
             return drv.Result(0, self.data_mode + "\n")
         if r == ["sudo", "-n", "/usr/bin/xattr", "-rs", drv.TENDCF_PREFIX]:
+            if self.xattr_fail:
+                return drv.Result(1, "", "xattr: operation not permitted\n")
             return drv.Result(
                 0,
                 f"{drv.TENDCF_PREFIX}/bin/cf-agent: com.apple.quarantine\n"
@@ -765,7 +789,7 @@ class FakeWorld:
                 return drv.Result(0, "tendcf-install: no change (CFEngine Core 3.29.0a)\n")
             return drv.Result(0, "tendcf-install: installed: CFEngine Core 3.29.0a\n")
         if sub == "workdir":
-            return drv.Result(0, self.workdir + "\n")
+            return drv.Result(0, (self.workdir_override or self.workdir) + "\n")
         if sub == "data":
             self.canary_absent_data = args[1].endswith("host_specific-absent.json")
             return drv.Result(0, "tendcf-install: data installed\n")
@@ -5607,6 +5631,56 @@ class CheckRenderer(Base):
         self.assertEqual(rc, 2, s)
         self.assertEqual(self.world.tart_calls("clone"), [])
 
+        self.sha_file.write_bytes(b"\xff\xfe\x00\x80")
+        rc, s = self.run_cmd(*self.tarball_args())
+        self.assertEqual(rc, 2, s)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_artifact_run_provenance_refusals(self):
+        for name, meta in (
+            (
+                "wrong repository",
+                {
+                    "head_repository": {"full_name": "attacker/tendcf"},
+                    "event": "workflow_dispatch",
+                    "name": "macOS fork build",
+                    "path": ".github/workflows/macos-fork-build.yml",
+                },
+            ),
+            (
+                "pull_request event",
+                {
+                    "head_repository": {"full_name": drv.GH_REPO},
+                    "event": "pull_request",
+                    "name": "macOS fork build",
+                    "path": ".github/workflows/macos-fork-build.yml",
+                },
+            ),
+            (
+                "wrong workflow",
+                {
+                    "head_repository": {"full_name": drv.GH_REPO},
+                    "event": "push",
+                    "name": "Check",
+                    "path": ".github/workflows/check.yml",
+                },
+            ),
+        ):
+            with self.subTest(name):
+                self.setUp()
+                self.world.gh_run_meta = meta
+                rc, s = self.run_cmd("check", "--artifact-run", "45093070656")
+                self.assertEqual(rc, 2, (name, s))
+                self.assertEqual(self.world.tart_calls("clone"), [], name)
+                self.assertEqual(self.world.argvs(["gh", "run", "download"]), [], name)
+
+        self.setUp()
+        self.world.gh_api_fail = True
+        rc, s = self.run_cmd("check", "--artifact-run", "45093070656")
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["error"]["status"], "fail")
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
     def test_gh_download_failure_reports_error_without_cloning(self):
         self.world.gh_fail = True
         rc, s = self.run_cmd("check", "--artifact-run", "45093070656")
@@ -5617,10 +5691,12 @@ class CheckRenderer(Base):
     def test_step3_failures_skip_dependent_steps_and_still_clean_up(self):
         for name, mutate in (
             ("install fails", lambda w: setattr(w, "install_fail", True)),
+            ("bad workdir traversal", lambda w: setattr(w, "workdir_override", "/opt/tendcf/../etc")),
             ("binary tree writable", lambda w: setattr(w, "tendcf_tree_bad", True)),
             ("policy tree writable", lambda w: setattr(w, "policy_tree_bad", True)),
             ("data mode 644", lambda w: setattr(w, "data_mode", "root:wheel 644")),
             ("quarantine left", lambda w: setattr(w, "quarantine_left", True)),
+            ("xattr fails closed", lambda w: setattr(w, "xattr_fail", True)),
         ):
             with self.subTest(name):
                 self.setUp()
@@ -5650,6 +5726,7 @@ class CheckRenderer(Base):
             ("8", "drift not reloaded", lambda w: setattr(w, "drift_no_reload", True)),
             ("9", "nonroot installer ok", lambda w: setattr(w, "nonroot_installer_succeeds", True)),
             ("9", "nonroot cf-agent mutates", lambda w: setattr(w, "nonroot_cfagent_mutates", True)),
+            ("9", "nonroot cf-agent rc0 no refusal", lambda w: setattr(w, "nonroot_cfagent_rc0_no_refusal", True)),
             ("9", "nonroot bootstrap ok", lambda w: setattr(w, "nonroot_bootstrap_succeeds", True)),
             ("9a", "execd enable fails", lambda w: setattr(w, "execd_enable_fail", True)),
             ("9a", "execd enable rerun changes", lambda w: setattr(w, "execd_enable_rerun_changes", True)),
@@ -5700,18 +5777,29 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
 
     def test_installer_syntax_guards_and_plist_template(self):
         r = subprocess.run(
-            ["bash", "-n", str(self.INSTALLER)], capture_output=True, text=True, check=False
+            ["/bin/bash", "-n", str(self.INSTALLER)], capture_output=True, text=True, check=False
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         text = self.INSTALLER.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("#!/bin/bash\n"))
         self.assertIn("set -euo pipefail", text)
+        self.assertIn("/usr/bin/env -i TENDCF_CLEAN_ENV=1", text)
+        self.assertIn("compgen -e", text)
         self.assertIn("unset DYLD_LIBRARY_PATH", text)
         self.assertIn('= 0 ] || die "run as root"', text)
         self.assertIn('= Darwin ] || die "Darwin only"', text)
+        self.assertIn("/bin/cp -RP", text)
+        self.assertIn("/bin/chmod -RN", text)
+        self.assertIn("/usr/bin/chflags -R 0", text)
+        self.assertIn("/bin/chmod -R a-s,go-w", text)
+        self.assertIn('"$py" -I -', text)
+        self.assertIn("LC_DYLD_ENVIRONMENT", text)
+        self.assertIn("LC_LOAD_DYLINKER", text)
         self.assertIn("com.apple.quarantine", text)
         self.assertIn("plutil -lint", text)
         self.assertIn("launchctl print", text)
         self.assertIn("org.tendcf.execd", text)
+        self.assertIn("status) cmd_status ;;", text)
 
         # Render the embedded org.tendcf.execd plist heredoc and parse with plistlib.
         m = re.search(
@@ -5734,67 +5822,139 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
 
     def test_embedded_macho_parser_accepts_valid_and_rejects_bad_deps(self):
         text = self.INSTALLER.read_text(encoding="utf-8")
-        m = re.search(r'"\$py" - "\$prefix" "\$tree_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY', text, re.DOTALL)
+        m = re.search(
+            r'"\$py" -I - "\$prefix" "\$canon_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY',
+            text,
+            re.DOTALL,
+        )
         self.assertIsNotNone(m)
         py_code = m.group(1)
 
-        def make_macho(dylibs=(), rpaths=()):
+        def make_macho(
+            dylibs=(),
+            rpaths=(),
+            *,
+            dylinker="/usr/lib/dyld",
+            dyld_env=None,
+            endian="<",
+        ):
             cmds = bytearray()
+            ncmds = 0
             for d in dylibs:
                 s = d.encode("utf-8") + b"\x00"
                 raw_len = 24 + len(s)
                 cmdsize = (raw_len + 7) & ~7
-                cmds += struct.pack("<IIIIII", 0x0C, cmdsize, 24, 0, 0, 0)
+                cmds += struct.pack(endian + "IIIIII", 0x0C, cmdsize, 24, 0, 0, 0)
                 cmds += s + b"\x00" * (cmdsize - raw_len)
+                ncmds += 1
             for rp in rpaths:
                 s = rp.encode("utf-8") + b"\x00"
                 raw_len = 12 + len(s)
                 cmdsize = (raw_len + 7) & ~7
-                cmds += struct.pack("<III", 0x8000001C, cmdsize, 12)
+                cmds += struct.pack(endian + "III", 0x8000001C, cmdsize, 12)
                 cmds += s + b"\x00" * (cmdsize - raw_len)
-            ncmds = len(dylibs) + len(rpaths)
-            hdr = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, ncmds, len(cmds), 0, 0)
+                ncmds += 1
+            if dylinker is not None:
+                s = dylinker.encode("utf-8") + b"\x00"
+                raw_len = 12 + len(s)
+                cmdsize = (raw_len + 7) & ~7
+                cmds += struct.pack(endian + "III", 0x0E, cmdsize, 12)
+                cmds += s + b"\x00" * (cmdsize - raw_len)
+                ncmds += 1
+            if dyld_env is not None:
+                s = dyld_env.encode("utf-8") + b"\x00"
+                raw_len = 12 + len(s)
+                cmdsize = (raw_len + 7) & ~7
+                cmds += struct.pack(endian + "III", 0x27, cmdsize, 12)
+                cmds += s + b"\x00" * (cmdsize - raw_len)
+                ncmds += 1
+            magic = 0xFEEDFACF if endian == "<" else 0xFEEDFACF
+            # MH_CIGAM_64 when big-endian (read as little-endian gives 0xCFFAEDFE).
+            hdr = struct.pack(endian + "IIIIIIII", magic, 0x0100000C, 0, 2, ncmds, len(cmds), 0, 0)
             return hdr + bytes(cmds)
+
+        def make_fat(slices):
+            # FAT_MAGIC big-endian header + 20-byte arch entries
+            hdr = bytearray(struct.pack(">II", 0xCAFEBABE, len(slices)))
+            off = 8 + 20 * len(slices)
+            body = bytearray()
+            for sl in slices:
+                hdr += struct.pack(">IIIII", 0x0100000C, 0, off, len(sl), 0)
+                body += sl
+                off += len(sl)
+            return bytes(hdr) + bytes(body)
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "bin").mkdir()
             (root / "lib").mkdir()
-            (root / "lib" / "libpromises.3.dylib").write_bytes(b"stub")
+            lib_p = root / "lib" / "libpromises.3.dylib"
+            lib_p.write_bytes(make_macho(["/usr/lib/libSystem.B.dylib"]))
+            non_macho = root / "lib" / "not-macho.txt"
+            non_macho.write_text("plain text", encoding="utf-8")
             good = root / "bin" / "cf-agent"
-            good.write_bytes(make_macho(["/usr/lib/libSystem.B.dylib", "/opt/tendcf/lib/libpromises.3.dylib"]))
+            good.write_bytes(
+                make_macho(["/usr/lib/libSystem.B.dylib", "/opt/tendcf/lib/libpromises.3.dylib"])
+            )
             r_ok = subprocess.run(
-                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(good)],
+                [sys.executable, "-I", "-c", py_code, "/opt/tendcf", str(root), str(good), str(lib_p)],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
 
-            bad_brew = root / "bin" / "bad-brew"
-            bad_brew.write_bytes(make_macho(["/opt/homebrew/lib/libssl.3.dylib"]))
-            r_brew = subprocess.run(
-                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_brew)],
+            # Valid fat binary with little-endian and big-endian slices.
+            fat_ok = root / "bin" / "fat-ok"
+            fat_ok.write_bytes(
+                make_fat([
+                    make_macho(["/usr/lib/libSystem.B.dylib"], endian="<"),
+                    make_macho(["/usr/lib/libSystem.B.dylib"], endian=">"),
+                ])
+            )
+            r_fat_ok = subprocess.run(
+                [sys.executable, "-I", "-c", py_code, "/opt/tendcf", str(root), str(fat_ok)],
                 capture_output=True, text=True, check=False,
             )
-            self.assertNotEqual(r_brew.returncode, 0)
-            self.assertIn("outside /opt/tendcf", r_brew.stderr)
+            self.assertEqual(r_fat_ok.returncode, 0, r_fat_ok.stderr)
 
-            bad_missing = root / "bin" / "bad-missing"
-            bad_missing.write_bytes(make_macho(["/opt/tendcf/lib/libmissing.dylib"]))
-            r_miss = subprocess.run(
-                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_missing)],
-                capture_output=True, text=True, check=False,
+            # Rejections
+            bad_cases = (
+                ("homebrew dylib", make_macho(["/opt/homebrew/lib/libssl.3.dylib"]), "outside /opt/tendcf"),
+                ("missing in-prefix", make_macho(["/opt/tendcf/lib/libmissing.dylib"]), "missing in-prefix library"),
+                ("non-macho target", make_macho(["/opt/tendcf/lib/not-macho.txt"]), "non-Mach-O target"),
+                ("dylib .. traversal", make_macho(["/usr/lib/../../tmp/evil.dylib"]), "unsafe traversal"),
+                ("dylib . segment", make_macho(["/usr/lib/./libSystem.B.dylib"]), "unsafe traversal"),
+                ("dylib //", make_macho(["/usr/lib//libSystem.B.dylib"]), "unsafe dylib path"),
+                ("rpath external", make_macho(["/usr/lib/libSystem.B.dylib"], rpaths=["/opt/homebrew/lib"]), "forbidden LC_RPATH"),
+                ("rpath .. traversal", make_macho(["/usr/lib/libSystem.B.dylib"], rpaths=["/opt/tendcf/../tmp"]), "unsafe traversal"),
+                ("LC_DYLD_ENVIRONMENT", make_macho(["/usr/lib/libSystem.B.dylib"], dyld_env="DYLD_INSERT_LIBRARIES=/tmp/x"), "LC_DYLD_ENVIRONMENT"),
+                ("bad LC_LOAD_DYLINKER", make_macho(["/usr/lib/libSystem.B.dylib"], dylinker="/tmp/evil-dyld"), "LC_LOAD_DYLINKER"),
+                ("fat nfat=0", struct.pack(">II", 0xCAFEBABE, 0), "nfat=0"),
+                ("fat oob slice", struct.pack(">IIIIIII", 0xCAFEBABE, 1, 0, 0, 9999, 64, 0), "out-of-bounds"),
+                ("fat bad 2nd slice", make_fat([make_macho(["/usr/lib/libSystem.B.dylib"]), make_macho(["/tmp/evil.dylib"])]), "outside /opt/tendcf"),
+                (
+                    "truncated dylib cmdsize",
+                    struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 1, 16, 0, 0)
+                    + struct.pack("<IIII", 0x0C, 16, 24, 0),
+                    "truncated dylib cmdsize",
+                ),
+                (
+                    "invalid dylib str_off",
+                    struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 1, 24, 0, 0)
+                    + struct.pack("<IIIIII", 0x0C, 24, 12, 0, 0, 0),
+                    "invalid dylib string offset",
+                ),
             )
-            self.assertNotEqual(r_miss.returncode, 0)
-            self.assertIn("missing in-prefix library", r_miss.stderr)
-
-            bad_rpath = root / "bin" / "bad-rpath"
-            bad_rpath.write_bytes(make_macho(["/usr/lib/libSystem.B.dylib"], rpaths=["/opt/homebrew/Cellar/librsync/lib"]))
-            r_rp = subprocess.run(
-                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_rpath)],
-                capture_output=True, text=True, check=False,
-            )
-            self.assertNotEqual(r_rp.returncode, 0)
-            self.assertIn("forbidden LC_RPATH", r_rp.stderr)
+            for name, payload, want in bad_cases:
+                with self.subTest(name):
+                    bf = root / "bin" / "bad-bin"
+                    bf.write_bytes(payload)
+                    r = subprocess.run(
+                        [sys.executable, "-I", "-c", py_code, "/opt/tendcf", str(root), str(bf), str(lib_p)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertNotEqual(r.returncode, 0, name)
+                    self.assertIn(want, r.stderr, (name, r.stderr))
+                    self.assertNotIn("Traceback", r.stderr, (name, r.stderr))
 
 
 if __name__ == "__main__":
