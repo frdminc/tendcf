@@ -3516,6 +3516,8 @@ class Check(Base):
         self.assertIn("polls=1 waited=0s", st["2g"]["evidence"])
         self.assertEqual(st["10a"]["status"], "pass")
         self.assertIn("2g after the reboot: polls=4 waited=6s", st["10a"]["evidence"])
+        self.assertIn("listing:", st["10a"]["evidence"])
+        self.assertIn("/System/Volumes/Data:", st["10a"]["evidence"])
 
     # -- 2h / 10a: automatic download and install are off; the schedule text is information only
     def test_2h_passes_with_checking_on_and_the_keys_at_zero(self):
@@ -3785,6 +3787,31 @@ class Check(Base):
                 "unexpected line",
             ),
             ("a form feed is not a line break", root + "\x0c/Data:\n", "unexpected line"),
+            (
+                "header not starting with / is rejected",
+                "foo:\n\tIndexing disabled.\n" + MDUTIL_OFF,
+                "unexpected line",
+            ),
+            (
+                "error-like header not starting with / is rejected",
+                "Error: unknown:\n\tIndexing disabled.\n" + MDUTIL_OFF,
+                "unexpected line",
+            ),
+            (
+                "spoofed note header not starting with / is rejected",
+                "polls=9 waited=99s:\n\tIndexing disabled.\n" + MDUTIL_OFF,
+                "unexpected line",
+            ),
+            (
+                "tab-joined header hiding error status is rejected",
+                MDUTIL_OFF_3 + "/Volumes/X:\tError: unknown indexing state.\t/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "tab inside header path is rejected",
+                MDUTIL_OFF_3 + "/Volumes/X\tY:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
         )  # fmt: skip
         for name, out, why in cases:
             with self.subTest(name):
@@ -3798,11 +3825,39 @@ class Check(Base):
 
     def test_2g_passes_on_the_real_three_volume_listing(self):
         # T3/N4: the full macOS 27.2 listing observed in issue 70 run 4 passes 2g and 10a
-        self.world.mdutil_default = (0, MDUTIL_OFF_3)
+        for name, listing in (
+            ("three-volume listing", MDUTIL_OFF_3),
+            (
+                "extra volume with space in path",
+                MDUTIL_OFF_3 + "/Volumes/Macintosh HD:\n\tIndexing disabled.\n",
+            ),
+            (
+                # Opus N1 accepted trade-off: spaces and colons are legal in macOS volume
+                # names, so a space-joined /...: line matches the header grammar (while
+                # Indexing enabled / Transitioning remain checked across full output first).
+                "space-joined /...: header trade-off",
+                MDUTIL_OFF_3
+                + "/Volumes/X: Error: unknown indexing state. /Volumes/Y:\n\tIndexing disabled.\n",
+            ),
+        ):
+            with self.subTest(name):
+                self.world.mdutil_default = (0, listing)
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 0, s)
+                self.assertEqual(self.steps(s)["2g"]["status"], "pass")
+                self.assertEqual(self.steps(s)["10a"]["status"], "pass")
+                self.assertIn(
+                    "/System/Volumes/Preboot:", self.steps(s)["10a"]["evidence"]
+                )
+        # Even inside a space-joined /...: header, Indexing enabled still fails immediately
+        self.world.mdutil_default = (
+            0,
+            MDUTIL_OFF_3
+            + "/Volumes/X: Indexing enabled. /Volumes/Y:\n\tIndexing disabled.\n",
+        )
         rc, s = self.run_cmd(*self.check_args())
-        self.assertEqual(rc, 0, s)
-        self.assertEqual(self.steps(s)["2g"]["status"], "pass")
-        self.assertEqual(self.steps(s)["10a"]["status"], "pass")
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["2g"]["status"], "fail")
         self.world.mdutil_default = (0, MDUTIL_OFF)
 
     def test_2g_and_10a_read_mdutil_with_raw_newlines(self):
@@ -3856,14 +3911,42 @@ class Check(Base):
         self.world.mdutil_default = (0, MDUTIL_OFF)
 
     def test_10a_settle_note_is_the_drivers_own_value_not_guest_text(self):
-        # A4: a guest header that looks like the note must not be taken for it
-        spoof = "polls=9 waited=99s:\n\tIndexing disabled.\n" + MDUTIL_OFF
+        # A4 + Opus N4: a guest header containing the exact settle-note prefix must not be
+        # taken for the driver's settle note; the real note appears strictly before listing:.
+        spoof = (
+            "/Volumes/2g after the reboot: polls=9 waited=99s:\n\tIndexing disabled.\n"
+            + MDUTIL_OFF
+        )
         self.world.mdutil_outputs = [(0, MDUTIL_OFF), (0, spoof)]
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 0, s)
         ev = self.steps(s)["10a"]["evidence"]
-        self.assertIn("2g after the reboot: polls=1 waited=0s", ev)
-        self.assertNotIn("polls=9", ev)
+        self.assertIn("2g after the reboot: polls=1 waited=0s; listing: ", ev)
+        self.assertLess(
+            ev.index("2g after the reboot: polls=1 waited=0s"), ev.index("listing: ")
+        )
+        self.assertGreater(ev.index("polls=9 waited=99s"), ev.index("listing: "))
+        self.assertIn("/Volumes/2g after the reboot: polls=9 waited=99s:", ev)
+
+    def test_10a_pass_evidence_records_and_clips_post_reboot_mdutil_listing(self):
+        # Issue 92 item 5: 10a pass evidence carries a clipped copy of the post-reboot
+        # mdutil -a -s listing (not the pre-reboot 2g one).
+        self.world.mdutil_outputs = [(0, MDUTIL_OFF), (0, MDUTIL_OFF_3)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)
+        self.assertNotIn("/System/Volumes/Preboot:", st["2g"]["evidence"])
+        self.assertEqual(st["10a"]["status"], "pass")
+        self.assertIn("listing: ", st["10a"]["evidence"])
+        self.assertIn("/System/Volumes/Preboot:", st["10a"]["evidence"])
+
+        long_vol = "/Volumes/" + "V" * 350 + ":\n\tIndexing disabled.\n"
+        self.world.mdutil_outputs = [(0, MDUTIL_OFF), (0, MDUTIL_OFF + long_vol)]
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        ev = self.steps(s)["10a"]["evidence"]
+        self.assertIn("...[+", ev)
+        self.assertNotIn("V" * 320, ev)
 
     def test_reboot_restarts_tart_run_when_it_exits(self):
         self.world.run_exits_on_reboot = True
@@ -5047,7 +5130,9 @@ class GuestScripts(unittest.TestCase):
         f.chmod(0o755)
         return d
 
-    def run_snippet(self, snippet, fakes, env=None, links=(), *, raw_bytes=False):
+    def run_snippet(
+        self, snippet, fakes, env=None, links=(), *, raw_bytes=False, pre="", cwd=None
+    ):
         """Run a slice of prep.sh with only fake tools on PATH (plus the named host tools,
         symlinked into the fake directory): the host's own tools cannot be reached."""
         d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
@@ -5063,26 +5148,46 @@ class GuestScripts(unittest.TestCase):
             'log() { printf "prep: %s\\n" "$*"; }\n'
         )
         return subprocess.run(
-            ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+            ["/bin/sh", "-c", stub + "set -eu\n" + pre + snippet],
             capture_output=True,
             text=not raw_bytes,
             check=False,
             env={"PATH": str(d), **(env or {})},
+            cwd=cwd,
         )
 
-    def test_prep_settles_mdutil_with_a_bounded_retry(self):
+    def _prep_mdutil_snippet(self):
         text = self.text("prep.sh")
-        a = text.index("mdutil_start=$(date +%s)")
+        a = text.index("SECONDS=0")
         b = text.index('log "spotlight: off', a)
-        snippet = text[a : text.index("\n", b) + 1]
-        for host in ("/usr/bin/mdutil", "/usr/bin/awk", "/bin/sleep"):
+        return text[a : text.index("\n", b) + 1]
+
+    def test_prep_settles_mdutil_with_a_bounded_retry(self):
+        snippet = self._prep_mdutil_snippet()
+        for host in (
+            "/usr/bin/mdutil",
+            "/usr/bin/awk",
+            "/bin/sleep",
+            "/usr/bin/tr",
+            "/usr/bin/mktemp",
+        ):
             self.assertNotIn(host, snippet)
+        self.assertNotIn("date +%s", snippet)
+        self.assertNotIn("TMPDIR", snippet)
+        self.assertIn('mktemp -- "$STATE_DIR/tendcf-mdutil.XXXXXX"', snippet)
+        self.assertIn("trap 'exit 129' HUP INT TERM", snippet)
+        self.assertIn("trap - EXIT HUP INT TERM", snippet)
+        self.assertIn("LC_ALL=C tr", snippet)
+        self.assertIn("LC_ALL=C awk", snippet)
         seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-seq-"))
         self.addCleanup(shutil.rmtree, seq, True)
+        state_check = Path(tempfile.mkdtemp(prefix="tendcf-prep-state-"))
+        self.addCleanup(shutil.rmtree, state_check, True)
         fakes = {
             # the Nth call prints $SEQ/out.N (else out.last) and costs MDUTIL_COST seconds of
             # the fake clock; if BACKSTEP is set, call 2 steps the clock backwards by that many
-            # seconds; sleep advances it; date prints it; the exit status is MDUTIL_RC
+            # seconds; sleep advances it; the shell wrappers below sync $SECONDS from $SEQ/clock;
+            # the exit status is MDUTIL_RC
             "mdutil": 'D=$SEQ; n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n + 1)); '
             'echo "$n" >"$D/n"; echo "$n" >>"$D/calls"; f="$D/out.$n"; [ -f "$f" ] || f="$D/out.last"; '
             'c=$(cat "$D/clock"); '
@@ -5090,13 +5195,27 @@ class GuestScripts(unittest.TestCase):
             'echo $((c + ${MDUTIL_COST:-0})) >"$D/clock"; '
             'cat "$f"; exit "${MDUTIL_RC:-0}"\n',
             "sleep": 'c=$(cat "$SEQ/clock"); echo $((c + $1)) >"$SEQ/clock"; echo "$1" >>"$SEQ/slept"\n',
-            "date": 'cat "$SEQ/clock"\n',
         }
+        clock_wrappers = (
+            'mdutil() { _rc=0; command mdutil "$@" || _rc=$?; SECONDS=$(cat "$SEQ/clock"); return "$_rc"; }\n'
+            'sleep() { command sleep "$@"; SECONDS=$(cat "$SEQ/clock"); }\n'
+        )
 
         def run(
-            outs, last, rc="0", cost="0", backstep="", extra_env=None, raw_bytes=False
+            outs,
+            last,
+            rc="0",
+            cost="0",
+            backstep="",
+            extra_env=None,
+            raw_bytes=False,
+            state_dir=None,
+            cwd=None,
         ):
             for f in seq.iterdir():
+                f.unlink()
+            check_dir = state_check if state_dir is None else Path(cwd or ".") / state_dir
+            for f in check_dir.iterdir():
                 f.unlink()
             for i, o in enumerate(outs, 1):
                 (seq / f"out.{i}").write_text(o)
@@ -5104,20 +5223,27 @@ class GuestScripts(unittest.TestCase):
                 (seq / "out.last").write_bytes(last)
             else:
                 (seq / "out.last").write_text(last)
-            (seq / "clock").write_text("1000\n")
-            return self.run_snippet(
+            (seq / "clock").write_text("0\n")
+            res = self.run_snippet(
                 snippet,
                 fakes,
                 {
                     "SEQ": str(seq),
+                    "STATE_DIR": str(state_check) if state_dir is None else state_dir,
+                    "TMPDIR": "/nonexistent-tmpdir-must-not-be-used",
                     "MDUTIL_RC": rc,
                     "MDUTIL_COST": cost,
                     "BACKSTEP": backstep,
                     **(extra_env or {}),
                 },
-                links=("awk", "cat"),
+                links=("awk", "cat", "mktemp", "tr", "rm"),
                 raw_bytes=raw_bytes,
+                pre=clock_wrappers,
+                cwd=cwd,
             )
+            # mktemp file under STATE_DIR must be cleaned up on every pass and failure path
+            self.assertEqual(list(check_dir.iterdir()), [], "leaked mdutil mktemp file")
+            return res
 
         def slept():
             f = seq / "slept"
@@ -5129,30 +5255,40 @@ class GuestScripts(unittest.TestCase):
 
         r = run([MDUTIL_TRANSITIONING] * 2, MDUTIL_OFF)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("3 poll(s), 4 s elapsed", r.stdout)
+        m = re.search(r"3 poll\(s\), (\d+) s elapsed", r.stdout)
+        self.assertIsNotNone(m, r.stdout)
+        self.assertGreaterEqual(int(m.group(1)), 4, r.stdout)
+        self.assertLessEqual(int(m.group(1)), 6, r.stdout)
         self.assertEqual(slept(), ["2", "2"])
-        # F1: Transitioning with exit 1 is retried; to the timeout it dies, 120 s of real time
+        # F1: Transitioning with exit 1 is retried; to the timeout it dies, 120 s elapsed
         r = run([MDUTIL_TRANSITIONING], MDUTIL_OFF, rc="1")
         self.assertEqual(r.returncode, 1)  # the final answer has exit 1: not a pass
         self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)
         self.assertGreaterEqual(calls(), 2)
         r = run([], MDUTIL_TRANSITIONING, rc="1")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("still transitioning after 120 s", r.stderr)
+        m = re.search(r"still transitioning after (\d+) s", r.stderr)
+        self.assertIsNotNone(m, r.stderr)
+        self.assertGreaterEqual(int(m.group(1)), 120, r.stderr)
+        self.assertLessEqual(int(m.group(1)), 122, r.stderr)
         self.assertIn("(rc 1)", r.stderr)
-        self.assertEqual(len(slept()), 60)
+        self.assertIn(len(slept()), (59, 60))
         # F4: real elapsed time, not the number of waits: a slow mdutil shortens the loop
         r = run([], MDUTIL_TRANSITIONING, cost="30")
         self.assertEqual(r.returncode, 1)
         self.assertIn("still transitioning after", r.stderr)
         self.assertLess(calls(), 10)
-        # F9/A10: a backwards wall-clock step cannot stretch the loop past the poll-count cap
+        # F9/A10 + Issue 92 item 4: a backwards clock step cannot stretch the loop past the
+        # 65-poll cap, and printed elapsed seconds are clamped at >= 0 (never negative)
         r = run([], MDUTIL_TRANSITIONING, backstep="600")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("still transitioning after", r.stderr)
-        self.assertIn("65 poll(s)", r.stderr)
+        self.assertIn("still transitioning after 0 s, 65 poll(s)", r.stderr)
         self.assertEqual(calls(), 65)
         self.assertEqual(len(slept()), 64)
+        # Pass log elapsed seconds are also clamped at >= 0 after a backwards step
+        r = run([MDUTIL_TRANSITIONING, MDUTIL_TRANSITIONING], MDUTIL_OFF, backstep="600")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("3 poll(s), 0 s elapsed", r.stdout)
         # enabled is never retried into a pass, before or after a Transitioning poll
         for outs in ([MDUTIL_ON], [MDUTIL_TRANSITIONING]):
             r = run(outs, MDUTIL_ON)
@@ -5208,18 +5344,102 @@ class GuestScripts(unittest.TestCase):
                 MDUTIL_OFF_3 + "/Volumes/X\x7f:\n\tIndexing disabled.\n",
                 "unexpected line",
             ),
+            (
+                "header not starting with / is rejected",
+                "foo:\n\tIndexing disabled.\n" + MDUTIL_OFF,
+                "unexpected line",
+            ),
+            (
+                "error-like header not starting with / is rejected",
+                "Error: unknown:\n\tIndexing disabled.\n" + MDUTIL_OFF,
+                "unexpected line",
+            ),
+            (
+                "tab-joined header hiding error status is rejected",
+                MDUTIL_OFF_3 + "/Volumes/X:\tError: unknown indexing state.\t/Volumes/Y:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
+            (
+                "tab inside header path is rejected",
+                MDUTIL_OFF_3 + "/Volumes/X\tY:\n\tIndexing disabled.\n",
+                "unexpected line",
+            ),
         ):  # fmt: skip
             with self.subTest(name):
                 r = run([], out)
                 self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
                 self.assertIn(why, r.stderr)
                 self.assertEqual(slept(), [])
+        # Issue 92 item 2 + PR 100 R1 Adversary #1: NUL bytes in mdutil output are preserved
+        # via root-only $STATE_DIR mktemp + single LC_ALL=C tr -> $mdutil_out and rejected
+        # (including EOF NUL and a NUL-joined header with NO tab, which specifically proves
+        # NUL detection independently of item 1's tab rejection).
+        for name, raw_out, want_msg in (
+            (
+                "NUL inside header is rejected",
+                MDUTIL_OFF_3.encode() + b"/Volumes/X\x00:\n\tIndexing disabled.\n",
+                b"unexpected line",
+            ),
+            (
+                "NUL-joined header without tab hides error status",
+                MDUTIL_OFF_3.encode()
+                + b"/Volumes/X:\x00Error: unknown indexing state.\x00/Volumes/Y:\n\tIndexing disabled.\n",
+                b"unexpected line",
+            ),
+            (
+                "NUL splitting Indexing enabled is rejected",
+                MDUTIL_OFF_3.encode() + b"/Volumes/X:\n\tIndexing\x00 enabled.\n",
+                b"unexpected line",
+            ),
+            (
+                "EOF NUL after valid listing is rejected",
+                MDUTIL_OFF_3.encode() + b"\x00",
+                b"unexpected line",
+            ),
+            (
+                "only newlines is rejected as no volume listed",
+                b"\n\n\n",
+                b"no volume listed",
+            ),
+        ):
+            with self.subTest(name):
+                r = run([], raw_out, raw_bytes=True)
+                self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+                self.assertIn(want_msg, r.stderr)
+                self.assertEqual(slept(), [])
         r = run([], MDUTIL_OFF)  # all volumes disabled passes
         self.assertEqual(r.returncode, 0, r.stderr)
         r = run([], MDUTIL_OFF_3)  # T3/N4: full real 27.2 three-volume listing passes
         self.assertEqual(r.returncode, 0, r.stderr)
-        # A1 / R2-2: pin LC_ALL=C on awk under a UTF-8 locale (plain awk fails U+0085 as
-        # [[:cntrl:]] and aborts with exit 2 on an invalid UTF-8 byte)
+        # Positive check for tightened grammar: spaces in volume names still pass, and
+        # (Opus N1 accepted trade-off) a space-joined /...: line still matches header grammar
+        # while Indexing enabled remains checked across the full output first.
+        r = run([], MDUTIL_OFF_3 + "/Volumes/Macintosh HD:\n\tIndexing disabled.\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run(
+            [],
+            MDUTIL_OFF_3
+            + "/Volumes/X: Error: unknown indexing state. /Volumes/Y:\n\tIndexing disabled.\n",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run(
+            [],
+            MDUTIL_OFF_3
+            + "/Volumes/X: Indexing enabled. /Volumes/Y:\n\tIndexing disabled.\n",
+        )
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("still enabled", r.stderr)
+        # PR 100 R1 Adversary #1/#3: mktemp -- and rm -f -- handle a leading '-' in STATE_DIR
+        # cleanly, and TMPDIR is never consulted.
+        dash_parent = Path(tempfile.mkdtemp(prefix="tendcf-prep-dash-"))
+        self.addCleanup(shutil.rmtree, dash_parent, True)
+        (dash_parent / "-dash-state").mkdir()
+        r = run([], MDUTIL_OFF_3, state_dir="-dash-state", cwd=str(dash_parent))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A1 / R2-2: acceptance under LC_ALL=en_US.UTF-8 on all platforms. Note (issue 92
+        # item 3): on Linux CI (mawk/gawk), plain awk does not exhibit macOS BSD awk 20200816's
+        # U+0085 [[:cntrl:]] / invalid-UTF-8 abort, so the BSD-awk mutation kill itself is
+        # proved in test_prep_mdutil_lc_all_c_pin_kills_macos_bsd_awk_mutant (darwin-only).
         for name, out, raw_bytes in (
             (
                 "U+0085 in extra volume under UTF-8 locale",
@@ -5243,6 +5463,79 @@ class GuestScripts(unittest.TestCase):
         r = run([], MDUTIL_OFF, rc="1")  # a failing mdutil dies, whatever it printed
         self.assertEqual(r.returncode, 1)
         self.assertIn("mdutil -a -s failed (rc 1)", r.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "BSD awk locale-dependent U+0085 / invalid-UTF-8 mutation kill only bites on macOS "
+        "(Linux CI runs mawk/gawk)",
+    )
+    def test_prep_mdutil_lc_all_c_pin_kills_macos_bsd_awk_mutant(self):
+        # Issue 92 item 3: on macOS (BSD awk 20200816), explicitly prove that removing
+        # LC_ALL=C from prep.sh's awk fails on U+0085 and invalid UTF-8 (\xff) under
+        # LC_ALL=en_US.UTF-8, while the real pinned snippet passes both. Skipped on Linux CI
+        # so a green Linux run never implies BSD-awk mutation coverage.
+        snippet = self._prep_mdutil_snippet()
+        self.assertIn("LC_ALL=C awk", snippet)
+        mutant = snippet.replace("LC_ALL=C awk", "awk", 1)
+        self.assertNotEqual(mutant, snippet)
+        seq = Path(tempfile.mkdtemp(prefix="tendcf-prep-awk-"))
+        self.addCleanup(shutil.rmtree, seq, True)
+        state_check = Path(tempfile.mkdtemp(prefix="tendcf-prep-awk-state-"))
+        self.addCleanup(shutil.rmtree, state_check, True)
+        fakes = {
+            "mdutil": 'cat "$SEQ/out"\n',
+            "sleep": "exit 0\n",
+        }
+        for name, raw_out in (
+            (
+                "U+0085 in extra volume",
+                (MDUTIL_OFF_3 + "/Volumes/X\u0085Y:\n\tIndexing disabled.\n").encode(
+                    "utf-8"
+                ),
+            ),
+            (
+                "invalid UTF-8 byte in extra volume",
+                MDUTIL_OFF_3.encode() + b"/Volumes/X\xffY:\n\tIndexing disabled.\n",
+            ),
+        ):
+            with self.subTest(name):
+                (seq / "out").write_bytes(raw_out)
+                env = {
+                    "SEQ": str(seq),
+                    "STATE_DIR": str(state_check),
+                    "TMPDIR": "/nonexistent-tmpdir-must-not-be-used",
+                    "LC_ALL": "en_US.UTF-8",
+                }
+                r_mut = self.run_snippet(
+                    mutant,
+                    fakes,
+                    env,
+                    links=("awk", "cat", "mktemp", "tr", "rm"),
+                    raw_bytes=True,
+                )
+                self.assertNotEqual(
+                    r_mut.returncode,
+                    0,
+                    f"expected unpinned macOS BSD awk mutant to fail on {name}",
+                )
+                self.assertEqual(
+                    list(state_check.iterdir()),
+                    [],
+                    "leaked mdutil mktemp file on mutant fail",
+                )
+                r_pin = self.run_snippet(
+                    snippet,
+                    fakes,
+                    env,
+                    links=("awk", "cat", "mktemp", "tr", "rm"),
+                    raw_bytes=True,
+                )
+                self.assertEqual(r_pin.returncode, 0, r_pin.stderr)
+                self.assertEqual(
+                    list(state_check.iterdir()),
+                    [],
+                    "leaked mdutil mktemp file on pinned pass",
+                )
 
     def test_prep_turns_automatic_downloads_and_installs_off_and_only_reads_the_schedule(
         self,
