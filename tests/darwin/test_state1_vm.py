@@ -14,16 +14,20 @@ import base64
 import contextlib
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import urllib.error
@@ -179,6 +183,57 @@ class FakeWorld:
         self.hostkey_mismatch = False
         self.cur_argv = None
         self.no_tty_calls = []
+        # renderer / darwin installer simulation (steps 3-9, 9a, 10b, 11a)
+        self.gh_fail = False
+        self.gh_tarball_bytes = b"fake-tarball-payload"
+        self.gh_bad_sha = False
+        self.stage_bundles = []  # raw tar.gz bytes uploaded to guest
+        self.guest_stage_dir = "/var/tmp/tendcf-stage.abc123"
+        self.workdir = "/opt/tendcf/var/libntech"
+        self.install_count = 0
+        self.enable_count = 0
+        self.install_fail = False
+        self.install_rerun_changes = False
+        self.tendcf_tree_bad = False
+        self.policy_tree_bad = False
+        self.data_mode = "root:wheel 600"
+        self.quarantine_left = False
+        self.run_once_fail = False
+        self.run_once_rerun_repairs = False
+        self.run_once_rerun_reloads = False
+        self.canary_plist_bytes = drv.CANARY_GOLDEN.read_text(encoding="utf-8")
+        self.canary_plist_mode = "root:wheel 644"
+        self.canary_plutil_fail = False
+        self.canary_backup_present = False
+        self.canary_loaded = False
+        self.canary_pid = 400
+        self.canary_args = [drv.CANARY_PROG, drv.CANARY_ARG]
+        self.canary_drifted = False
+        self.drift_unrepaired = False
+        self.drift_no_reload = False
+        self.kickstart_fail = False
+        self.kickstart_same_pid = False
+        self.canary_absent_data = False
+        self.canary_teardown_keeps_plist = False
+        self.canary_teardown_keeps_loaded = False
+        self.canary_lost_after_reboot = False
+        self.nonroot_installer_succeeds = False
+        self.nonroot_cfagent_mutates = False
+        self.nonroot_bootstrap_succeeds = False
+        self.execd_enable_fail = False
+        self.execd_enable_rerun_changes = False
+        self.execd_plist_present = False
+        self.execd_plist_mode = "root:wheel 644"
+        self.execd_loaded = False
+        self.execd_state = "running"
+        self.execd_program = drv.EXECD_PROG
+        self.execd_pid = 500
+        self.execd_user = "root"
+        self.execd_comm = "/opt/tendcf/bin/cf-execd"
+        self.execd_lost_after_reboot = False
+        self.execd_disable_fail = False
+        self.execd_disable_keeps_loaded = False
+        self.stage_removed = False
 
     # -- helpers
     def argvs(self, prefix):
@@ -196,6 +251,7 @@ class FakeWorld:
         argv,
         *,
         input_text=None,
+        input_bytes=None,
         env=None,
         timeout=None,
         log_path=None,
@@ -203,6 +259,7 @@ class FakeWorld:
         raw_newlines=False,
     ):
         self._raw_newlines = raw_newlines
+        self._input_bytes = input_bytes
         self.calls.append((list(argv), dict(env) if env else None))
         if no_tty:
             self.no_tty_calls.append(list(argv))
@@ -214,6 +271,8 @@ class FakeWorld:
             if self.interrupt_after_tart == argv[1]:
                 raise Interrupt("SIGINT")
             return res
+        if argv[0] == "gh":
+            return self._gh(argv[1:])
         if argv[0] == "ssh-keygen":  # a real one: the minted key must be a real key
             r = subprocess.run(argv, capture_output=True, text=True, check=False)
             return drv.Result(r.returncode, r.stdout, r.stderr)
@@ -227,6 +286,26 @@ class FakeWorld:
             self.ssh_calls.append((list(argv), dict(env) if env else None))
             return self._ssh(argv, input_text, env or {})
         raise AssertionError(f"unexpected command {argv}")
+
+    def _gh(self, a):
+        if a[:2] == ["run", "download"]:
+            if self.gh_fail:
+                return drv.Result(1, "", "gh: artifact not found")
+            name = a[a.index("-n") + 1]
+            dest = Path(a[a.index("-D") + 1])
+            dest.mkdir(parents=True, exist_ok=True)
+            tar_name = f"{name}.tar.gz"
+            (dest / tar_name).write_bytes(self.gh_tarball_bytes)
+            digest = (
+                "0" * 64
+                if self.gh_bad_sha
+                else hashlib.sha256(self.gh_tarball_bytes).hexdigest()
+            )
+            (dest / f"{tar_name}.sha256").write_text(
+                f"{digest}  {tar_name}\n", encoding="utf-8"
+            )
+            return drv.Result(0, "")
+        raise AssertionError(f"unexpected gh command {a}")
 
     def start(self, argv, *, log_path, env=None):
         self.calls.append((list(argv), dict(env) if env else None))
@@ -405,11 +484,131 @@ class FakeWorld:
             return drv.Result(0)
         if r[:3] == ["/bin/sh", "-c", drv.RUN_SCRIPT_SH]:
             return self._run_script(r[4:], input_text)
+        if r[:3] == ["/bin/sh", "-c", drv.STAGE_UPLOAD_SH]:
+            self.stage_bundles.append(self._input_bytes)
+            return drv.Result(0, self.guest_stage_dir + "\n")
         if r[:3] == ["/bin/sh", "-c", drv.TREE_CHECK_SH]:
-            bad = "" if self.fw_owner == FW_PYTHON_FIXED else f"{r[4]}\n"
-            if r[4] == FW_ROOT and self.fw_versions != FW_PYTHON_FIXED:
+            path = r[4]
+            if path == drv.TENDCF_PREFIX:
+                return drv.Result(0, f"{path}/bin/cf-agent\n" if self.tendcf_tree_bad else "")
+            if path == f"{self.workdir}/inputs":
+                return drv.Result(0, f"{path}/promises.cf\n" if self.policy_tree_bad else "")
+            bad = "" if self.fw_owner == FW_PYTHON_FIXED else f"{path}\n"
+            if path == FW_ROOT and self.fw_versions != FW_PYTHON_FIXED:
                 bad += f"{FW_ROOT}/Versions\n"
             return drv.Result(0, bad)
+        if r[:3] == ["sudo", "-n", f"{self.guest_stage_dir}/tendcf-install.sh"]:
+            return self._guest_installer(r[3:])
+        if r[:1] == [f"{self.guest_stage_dir}/tendcf-install.sh"]:
+            if self.nonroot_installer_succeeds:
+                return drv.Result(0, "ok\n")
+            return drv.Result(1, "", "tendcf-install: run as root\n")
+        if r == [f"{drv.TENDCF_PREFIX}/bin/cf-agent", "-K", "-f", f"{self.workdir}/inputs/promises.cf"]:
+            if self.nonroot_cfagent_mutates:
+                self.canary_plist_bytes = self.canary_plist_bytes + "<!-- mutated -->\n"
+                return drv.Result(0, "")
+            return drv.Result(1, "", "error: permission denied\n")
+        if r == ["/bin/launchctl", "bootstrap", "system", drv.CANARY_PLIST]:
+            if self.nonroot_bootstrap_succeeds:
+                return drv.Result(0, "")
+            return drv.Result(1, "", "Bootstrap failed: 1: Operation not permitted\n")
+        if r == ["sudo", "-n", "/usr/bin/stat", "-f", "%Su:%Sg %Lp", f"{self.workdir}/data/host_specific.json"]:
+            return drv.Result(0, self.data_mode + "\n")
+        if r == ["/usr/bin/xattr", "-rs", drv.TENDCF_PREFIX]:
+            return drv.Result(
+                0,
+                f"{drv.TENDCF_PREFIX}/bin/cf-agent: com.apple.quarantine\n"
+                if self.quarantine_left
+                else "",
+            )
+        if (
+            r[:5] == ["sudo", "-n", "/bin/sh", "-c", 'test -f "$1" && ! test -L "$1" && /usr/bin/stat -f "%Su:%Sg %Lp" "$1"']
+            and len(r) == 7
+        ):
+            p = r[6]
+            if p == drv.CANARY_PLIST:
+                if not self.canary_plist_bytes:
+                    return drv.Result(1, "", "")
+                return drv.Result(0, self.canary_plist_mode + "\n")
+            if p == drv.EXECD_PLIST:
+                if not self.execd_plist_present:
+                    return drv.Result(1, "", "")
+                return drv.Result(0, self.execd_plist_mode + "\n")
+        if r[:4] == ["sudo", "-n", "/usr/bin/plutil", "-lint"]:
+            if r[4] == drv.CANARY_PLIST and self.canary_plutil_fail:
+                return drv.Result(1, "", f"{r[4]}: malformed plist\n")
+            return drv.Result(0, f"{r[4]}: OK\n")
+        if r[:5] == ["sudo", "-n", "/bin/sh", "-c", '! test -e "$1.cf-before-edit"']:
+            return drv.Result(1 if self.canary_backup_present else 0, "")
+        if r[:5] == ["sudo", "-n", "/bin/sh", "-c", '! test -e "$1"'] and len(r) == 7:
+            p = r[6]
+            if p == drv.CANARY_PLIST:
+                return drv.Result(1 if self.canary_plist_bytes else 0, "")
+            if p == drv.EXECD_PLIST:
+                return drv.Result(1 if self.execd_plist_present else 0, "")
+        if r == ["sudo", "-n", "/bin/cat", drv.CANARY_PLIST]:
+            return drv.Result(0, self.canary_plist_bytes)
+        if r[:4] == ["sudo", "-n", "/usr/bin/shasum", "-a"] and r[4] == "256":
+            if r[5] == drv.CANARY_PLIST:
+                digest = hashlib.sha256(self.canary_plist_bytes.encode("utf-8")).hexdigest()
+                return drv.Result(0, f"{digest}  {r[5]}\n")
+            return drv.Result(1, "", "No such file")
+        if r == ["sudo", "-n", "/usr/bin/plutil", "-replace", "ProgramArguments.1", "-string", drv.CANARY_DRIFT_ARG, drv.CANARY_PLIST]:
+            self.canary_plist_bytes = self.canary_plist_bytes.replace(
+                f"<string>{drv.CANARY_ARG}</string>",
+                f"<string>{drv.CANARY_DRIFT_ARG}</string>",
+            )
+            self.canary_drifted = True
+            return drv.Result(0, "")
+        if r[:4] == ["sudo", "-n", "/bin/launchctl", "print"]:
+            target = r[4]
+            if target == f"system/{drv.CANARY_LABEL}":
+                if not self.canary_loaded or (self.rebooted and self.canary_lost_after_reboot):
+                    return drv.Result(113, "", "Could not find service\n")
+                args_lines = "\n".join(f"\t\t{a}" for a in self.canary_args)
+                return drv.Result(
+                    0,
+                    f"system/{drv.CANARY_LABEL} = {{\n"
+                    f"\tpath = {drv.CANARY_PLIST}\n"
+                    "\ttype = LaunchDaemon\n"
+                    "\tstate = running\n"
+                    f"\tprogram = {self.canary_args[0]}\n"
+                    "\targuments = {\n"
+                    f"{args_lines}\n"
+                    "\t}\n"
+                    f"\tpid = {self.canary_pid}\n"
+                    "}\n",
+                )
+            if target == f"system/{drv.EXECD_LABEL}":
+                if not self.execd_loaded or (self.rebooted and self.execd_lost_after_reboot):
+                    return drv.Result(113, "", "Could not find service\n")
+                return drv.Result(
+                    0,
+                    f"system/{drv.EXECD_LABEL} = {{\n"
+                    f"\tpath = {drv.EXECD_PLIST}\n"
+                    "\ttype = LaunchDaemon\n"
+                    f"\tstate = {self.execd_state}\n"
+                    f"\tprogram = {self.execd_program}\n"
+                    "\targuments = {\n"
+                    f"\t\t{self.execd_program}\n"
+                    "\t\t--no-fork\n"
+                    "\t}\n"
+                    f"\tpid = {self.execd_pid}\n"
+                    "}\n",
+                )
+        if r == ["sudo", "-n", "/bin/launchctl", "kickstart", "-k", f"system/{drv.CANARY_LABEL}"]:
+            if self.kickstart_fail:
+                return drv.Result(1, "", "kickstart failed\n")
+            if not self.kickstart_same_pid:
+                self.canary_pid += 1
+            return drv.Result(0, "")
+        if r[:3] == ["ps", "-o", "user=,comm="] and r[3] == "-p":
+            if r[4] == str(self.execd_pid):
+                return drv.Result(0, f"{self.execd_user} {self.execd_comm}\n")
+            return drv.Result(1, "", "")
+        if r == ["/bin/rm", "-rf", self.guest_stage_dir]:
+            self.stage_removed = True
+            return drv.Result(0, "")
         if r == ["sudo", "-n", "sh", "-c", "id -u"]:
             return drv.Result(0, "0\n")
         if r == ["sw_vers", "-productVersion"]:
@@ -510,6 +709,8 @@ class FakeWorld:
                 ),
             )
         if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"]:
+            if r[3] in (drv.TENDCF_PREFIX, f"{self.workdir}/inputs"):
+                return drv.Result(0, FW_PYTHON_FIXED + "\n")
             return drv.Result(0, self.fw_owner + "\n")
         if r[:3] == ["sysctl", "-n", "kern.bootsessionuuid"]:
             n = self.boot if self.reboot_changes_uuid else 1
@@ -528,6 +729,65 @@ class FakeWorld:
                 self._stop_current()
             return drv.Result(255, "", "Connection closed")
         raise AssertionError(f"unexpected guest command {r}")
+
+    def _guest_installer(self, args):
+        sub = args[0]
+        if sub == "install":
+            self.install_count += 1
+            if self.install_fail:
+                return drv.Result(1, "", "tendcf-install: sha256 mismatch\n")
+            if self.install_count > 1 and not self.install_rerun_changes:
+                return drv.Result(0, "tendcf-install: no change (CFEngine Core 3.29.0a)\n")
+            return drv.Result(0, "tendcf-install: installed: CFEngine Core 3.29.0a\n")
+        if sub == "workdir":
+            return drv.Result(0, self.workdir + "\n")
+        if sub == "data":
+            self.canary_absent_data = args[1].endswith("host_specific-absent.json")
+            return drv.Result(0, "tendcf-install: data installed\n")
+        if sub == "run-once":
+            if self.run_once_fail:
+                return drv.Result(1, "", "cf-agent failed\n")
+            if self.canary_absent_data:
+                if not self.canary_teardown_keeps_plist:
+                    self.canary_plist_bytes = ""
+                if not self.canary_teardown_keeps_loaded:
+                    self.canary_loaded = False
+                return drv.Result(0, "info: deleted canary\n")
+            if not self.canary_loaded:
+                self.canary_loaded = True
+                self.canary_args = [drv.CANARY_PROG, drv.CANARY_ARG]
+                return drv.Result(0, "info: Created file and bootstrapped\n")
+            if self.canary_drifted:
+                if not self.drift_unrepaired:
+                    self.canary_plist_bytes = drv.CANARY_GOLDEN.read_text(encoding="utf-8")
+                    self.canary_args = [drv.CANARY_PROG, drv.CANARY_ARG]
+                if not self.drift_no_reload:
+                    self.canary_pid += 1
+                self.canary_drifted = False
+                return drv.Result(0, "info: Updated rendering and reloaded\n")
+            # idempotent re-run
+            if self.run_once_rerun_reloads:
+                self.canary_pid += 1
+            if self.run_once_rerun_repairs:
+                return drv.Result(0, "info: Updated rendering of plist\n")
+            return drv.Result(0, "")
+        if sub == "enable":
+            self.enable_count += 1
+            if self.execd_enable_fail:
+                return drv.Result(1, "", "tendcf-install: bootstrap failed\n")
+            self.execd_plist_present = True
+            self.execd_loaded = True
+            if self.enable_count > 1 and not self.execd_enable_rerun_changes:
+                return drv.Result(0, "tendcf-install: no change (org.tendcf.execd already loaded)\n")
+            return drv.Result(0, "tendcf-install: enabled: org.tendcf.execd\n")
+        if sub == "disable":
+            if self.execd_disable_fail:
+                return drv.Result(1, "", "tendcf-install: bootout failed\n")
+            self.execd_plist_present = False
+            if not self.execd_disable_keeps_loaded:
+                self.execd_loaded = False
+            return drv.Result(0, "tendcf-install: disabled: org.tendcf.execd\n")
+        raise AssertionError(f"unexpected guest installer subcommand {args}")
 
     def _run_script(self, args, script):
         self.script_calls.append((script, list(self.cur_argv)))
@@ -2998,13 +3258,13 @@ class Check(Base):
         ):  # fmt: skip
             self.assertEqual(st[sid]["status"], "pass", (sid, st[sid]))
         self.assertEqual(st["3"]["status"], "skip")
-        self.assertIn("needs the renderer slice", st["3"]["evidence"])
-        for sid in "456789":
+        self.assertIn("no artifact supplied", st["3"]["evidence"])
+        for sid in ("4", "5", "6", "7", "8", "9", "9a"):
             self.assertEqual(st[sid]["status"], "skip")
-            self.assertEqual(st[sid]["evidence"], "SKIP: renderer slice")
+            self.assertIn("no artifact supplied", st[sid]["evidence"])
         for sid in ("10b", "11a"):
             self.assertEqual(st[sid]["status"], "skip")
-            self.assertIn("renderer slice", st[sid]["evidence"])
+            self.assertIn("no artifact supplied", st[sid]["evidence"])
         self.assertEqual(
             sorted(self.world.vms), [GOLDEN]
         )  # the throwaway clone is gone
@@ -5247,6 +5507,269 @@ class GuestScripts(unittest.TestCase):
         self.assertNotEqual(self.pkgutil_check(not_leaf).returncode, 0)
         # pkgutil itself failing, whatever it printed
         self.assertNotEqual(self.pkgutil_check(self.GOOD_SIG, rc=1).returncode, 0)
+
+
+class CheckRenderer(Base):
+    """Steps 3-9, 9a, 10b and 11a (issue 70 renderer slice + root cf-execd)."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_golden()
+        self.tarball = self.tmp / "tendcf-fork-macos-arm64-4443504fdeb7ad0be247b26ee8ebdf8ee2ee5a28.tar.gz"
+        self.tarball.write_bytes(b"fake-fork-tarball-content")
+        self.sha_file = Path(str(self.tarball) + ".sha256")
+        digest = hashlib.sha256(self.tarball.read_bytes()).hexdigest()
+        self.sha_file.write_text(f"{digest}  {self.tarball.name}\n", encoding="utf-8")
+
+    def tarball_args(self, *extra):
+        return self.check_args("--tarball", str(self.tarball), *extra)
+
+    def test_full_happy_path_with_tarball_runs_every_step_live(self):
+        rc, s = self.run_cmd(*self.tarball_args())
+        self.assertEqual(rc, 0, s)
+        self.assertTrue(s["ok"])
+        st = self.steps(s)
+        for sid in (
+            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l",
+            "3", "4", "5", "6", "7", "8", "9", "9a", "10", "10a", "10b", "11a", "11",
+        ):  # fmt: skip
+            self.assertEqual(st[sid]["status"], "pass", (sid, st[sid]))
+        self.assertEqual(len(self.world.stage_bundles), 1)
+        with tarfile.open(fileobj=io.BytesIO(self.world.stage_bundles[0]), mode="r:gz") as tf:
+            names = set(tf.getnames())
+        self.assertIn("tendcf-install.sh", names)
+        self.assertIn(f"artifact/{self.tarball.name}", names)
+        self.assertIn(f"artifact/{self.sha_file.name}", names)
+        self.assertIn("policy/tendcf_services.cf", names)
+        self.assertIn("canary/host_specific.json", names)
+        self.assertIn("canary/host_specific-absent.json", names)
+        self.assertTrue(self.world.stage_removed)
+        self.assertEqual(sorted(self.world.vms), [GOLDEN])
+
+    def test_artifact_run_downloads_verifies_and_passes(self):
+        rc, s = self.run_cmd(*self.check_args("--artifact-run", "45093070656"))
+        self.assertEqual(rc, 0, s)
+        self.assertTrue(s["ok"])
+        self.assertEqual(s["artifact_run"], "45093070656")
+        gh_calls = self.world.argvs(["gh", "run", "download"])
+        self.assertEqual(len(gh_calls), 1)
+        self.assertIn("45093070656", gh_calls[0])
+        self.assertEqual(self.steps(s)["10b"]["status"], "pass")
+        self.assertEqual(self.steps(s)["11a"]["status"], "pass")
+
+    def test_refuses_bad_artifact_arguments_before_cloning(self):
+        cases = (
+            ("both tarball and artifact-run", self.check_args("--tarball", str(self.tarball), "--artifact-run", "12345")),
+            ("sha256 without tarball", self.check_args("--sha256", str(self.sha_file))),
+            ("non-numeric artifact-run", self.check_args("--artifact-run", "abc123")),
+            ("missing tarball", self.check_args("--tarball", str(self.tmp / "missing.tar.gz"))),
+        )
+        for name, argv in cases:
+            with self.subTest(name):
+                rc, s = self.run_cmd(*argv)
+                self.assertEqual(rc, 2, (name, s))
+                self.assertEqual(self.world.tart_calls("clone"), [], name)
+
+    def test_refuses_mismatched_or_malformed_sha256_before_cloning(self):
+        self.sha_file.write_text(f"{'0' * 64}  {self.tarball.name}\n", encoding="utf-8")
+        rc, s = self.run_cmd(*self.tarball_args())
+        self.assertEqual(rc, 2, s)
+        self.assertIn("sha256 mismatch", self.steps(s)["refused"]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+        self.sha_file.write_text("not-a-sha\n", encoding="utf-8")
+        rc, s = self.run_cmd(*self.tarball_args())
+        self.assertEqual(rc, 2, s)
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_gh_download_failure_reports_error_without_cloning(self):
+        self.world.gh_fail = True
+        rc, s = self.run_cmd(*self.check_args("--artifact-run", "45093070656"))
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["error"]["status"], "fail")
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+    def test_step3_failures_skip_dependent_steps_and_still_clean_up(self):
+        for name, mutate in (
+            ("install fails", lambda w: setattr(w, "install_fail", True)),
+            ("binary tree writable", lambda w: setattr(w, "tendcf_tree_bad", True)),
+            ("policy tree writable", lambda w: setattr(w, "policy_tree_bad", True)),
+            ("data mode 644", lambda w: setattr(w, "data_mode", "root:wheel 644")),
+            ("quarantine left", lambda w: setattr(w, "quarantine_left", True)),
+        ):
+            with self.subTest(name):
+                self.setUp()
+                mutate(self.world)
+                rc, s = self.run_cmd(*self.tarball_args())
+                self.assertEqual(rc, 1, (name, s))
+                st = self.steps(s)
+                self.assertEqual(st["3"]["status"], "fail", (name, st["3"]))
+                for sid in ("4", "5", "6", "7", "8", "9", "9a", "10b", "11a"):
+                    self.assertEqual(st[sid]["status"], "skip", (name, sid))
+                self.assertEqual(st["11"]["status"], "pass", name)
+                self.assertEqual(sorted(self.world.vms), [GOLDEN], name)
+
+    def test_step4_to_step9a_failure_paths(self):
+        cases = (
+            ("4", "run-once fails", lambda w: setattr(w, "run_once_fail", True)),
+            ("4", "bad plist mode", lambda w: setattr(w, "canary_plist_mode", "root:wheel 664")),
+            ("4", "plutil fails", lambda w: setattr(w, "canary_plutil_fail", True)),
+            ("4", "backup file left", lambda w: setattr(w, "canary_backup_present", True)),
+            ("5", "golden mismatch", lambda w: setattr(w, "canary_plist_bytes", "<plist>wrong</plist>\n")),
+            ("6", "kickstart fails", lambda w: setattr(w, "kickstart_fail", True)),
+            ("6", "kickstart same pid", lambda w: setattr(w, "kickstart_same_pid", True)),
+            ("7", "rerun reports repair", lambda w: setattr(w, "run_once_rerun_repairs", True)),
+            ("7", "rerun reloads daemon", lambda w: setattr(w, "run_once_rerun_reloads", True)),
+            ("7", "installer rerun changes", lambda w: setattr(w, "install_rerun_changes", True)),
+            ("8", "drift unrepaired", lambda w: setattr(w, "drift_unrepaired", True)),
+            ("8", "drift not reloaded", lambda w: setattr(w, "drift_no_reload", True)),
+            ("9", "nonroot installer ok", lambda w: setattr(w, "nonroot_installer_succeeds", True)),
+            ("9", "nonroot cf-agent mutates", lambda w: setattr(w, "nonroot_cfagent_mutates", True)),
+            ("9", "nonroot bootstrap ok", lambda w: setattr(w, "nonroot_bootstrap_succeeds", True)),
+            ("9a", "execd enable fails", lambda w: setattr(w, "execd_enable_fail", True)),
+            ("9a", "execd enable rerun changes", lambda w: setattr(w, "execd_enable_rerun_changes", True)),
+            ("9a", "execd not running", lambda w: setattr(w, "execd_state", "spawn scheduled")),
+            ("9a", "execd runs as nobody", lambda w: setattr(w, "execd_user", "nobody")),
+            ("10b", "canary missing post-reboot", lambda w: setattr(w, "canary_lost_after_reboot", True)),
+            ("10b", "execd missing post-reboot", lambda w: setattr(w, "execd_lost_after_reboot", True)),
+            ("11a", "canary plist stays", lambda w: setattr(w, "canary_teardown_keeps_plist", True)),
+            ("11a", "canary still loaded", lambda w: setattr(w, "canary_teardown_keeps_loaded", True)),
+            ("11a", "execd disable fails", lambda w: setattr(w, "execd_disable_fail", True)),
+            ("11a", "execd still loaded", lambda w: setattr(w, "execd_disable_keeps_loaded", True)),
+        )
+        for sid, name, mutate in cases:
+            with self.subTest(step=sid, case=name):
+                self.setUp()
+                mutate(self.world)
+                rc, s = self.run_cmd(*self.tarball_args())
+                self.assertEqual(rc, 1, (sid, name, s))
+                st = self.steps(s)
+                self.assertEqual(st[sid]["status"], "fail", (sid, name, st[sid]))
+                self.assertEqual(st["11"]["status"], "pass", (sid, name))
+
+    def test_step10_reboot_failure_skips_10a_10b_11a(self):
+        self.world.reboot_changes_uuid = False
+        rc, s = self.run_cmd(*self.tarball_args())
+        self.assertEqual(rc, 1, s)
+        st = self.steps(s)
+        self.assertEqual(st["10"]["status"], "fail")
+        for sid in ("10a", "10b", "11a"):
+            self.assertEqual(st[sid]["status"], "skip", sid)
+            self.assertIn("step 10 failed", st[sid]["evidence"], sid)
+        self.assertEqual(st["11"]["status"], "pass")
+
+
+class DarwinInstallerAndSymlink(unittest.TestCase):
+    """Static and hermetic checks on deploy/darwin/tendcf-install.sh and deploy/macos."""
+
+    INSTALLER = REPO / "deploy" / "darwin" / "tendcf-install.sh"
+    SYMLINK = REPO / "deploy" / "macos"
+
+    def test_macos_symlink_is_relative_to_darwin(self):
+        self.assertTrue(self.SYMLINK.is_symlink())
+        self.assertEqual(os.readlink(self.SYMLINK), "darwin")
+        self.assertEqual(
+            (self.SYMLINK / "tendcf-install.sh").resolve(),
+            self.INSTALLER.resolve(),
+        )
+
+    def test_installer_syntax_guards_and_plist_template(self):
+        r = subprocess.run(
+            ["bash", "-n", str(self.INSTALLER)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = self.INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("set -euo pipefail", text)
+        self.assertIn("unset DYLD_LIBRARY_PATH", text)
+        self.assertIn('= 0 ] || die "run as root"', text)
+        self.assertIn('= Darwin ] || die "Darwin only"', text)
+        self.assertIn("com.apple.quarantine", text)
+        self.assertIn("plutil -lint", text)
+        self.assertIn("launchctl print", text)
+        self.assertIn("org.tendcf.execd", text)
+
+        # Render the embedded org.tendcf.execd plist heredoc and parse with plistlib.
+        m = re.search(
+            r'cat > "\$dest" <<EOF\n(.*?)\nEOF', text, re.DOTALL
+        )
+        self.assertIsNotNone(m)
+        rendered = (
+            m.group(1)
+            .replace("$label", "org.tendcf.execd")
+            .replace("$cf_execd", "/opt/tendcf/bin/cf-execd")
+            .replace("$prefix", "/opt/tendcf")
+            .replace("$workdir", "/opt/tendcf/var/libntech")
+        )
+        parsed = plistlib.loads(rendered.encode("utf-8"))
+        self.assertEqual(parsed["Label"], "org.tendcf.execd")
+        self.assertEqual(parsed["ProgramArguments"], ["/opt/tendcf/bin/cf-execd", "--no-fork"])
+        self.assertEqual(parsed["UserName"], "root")
+        self.assertTrue(parsed["RunAtLoad"])
+        self.assertTrue(parsed["KeepAlive"])
+
+    def test_embedded_macho_parser_accepts_valid_and_rejects_bad_deps(self):
+        text = self.INSTALLER.read_text(encoding="utf-8")
+        m = re.search(r'"\$py" - "\$prefix" "\$tree_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY', text, re.DOTALL)
+        self.assertIsNotNone(m)
+        py_code = m.group(1)
+
+        def make_macho(dylibs=(), rpaths=()):
+            cmds = bytearray()
+            for d in dylibs:
+                s = d.encode("utf-8") + b"\x00"
+                raw_len = 24 + len(s)
+                cmdsize = (raw_len + 7) & ~7
+                cmds += struct.pack("<IIIIII", 0x0C, cmdsize, 24, 0, 0, 0)
+                cmds += s + b"\x00" * (cmdsize - raw_len)
+            for rp in rpaths:
+                s = rp.encode("utf-8") + b"\x00"
+                raw_len = 12 + len(s)
+                cmdsize = (raw_len + 7) & ~7
+                cmds += struct.pack("<III", 0x8000001C, cmdsize, 12)
+                cmds += s + b"\x00" * (cmdsize - raw_len)
+            ncmds = len(dylibs) + len(rpaths)
+            hdr = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, ncmds, len(cmds), 0, 0)
+            return hdr + bytes(cmds)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "bin").mkdir()
+            (root / "lib").mkdir()
+            (root / "lib" / "libpromises.3.dylib").write_bytes(b"stub")
+            good = root / "bin" / "cf-agent"
+            good.write_bytes(make_macho(["/usr/lib/libSystem.B.dylib", "/opt/tendcf/lib/libpromises.3.dylib"]))
+            r_ok = subprocess.run(
+                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(good)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+
+            bad_brew = root / "bin" / "bad-brew"
+            bad_brew.write_bytes(make_macho(["/opt/homebrew/lib/libssl.3.dylib"]))
+            r_brew = subprocess.run(
+                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_brew)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_brew.returncode, 0)
+            self.assertIn("outside /opt/tendcf", r_brew.stderr)
+
+            bad_missing = root / "bin" / "bad-missing"
+            bad_missing.write_bytes(make_macho(["/opt/tendcf/lib/libmissing.dylib"]))
+            r_miss = subprocess.run(
+                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_missing)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_miss.returncode, 0)
+            self.assertIn("missing in-prefix library", r_miss.stderr)
+
+            bad_rpath = root / "bin" / "bad-rpath"
+            bad_rpath.write_bytes(make_macho(["/usr/lib/libSystem.B.dylib"], rpaths=["/opt/homebrew/Cellar/librsync/lib"]))
+            r_rp = subprocess.run(
+                [sys.executable, "-c", py_code, "/opt/tendcf", str(root), str(bad_rpath)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_rp.returncode, 0)
+            self.assertIn("forbidden LC_RPATH", r_rp.stderr)
 
 
 if __name__ == "__main__":
