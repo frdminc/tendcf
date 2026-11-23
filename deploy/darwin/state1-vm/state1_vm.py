@@ -1528,7 +1528,7 @@ def read_fork_core_sha(pin_path: Path = FORK_PIN_JSON) -> str:
     """Read the 40-char core commit SHA from overlay/fork.json."""
     try:
         doc = json.loads(pin_path.read_text(encoding="utf-8"))
-        core = doc["core"]
+        core = doc["core"]["commit"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
         raise Refusal(f"{pin_path}: cannot read fork core sha: {e}") from e
     if not isinstance(core, str) or not re.fullmatch(r"[0-9a-f]{40}", core):
