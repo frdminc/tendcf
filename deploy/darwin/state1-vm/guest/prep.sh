@@ -94,22 +94,24 @@ mdutil -a -i off >/dev/null 2>&1 || true
 # 120 s have passed or 65 polls (deadline / interval + 5 margin, stopping the loop after 65 polls
 # — about 130 s plus mdutil's own time — if the clock steps backwards; macOS /bin/sh is bash 3.2,
 # where $SECONDS is backed by time(), so printed elapsed seconds are also clamped at >= 0).
-# Order, every poll: write raw mdutil output to a temp file (preserving mdutil's exit status and
-# NUL bytes, which bash 3.2 command substitution would drop) and map NUL -> SOH via LC_ALL=C tr
-# before shell/awk inspection; "Indexing enabled" anywhere is fatal; then Transitioning anywhere
-# is retried whatever mdutil's exit status was (that status was never recorded); then a non-0
-# exit is fatal; then any line holding a control character other than tab (NUL included, via the
-# SOH mapping) fails as unexpected, and the whole answer must be volume headers (a line starting
-# with "/", ending in ":", and containing no tab), each followed by exactly one
-# "Indexing disabled." line, "/:" and "/System/Volumes/Data:" among them.
+# Order, every poll: write raw mdutil output to a root-only temp file under $STATE_DIR
+# (preserving mdutil's exit status and NUL bytes, which bash 3.2 command substitution would
+# drop) and map NUL -> SOH via LC_ALL=C tr once into $mdutil_out under set -e; "Indexing
+# enabled" anywhere is fatal; then Transitioning anywhere is retried whatever mdutil's exit
+# status was (that status was never recorded); then a non-0 exit is fatal; then any line
+# holding a control character other than tab (NUL included, via the SOH mapping) fails as
+# unexpected, and the whole answer must be volume headers (a line starting with "/", ending
+# in ":", and containing no tab), each followed by exactly one "Indexing disabled." line,
+# "/:" and "/System/Volumes/Data:" among them.
 # shellcheck disable=SC3028 # macOS /bin/sh is bash 3.2, which provides $SECONDS
 SECONDS=0
 mdutil_deadline=120
 mdutil_interval=2
 mdutil_max_polls=$((mdutil_deadline / mdutil_interval + 5))
 mdutil_polls=0
-mdutil_tmp=$(mktemp "${TMPDIR:-/tmp}/tendcf-mdutil.XXXXXX")
-trap 'rm -f "$mdutil_tmp"' EXIT
+mdutil_tmp=$(mktemp -- "$STATE_DIR/tendcf-mdutil.XXXXXX")
+trap 'rm -f -- "$mdutil_tmp"' EXIT
+trap 'exit 129' HUP INT TERM
 while :; do
     mdutil_polls=$((mdutil_polls + 1))
     mdutil_rc=0
@@ -125,8 +127,10 @@ while :; do
     fi
     sleep "$mdutil_interval"
 done
+rm -f -- "$mdutil_tmp"
+trap - EXIT HUP INT TERM
 [ "$mdutil_rc" -eq 0 ] || die "mdutil -a -s failed (rc $mdutil_rc): $mdutil_out"
-mdutil_bad=$(LC_ALL=C tr '\000' '\001' <"$mdutil_tmp" | LC_ALL=C awk '
+mdutil_bad=$(printf '%s\n' "$mdutil_out" | LC_ALL=C awk '
     function fail(msg) { if (!bad) print msg; bad = 1 }
     { t = $0; gsub(/\t/, "", t); if (t ~ /[[:cntrl:]]/) { fail("unexpected line: " $0); next } }
     /^[ \t]*$/ { next }
@@ -152,8 +156,6 @@ mdutil_bad=$(LC_ALL=C tr '\000' '\001' <"$mdutil_tmp" | LC_ALL=C awk '
         else if (!root) fail("no / volume listed")
         else if (!data) fail("no /System/Volumes/Data volume listed")
     }')
-rm -f "$mdutil_tmp"
-trap - EXIT
 [ -z "$mdutil_bad" ] || die "mdutil -a -s: $mdutil_bad: $mdutil_out"
 # shellcheck disable=SC3028 # macOS /bin/sh is bash 3.2 ($SECONDS)
 mdutil_elapsed=$SECONDS
