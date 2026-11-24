@@ -682,6 +682,14 @@ def render_goal_file(
                 f"schema_version {LAUNCHD_V9_SCHEMA_VERSION}"
             )
             continue
+        if launchd_domain in ("user-gui", "user-background") and rec.get("runs_as") == "root":
+            errors.append(
+                f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r} "
+                "with runs_as='root' — root cf-agent skips user-* domains and non-root "
+                "cf-agent refuses run_as='root', so the entry can never converge. "
+                "Resolution: use a non-root runs_as for user-* domains, or set launchd.domain='system'"
+            )
+            continue
         launchd_bools = {k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()}
         if schema_version < LAUNCHD_V8_SCHEMA_VERSION:
             launchd_unit: dict[str, Any] = launchd_bools

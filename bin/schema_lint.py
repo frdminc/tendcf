@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the two hundred thirty-four deliberately broken fixtures in examples/broken/
+  6. each of the two hundred thirty-six deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 234
+EXPECTED_BROKEN = 236
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -1733,6 +1733,14 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
                         "writer prefix or exact label (launchd-writers.yml) — this is the two-writers rail",
                         rule=RULE_CROSS_FILE,
                     )
+        launchd_domain = launchd_cfg.get("domain") if isinstance(launchd_cfg, dict) else None
+        if launchd_domain in ("user-gui", "user-background") and service.get("runs_as") == "root":
+            fail(
+                f"services: {name} sets launchd.domain {launchd_domain!r} with runs_as 'root' — "
+                "root cf-agent skips user-* domains and non-root cf-agent refuses run_as 'root', "
+                "so the entry can never converge",
+                rule=RULE_CROSS_FILE,
+            )
 
         systemd_cfg = service.get("systemd")
         systemd_unit = systemd_cfg.get("unit") if isinstance(systemd_cfg, dict) else None
@@ -2079,6 +2087,29 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     f"tombstones reserved systemd installer unit ({RESERVED_SYSTEMD_UNIT!r} / "
                     "bare stem or companion unit), which is reserved exclusively for "
                     "'tendcf-install' and cannot be removed by cfengine",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+
+    # --- launchd user-* domains cannot pair with run_as: "root" -------------
+    # Root cf-agent skips user-gui/user-background entries (Q1) and non-root
+    # cf-agent refuses run_as != running user (including "root"), so the
+    # combination can never converge on any host.
+    for domain_name, domain in domains.items():
+        if not isinstance(domain, dict):
+            continue
+        entries = domain.get("entries") or {}
+        for service_id, service in (entries.get("service") or {}).items():
+            if not isinstance(service, dict) or service.get("state") != "present":
+                continue
+            unit = service.get("unit")
+            launchd_unit = unit.get("launchd") if isinstance(unit, dict) else None
+            ld_domain = launchd_unit.get("domain") if isinstance(launchd_unit, dict) else None
+            if ld_domain in ("user-gui", "user-background") and service.get("run_as") == "root":
+                fail(
+                    f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                    f"sets unit.launchd.domain {ld_domain!r} with run_as 'root' — "
+                    "root cf-agent skips user-* domains and non-root cf-agent refuses "
+                    "run_as 'root', so the entry can never converge",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 
