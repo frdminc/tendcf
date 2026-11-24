@@ -77,6 +77,53 @@ carries `supervision: {"coverage": "deliberately-unmanaged"}` with the
 `examples/site/` is tendcf's own fixtures with one edit, so an interlock
 renders. Fixture, not site data.
 
+### Multi-site workspace (`nix2cf workspace` and `--site-name`)
+
+For multi-site local ops workspaces under `~/tendcf-ops` (override:
+`--ops-root` or `TENDCF_OPS_ROOT`), a single validated site slug pairs
+`tendcf-private-<site>` (required primary site root) with optional
+`tendcf-public-<site>` (publishable recipes/exports):
+
+```sh
+# Inspect the resolved workspace (human-readable or --json)
+uv run nix2cf workspace --site-name djbclark --json
+uv run nix2cf workspace --list
+
+# Compile from a workspace site (prints selected site + source to stderr)
+uv run nix2cf buildfile \
+    --host mac --platform macos --supervisor launchd \
+    --host-key ed25519:a1a1…a1 \
+    --device-trust ~/tendcf-ops/tendcf-private-djbclark/device-trust.json \
+    --site-name djbclark
+```
+
+- **Selector precedence:** `--site-name` > `TENDCF_SITE` > XDG `active-site`
+  file (`$XDG_CONFIG_HOME/tendcf/active-site` when absolute, else
+  `~/.config/tendcf/active-site`), or explicit `--config PATH` on `workspace`
+  (mutually exclusive with `--site-name`, honored ahead of ambient
+  `TENDCF_SITE`, and failing closed if missing). Fails closed when unset (never
+  globs a sole checkout; zero legacy aliases). On `buildfile`, XDG `active-site`
+  is read only when workspace mode is explicitly opted in (`--workspace`,
+  `--ops-root`, or ambient `TENDCF_SITE` with no `--site` or explicit file
+  flags), keeping omitted-`--site` invocations hermetic.
+- **`--site DIR`** and explicit `--services`/`--roles`/`--launchd-writers`
+  remain available and are mutually exclusive with `--site-name`, `--ops-root`,
+  and `--workspace`.
+- **`<ops_root>/tendcf`** is reported by `nix2cf workspace` strictly as
+  informational metadata; `buildfile` never auto-loads schemas or
+  `bin/projector.py` from a sibling `<ops_root>/tendcf` checkout.
+- **Dev-only `--override-input NS=PATH`** (repeatable on `buildfile` and
+  `workspace`): today it validates the namespace and target directory, warns
+  loudly on stderr, records taint on `WorkspaceResolution` and `CompileResult`,
+  refuses `-o`/`--output` writes unless `--allow-tainted` is also passed, and
+  fails `--check-releasable` / `assert_releasable()`. Actual `site.lock`
+  foreign-input substitution is not yet wired into `compile_host`; future
+  release/signing pipelines must call the release gate and refuse override
+  builds.
+- **XDG runtime state:** `workspace.state_dir()` (`$XDG_STATE_HOME/tendcf` or
+  `~/.local/state/tendcf`) and `workspace.cache_dir()` (`$XDG_CACHE_HOME/tendcf`
+  or `~/.cache/tendcf`) keep mutable state out of git checkouts.
+
 ## Not here yet
 
 - **Inference** (`provides`/`requires` → ordering edges): waits until real

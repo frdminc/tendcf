@@ -30,12 +30,21 @@ from __future__ import annotations
 import copy
 import re
 import unicodedata
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import rfc8785
 
 from .sitemodel import GOAL_FILE_SCHEMA, Document, Schemas, SiteModel
+from .workspace import (
+    OverrideInput,
+    WorkspaceError,
+    format_overrides_summary,
+    normalize_overrides,
+    refuse_release_if_tainted,
+)
 
 # Must equal the `const` of `tendcf/schema/goal-file.schema.json`
 # `schema_version`; CI fails when it does not (.github/workflows/check.yml).
@@ -170,6 +179,15 @@ class CompileResult:
     canonical: bytes
     diagnostics: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    overrides: tuple[OverrideInput, ...] = ()
+
+    @property
+    def tainted(self) -> bool:
+        return bool(self.overrides)
+
+    def assert_releasable(self) -> None:
+        """Fail closed if any dev-only `--override-input` tainted this compile."""
+        refuse_release_if_tainted(self.overrides)
 
 
 def _by_name(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -755,6 +773,7 @@ def compile_host(
     host: HostSpec,
     schemas: Schemas | None = None,
     schema_version: int = GOAL_FILE_SCHEMA_VERSION,
+    overrides: Iterable[OverrideInput] | Mapping[str, Path | str] | None = None,
 ) -> CompileResult:
     """The whole path for one host. Raises CompileError; never emits a wrong file.
 
@@ -762,9 +781,24 @@ def compile_host(
     §6.2 item 6): the CLI always renders the current one. `schemas` validates
     against tendcf's current schema only, so an older version is not
     schema-checked here.
+
+    `overrides` records any explicit dev-only `--override-input` bindings on the
+    returned `CompileResult` (setting `tainted = True` and blocking release via
+    `assert_releasable()`). Note: `site.lock` foreign-input substitution is not
+    yet wired into `compile_host`, so overrides record taint only today.
     """
+    try:
+        override_tuple = normalize_overrides(overrides)
+    except WorkspaceError as exc:
+        raise CompileError([str(exc)]) from exc
     errors: list[str] = host_errors(host, schema_version)
     diagnostics: list[str] = []
+    if override_tuple:
+        diagnostics.append(
+            f"TAINTED (not releasable): dev-only --override-input active "
+            f"({format_overrides_summary(override_tuple)}); foreign-input substitution "
+            "is not yet wired into compile_host"
+        )
 
     selected, diag, errs = select_services(model, host)
     diagnostics += diag
@@ -807,4 +841,9 @@ def compile_host(
         )
 
     raw = canonical_bytes(doc)
-    return CompileResult(goal_file=doc, canonical=raw, diagnostics=diagnostics)
+    return CompileResult(
+        goal_file=doc,
+        canonical=raw,
+        diagnostics=diagnostics,
+        overrides=override_tuple,
+    )
