@@ -473,10 +473,11 @@ else
         "host guard: launchd entries refused on non-Darwin"
 fi
 
-echo "# 5m. launchd adapter, per-domain system golden and lifecycle (C-policy-03/04/05)"
+echo "# 5m. launchd adapter, per-domain system+user goldens and lifecycle (C-policy-03/04/05, issues #94/#99)"
 plutil_lint() { plutil -lint "$1" >/dev/null; }
 golden_sys_dir="$repo/tests/policy/golden/launchd/system"
-for svc in com.tendcf.demo.main com.tendcf.demo.second; do
+golden_user_dir="$repo/tests/policy/golden/launchd/user"
+for svc in com.tendcf.demo.main com.tendcf.demo.second com.tendcf.canary.main; do
     gplist="$golden_sys_dir/$svc.plist"
     check "launchd golden exists: system/$svc.plist" test -f "$gplist"
     check "launchd golden parses as valid plist (plistlib): system/$svc.plist" \
@@ -490,7 +491,7 @@ assert isinstance(doc["ProgramArguments"], list) and len(doc["ProgramArguments"]
 assert doc["UserName"] == "nobody"
 assert doc["WorkingDirectory"] == "/"
 assert doc["RunAtLoad"] is True
-expected_ka = (svc == "com.tendcf.demo.main")
+expected_ka = svc in ("com.tendcf.demo.main", "com.tendcf.canary.main")
 assert doc["KeepAlive"] is expected_ka, f"KeepAlive={doc.get('KeepAlive')!r}"
 PYEOF
     if command -v plutil >/dev/null 2>&1; then
@@ -501,6 +502,27 @@ PYEOF
             "launchd golden passes plutil -lint: system/$svc.plist"
     fi
 done
+uplist="$golden_user_dir/com.tendcf.canary.main.plist"
+check "launchd golden exists: user/com.tendcf.canary.main.plist" test -f "$uplist"
+check "launchd golden parses as valid plist (plistlib, no UserName, parity with system): user/com.tendcf.canary.main.plist" \
+    python3 - "$uplist" "$golden_sys_dir/com.tendcf.canary.main.plist" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    user_doc = plistlib.load(f)
+with open(sys.argv[2], "rb") as f:
+    sys_doc = plistlib.load(f)
+assert "UserName" not in user_doc, f"unexpected UserName in user golden: {user_doc!r}"
+assert "UserName" in sys_doc
+sys_without_user = {k: v for k, v in sys_doc.items() if k != "UserName"}
+assert user_doc == sys_without_user, f"mismatch: {user_doc!r} != {sys_without_user!r}"
+PYEOF
+if command -v plutil >/dev/null 2>&1; then
+    check "launchd golden passes plutil -lint: user/com.tendcf.canary.main.plist" \
+        plutil_lint "$uplist"
+else
+    platform_skip "plutil not available on $(uname)" \
+        "launchd golden passes plutil -lint: user/com.tendcf.canary.main.plist"
+fi
 
 # Override safety (every platform): a CMDB host_specific.json or def.json
 # trying to preset tendcf_services_apply's bundle parameters or service_ids
@@ -526,10 +548,13 @@ import json, pathlib, sys
 evil_dir, out_path = sys.argv[1], sys.argv[2]
 doc = {
     "vars": {
+        "default:tendcf_services_apply.launchd_domain": "system",
         "default:tendcf_services_apply.launchd_dir": evil_dir,
         "default:tendcf_services_apply.launchctl_bin": "/bin/echo",
         "default:tendcf_services_apply.launchd_owner": "nobody",
         "default:tendcf_services_apply.launchd_group": "nobody",
+        "default:tendcf_services_apply.launchd_run_user": "nobody",
+        "default:tendcf_services_apply.launchd_uid": "0",
         "default:tendcf_services_apply.service_ids": ["com.tendcf.demo.main"],
         "tendcf_interlock": {
             "demo-check": {
@@ -547,7 +572,7 @@ doc = {
                 "command": ["/bin/sleep", "1"],
                 "run_as": "nobody",
                 "state": "present",
-                "unit": {"launchd": {"keep_alive": True, "run_at_load": True}},
+                "unit": {"launchd": {"domain": "system", "keep_alive": True, "run_at_load": True}},
                 "working_dir": "/",
             }
         },
@@ -598,17 +623,18 @@ check "launchd def.json override preset: no plist written to preset dir" \
 
 if [ "$(uname)" = Darwin ]; then
     launchd_daemons="$work/launchd-daemons"
+    launchd_agents="$work/launchd-agents"
     launchctl_state="$work/launchd-loaded"
     launchctl_log="$work/launchctl.log"
     launchctl_mode="$work/launchctl.mode"
     launchctl_stub="$work/launchctl-stub"
-    mkdir -p "$launchd_daemons" "$launchctl_state"
+    mkdir -p "$launchd_daemons" "$launchd_agents" "$launchctl_state"
     : > "$launchctl_log"
     printf 'normal\n' > "$launchctl_mode"
     {
         printf '#!/usr/bin/env bash\nset -euo pipefail\n'
-        printf 'log=%q\nstate=%q\ndaemons=%q\nmode_file=%q\n' \
-            "$launchctl_log" "$launchctl_state" "$launchd_daemons" "$launchctl_mode"
+        printf 'log=%q\nstate=%q\ndaemons=%q\nagents=%q\nmode_file=%q\n' \
+            "$launchctl_log" "$launchctl_state" "$launchd_daemons" "$launchd_agents" "$launchctl_mode"
         cat <<'STUBEOF'
 if [ $# -gt 0 ]; then
     printf '%s' "$1" >> "$log"
@@ -626,33 +652,67 @@ case "$sub" in
     print)
         target="${2:-}"
         case "$target" in
-            system/*) label="${target#system/}" ;;
+            system/*)
+                label="${target#system/}"
+                st="$state/$label"
+                ;;
+            gui/[1-9]*/*)
+                rest="${target#gui/}"
+                uid="${rest%%/*}"
+                label="${rest#*/}"
+                [[ "$uid" =~ ^[1-9][0-9]*$ ]] || exit 64
+                st="$state/gui.$label"
+                ;;
             *) exit 64 ;;
         esac
         if [ "$mode" = "fail-print" ]; then exit 5; fi
         if [ "$mode" = "print-unloaded-3" ]; then exit 3; fi
-        if [ -f "$state/$label" ]; then exit 0; else exit 113; fi
+        if [ -f "$st" ]; then exit 0; else exit 113; fi
         ;;
     bootstrap)
-        [ "${2:-}" = "system" ] || exit 64
+        dom="${2:-}"
         plist="${3:-}"
         [ -f "$plist" ] || exit 2
         if [ "$mode" = "fail-bootstrap" ]; then exit 5; fi
         label="$(basename "$plist" .plist)"
-        : > "$state/$label"
+        case "$dom" in
+            system)
+                : > "$state/$label"
+                ;;
+            gui/[1-9]*)
+                uid="${dom#gui/}"
+                [[ "$uid" =~ ^[1-9][0-9]*$ ]] || exit 64
+                : > "$state/gui.$label"
+                ;;
+            *) exit 64 ;;
+        esac
         exit 0
         ;;
     bootout)
         target="${2:-}"
         case "$target" in
-            system/*) label="${target#system/}" ;;
+            system/*)
+                label="${target#system/}"
+                st="$state/$label"
+                had="$state/$label.had_plist"
+                pfile="$daemons/$label.plist"
+                ;;
+            gui/[1-9]*/*)
+                rest="${target#gui/}"
+                uid="${rest%%/*}"
+                label="${rest#*/}"
+                [[ "$uid" =~ ^[1-9][0-9]*$ ]] || exit 64
+                st="$state/gui.$label"
+                had="$state/gui.$label.had_plist"
+                pfile="$agents/$label.plist"
+                ;;
             *) exit 64 ;;
         esac
         if [ "$mode" = "fail-bootout" ]; then exit 5; fi
-        if [ -f "$daemons/$label.plist" ]; then
-            : > "$state/$label.had_plist"
+        if [ -f "$pfile" ]; then
+            : > "$had"
         fi
-        rm -f "$state/$label"
+        rm -f "$st"
         exit 0
         ;;
     *)
@@ -665,6 +725,8 @@ STUBEOF
 
     test_user="$(id -un)"
     test_group="$(id -gn)"
+    test_uid="$(id -u)"
+    test_gid="$(id -g)"
     cat > "$work/inputs/launchd-harness.cf" <<EOF
 body common control
 {
@@ -675,7 +737,20 @@ bundle agent tendcf_launchd_harness
 {
   methods:
       "run"
-        usebundle => tendcf_services_apply("$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group");
+        usebundle => tendcf_services_apply("system", "$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group", "$test_user", "0");
+}
+EOF
+    cat > "$work/inputs/launchd-user-harness.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_user_harness", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_user_harness
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("user", "$launchd_agents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid");
 }
 EOF
     cat > "$work/inputs/launchd-sim-harness.cf" <<EOF
@@ -688,7 +763,7 @@ bundle agent tendcf_launchd_harness
 {
   methods:
       "run"
-        usebundle => tendcf_services_apply("$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group");
+        usebundle => tendcf_services_apply("system", "$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group", "$test_user", "0");
 }
 EOF
 
@@ -812,6 +887,22 @@ PYEOF
     check "launchd first render: no bootout call on initial load" \
         bash -c "! grep -q '^bootout' '$launchctl_log'"
     check "launchd first render: no .cf-*-edit backup/temp left" no_cf_edit_files
+
+    # 5m.1b Canary system render (issue #99 L6): deploy/darwin/canary/host_specific.json renders byte-identical to system golden.
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    cp "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-canary-sys.out" 2>&1 || true
+    canary_sys_p="$launchd_daemons/com.tendcf.canary.main.plist"
+    check "launchd canary system render: policy completed" policy_completed "$work/launchd-canary-sys.out"
+    check "launchd canary system render: byte-identical to committed system golden" \
+        cmp -s "$golden_sys_dir/com.tendcf.canary.main.plist" "$canary_sys_p"
+    check "launchd canary system render: passes plutil -lint" plutil_lint "$canary_sys_p"
+    check "launchd canary system render: mode is 0644" \
+        bash -c "[ \"\$(stat -f '%Lp' '$canary_sys_p')\" = 644 ]"
+    check "launchd canary system render: bootstrapped via launchctl bootstrap system" \
+        grep -qxF "$(printf 'bootstrap\tsystem\t%s' "$canary_sys_p")" "$launchctl_log"
+    check "launchd canary system render: no .cf-*-edit backup/temp left" no_cf_edit_files
 
     # 5m.2 Unchanged re-run (loaded, unchanged -> hash unchanged, zero launchctl write calls).
     hash_main_1="$(shasum -a 256 "$launchd_daemons/com.tendcf.demo.main.plist" | awk '{print $1}')"
@@ -1023,7 +1114,7 @@ PYEOF
     ln -s /nonexistent/tendcf-present "$launchd_daemons/com.tendcf.demo.present-dangling.plist"
     mkdir -p "$launchd_daemons/com.tendcf.demo.present-dir.plist"
     cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.present-sym":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.present-dangling":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.present-dir":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"}}}}
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.present-sym":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.present-dangling":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.present-dir":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"}}}}
 EOF
     : > "$launchctl_log"
     printf 'normal\n' > "$launchctl_mode"
@@ -1056,7 +1147,7 @@ svc_body = {
     "command": ["/bin/sleep", "1"],
     "run_as": "nobody",
     "state": "present",
-    "unit": {"launchd": {"keep_alive": True, "run_at_load": True}},
+    "unit": {"launchd": {"domain": "system", "keep_alive": True, "run_at_load": True}},
     "working_dir": "/",
 }
 doc = {
@@ -1120,7 +1211,7 @@ PYEOF
     printf 'keep-symlink\n' > "$col_sym_target"
     ln -s "$col_sym_target" "$launchd_daemons/com.tendcf.demo-main.plist"
     cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo-main":{"state":"absent"}}}}
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo-main":{"state":"absent"}}}}
 EOF
     : > "$launchctl_log"
     printf 'normal\n' > "$launchctl_mode"
@@ -1137,7 +1228,7 @@ EOF
 
     # 5m.16b Valid ID paired with colliding invalid ID (space) -> refused, zero actuation.
     cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"}}}}
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"}}}}
 EOF
     : > "$launchctl_log"
     "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-col-invalid.out" 2>&1 || true
@@ -1150,7 +1241,7 @@ EOF
 
     # 5m.16c Case-colliding IDs on darwin APFS -> refused, zero actuation.
     cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.Demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.main":{"state":"absent"}}}}
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.Demo.main":{"bundle":"demo","command":["/bin/sleep","1"],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":true,"run_at_load":true}},"working_dir":"/"},"com.tendcf.demo.main":{"state":"absent"}}}}
 EOF
     : > "$launchctl_log"
     "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-col-case.out" 2>&1 || true
@@ -1179,7 +1270,7 @@ EOF
 
     # 5m.17 XML-escaping round-trip (<, >, &, ") through launchd.plist.mustache + plutil -lint + plistlib.load.
     cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.xml":{"bundle":"demo","command":["/bin/echo","a&b","<tag>","\"quoted\""],"run_as":"nobody","state":"present","unit":{"launchd":{"keep_alive":false,"run_at_load":true}},"working_dir":"/tmp/dir&<\"x\">"}}}}
+{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.xml":{"bundle":"demo","command":["/bin/echo","a&b","<tag>","\"quoted\""],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":false,"run_at_load":true}},"working_dir":"/tmp/dir&<\"x\">"}}}}
 EOF
     : > "$launchctl_log"
     printf 'normal\n' > "$launchctl_mode"
@@ -1210,7 +1301,7 @@ bundle agent tendcf_launchd_badhost
 {
   methods:
       "run"
-        usebundle => tendcf_services_apply("$bad_dir_link", "$launchctl_stub", "$test_user", "$test_group");
+        usebundle => tendcf_services_apply("system", "$bad_dir_link", "$launchctl_stub", "$test_user", "$test_group", "$test_user", "0");
 }
 EOF
     : > "$launchctl_log"
@@ -1221,15 +1312,128 @@ EOF
     check "launchd tombstone on !tendcf_launchd_host: zero launchctl calls" test ! -s "$launchctl_log"
     check "launchd tombstone on !tendcf_launchd_host: plist untouched" \
         test -f "$launchd_daemons/com.tendcf.demo.main.plist"
+
+    # 5m.19 User-domain LaunchAgent lifecycle & fail-closed privilege separation (issue #94).
+    # 5m.19a First render in user domain -> byte-identical to user golden (no UserName), plutil -lint, mode 0644, gui/<uid> bootstrap.
+    user_canary_fx="$work/host_specific-user-canary.json"
+    python3 - "$repo/deploy/darwin/canary/host_specific-user.json" "$user_canary_fx" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["run_as"] = sys.argv[3]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    cp "$user_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-first.out" 2>&1 || true
+    user_plist="$launchd_agents/com.tendcf.canary.main.plist"
+    check "launchd user render: policy completed" policy_completed "$work/launchd-user-first.out"
+    check "launchd user render: byte-identical to committed user golden (no UserName)" \
+        cmp -s "$golden_user_dir/com.tendcf.canary.main.plist" "$user_plist"
+    check "launchd user render: passes plutil -lint" plutil_lint "$user_plist"
+    check "launchd user render: mode is 0644" \
+        bash -c "[ \"\$(stat -f '%Lp' '$user_plist')\" = 644 ]"
+    check "launchd user render: owner is $test_user" \
+        bash -c "[ \"\$(stat -f '%Su' '$user_plist')\" = '$test_user' ]"
+    check "launchd user render: probed via launchctl print gui/$test_uid/com.tendcf.canary.main" \
+        grep -qxF "$(printf 'print\tgui/%s/com.tendcf.canary.main' "$test_uid")" "$launchctl_log"
+    check "launchd user render: bootstrapped via launchctl bootstrap gui/$test_uid" \
+        grep -qxF "$(printf 'bootstrap\tgui/%s\t%s' "$test_uid" "$user_plist")" "$launchctl_log"
+    check "launchd user render: no .cf-*-edit backup/temp left" \
+        bash -c "[ -z \"\$(find '$launchd_agents' -name '*.cf-*-edit')\" ]"
+
+    # 5m.19b User-domain unchanged re-run -> zero bootstrap/bootout calls.
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-unchanged.out" 2>&1 || true
+    check "launchd user unchanged re-run: zero launchctl write calls" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
+
+    # 5m.19c User-domain tombstone teardown stays strictly in user domain (system canary plist untouched).
+    : > "$launchctl_log"
+    cp "$repo/deploy/darwin/canary/host_specific-absent.json" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-tomb.out" 2>&1 || true
+    check "launchd user tombstone: bootout ran on gui/$test_uid" \
+        grep -qxF "$(printf 'bootout\tgui/%s/com.tendcf.canary.main' "$test_uid")" "$launchctl_log"
+    check "launchd user tombstone: user plist removed" test ! -e "$user_plist"
+    check "launchd user tombstone: system canary plist untouched" test -f "$canary_sys_p"
+
+    # 5m.19d Fail-closed domain & run_as mismatch refusals.
+    # (1) domain: "user" refused in system mode.
+    : > "$launchctl_log"
+    cp "$user_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-mismatch-user-in-sys.out" 2>&1 || true
+    check "launchd privilege split (user entry in system mode): refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: unit.launchd.domain 'user' does not match running launchd agent domain 'system'" "$work/launchd-mismatch-user-in-sys.out"
+    check "launchd privilege split (user entry in system mode): zero launchctl calls" test ! -s "$launchctl_log"
+
+    # (2) domain: "system" refused in user mode.
+    : > "$launchctl_log"
+    cp "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-mismatch-sys-in-user.out" 2>&1 || true
+    check "launchd privilege split (system entry in user mode): refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: unit.launchd.domain 'system' does not match running launchd agent domain 'user'" "$work/launchd-mismatch-sys-in-user.out"
+    check "launchd privilege split (system entry in user mode): no plist written in agents dir" test ! -e "$user_plist"
+    check "launchd privilege split (system entry in user mode): zero launchctl calls" test ! -s "$launchctl_log"
+
+    # (3) domain: "user" with mismatched run_as refused in user mode.
+    python3 - "$repo/deploy/darwin/canary/host_specific-user.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["run_as"] = "otheruser"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-mismatch-runas.out" 2>&1 || true
+    check "launchd privilege split (mismatched run_as in user mode): refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: user-domain service run_as 'otheruser' does not match running user '$test_user'" "$work/launchd-mismatch-runas.out"
+    check "launchd privilege split (mismatched run_as in user mode): no plist written" test ! -e "$user_plist"
+    check "launchd privilege split (mismatched run_as in user mode): zero launchctl calls" test ! -s "$launchctl_log"
+
+    # (4) missing unit.launchd.domain refused fail-closed.
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+del doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["unit"]["launchd"]["domain"]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-missing-domain.out" 2>&1 || true
+    check "launchd missing unit.launchd.domain: refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: missing or invalid unit.launchd.domain" "$work/launchd-missing-domain.out"
+    check "launchd missing unit.launchd.domain: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # (5) user mode with uid 0 fails closed (!tendcf_launchd_host).
+    cat > "$work/inputs/launchd-user-uid0.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_user_uid0", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_user_uid0
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("user", "$launchd_agents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "0");
+}
+EOF
+    : > "$launchctl_log"
+    cp "$user_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-uid0.cf" >"$work/launchd-user-uid0.out" 2>&1 || true
+    check "launchd user mode with uid 0: refused fail-closed" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: launchd domain/identity invalid" "$work/launchd-user-uid0.out"
+    check "launchd user mode with uid 0: no plist written" test ! -e "$user_plist"
+    check "launchd user mode with uid 0: zero launchctl calls" test ! -s "$launchctl_log"
 else
     for name in \
         "launchd first render: byte-identical to committed golden, perms 0644, no backup, bootstrap" \
+        "launchd canary system render: byte-identical to committed system golden" \
         "launchd unchanged re-run: plist hash unchanged, zero launchctl write calls" \
         "launchd one-key drift: repaired to golden, bootout before bootstrap, sibling untouched" \
         "launchd perms drift: mode repaired to 0644, reloaded" \
         "launchd failed bootout/bootstrap and M1 reload recovery: fail-closed, persisted recovery, reported" \
         "launchd tombstone: bootout before delete, print-error fail-closed, second run no-op, C-policy-04 non-regular refusal" \
-        "launchd dry-run (-n), plist_failed, canonify/APFS collisions, XML escaping, invalid ids, and non-regular present refusals"; do
+        "launchd dry-run (-n), plist_failed, canonify/APFS collisions, XML escaping, invalid ids, and non-regular present refusals" \
+        "launchd user-domain LaunchAgent render/tombstone (gui/<uid>) and fail-closed domain/run_as privilege separation"; do
         platform_skip "not Darwin ($(uname)); launchd adapter requires darwin class" "$name"
     done
 fi
