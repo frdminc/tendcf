@@ -1724,7 +1724,9 @@ EOF
         "trailing:/Library/LaunchAgents/." \
         "firmlink-agents:/System/Volumes/Data/Library/LaunchAgents" \
         "firmlink-daemons:/System/Volumes/Data/Library/LaunchDaemons" \
-        "firmlink-case:/system/volumes/data/library/launchagents/."; do
+        "firmlink-case:/system/volumes/data/library/launchagents/." \
+        "dotdot-sys:/System/../Library/LaunchAgents" \
+        "dotdot-parent:$launchd_agents/.."; do
         cname="${sys_agents_case%%:*}"
         cdir="${sys_agents_case#*:}"
         cat > "$work/inputs/launchd-user-sysdir-$cname.cf" <<EOF
@@ -2426,6 +2428,33 @@ PYEOF
         bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
     check "launchd user dry-run headless switch bg->gui: plist and loaded state untouched" \
         bash -c "cmp -s '$golden_user_bg_dir/com.tendcf.canary.main.plist' '$user_plist' && [ -f '$launchctl_state/user.com.tendcf.canary.main' ] && [ ! -e '$launchctl_state/gui.com.tendcf.canary.main' ]"
+    rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.canary.main"
+
+    # PR #108 Opus R1 Nit-2: symmetric dry-run (-n) user-domain-absent (112) domain switch
+    # (loaded in gui/<uid>, switching to user-background while user/<uid> is absent) must preserve
+    # BOTH the peer bootout preview AND the user/<uid> `deferred:` notice without mutating state.
+    cp "$golden_user_gui_dir/com.tendcf.canary.main.plist" "$user_plist"
+    : > "$launchctl_state/gui.com.tendcf.canary.main"
+    rm -f "$launchctl_state/user.com.tendcf.canary.main"
+    : > "$launchctl_log"
+    printf 'user-domain-absent\n' > "$launchctl_mode"
+    python3 - "$user_bg_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    "$cf_agent" -n -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-dry-switch-user-absent.out" 2>&1 || true
+    check "launchd user dry-run user-domain-absent switch gui->bg: policy completed" dry_policy_completed "$work/launchd-user-dry-switch-user-absent.out"
+    check "launchd user dry-run user-domain-absent switch gui->bg: zero failed reports" no_failed_reports "$work/launchd-user-dry-switch-user-absent.out"
+    check "launchd user dry-run user-domain-absent switch gui->bg: previews peer bootout gui/<uid>/<id>" \
+        grep -Eq "Would execute script .*bootout gui/$test_uid/com\\.tendcf\\.canary\\.main" "$work/launchd-user-dry-switch-user-absent.out"
+    check "launchd user dry-run user-domain-absent switch gui->bg: preserves user/<uid> deferred notice under -n" \
+        grep -qF "tendcf: service 'com.tendcf.canary.main' deferred: launchd domain 'user/$test_uid' unavailable (no user domain)" "$work/launchd-user-dry-switch-user-absent.out"
+    check "launchd user dry-run user-domain-absent switch gui->bg: zero launchctl write calls" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
+    check "launchd user dry-run user-domain-absent switch gui->bg: plist and loaded state untouched" \
+        bash -c "cmp -s '$golden_user_gui_dir/com.tendcf.canary.main.plist' '$user_plist' && [ -f '$launchctl_state/gui.com.tendcf.canary.main' ] && [ ! -e '$launchctl_state/user.com.tendcf.canary.main' ]"
     rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.canary.main"
 
     # 5m.19o Adversary Blocker #1: forged class `tendcf_launchd_user_needs_domain_probes`

@@ -474,8 +474,8 @@ def test_launchd_user_domains_with_root_runs_as_refused(domain: str, schemas: Sc
     from nix2cf.compile import render_goal_file, select_services
 
     model = _model(SITE)
-    # service[2] is tailscaled with runs_as: root
-    model.services.data["services"][2]["launchd"]["domain"] = domain
+    tailscaled = next(s for s in model.services.data["services"] if s["name"] == "tailscaled")
+    tailscaled["launchd"]["domain"] = domain
     host = _host(SITE)
     with pytest.raises(CompileError) as exc:
         compile_host(model, host, None)

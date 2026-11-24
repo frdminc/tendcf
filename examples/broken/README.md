@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred thirty-four deliberately broken overlays, plus six byte-class fixtures in
+Two hundred thirty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 

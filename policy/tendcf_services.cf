@@ -1084,11 +1084,17 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # its own `tendcf_svc_*_supported__*` disjunct; nothing here is removed.
       #
       # launchd host guard: darwin with valid domain/identity parameters, an
-      # absolute, real (non-symlink) directory (never system-wide
-      # `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `/System/Library/...`,
-      # or their APFS firmlink aliases under `/System/Volumes/Data/Library/...`
-      # in user mode) and an absolute, executable launchctl binary. Operand
-      # order is load-bearing (same reason as systemd below).
+      # absolute, real (non-symlink) directory with no `..` traversal segments
+      # (never system-wide `/Library/LaunchAgents`, `/Library/LaunchDaemons`,
+      # `/System/Library/...`, or their APFS firmlink aliases under
+      # `/System/Volumes/Data/Library/...` in user mode) and an absolute,
+      # executable launchctl binary. Residual note: a symlinked parent
+      # component (e.g. `/Volumes/Macintosh HD -> /`) on a direct
+      # `tendcf_services_apply(...)` call is not canonicalized by `regcmp`;
+      # production `tendcf_services` derives the path solely from
+      # `getpwuid(getuid())`, and OS DAC still prevents non-root writes to
+      # `/Library/LaunchAgents`. Operand order is load-bearing (same reason
+      # as systemd below).
       "tendcf_launchd_mode_system"
         expression => strcmp("$(launchd_domain)", "system");
 
@@ -1102,11 +1108,14 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => and(regcmp("[a-z_][a-z0-9_-]*", "$(launchd_run_user)"),
                           islessthan(string_length("$(launchd_run_user)"), 33));
 
+      "tendcf_launchd_dir_has_dotdot"
+        expression => regcmp("(^|.*/)\\.\\.(/.*|$)", "$(launchd_dir)");
+
       "tendcf_launchd_dir_is_system_agents"
-        expression => regcmp("(?i)/+(\\./+)*(System/+(\\./+)*(Volumes/+(\\./+)*Data/+(\\./+)*)?)?Library/+(\\./+)*Launch(Agents|Daemons)(/+|\\.)*", "$(launchd_dir)");
+        expression => regcmp("(?i)/+(\\./+)*(System/+(\\./+)*(Volumes/+(\\./+)*Data/+(\\./+)*)?)?Library/+(\\./+)*Launch(Agents|Daemons)(/+\\.)*/*", "$(launchd_dir)");
 
       "tendcf_launchd_mode_valid"
-        expression => "tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid.!tendcf_launchd_dir_is_system_agents)";
+        expression => "!tendcf_launchd_dir_has_dotdot.(tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid.!tendcf_launchd_dir_is_system_agents))";
 
       "tendcf_launchd_dir_abs"
         expression => regcmp("/.*", "$(launchd_dir)");
@@ -1359,7 +1368,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => "(tendcf_launchd_mode_system.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]))|(tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_available)|(tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)]).tendcf_launchd_user_available)))";
 
       "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)])"
-        expression => "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_absent)|(tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)]).tendcf_launchd_user_absent)).((!opt_dry_run.!tendcf_svc_launchd_peer_failed__$(service_canon[$(service_ids)]))|(opt_dry_run.!tendcf_svc_launchd_peer_probe_failed__$(service_canon[$(service_ids)])))";
+        expression => "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_absent)|(tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)]).tendcf_launchd_user_absent)).((!opt_dry_run.tendcf_svc_launchd_peer_clear__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_peer_failed__$(service_canon[$(service_ids)]))|(opt_dry_run.!tendcf_svc_launchd_peer_probe_failed__$(service_canon[$(service_ids)])))";
 
       # User-mode tombstone absent-domain legs (Pass 2): an absent domain cannot
       # host a running job, so that leg is clear with zero per-service probes.
