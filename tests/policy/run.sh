@@ -1713,14 +1713,18 @@ EOF
     check "launchd user mode with uid 0: no plist written" test ! -e "$user_plist"
     check "launchd user mode with uid 0: zero launchctl calls" test ! -s "$launchctl_log"
 
-    # (6)-(7) user mode must reject system-wide /Library/LaunchAgents variants (Neon HIGH #1, Adversary Note B).
+    # (6)-(7) user mode must reject system-wide /Library/LaunchAgents variants
+    # including APFS firmlink aliases under /System/Volumes/Data/Library/... (Neon HIGH #1, Adversary Note B, Opus R2 N3).
     for sys_agents_case in \
         "single:/Library/LaunchAgents" \
         "double://Library/LaunchAgents" \
         "case:/library/launchagents" \
         "dotslash:/./Library/LaunchAgents" \
         "syslib:/System/Library/LaunchAgents" \
-        "trailing:/Library/LaunchAgents/."; do
+        "trailing:/Library/LaunchAgents/." \
+        "firmlink-agents:/System/Volumes/Data/Library/LaunchAgents" \
+        "firmlink-daemons:/System/Volumes/Data/Library/LaunchDaemons" \
+        "firmlink-case:/system/volumes/data/library/launchagents/."; do
         cname="${sys_agents_case%%:*}"
         cdir="${sys_agents_case#*:}"
         cat > "$work/inputs/launchd-user-sysdir-$cname.cf" <<EOF
@@ -2143,21 +2147,34 @@ PYEOF
         rm -f "$headless_tomb_p" "$launchctl_state/user.com.tendcf.headless.tomb"
     done
 
-    # 5m.19k `user-domain-absent` (print user/<uid> returns 112):
-    # user-background attempts bootstrap user/<uid> and converges; user-gui sees peer absent -> converges; tombstone deletes plist.
+    # 5m.19k `user-domain-absent` (print user/<uid> returns 112; Opus R2 L1):
+    # - user-background writes NO plist, makes ZERO `bootstrap user/<uid>` calls, emits the
+    #   `deferred: launchd domain 'user/<uid>' unavailable (no user domain)` notice, and STILL
+    #   boots out any stale `gui/<uid>` peer job while `gui/<uid>` is available;
+    # - user-gui sees peer absent -> converges cleanly in `gui/<uid>`;
+    # - tombstone boots out `gui/<uid>` and deletes its plist cleanly.
     cp "$golden_user_gui_dir/com.tendcf.canary.main.plist" "$headless_tomb_p"
     : > "$launchctl_state/gui.com.tendcf.headless.tomb"
+    : > "$launchctl_state/gui.com.tendcf.canary.main"
     rm -f "$headless_gui_p" "$headless_bg_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.headless.gui"
     : > "$launchctl_log"
     printf 'user-domain-absent\n' > "$launchctl_mode"
     "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-absent.out" 2>&1 || true
-    check "launchd user-domain-absent: user-background bootstrapped into user/$test_uid" \
-        grep -qxF "$(printf 'bootstrap\tuser/%s\t%s' "$test_uid" "$headless_bg_p")" "$launchctl_log"
+    check "launchd user-domain-absent: user-background wrote no plist" \
+        test ! -e "$headless_bg_p"
+    check "launchd user-domain-absent: zero bootstrap user/$test_uid calls" \
+        bash -c "! grep -Eq '^bootstrap[[:space:]]+user/' '$launchctl_log'"
+    check "launchd user-domain-absent: user-background emitted exact deferred notice" \
+        grep -qF "tendcf: service 'com.tendcf.canary.main' deferred: launchd domain 'user/$test_uid' unavailable (no user domain)" "$work/launchd-user-absent.out"
+    check "launchd user-domain-absent: user-background NOT reported as refused or failed" \
+        bash -c "! grep -Eq \"'com\\.tendcf\\.canary\\.main' (refused|failed):\" '$work/launchd-user-absent.out'"
+    check "launchd user-domain-absent: stale gui/$test_uid peer for user-background still booted out" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tgui/%s/com.tendcf.canary.main' '$test_uid')\" '$launchctl_log' && [ ! -e '$launchctl_state/gui.com.tendcf.canary.main' ]"
     check "launchd user-domain-absent: user-gui bootstrapped into gui/$test_uid with zero peer user/<uid>/<id> probe" \
         bash -c "grep -qxF \"\$(printf 'bootstrap\tgui/%s\t%s' '$test_uid' '$headless_gui_p')\" '$launchctl_log' && ! grep -q \"print\tuser/$test_uid/com.tendcf.headless.gui\" '$launchctl_log'"
     check "launchd user-domain-absent: tombstone booted out gui/$test_uid and deleted plist" \
         bash -c "grep -qxF \"\$(printf 'bootout\tgui/%s/com.tendcf.headless.tomb' '$test_uid')\" '$launchctl_log' && [ ! -e '$headless_tomb_p' ]"
-    rm -f "$headless_bg_p" "$headless_gui_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.headless.gui"
+    rm -f "$headless_bg_p" "$headless_gui_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.headless.gui"
 
     # 5m.19l Domain switches (`user-gui` <-> `user-background`) & peer bootout fail-closed & headless bg->gui cleanup.
     # Start loaded in user-gui:
@@ -2384,6 +2401,33 @@ PYEOF
         bash -c "cmp -s '$golden_user_gui_dir/com.tendcf.canary.main.plist' '$user_plist' && [ -f '$launchctl_state/gui.com.tendcf.canary.main' ] && [ ! -e '$launchctl_state/user.com.tendcf.canary.main' ]"
     rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.canary.main"
 
+    # Opus R2 N1: dry-run (-n) headless domain-switch (loaded in user/<uid>, switching to user-gui
+    # while gui/<uid> is absent) must preserve BOTH the peer bootout preview AND the `deferred:`
+    # report line without mutating disk or loaded state.
+    cp "$golden_user_bg_dir/com.tendcf.canary.main.plist" "$user_plist"
+    rm -f "$launchctl_state/gui.com.tendcf.canary.main"
+    : > "$launchctl_state/user.com.tendcf.canary.main"
+    : > "$launchctl_log"
+    printf 'headless-no-gui\n' > "$launchctl_mode"
+    python3 - "$user_gui_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    "$cf_agent" -n -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-dry-switch-headless.out" 2>&1 || true
+    check "launchd user dry-run headless switch bg->gui: policy completed" dry_policy_completed "$work/launchd-user-dry-switch-headless.out"
+    check "launchd user dry-run headless switch bg->gui: zero failed reports" no_failed_reports "$work/launchd-user-dry-switch-headless.out"
+    check "launchd user dry-run headless switch bg->gui: previews peer bootout user/<uid>/<id>" \
+        grep -Eq "Would execute script .*bootout user/$test_uid/com\\.tendcf\\.canary\\.main" "$work/launchd-user-dry-switch-headless.out"
+    check "launchd user dry-run headless switch bg->gui: preserves deferred notice under -n" \
+        grep -qF "tendcf: service 'com.tendcf.canary.main' deferred: launchd 'gui/$test_uid' domain is unavailable" "$work/launchd-user-dry-switch-headless.out"
+    check "launchd user dry-run headless switch bg->gui: zero launchctl write calls" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
+    check "launchd user dry-run headless switch bg->gui: plist and loaded state untouched" \
+        bash -c "cmp -s '$golden_user_bg_dir/com.tendcf.canary.main.plist' '$user_plist' && [ -f '$launchctl_state/user.com.tendcf.canary.main' ] && [ ! -e '$launchctl_state/gui.com.tendcf.canary.main' ]"
+    rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.canary.main"
+
     # 5m.19o Adversary Blocker #1: forged class `tendcf_launchd_user_needs_domain_probes`
     # via CMDB `"classes"` (`"any::"`) AND via `def.json` (`["any"]`) must NEVER trigger
     # non-iterating domain probes 0a/0b in either user or system harness.
@@ -2506,7 +2550,70 @@ PYEOF
         bash -c "grep -qxF \"\$(printf 'print\tgui/%s' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'print\tuser/%s' '$test_uid')\" '$launchctl_log'"
     check "launchd no -K run 2 (within 60s): second service rendered and bootstrapped cleanly" \
         bash -c "[ -f '$nok2_p' ] && grep -qxF \"\$(printf 'bootstrap\tuser/%s\t%s' '$test_uid' '$nok2_p')\" '$launchctl_log'"
-    rm -f "$user_plist" "$nok2_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.nok.second"
+
+    # Opus R2 L4: consecutive non-`-K` runs within 1s must NOT lock-skip one-shot
+    # `bootout` actuation commands (`0d` peer, `3d`/`3f` user tombstones, `3b` system tombstone).
+    # Run 3 (no -K): switch canary.main user-background -> user-gui (0d peer bootout) and
+    # tombstone nok.second loaded in both gui & user (3d/3f tombstone bootouts + plist delete).
+    : > "$launchctl_state/gui.com.tendcf.nok.second"
+    python3 - "$user_gui_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+doc["vars"]["tendcf_service"]["com.tendcf.nok.second"] = {"state": "absent"}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -I -f "$work/inputs/launchd-user-nok-harness.cf" >"$work/launchd-r1-nok-run3.out" 2>&1 || true
+    check "launchd no -K run 3: peer 0d bootout + user-gui bootstrap ran" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tuser/%s/com.tendcf.canary.main' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'bootstrap\tgui/%s\t%s' '$test_uid' '$user_plist')\" '$launchctl_log'"
+    check "launchd no -K run 3: dual-leg tombstone 3d/3f bootouts ran and deleted plist" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tgui/%s/com.tendcf.nok.second' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'bootout\tuser/%s/com.tendcf.nok.second' '$test_uid')\" '$launchctl_log' && [ ! -e '$nok2_p' ]"
+
+    # Run 4 (within 1s, no -K): re-plant the exact same peer & tombstone targets so identical
+    # bootout command locks would fire without `action => tendcf_probe_always`.
+    : > "$launchctl_state/user.com.tendcf.canary.main"
+    cp "$golden_user_bg_dir/com.tendcf.canary.main.plist" "$nok2_p"
+    : > "$launchctl_state/gui.com.tendcf.nok.second"
+    : > "$launchctl_state/user.com.tendcf.nok.second"
+    : > "$launchctl_log"
+    "$cf_agent" -I -f "$work/inputs/launchd-user-nok-harness.cf" >"$work/launchd-r1-nok-run4.out" 2>&1 || true
+    check "launchd no -K run 4 (within 1s): peer 0d bootout re-ran (not lock-skipped)" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tuser/%s/com.tendcf.canary.main' '$test_uid')\" '$launchctl_log' && [ ! -e '$launchctl_state/user.com.tendcf.canary.main' ]"
+    check "launchd no -K run 4 (within 1s): tombstone 3d/3f bootouts re-ran (not lock-skipped)" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tgui/%s/com.tendcf.nok.second' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'bootout\tuser/%s/com.tendcf.nok.second' '$test_uid')\" '$launchctl_log' && [ ! -e '$launchctl_state/gui.com.tendcf.nok.second' ] && [ ! -e '$launchctl_state/user.com.tendcf.nok.second' ]"
+    rm -f "$user_plist" "$nok2_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.nok.second" "$launchctl_state/gui.com.tendcf.nok.second"
+
+    # System-mode tombstone 3b across two consecutive non-`-K` runs within 1s:
+    cat > "$work/inputs/launchd-sys-nok-harness.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_sys_nok_harness", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_sys_nok_harness
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("system", "$launchd_daemons", "$launchctl_stub", "$test_user", "$test_group", "$test_user", "0"),
+        action => tendcf_probe_always;
+}
+EOF
+    nok_sys_p="$launchd_daemons/com.tendcf.nok.sys.plist"
+    printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"com.tendcf.nok.sys":{"state":"absent"}}}}' > "$work/data/host_specific.json"
+    cp "$golden_sys_dir/com.tendcf.demo.main.plist" "$nok_sys_p"
+    : > "$launchctl_state/com.tendcf.nok.sys"
+    : > "$launchctl_log"
+    "$cf_agent" -I -f "$work/inputs/launchd-sys-nok-harness.cf" >"$work/launchd-r1-sys-nok-run1.out" 2>&1 || true
+    check "launchd system tombstone no -K run 1: 3b bootout ran and deleted plist" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tsystem/com.tendcf.nok.sys')\" '$launchctl_log' && [ ! -e '$nok_sys_p' ]"
+    cp "$golden_sys_dir/com.tendcf.demo.main.plist" "$nok_sys_p"
+    : > "$launchctl_state/com.tendcf.nok.sys"
+    : > "$launchctl_log"
+    "$cf_agent" -I -f "$work/inputs/launchd-sys-nok-harness.cf" >"$work/launchd-r1-sys-nok-run2.out" 2>&1 || true
+    check "launchd system tombstone no -K run 2 (within 1s): 3b bootout re-ran (not lock-skipped)" \
+        bash -c "grep -qxF \"\$(printf 'bootout\tsystem/com.tendcf.nok.sys')\" '$launchctl_log' && [ ! -e '$launchctl_state/com.tendcf.nok.sys' ]"
+    rm -f "$nok_sys_p" "$launchctl_state/com.tendcf.nok.sys"
 
     # Darwin entry.cf safety guard: no repo fixture fed to entry.cf may match
     # unprivileged user-domain actuation (domain in user/user-gui/user-background && run_as==$test_user),
