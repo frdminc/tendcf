@@ -469,6 +469,29 @@ def test_launchd_invalid_domain_refused() -> None:
         compile_host(model, _host(SITE), None)
 
 
+@pytest.mark.parametrize("domain", ["user-gui", "user-background"])
+def test_launchd_user_domains_with_root_runs_as_refused(domain: str, schemas: Schemas) -> None:
+    from nix2cf.compile import render_goal_file, select_services
+
+    model = _model(SITE)
+    tailscaled = next(s for s in model.services.data["services"] if s["name"] == "tailscaled")
+    tailscaled["launchd"]["domain"] = domain
+    host = _host(SITE)
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, host, None)
+    msg = str(exc.value)
+    assert f"launchd.domain={domain!r}" in msg
+    assert "runs_as='root'" in msg
+
+    with pytest.raises(CompileError, match="runs_as='root'"):
+        compile_host(model, host, schemas)
+
+    selected, _, _ = select_services(model, host)
+    doc, errs = render_goal_file(model, host, selected)
+    assert "com.tendcf.example.tailscaled" not in doc["domains"]["supervision"]["entries"].get("service", {})
+    assert any(f"launchd.domain={domain!r}" in e and "runs_as='root'" in e for e in errs)
+
+
 def test_render_goal_file_alone_refuses_stale_user_and_v9_domains_below_v9() -> None:
     from nix2cf.compile import render_goal_file, select_services
 

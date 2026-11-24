@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred thirty-four deliberately broken overlays, plus six byte-class fixtures in
+Two hundred thirty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -564,14 +564,16 @@ Issue #102 guards tendcf's own installer-owned scheduler units (`org.tendcf.exec
 | 261 | `261-systemd-service-present-execd-timer` | systemd goal file (`not-yet-migrated` `supervision`) with companion present service `tendcf-execd.timer` | goal cross-file |
 | 262 | `262-runit-service-present-execd` | runit goal file (`not-yet-migrated` `supervision`) with present service `org.tendcf.execd` (cross-supervisor guard) | goal cross-file |
 
-## Schema v9 launchd 3-domain cases (263-264)
+## Schema v9 launchd 3-domain cases (263-266)
 
-Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `unit.launchd.domain` to `system` | `user-gui` | `user-background` and removes v8's `"user"` so stale v8 documents fail closed rather than silently demoting Aqua jobs to Background.
+Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `unit.launchd.domain` to `system` | `user-gui` | `user-background` and removes v8's `"user"` so stale v8 documents fail closed rather than silently demoting Aqua jobs to Background. Cross-field lint also rejects pairing `user-gui` or `user-background` with `run_as`/`runs_as: "root"` (root `cf-agent` skips `user-*` domains under Q1 and non-root `cf-agent` refuses `run_as: root`, so the entry can never converge).
 
 | # | Case | Broken input | Caught by |
 |---|------|--------------|-----------|
 | 263 | `263-launchd-stale-v8-user-domain` | launchd goal file with stale v8 `unit.launchd.domain: "user"` | schema (`enum`) |
 | 264 | `264-services-stale-v8-user-domain` | `services.yml` service with stale v3 `launchd.domain: user` | schema (`enum`) |
+| 265 | `265-launchd-user-gui-run-as-root` | launchd goal file with `unit.launchd.domain: "user-gui"` and `run_as: "root"` | goal cross-file |
+| 266 | `266-services-launchd-user-bg-run-as-root` | `services.yml` service with `launchd.domain: user-background` and `runs_as: root` | cross-file |
 
 ## Every class has a fixture
 

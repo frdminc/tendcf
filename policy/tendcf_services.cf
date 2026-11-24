@@ -92,15 +92,22 @@
 #       * `launchctl print user/<uid>`: exit 0 -> `user_available`; exit 112 ->
 #         `user_absent` (125 is NOT accepted as absent); any other exit/timeout
 #         -> `user_probe_failed` (fail closed);
-#   - headless deferral: when `gui_absent`, `user-background` converges cleanly
-#     in `user/<uid>`, while `user-gui` emits a distinct `deferred:` notice
-#     with no plist written and no `bootstrap gui/<uid>` (still sweeping any
-#     stale peer job in `user/<uid>` on a `user-background` -> `user-gui`
-#     domain switch; caveat: the stale `LimitLoadToSessionType=Background` plist
-#     remains on disk while headless and is self-healed on the first post-login
-#     run — even if launchd auto-loads it into `user/<uid>` first, the peer
-#     sweep boots out `user/<uid>/<label>` before rewriting to `Aqua` and
-#     bootstrapping `gui/<uid>`);
+#   - absent-domain deferral:
+#       * when `gui_absent`, `user-background` converges cleanly in
+#         `user/<uid>`, while `user-gui` emits a distinct `deferred:` notice
+#         with no plist written and no `bootstrap gui/<uid>` (still sweeping
+#         any stale peer job in `user/<uid>` on a `user-background` ->
+#         `user-gui` domain switch; caveat: the stale
+#         `LimitLoadToSessionType=Background` plist remains on disk while
+#         headless and is self-healed on the first post-login run — even if
+#         launchd auto-loads it into `user/<uid>` first, the peer sweep boots
+#         out `user/<uid>/<label>` before rewriting to `Aqua` and
+#         bootstrapping `gui/<uid>`);
+#       * symmetrically, when `user_absent` (`print user/<uid>` exited 112),
+#         `user-gui` converges cleanly in `gui/<uid>`, while `user-background`
+#         emits a distinct `deferred:` notice with no plist written and no
+#         `bootstrap user/<uid>` (still sweeping any stale peer job in
+#         `gui/<uid>` if `gui/<uid>` is available);
 #   - peer-domain anti-dual-load sweep (user mode present services): before
 #     rendering/bootstrapping into the target domain, if the peer domain is
 #     available, probe `launchctl print <peer>/<label>` (113/3 -> clear; 0 ->
@@ -1077,10 +1084,17 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # its own `tendcf_svc_*_supported__*` disjunct; nothing here is removed.
       #
       # launchd host guard: darwin with valid domain/identity parameters, an
-      # absolute, real (non-symlink) directory (never system-wide
-      # `/Library/LaunchAgents` or `/Library/LaunchDaemons` in user mode) and
-      # an absolute, executable launchctl binary. Operand order is load-bearing
-      # (same reason as systemd below).
+      # absolute, real (non-symlink) directory with no `..` traversal segments
+      # (never system-wide `/Library/LaunchAgents`, `/Library/LaunchDaemons`,
+      # `/System/Library/...`, or their APFS firmlink aliases under
+      # `/System/Volumes/Data/Library/...` in user mode) and an absolute,
+      # executable launchctl binary. Residual note: a symlinked parent
+      # component (e.g. `/Volumes/Macintosh HD -> /`) on a direct
+      # `tendcf_services_apply(...)` call is not canonicalized by `regcmp`;
+      # production `tendcf_services` derives the path solely from
+      # `getpwuid(getuid())`, and OS DAC still prevents non-root writes to
+      # `/Library/LaunchAgents`. Operand order is load-bearing (same reason
+      # as systemd below).
       "tendcf_launchd_mode_system"
         expression => strcmp("$(launchd_domain)", "system");
 
@@ -1094,11 +1108,14 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => and(regcmp("[a-z_][a-z0-9_-]*", "$(launchd_run_user)"),
                           islessthan(string_length("$(launchd_run_user)"), 33));
 
+      "tendcf_launchd_dir_has_dotdot"
+        expression => regcmp("(^|.*/)\\.\\.(/.*|$)", "$(launchd_dir)");
+
       "tendcf_launchd_dir_is_system_agents"
-        expression => regcmp("(?i)/+(\\./+)*(System/+)?Library/+Launch(Agents|Daemons)(/+|\\.)*", "$(launchd_dir)");
+        expression => regcmp("(?i)/+(\\./+)*(System/+(\\./+)*(Volumes/+(\\./+)*Data/+(\\./+)*)?)?Library/+(\\./+)*Launch(Agents|Daemons)(/+\\.)*/*", "$(launchd_dir)");
 
       "tendcf_launchd_mode_valid"
-        expression => "tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid.!tendcf_launchd_dir_is_system_agents)";
+        expression => "!tendcf_launchd_dir_has_dotdot.(tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid.!tendcf_launchd_dir_is_system_agents))";
 
       "tendcf_launchd_dir_abs"
         expression => regcmp("/.*", "$(launchd_dir)");
@@ -1348,10 +1365,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => "(tendcf_svc_launchd_peer_clear__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_peer_failed__$(service_canon[$(service_ids)]))|(opt_dry_run.tendcf_svc_launchd_peer_loaded__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_peer_probe_failed__$(service_canon[$(service_ids)]))";
 
       "tendcf_svc_launchd_target_ready__$(service_canon[$(service_ids)])"
-        expression => "(tendcf_launchd_mode_system.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]))|(tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_available)|tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)])))";
+        expression => "(tendcf_launchd_mode_system.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]))|(tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_available)|(tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)]).tendcf_launchd_user_available)))";
 
       "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)])"
-        expression => "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.tendcf_launchd_gui_absent.!tendcf_svc_launchd_peer_failed__$(service_canon[$(service_ids)])";
+        expression => "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_domain_probes_ok.((tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)]).tendcf_launchd_gui_absent)|(tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)]).tendcf_launchd_user_absent)).((!opt_dry_run.tendcf_svc_launchd_peer_clear__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_peer_failed__$(service_canon[$(service_ids)]))|(opt_dry_run.!tendcf_svc_launchd_peer_probe_failed__$(service_canon[$(service_ids)])))";
 
       # User-mode tombstone absent-domain legs (Pass 2): an absent domain cannot
       # host a running job, so that leg is clear with zero per-service probes.
@@ -1574,10 +1591,20 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       #        when the peer domain is available, probe `<peer>/<label>` and
       #        bootout by service-target strictly before target rendering and
       #        bootstrap. Also runs for `user-gui` while headless (`gui_absent`
-      #        + `user_available`) so a `user-background` -> `user-gui` switch
-      #        stops the old background job immediately. Clears ONLY the peer
-      #        domain's reload_pending marker (retaining any pending target
-      #        reload until target bootstrap succeeds).
+      #        + `user_available`) and for `user-background` when `user_absent`
+      #        + `gui_available`, so a domain switch stops the stale peer job
+      #        immediately even while the target domain is deferred. Clears
+      #        ONLY the peer domain's reload_pending marker (retaining any
+      #        pending target reload until target bootstrap succeeds).
+      #        `action => tendcf_probe_always` (`ifelapsed => "0"`) on one-shot
+      #        bootout actuation (0d, 3b, 3d, 3f) avoids silent 1-run lock-skip
+      #        stalls on consecutive non-`-K` runs within 60 s and is safe:
+      #        each promise is one-shot per run via its `!clear.!failed` /
+      #        `!torn_down.!teardown_failed` guard, CFEngine's per-run promise
+      #        lock cache (`AcquireLock`, `locks.c:856-862`) blocks intra-run
+      #        re-execution across passes, and concurrent-agent "already
+      #        running" exclusion (`locks.c:942-973`) still applies regardless
+      #        of `ifelapsed`.
       "$(launchctl_bin)"
         arglist => { "print", "$(service_launchd_peer[$(service_ids)])/$(service_ids)" },
         action => tendcf_probe_always,
@@ -1590,6 +1617,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
 
       "$(launchctl_bin)"
         arglist => { "bootout", "$(service_launchd_peer[$(service_ids)])/$(service_ids)" },
+        action => tendcf_probe_always,
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
           "tendcf_svc_launchd_peer_clear__$(service_canon[$(service_ids)])",
@@ -1644,7 +1672,9 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
           "tendcf_launchd_user_background_reload_pending__$(service_canon[$(service_ids)])"),
         ifvarclass => "tendcf_launchd_mode_user.tendcf_svc_launchd_target_ready__$(service_canon[$(service_ids)]).tendcf_svc_launchd_peer_ready__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrapped__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrap_failed__$(service_canon[$(service_ids)]).((!opt_dry_run.tendcf_svc_plist_ready__$(service_canon[$(service_ids)]).!tendcf_svc_plist_failed__$(service_canon[$(service_ids)]).(!tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)])|tendcf_svc_launchd_booted_out__$(service_canon[$(service_ids)])))|(opt_dry_run.((!tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).(tendcf_svc_plist_ready__$(service_canon[$(service_ids)])|tendcf_svc_plist_failed__$(service_canon[$(service_ids)])))|(tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).(tendcf_svc_plist_failed__$(service_canon[$(service_ids)])|tendcf_launchd_$(service_launchd_reload_key[$(service_ids)])_reload_pending__$(service_canon[$(service_ids)]))))))";
 
-      # 3a/3b. System-mode tombstone probe & teardown (C-policy-04, Adversary #2).
+      # 3a/3b. System-mode tombstone probe & teardown (C-policy-04, Adversary #2;
+      #        3b/3d/3f carry `action => tendcf_probe_always` for the same
+      #        one-shot + per-run lock-cache reasons documented at 0c/0d).
       "$(launchctl_bin)"
         arglist => { "print", "system/$(service_ids)" },
         action => tendcf_probe_always,
@@ -1657,6 +1687,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
 
       "$(launchctl_bin)"
         arglist => { "bootout", "system/$(service_ids)" },
+        action => tendcf_probe_always,
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
           "tendcf_svc_launchd_torn_down__$(service_canon[$(service_ids)])",
@@ -1677,6 +1708,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
 
       "$(launchctl_bin)"
         arglist => { "bootout", "gui/$(launchd_uid)/$(service_ids)" },
+        action => tendcf_probe_always,
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
           "tendcf_svc_tomb_gui_clear__$(service_canon[$(service_ids)])",
@@ -1697,6 +1729,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
 
       "$(launchctl_bin)"
         arglist => { "bootout", "user/$(launchd_uid)/$(service_ids)" },
+        action => tendcf_probe_always,
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
           "tendcf_svc_tomb_user_clear__$(service_canon[$(service_ids)])",
@@ -1772,8 +1805,11 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "tendcf_launchd_mode_user.tendcf_svc_launchd_domain_skipped__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' skipped: belongs to launchd 'system' domain (this agent runs 'user-gui' and 'user-background')";
 
-      "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)])"::
+      "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)]).tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' deferred: launchd 'gui/$(launchd_uid)' domain is unavailable (no active Aqua GUI login session); user-gui convergence skipped";
+
+      "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)]).tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)])"::
+        "tendcf: service '$(service_ids)' deferred: launchd domain 'user/$(launchd_uid)' unavailable (no user domain)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_launchd_mode_system.!tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' refused: system-domain service run_as '$(service_run_as_display[$(service_ids)])' is missing or invalid ([a-z_][a-z0-9_-]*, <=32 chars)";
