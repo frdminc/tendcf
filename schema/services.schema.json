@@ -7,9 +7,9 @@
   "type": "object",
   "properties": {
     "contract_version": {
-      "description": "3 since 2026-11-24 (issue #94): adds optional `launchd.domain` (`system` | `user`; nix2cf defaults omitted to `system`). 2 (2026-11-14, C-policy-01) held interlock pre_action.command to common.schema.json#/$defs/interlock_argv. An exact pin (`const`, as schema_version does): a document declaring any other number fails here instead of being judged under rules it never claimed, because the same number must mean the same acceptance set. roles.yml and launchd-writers.yml are separate documents on their own axes.",
+      "description": "4 since 2026-11-24 (issue #103): widens `launchd.domain` to 3 values (`system` | `user-gui` | `user-background`; nix2cf defaults omitted to `system`), replacing v3's `user`. 3 (2026-11-24, issue #94) added optional `launchd.domain` (`system` | `user`). 2 (2026-11-14, C-policy-01) held interlock pre_action.command to common.schema.json#/$defs/interlock_argv. An exact pin (`const`, as schema_version does): a document declaring any other number fails here instead of being judged under rules it never claimed, because the same number must mean the same acceptance set. roles.yml and launchd-writers.yml are separate documents on their own axes.",
       "$ref": "common.schema.json#/$defs/contract_version",
-      "const": 3
+      "const": 4
     },
 
     "domains": {
@@ -102,8 +102,8 @@
               "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$"
             },
             "domain": {
-              "description": "Which launchd domain runs the job (`system` or `user`). Optional in the Site Model; nix2cf resolves an omitted value to `system` when rendering the goal file.",
-              "enum": ["system", "user"],
+              "description": "Which launchd domain runs the job (`system`, `user-gui`, or `user-background`). Optional in the Site Model; nix2cf resolves an omitted value to `system` when rendering the goal file.",
+              "enum": ["system", "user-gui", "user-background"],
               "default": "system"
             },
             "run_at_load": { "type": "boolean" },

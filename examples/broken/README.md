@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred thirty-two deliberately broken overlays, plus six byte-class fixtures in
+Two hundred thirty-four deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -57,7 +57,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 9`, one above the current 8 | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 10`, one above the current 9 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -439,7 +439,7 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 157 | `157-interlock-argv-space` | one element, `validate --config`, holds a space: the joined string would split it into two arguments | schema (`pattern`) |
 | 158 | `158-interlock-argv-shell-char` | an element ends `;/usr/bin/id` | schema (`pattern`) |
 | 159 | `159-interlock-argv-newline` | an element `validate\n` with a trailing newline, which a `$`-anchored pattern alone accepts in Python's regex engine | schema (`not`) |
-| 160 | `160-services-contract-version-stale` | `services.yml` still declaring `contract_version: 2`, not the pinned 3 | schema (`const`) |
+| 160 | `160-services-contract-version-stale` | `services.yml` still declaring `contract_version: 3`, not the pinned 4 | schema (`const`) |
 | 161 | `161-interlock-argv-leading-quote` | an element starting with `'`: ArgSplitCommand would read it as an opening quote and merge the elements after it | schema (`pattern`) |
 | 162 | `162-interlock-argv-leading-backtick` | an element starting with a backtick, the third quote character ArgSplitCommand knows | schema (`pattern`) |
 | 163 | `163-interlock-argv-tab` | an element holding a tab, which the splitter treats as a separator | schema (`pattern`) |
@@ -454,7 +454,7 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 172 | `172-interlock-command-substitution` | `command[0]` is `/opt/homebrew/bin/$(id)` | schema (`pattern`) |
 | 173 | `173-interlock-command-non-ascii` | `command[0]` is `/opt/homebrew/bin/càddy` (ASCII only) | schema (`pattern`) |
 | 174 | `174-site-interlock-command-space` | the Site Model interlock with `command[0]` `/usr/local/bin/tail scale`: the authoring-time half for the executable | schema (`pattern`) |
-| 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 4`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
+| 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 5`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
 | 176 | `176-interlock-command-newline` | `command[0]` is `/opt/homebrew/bin/caddy\n` with a trailing newline, which the `$`-anchored pattern alone accepts: only `prefixItems[0]`'s `not` refuses it | schema (`not`) |
 
 ## Approval-record v7 cases (177-228)
@@ -563,6 +563,15 @@ Issue #102 guards tendcf's own installer-owned scheduler units (`org.tendcf.exec
 | 260 | `260-systemd-tombstone-execd-nosuffix` | systemd goal file (`not-yet-migrated` `apps`) with suffixless tombstone `tendcf-execd` | goal cross-file |
 | 261 | `261-systemd-service-present-execd-timer` | systemd goal file (`not-yet-migrated` `supervision`) with companion present service `tendcf-execd.timer` | goal cross-file |
 | 262 | `262-runit-service-present-execd` | runit goal file (`not-yet-migrated` `supervision`) with present service `org.tendcf.execd` (cross-supervisor guard) | goal cross-file |
+
+## Schema v9 launchd 3-domain cases (263-264)
+
+Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `unit.launchd.domain` to `system` | `user-gui` | `user-background` and removes v8's `"user"` so stale v8 documents fail closed rather than silently demoting Aqua jobs to Background.
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 263 | `263-launchd-stale-v8-user-domain` | launchd goal file with stale v8 `unit.launchd.domain: "user"` | schema (`enum`) |
+| 264 | `264-services-stale-v8-user-domain` | `services.yml` service with stale v3 `launchd.domain: user` | schema (`enum`) |
 
 ## Every class has a fixture
 

@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {
       "description": "Family version, shared with goal-file and approval-record (§11).",
-      "const": 8
+      "const": 9
     },
     "host": {
       "description": "Device public key, same identity rule as goal-file.schema.json#/properties/host.",

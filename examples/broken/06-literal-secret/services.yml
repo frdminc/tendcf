@@ -1,4 +1,4 @@
-contract_version: 3
+contract_version: 4
 domains:
   macos-launchd-services:
     description: launchd jobs on the operator's Mac under com.djbclark.* and com.tendcf.example.*
