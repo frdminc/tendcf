@@ -501,6 +501,87 @@ def test_launchd_tendcf_install_wrong_label_refused(schemas: Schemas) -> None:
     assert "reserved exclusively for exact label 'org.tendcf.execd'" in msg
 
 
+def _model_without_execd_writer(site: Path) -> SiteModel:
+    model = _model(site)
+    model.launchd_writers.data["writers"] = [
+        w for w in model.launchd_writers.data["writers"]
+        if w.get("label") != "org.tendcf.execd"
+    ]
+    return model
+
+
+@pytest.mark.parametrize(
+    "writer_entry",
+    [
+        {"prefix": "org.tendcf.*", "writer": "cfengine", "note": "Prefix covers org.tendcf.execd."},
+        {"prefix": "Org.Tendcf.*", "writer": "cfengine", "note": "Case-variant prefix."},
+        {"prefix": "org.Tendcf.*", "writer": "cfengine", "note": "Mixed-case prefix."},
+        {"label": "org.tendcf.execd", "writer": "cfengine", "note": "Exact execd with cfengine."},
+        {"label": "org.tendcf.execd", "writer": "third-party", "note": "Exact execd with third-party."},
+        {"label": "ORG.TENDCF.EXECD", "writer": "cfengine", "note": "Uppercase exact with cfengine."},
+        {"label": "ORG.TENDCF.EXECD", "writer": "tendcf-install", "note": "Uppercase exact with tendcf-install."},
+        {"label": "org.tendcf.EXECD", "writer": "tendcf-install", "note": "Mixed-case exact with tendcf-install."},
+    ],
+)
+def test_launchd_writer_covering_reserved_execd_refused(schemas: Schemas, writer_entry: dict[str, str]) -> None:
+    model = _model_without_execd_writer(SITE)
+    model.launchd_writers.data["writers"].append(writer_entry)
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "reserved installer-owned label 'org.tendcf.execd'" in msg
+    assert "Resolution:" in msg
+
+
+def test_launchd_writer_prefix_covering_reserved_execd_refused_below_v8() -> None:
+    model = _v7_model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"prefix": "org.tendcf.*", "writer": "cfengine", "note": "Prefix covers execd at v7."}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), None, schema_version=7)
+    assert "reserved installer-owned label 'org.tendcf.execd'" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad_label", ["org.tendcf.execd", "ORG.TENDCF.EXECD", "org.tendcf.EXECD", "tendcf-execd.service"])
+def test_service_targeting_reserved_installer_unit_refused(schemas: Schemas, bad_label: str) -> None:
+    from nix2cf.compile import render_goal_file, select_services
+
+    model = _model(SITE)
+    model.services.data["services"][0]["launchd"]["label"] = bad_label
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert bad_label in msg
+    assert "reserved installer-owned unit" in msg
+    assert "Resolution:" in msg
+
+    # Direct render_goal_file() also refuses without relying on conflict_check().
+    host = _host(SITE)
+    selected, _, _ = select_services(model, host)
+    doc, errs = render_goal_file(model, host, selected)
+    assert doc == {}
+    assert any("reserved installer-owned unit" in e and bad_label in e for e in errs)
+
+
+def test_service_targeting_reserved_systemd_unit_refused_in_conflict_check() -> None:
+    from nix2cf.compile import conflict_check, select_services
+
+    model = _model(SITE)
+    model.services.data["services"][0]["systemd"] = {"unit": "tendcf-execd.service"}
+    host = _host(SITE)
+    selected, _, _ = select_services(model, host)
+    errs, _ = conflict_check(model, host, selected)
+    assert any("tendcf-execd.service" in e and "reserved installer-owned unit" in e for e in errs)
+
+
+def test_launchd_exact_execd_tendcf_install_v8_positive_control(schemas: Schemas, lint) -> None:
+    result = compile_host(_model(SITE), _host(SITE), schemas)
+    writers = result.goal_file["domains"]["supervision"]["entries"]["unit-writer"]
+    assert writers["org.tendcf.execd"] == {"state": "present", "writer": "tendcf-install"}
+    assert _cross_file_findings(lint, result.goal_file) == []
+
+
 def test_render_goal_file_alone_refuses_nixos_below_v4() -> None:
     from nix2cf.compile import render_goal_file
 

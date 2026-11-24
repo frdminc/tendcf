@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the two hundred eleven deliberately broken fixtures in examples/broken/
+  6. each of the two hundred twenty-eight deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 211
+EXPECTED_BROKEN = 228
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -261,6 +261,11 @@ CLASSES_WITHOUT_FIXTURES = frozenset({RULE_PAIRING, RULE_SCHEMA_META, RULE_HARNE
 # it and a second spelling of the domain name would be exactly the defect
 # check_trust_inexpressible() exists to catch.
 TRUST_DOMAIN = "device-trust"
+# Installer-owned scheduler units reserved exclusively for `tendcf-install`
+# (issue #102): no other unit-writer may cover them (case-insensitively on
+# launchd for APFS safety), and no service or tombstone entry may target them.
+RESERVED_LAUNCHD_UNIT = "org.tendcf.execd"
+RESERVED_SYSTEMD_UNIT = "tendcf-execd.service"
 
 
 class Finding(NamedTuple):
@@ -1605,7 +1610,19 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
             )
         seen_writer_keys.add(key)
         writer_keys.append(key)
-        if has_label and writer.get("writer") == "tendcf-install" and key != "org.tendcf.execd":
+        w_writer = writer.get("writer")
+        if has_prefix and w_writer == "tendcf-install":
+            pass  # schema oneOf already forbids writer: tendcf-install on prefix
+        elif unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT) and not (
+            has_label and key == RESERVED_LAUNCHD_UNIT and w_writer == "tendcf-install"
+        ):
+            fail(
+                f"launchd-writers: {key!r} (writer {w_writer!r}) covers "
+                f"{RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is reserved "
+                f"exclusively for exact label {RESERVED_LAUNCHD_UNIT!r} with writer 'tendcf-install'",
+                rule=RULE_CROSS_FILE,
+            )
+        elif has_label and w_writer == "tendcf-install" and key != RESERVED_LAUNCHD_UNIT:
             fail(
                 f"launchd-writers: exact label {key!r} carries writer 'tendcf-install', "
                 "which names exactly one launchd label, org.tendcf.execd",
@@ -1672,13 +1689,30 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
 
         label = (service.get("launchd") or {}).get("label")
         if label is not None:
-            matched = [k for k in writer_keys if unit_key_covers(k, label)]
-            if not matched:
+            if label.lower() == RESERVED_LAUNCHD_UNIT:
                 fail(
-                    f"services: {name} launchd label {label!r} falls under no declared "
-                    "writer prefix or exact label (launchd-writers.yml) — this is the two-writers rail",
+                    f"services: {name} launchd label {label!r} targets "
+                    f"{RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is reserved "
+                    "exclusively for 'tendcf-install' and cannot be declared as a service",
                     rule=RULE_CROSS_FILE,
                 )
+            else:
+                matched = [k for k in writer_keys if unit_key_covers(k, label)]
+                if not matched:
+                    fail(
+                        f"services: {name} launchd label {label!r} falls under no declared "
+                        "writer prefix or exact label (launchd-writers.yml) — this is the two-writers rail",
+                        rule=RULE_CROSS_FILE,
+                    )
+
+        systemd_unit = (service.get("systemd") or {}).get("unit")
+        if systemd_unit == RESERVED_SYSTEMD_UNIT:
+            fail(
+                f"services: {name} systemd unit {systemd_unit!r} targets "
+                f"{RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively for "
+                "'tendcf-install' and cannot be declared as a service",
+                rule=RULE_CROSS_FILE,
+            )
 
     for service in services:
         for target in service.get("depends_on") or []:
@@ -1798,6 +1832,10 @@ def check_unit_claim_selftest() -> None:
         ("foo-*", "foo-w@1.service", True),
         ("org.tendcf.execd", "org.tendcf.execd", True),
         ("org.tendcf.execd", "org.tendcf.execd.sub", False),
+        ("org.tendcf.*", "org.tendcf.execd", True),
+        ("tendcf-*", "tendcf-execd.service", True),
+        ("tendcf-execd.*", "tendcf-execd.service", True),
+        ("tendcf.canary.*", "tendcf-execd.service", False),
         ("com.tendcf.example.*", "com.tendcf.example.tailscaled", True),
     )
     for key, name, want in covers_table:
@@ -1983,22 +2021,82 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
     )
     if supervisor == "systemd":
         for domain_name, key, writer in keys:
-            if writer == "tendcf-install" and key != "tendcf-execd.service":
+            if key.endswith("*") and writer != "cfengine":
+                continue  # schema if/then already forbids non-cfengine systemd prefixes
+            if unit_key_covers(key, RESERVED_SYSTEMD_UNIT) and not (
+                key == RESERVED_SYSTEMD_UNIT and writer == "tendcf-install"
+            ):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers {RESERVED_SYSTEMD_UNIT!r}, "
+                    f"which is reserved exclusively for exact unit {RESERVED_SYSTEMD_UNIT!r} "
+                    "with writer 'tendcf-install'",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif writer == "tendcf-install" and key != RESERVED_SYSTEMD_UNIT:
                 fail(
                     f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
                     "carries writer 'tendcf-install', which names exactly one "
                     "unit, tendcf-execd.service",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
+        for domain_name, ids in service_ids_by_domain.items():
+            for service_id in ids:
+                if service_id == RESERVED_SYSTEMD_UNIT:
+                    fail(
+                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                        f"targets {RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively "
+                        "for 'tendcf-install' and cannot be managed as a service",
+                        rule=RULE_GOAL_CROSS_FILE,
+                    )
+        for domain_name, ids in tombstones_by_domain.items():
+            for service_id in ids:
+                if service_id == RESERVED_SYSTEMD_UNIT:
+                    fail(
+                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                        f"tombstones {RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively "
+                        "for 'tendcf-install' and cannot be removed by cfengine",
+                        rule=RULE_GOAL_CROSS_FILE,
+                    )
     elif supervisor == "launchd":
         for domain_name, key, writer in keys:
-            if writer == "tendcf-install" and not key.endswith("*") and key != "org.tendcf.execd":
+            if key.endswith("*") and writer == "tendcf-install":
+                continue  # schema if/then already forbids tendcf-install on launchd prefixes
+            if unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT) and not (
+                key == RESERVED_LAUNCHD_UNIT and writer == "tendcf-install"
+            ):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), "
+                    f"which is reserved exclusively for exact label {RESERVED_LAUNCHD_UNIT!r} "
+                    "with writer 'tendcf-install'",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif writer == "tendcf-install" and key != RESERVED_LAUNCHD_UNIT:
                 fail(
                     f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
                     "carries writer 'tendcf-install', which names exactly one "
                     "launchd label, org.tendcf.execd",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
+        for domain_name, ids in service_ids_by_domain.items():
+            for service_id in ids:
+                if service_id.lower() == RESERVED_LAUNCHD_UNIT:
+                    fail(
+                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                        f"targets {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
+                        "reserved exclusively for 'tendcf-install' and cannot be managed as a service",
+                        rule=RULE_GOAL_CROSS_FILE,
+                    )
+        for domain_name, ids in tombstones_by_domain.items():
+            for service_id in ids:
+                if service_id.lower() == RESERVED_LAUNCHD_UNIT:
+                    fail(
+                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                        f"tombstones {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
+                        "reserved exclusively for 'tendcf-install' and cannot be removed by cfengine",
+                        rule=RULE_GOAL_CROSS_FILE,
+                    )
 
 
 def canonical_sha256(doc: Any) -> str:

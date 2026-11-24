@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred eleven deliberately broken overlays, plus six byte-class fixtures in
+Two hundred twenty-eight deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -535,6 +535,30 @@ Schema v8 (issues #99 + #94) adds required `unit.launchd.domain` (`system` | `us
 | 239 | `239-launchd-writers-exact-label-overlap-prefix` | `launchd-writers.yml` with exact `label: org.tendcf.execd` overlapping `prefix: org.tendcf.*` | cross-file |
 | 240 | `240-services-invalid-launchd-domain` | `services.yml` service with `launchd.domain: gui` | schema (`enum`) |
 | 241 | `241-runit-exact-launchd-label` | runit goal file carrying bare exact reverse-DNS key `org.tendcf.execd` (`writer: cfengine`) | schema (`if/then`) |
+
+## Reserved installer-owned unit cases (242-258)
+
+Issue #102 guards tendcf's own installer-owned scheduler units (`org.tendcf.execd` on launchd, matched case-insensitively for macOS APFS safety; `tendcf-execd.service` on systemd) even when no `tendcf-install` claim is present: no other `unit-writer` entry may cover them, and no `service` entry (present or tombstone, in any domain) may target them. Present-service cases use `not-yet-migrated` `supervision` and tombstone cases use a `not-yet-migrated` `apps` domain so missing-writer rules cannot mask the reserved-unit refusal.
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 242 | `242-launchd-writer-prefix-covers-execd` | launchd goal file with `org.tendcf.*` (`writer: cfengine`, no `tendcf-install` entry) | goal cross-file |
+| 243 | `243-launchd-writer-exact-execd-cfengine` | launchd goal file with exact `org.tendcf.execd` (`writer: cfengine`) | goal cross-file |
+| 244 | `244-launchd-writer-case-variant-execd` | launchd goal file with case-variant prefix `org.Tendcf.*` (`writer: cfengine`) | goal cross-file |
+| 245 | `245-launchd-writer-case-variant-exact-execd` | launchd goal file with case-variant exact label `org.tendcf.EXECD` (`writer: tendcf-install`) | goal cross-file |
+| 246 | `246-launchd-service-present-execd` | launchd goal file (`not-yet-migrated` `supervision`) with present service `org.tendcf.execd` | goal cross-file |
+| 247 | `247-launchd-service-present-execd-case-variant` | launchd goal file (`not-yet-migrated` `supervision`) with present service `ORG.TENDCF.EXECD` | goal cross-file |
+| 248 | `248-launchd-tombstone-execd` | launchd goal file (`not-yet-migrated` `apps`) with tombstone `org.tendcf.execd` | goal cross-file |
+| 249 | `249-launchd-tombstone-execd-case-variant` | launchd goal file (`not-yet-migrated` `apps`) with tombstone `ORG.TENDCF.EXECD` | goal cross-file |
+| 250 | `250-systemd-writer-prefix-covers-execd` | systemd goal file with `tendcf-*` (`writer: cfengine`, no `tendcf-install` entry) | goal cross-file |
+| 251 | `251-systemd-writer-exact-execd-cfengine` | systemd goal file with exact `tendcf-execd.service` (`writer: cfengine`) | goal cross-file |
+| 252 | `252-systemd-service-present-execd` | systemd goal file (`not-yet-migrated` `supervision`) with present service `tendcf-execd.service` | goal cross-file |
+| 253 | `253-systemd-tombstone-execd` | systemd goal file (`not-yet-migrated` `apps`) with tombstone `tendcf-execd.service` | goal cross-file |
+| 254 | `254-launchd-writers-prefix-covers-execd` | `launchd-writers.yml` with `prefix: org.tendcf.*` (`writer: cfengine`, replacing `tendcf-install`) | cross-file |
+| 255 | `255-launchd-writers-exact-execd-cfengine` | `launchd-writers.yml` with exact `label: org.tendcf.execd` and `writer: cfengine` | cross-file |
+| 256 | `256-launchd-writers-case-variant-execd` | `launchd-writers.yml` with case-variant `prefix: org.Tendcf.*` (`writer: cfengine`) | cross-file |
+| 257 | `257-services-launchd-execd` | `services.yml` macOS service with `launchd.label: org.tendcf.execd` | cross-file |
+| 258 | `258-services-systemd-execd` | `services.yml` Linux service with `systemd.unit: tendcf-execd.service` | cross-file |
 
 ## Every class has a fixture
 

@@ -80,6 +80,10 @@ SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, 7, GOAL_FILE_SCHEMA_VERSION)
 # `tendcf/examples/goal-file.json` does not do that, so this compiler follows
 # the oracle and emits no other domains until the mapping is decided.
 SUPERVISION_DOMAIN = "supervision"
+# Installer-owned scheduler units reserved exclusively for `tendcf-install`
+# (issue #102): never emitted as a cfengine service or covered by any other writer.
+RESERVED_LAUNCHD_UNIT = "org.tendcf.execd"
+RESERVED_SYSTEMD_UNIT = "tendcf-execd.service"
 
 HOST_KEY = re.compile(r"^ed25519:[0-9a-f]{64}\Z")
 # The closed set of `device-trust.entries.supervisor.host.name`
@@ -229,6 +233,39 @@ def _keys_overlap(a: str, b: str) -> bool:
     return a == b
 
 
+def _unit_key_covers(key: str, name: str) -> bool:
+    """Does unit-writer `key` (prefix ending in `*` or exact name) cover `name`?"""
+    if key.endswith("*"):
+        return name.startswith(key[:-1])
+    return name == key
+
+
+def _reserved_service_errors(selected: list[Selected]) -> list[str]:
+    """Refuse any selected service targeting an installer-owned scheduler unit."""
+    errors: list[str] = []
+    for sel in selected:
+        rec = sel.record
+        name = rec.get("name", "<unnamed>")
+        launchd_label = (rec.get("launchd") or {}).get("label")
+        if isinstance(launchd_label, str) and (
+            launchd_label.lower() == RESERVED_LAUNCHD_UNIT
+            or launchd_label == RESERVED_SYSTEMD_UNIT
+        ):
+            errors.append(
+                f"{sel.where}: service {name!r} targets reserved installer-owned unit "
+                f"{launchd_label!r} (owned exclusively by 'tendcf-install'). "
+                "Resolution: remove this service or choose a non-reserved launchd label"
+            )
+        systemd_unit = (rec.get("systemd") or {}).get("unit")
+        if systemd_unit == RESERVED_SYSTEMD_UNIT:
+            errors.append(
+                f"{sel.where}: service {name!r} targets reserved installer-owned unit "
+                f"{systemd_unit!r} (owned exclusively by 'tendcf-install'). "
+                "Resolution: remove this service or choose a non-reserved systemd unit name"
+            )
+    return errors
+
+
 # --------------------------------------------------------------------------
 # Stage 1: merge — which services, with which resolved values, on this host
 # --------------------------------------------------------------------------
@@ -332,13 +369,20 @@ def conflict_check(model: SiteModel, host: HostSpec, selected: list[Selected]) -
         else:
             seen_names[name] = where
 
+    # Installer-owned scheduler units are reserved exclusively for
+    # `tendcf-install` and may never be declared as a cfengine service.
+    errors.extend(_reserved_service_errors(selected))
+
     # One id space per host: the entry id (launchd label) is the promiser, and
     # the projector refuses an id that appears twice (P-6.7). Two services
     # with one label is also two writers of one unit — the hazard the
     # unit-writer registry exists to make impossible.
     by_id: dict[str, Selected] = {}
     for sel in selected:
-        entry_id = sel.record["launchd"]["label"]
+        launchd = sel.record.get("launchd")
+        if not isinstance(launchd, dict) or "label" not in launchd:
+            continue
+        entry_id = launchd["label"]
         if entry_id in by_id:
             prior = by_id[entry_id]
             errors.append(
@@ -522,6 +566,8 @@ def render_goal_file(
     errors: list[str] = host_errors(host, schema_version)
     if not errors:
         errors = supervisor_refusals(host, selected)
+    if not errors:
+        errors = _reserved_service_errors(selected)
     if errors:
         return {}, errors
     supervisor = host.supervisor
@@ -672,12 +718,26 @@ def render_goal_file(
                 f"schema_version {LAUNCHD_V8_SCHEMA_VERSION}"
             )
             continue
+        if _unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT) and not (
+            schema_version >= LAUNCHD_V8_SCHEMA_VERSION
+            and "label" in w
+            and w["label"] == RESERVED_LAUNCHD_UNIT
+            and w["writer"] == "tendcf-install"
+        ):
+            errors.append(
+                f"{where}: launchd unit-writer {key!r} (writer {w['writer']!r}) covers "
+                f"reserved installer-owned label {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), "
+                f"which is reserved exclusively for exact label {RESERVED_LAUNCHD_UNIT!r} "
+                "with writer 'tendcf-install'. Resolution: narrow the prefix or declare "
+                f"exact `label: {RESERVED_LAUNCHD_UNIT}` with `writer: tendcf-install`"
+            )
+            continue
         if schema_version >= LAUNCHD_V8_SCHEMA_VERSION and w["writer"] == "tendcf-install":
-            if not ("label" in w and w["label"] == "org.tendcf.execd"):
+            if not ("label" in w and w["label"] == RESERVED_LAUNCHD_UNIT):
                 errors.append(
                     f"{where}: launchd unit-writer {key!r} declares writer 'tendcf-install', "
-                    "which is reserved exclusively for exact label 'org.tendcf.execd'. "
-                    "Resolution: use exact `label: org.tendcf.execd` or choose another writer"
+                    f"which is reserved exclusively for exact label {RESERVED_LAUNCHD_UNIT!r}. "
+                    f"Resolution: use exact `label: {RESERVED_LAUNCHD_UNIT}` or choose another writer"
                 )
                 continue
         conflict = False

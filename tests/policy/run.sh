@@ -456,6 +456,41 @@ malformed_case unresolved interlock-malformed.json \
 malformed_case index-key interlock-malformed-key.json \
     "Invalid variable specification in CMDB data: 'tendcf_interlock\\['"
 
+echo "# 4c. installer-owned unit guard (issue #102): refused on every host"
+reserved_cross_case() {  # reserved_cross_case NAME FIXTURE EXPECTED-MSG
+    local name="$1" fx="$2" expected="$3"
+    out="$work/reserved-$name.out"
+    cp "$repo/tests/policy/fixtures/$fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "reserved ($name): policy completed" policy_completed "$out"
+    check "reserved ($name): no CMDB cross-check refusal" no_crosscheck "$out"
+    check "reserved ($name): dedicated refusal reported" grep -qF "$expected" "$out"
+    check "reserved ($name): no generic flavour/host/domain refusal" \
+        bash -c "! grep -Eq \"refused: (unit flavour|launchd domain|missing or invalid|system-domain|user-domain|/etc/systemd/system)|tombstone not actuated\" '$out'"
+    check "reserved ($name): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+}
+reserved_cross_case launchd-present reserved-launchd-present.json \
+    "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"
+reserved_cross_case launchd-case-present reserved-launchd-case-present.json \
+    "tendcf: service 'ORG.TENDCF.EXECD' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"
+reserved_cross_case systemd-present reserved-systemd-present.json \
+    "tendcf: service 'tendcf-execd.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"
+reserved_cross_case launchd-absent reserved-launchd-absent.json \
+    "tendcf: service 'org.tendcf.execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine"
+reserved_cross_case launchd-case-absent reserved-launchd-case-absent.json \
+    "tendcf: service 'ORG.TENDCF.EXECD' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine"
+reserved_cross_case systemd-absent reserved-systemd-absent.json \
+    "tendcf: service 'tendcf-execd.service' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine"
+
+# Malformed state on a reserved unit fails closed with dedicated refusal.
+printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"org.tendcf.execd":{"state":"bogus"}}}}' > "$work/data/host_specific.json"
+out="$work/reserved-malformed-state.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "reserved (malformed state): policy completed" policy_completed "$out"
+check "reserved (malformed state): dedicated refusal reported" \
+    grep -qF "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be managed by cfengine" "$out"
+check "reserved (malformed state): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
     cp "$repo/tests/policy/fixtures/launchd-present.json" "$work/data/host_specific.json"
@@ -1688,6 +1723,123 @@ PYEOF
         check "darwin entry.cf safety: unprivileged tendcf_services does NOT define tendcf_running_as_root" \
             bash -c "! grep -q 'Private class: tendcf_running_as_root' '$work/launchd-entry-nonroot.out'"
     fi
+
+    # 5m.20 Installer-owned unit defence-in-depth on Darwin launchd harness (issue #102):
+    # system & user modes, exact & case-variant present/tombstone, plus sibling convergence.
+    execd_sys_plist="$launchd_daemons/org.tendcf.execd.plist"
+    execd_usr_plist="$launchd_agents/org.tendcf.execd.plist"
+    printf 'sentinel-execd-system-plist\n' > "$execd_sys_plist"
+    : > "$launchctl_state/org.tendcf.execd"
+    execd_sys_hash="$(shasum -a 256 "$execd_sys_plist" | awk '{print $1}')"
+
+    # (a) Present org.tendcf.execd (system mode)
+    launchd_run reserved-launchd-present.json "$work/launchd-reserved-sys-present.out"
+    check "launchd reserved (system present org.tendcf.execd): refused and reported" \
+        grep -qF "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/launchd-reserved-sys-present.out"
+    check "launchd reserved (system present org.tendcf.execd): zero launchctl calls (not even print)" test ! -s "$launchctl_log"
+    check "launchd reserved (system present org.tendcf.execd): existing plist hash unchanged" \
+        bash -c "[ \"\$(shasum -a 256 '$execd_sys_plist' | awk '{print \$1}')\" = '$execd_sys_hash' ]"
+
+    # (b) Present ORG.TENDCF.EXECD (system mode, APFS case-insensitive)
+    launchd_run reserved-launchd-case-present.json "$work/launchd-reserved-sys-case-present.out"
+    check "launchd reserved (system present ORG.TENDCF.EXECD): refused and reported" \
+        grep -qF "tendcf: service 'ORG.TENDCF.EXECD' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/launchd-reserved-sys-case-present.out"
+    check "launchd reserved (system present ORG.TENDCF.EXECD): zero launchctl calls" test ! -s "$launchctl_log"
+    check "launchd reserved (system present ORG.TENDCF.EXECD): existing plist hash unchanged" \
+        bash -c "[ \"\$(shasum -a 256 '$execd_sys_plist' | awk '{print \$1}')\" = '$execd_sys_hash' ]"
+
+    # (c) Present org.tendcf.execd & ORG.TENDCF.EXECD (user mode)
+    for case_spec in "exact:org.tendcf.execd" "case:ORG.TENDCF.EXECD"; do
+        cname="${case_spec%%:*}"
+        clabel="${case_spec#*:}"
+        python3 - "$work/data/host_specific.json" "$clabel" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {},
+        "tendcf_service": {
+            sys.argv[2]: {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": sys.argv[3],
+                "state": "present",
+                "unit": {"launchd": {"domain": "user", "keep_alive": True, "run_at_load": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+        : > "$launchctl_log"
+        printf 'normal\n' > "$launchctl_mode"
+        "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-reserved-user-$cname-present.out" 2>&1 || true
+        check "launchd reserved (user present $clabel): refused and reported" \
+            grep -qF "tendcf: service '$clabel' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/launchd-reserved-user-$cname-present.out"
+        check "launchd reserved (user present $clabel): zero launchctl calls" test ! -s "$launchctl_log"
+        check "launchd reserved (user present $clabel): no plist created in agents dir" test ! -e "$execd_usr_plist"
+    done
+
+    # (d) Tombstone org.tendcf.execd (system mode, loaded regular plist on disk)
+    launchd_run reserved-launchd-absent.json "$work/launchd-reserved-sys-absent.out"
+    check "launchd reserved (system tombstone org.tendcf.execd): refused and reported" \
+        grep -qF "tendcf: service 'org.tendcf.execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" "$work/launchd-reserved-sys-absent.out"
+    check "launchd reserved (system tombstone org.tendcf.execd): zero launchctl calls" test ! -s "$launchctl_log"
+    check "launchd reserved (system tombstone org.tendcf.execd): regular plist preserved intact" \
+        bash -c "[ -f '$execd_sys_plist' ] && [ \"\$(shasum -a 256 '$execd_sys_plist' | awk '{print \$1}')\" = '$execd_sys_hash' ]"
+
+    # (e) Tombstone ORG.TENDCF.EXECD (system mode, loaded regular plist on disk)
+    launchd_run reserved-launchd-case-absent.json "$work/launchd-reserved-sys-case-absent.out"
+    check "launchd reserved (system tombstone ORG.TENDCF.EXECD): refused and reported" \
+        grep -qF "tendcf: service 'ORG.TENDCF.EXECD' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" "$work/launchd-reserved-sys-case-absent.out"
+    check "launchd reserved (system tombstone ORG.TENDCF.EXECD): zero launchctl calls" test ! -s "$launchctl_log"
+    check "launchd reserved (system tombstone ORG.TENDCF.EXECD): regular plist preserved intact" \
+        bash -c "[ -f '$execd_sys_plist' ] && [ \"\$(shasum -a 256 '$execd_sys_plist' | awk '{print \$1}')\" = '$execd_sys_hash' ]"
+
+    # (f) Tombstone org.tendcf.execd (user mode, loaded regular plist in agents dir)
+    printf 'sentinel-execd-user-plist\n' > "$execd_usr_plist"
+    : > "$launchctl_state/gui.org.tendcf.execd"
+    execd_usr_hash="$(shasum -a 256 "$execd_usr_plist" | awk '{print $1}')"
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    cp "$repo/tests/policy/fixtures/reserved-launchd-absent.json" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-reserved-user-absent.out" 2>&1 || true
+    check "launchd reserved (user tombstone org.tendcf.execd): refused and reported" \
+        grep -qF "tendcf: service 'org.tendcf.execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" "$work/launchd-reserved-user-absent.out"
+    check "launchd reserved (user tombstone org.tendcf.execd): zero launchctl calls" test ! -s "$launchctl_log"
+    check "launchd reserved (user tombstone org.tendcf.execd): user plist preserved intact" \
+        bash -c "[ -f '$execd_usr_plist' ] && [ \"\$(shasum -a 256 '$execd_usr_plist' | awk '{print \$1}')\" = '$execd_usr_hash' ]"
+    rm -f "$execd_usr_plist" "$launchctl_state/gui.org.tendcf.execd"
+
+    # (g) Valid sibling alongside reserved org.tendcf.execd: sibling converges while reserved unit is refused and untouched.
+    rm -f "$canary_sys_p" "$launchctl_state/com.tendcf.canary.main"
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_service"]["org.tendcf.execd"] = {
+    "bundle": "canary",
+    "command": ["/bin/sleep", "1"],
+    "run_as": "nobody",
+    "state": "present",
+    "unit": {"launchd": {"domain": "system", "keep_alive": True, "run_at_load": True}},
+    "working_dir": "/",
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-reserved-sibling.out" 2>&1 || true
+    check "launchd reserved + sibling: reserved org.tendcf.execd refused" \
+        grep -qF "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/launchd-reserved-sibling.out"
+    check "launchd reserved + sibling: org.tendcf.execd plist hash unchanged" \
+        bash -c "[ \"\$(shasum -a 256 '$execd_sys_plist' | awk '{print \$1}')\" = '$execd_sys_hash' ]"
+    check "launchd reserved + sibling: zero launchctl calls naming org.tendcf.execd" \
+        bash -c "! grep -q 'org\\.tendcf\\.execd' '$launchctl_log'"
+    check "launchd reserved + sibling: valid sibling canary rendered byte-identical to golden" \
+        cmp -s "$golden_sys_dir/com.tendcf.canary.main.plist" "$canary_sys_p"
+    check "launchd reserved + sibling: valid sibling canary bootstrapped" \
+        grep -qxF "$(printf 'bootstrap\tsystem\t%s' "$canary_sys_p")" "$launchctl_log"
+    rm -f "$execd_sys_plist" "$launchctl_state/org.tendcf.execd" "$canary_sys_p" "$launchctl_state/com.tendcf.canary.main"
 else
     for name in \
         "launchd first render: byte-identical to committed golden, perms 0644, no backup, bootstrap" \
@@ -1698,7 +1850,8 @@ else
         "launchd failed bootout/bootstrap and M1 reload recovery: fail-closed, persisted recovery, reported" \
         "launchd tombstone: bootout before delete, print-error fail-closed, second run no-op, C-policy-04 non-regular refusal" \
         "launchd dry-run (-n), plist_failed, canonify/APFS collisions, XML escaping, invalid ids, and non-regular present refusals" \
-        "launchd user-domain LaunchAgent render/tombstone (gui/<uid>) and fail-closed domain/run_as privilege separation"; do
+        "launchd user-domain LaunchAgent render/tombstone (gui/<uid>) and fail-closed domain/run_as privilege separation" \
+        "launchd installer-owned org.tendcf.execd defence-in-depth (system/user, exact/case-variant, present/tombstone, sibling)"; do
         platform_skip "not Darwin ($(uname)); launchd adapter requires darwin class" "$name"
     done
 fi
@@ -1839,6 +1992,25 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "mask link left in place" bash -c "[ \"\$(readlink '$mask_path')\" = /dev/null ]"
         check "dangling link left in place" \
             bash -c "[ \"\$(readlink '$dangling_path')\" = /nonexistent/tendcf-test ]"
+
+        # 6c. Installer-owned unit defence-in-depth on a real systemd host (issue #102):
+        # refuse present and tombstone tendcf-execd.service with zero systemctl calls
+        # and zero unit file render/delete (without touching real /etc/systemd/system/tendcf-execd.service).
+        sysd_run_verbose reserved-systemd-present.json "$work/sysd-reserved-present.out"
+        check "systemd reserved present tendcf-execd.service: refused and reported" \
+            grep -qF "tendcf: service 'tendcf-execd.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/sysd-reserved-present.out"
+        check "systemd reserved present tendcf-execd.service: zero systemctl commands or probes" \
+            no_systemctl "$work/sysd-reserved-present.out"
+        check "systemd reserved present tendcf-execd.service: nothing rendered" \
+            bash -c "! grep -q 'Created file' '$work/sysd-reserved-present.out'"
+
+        sysd_run_verbose reserved-systemd-absent.json "$work/sysd-reserved-absent.out"
+        check "systemd reserved tombstone tendcf-execd.service: refused and reported" \
+            grep -qF "tendcf: service 'tendcf-execd.service' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" "$work/sysd-reserved-absent.out"
+        check "systemd reserved tombstone tendcf-execd.service: zero systemctl commands or probes" \
+            no_systemctl "$work/sysd-reserved-absent.out"
+        check "systemd reserved tombstone tendcf-execd.service: nothing deleted" \
+            bash -c "! grep -q 'Deleted file' '$work/sysd-reserved-absent.out'"
     fi
 elif [ "${TENDCF_TEST_SYSTEMD:-}" = 1 ]; then
     check "TENDCF_TEST_SYSTEMD=1 needs a host booted by systemd" false
@@ -2522,7 +2694,9 @@ if [ "$fail" != 0 ]; then
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
-             sysd-sim-present sysd-sim-tomb; do
+             reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
+             launchd-reserved-sys-present launchd-reserved-sys-case-present launchd-reserved-user-exact-present launchd-reserved-user-case-present launchd-reserved-sys-absent launchd-reserved-sys-case-absent launchd-reserved-user-absent launchd-reserved-sibling \
+             sysd-sim-present sysd-sim-tomb sysd-reserved-present sysd-reserved-absent; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
