@@ -118,6 +118,35 @@ a service id outside every declared writer prefix, or under a non-cfengine
 prefix in a comprehensive domain; a bundle whose domain differs from its
 member's.
 
+## Multi-site local workspace and dev-only overrides (issue #98)
+
+Operator rulings `2026-11-24` (`Ref: ANTIGRAVITY-we`, `Ref: ANTIGRAVITY-wf`)
+establish the local workspace resolver (`nix2cf/workspace.py`) and
+`nix2cf workspace` subcommand:
+
+- **Base directory:** `~/tendcf-ops`, overridden by `--ops-root` >
+  `TENDCF_OPS_ROOT` > `~/tendcf-ops`. Holds optional `tendcf/`, required
+  `tendcf-private-<site>/`, optional `tendcf-public-<site>/`, and read-only
+  foreign `tendcf-public-<other>/` clones. Development worktrees live outside
+  the site scan namespace (`~/src/` or `~/tendcf-ops/.worktrees/`); `-wt`
+  suffixes are rejected as site slugs and flagged by `workspace --list`.
+- **Fail-closed, pair-bound selection:** `--site-name` > `TENDCF_SITE` >
+  XDG `active-site` (`$XDG_CONFIG_HOME/tendcf/active-site` if absolute, else
+  `~/.config/tendcf/active-site`; plain single-line non-symlink regular file).
+  There is no sole-directory glob, no legacy alias (`tendcf-private`,
+  `site-private`, `.mysite`), and no uncoupled public/private selector.
+  `--site DIR` stays backward compatible for explicit paths and is mutually
+  exclusive with workspace flags.
+- **Dev-only `--override-input <ns>=<path>`:** repeatable on `buildfile` and
+  `workspace`, validates `<ns>` as a strict slug, refuses duplicate namespaces
+  (never last-wins), verifies `<path>` exists as a directory, records the
+  canonical path on `WorkspaceResolution` and `CompileResult` (`tainted = True`),
+  warns loudly on stderr, and blocks release signing/publishing via
+  `refuse_release_if_tainted()` / `assert_releasable()` / `--check-releasable`.
+- **XDG runtime state:** `state_dir()` (`$XDG_STATE_HOME/tendcf` or
+  `~/.local/state/tendcf`) and `cache_dir()` (`$XDG_CACHE_HOME/tendcf` or
+  `~/.cache/tendcf`) keep mutable state out of git checkouts.
+
 ## Tests
 
 `uv run pytest` (through `~/ops/site-private/bin/bg` on the operator's machine).

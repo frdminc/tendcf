@@ -77,6 +77,40 @@ carries `supervision: {"coverage": "deliberately-unmanaged"}` with the
 `examples/site/` is tendcf's own fixtures with one edit, so an interlock
 renders. Fixture, not site data.
 
+### Multi-site workspace (`nix2cf workspace` and `--site-name`)
+
+For multi-site local ops workspaces under `~/tendcf-ops` (override:
+`--ops-root` or `TENDCF_OPS_ROOT`), a single validated site slug pairs
+`tendcf-private-<site>` (required primary site root) with optional
+`tendcf-public-<site>` (publishable recipes/exports):
+
+```sh
+# Inspect the resolved workspace (human-readable or --json)
+uv run nix2cf workspace --site-name djbclark --json
+uv run nix2cf workspace --list
+
+# Compile from a workspace site (prints selected site + source to stderr)
+uv run nix2cf buildfile \
+    --host mac --platform macos --supervisor launchd \
+    --host-key ed25519:a1a1…a1 \
+    --device-trust ~/tendcf-ops/tendcf-private-djbclark/device-trust.json \
+    --site-name djbclark
+```
+
+- **Selector precedence:** `--site-name` > `TENDCF_SITE` > XDG `active-site`
+  file (`$XDG_CONFIG_HOME/tendcf/active-site` when absolute, else
+  `~/.config/tendcf/active-site`). Fails closed when unset (never globs a sole
+  checkout; zero legacy aliases).
+- **`--site DIR`** remains available for explicit directory paths and is
+  mutually exclusive with `--site-name`, `--ops-root`, and `--workspace`.
+- **Dev-only `--override-input NS=PATH`** (repeatable on `buildfile` and
+  `workspace`) binds a local directory during preview/test builds, emits a
+  stderr warning, marks the result tainted, and refuses release
+  signing/publishing (`workspace --check-releasable`, `assert_releasable()`).
+- **XDG runtime state:** mutable state and cache live under
+  `$XDG_STATE_HOME/tendcf` and `$XDG_CACHE_HOME/tendcf`, never inside git
+  checkouts.
+
 ## Not here yet
 
 - **Inference** (`provides`/`requires` → ordering edges): waits until real

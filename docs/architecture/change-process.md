@@ -68,13 +68,31 @@ device seven releases behind still computes one true diff (guide §7).
 
 ## 2. The inputs, and where they are pinned
 
-| Layer (map §3) | Repository today | What a release takes from it |
+| Layer (map §3) | Repository / local workspace convention | What a release takes from it |
 | --- | --- | --- |
-| tendcf | `frdminc/tendcf` | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import (#45); its one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
-| site-shared | not yet created | recipes |
-| foreign site-shared | none yet | recipes, namespaced |
-| site-private | `~/ops/site-private` (today: ops repo; the tendcf inventory does not exist yet) | inventory, allocations, secret *names*, trust policy, the lockfile |
+| tendcf | `frdminc/tendcf` (optional local checkout `~/tendcf-ops/tendcf`) | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import (#45); its one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
+| site-shared | `tendcf-public-<site>` under `~/tendcf-ops` (optional; not yet created) | recipes |
+| foreign site-shared | `tendcf-public-<other>` (optional read-only local clone; builds read `site.lock` only) | recipes, namespaced |
+| site-private | `tendcf-private-<site>` under `~/tendcf-ops` (`TENDCF_OPS_ROOT`; primary site root; migrating from legacy `~/ops/site-private`, [frdminc/tendcf#98](https://github.com/frdminc/tendcf/issues/98)) | inventory, allocations, secret *names*, trust policy, the lockfile |
 | tool forks | `djbclark/core`, `djbclark/libntech`, `frdminc/ShizukuTendCF` | reached only through tendcf's overlay or as digests of built artifacts |
+
+**Amended 2026-11-24 (multi-site local workspace and dev-only overrides;
+operator ruling, 2026-11-24, `Ref: ANTIGRAVITY-we`, `Ref: ANTIGRAVITY-wf`,
+`Ref: ANTIGRAVITY-wg` — narrow O4 docs lift for
+[frdminc/tendcf#98](https://github.com/frdminc/tendcf/issues/98)):** local
+checkouts live under `~/tendcf-ops` (`TENDCF_OPS_ROOT`) as
+`tendcf-private-<site>` (primary site root) and optional
+`tendcf-public-<site>` (paired deterministically by a single `--site-name` /
+`TENDCF_SITE` / XDG `active-site` selector, failing closed with no sole-dir
+glob or legacy aliases), alongside optional `tendcf/` and read-only
+`tendcf-public-<other>` clones; mutable runtime state lives under XDG
+(`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`), never inside git
+checkouts, and multi-item site inputs are designed around `*.d/` directories.
+**The composition boundary above is unchanged:** no device and no release build
+ever reads a sibling checkout — releases compose solely from `site.lock`. For
+local preview/test compiles only, `--override-input <ns>=<path>` may bind a
+local directory; any active override marks the compile and workspace tainted
+and **refuses release signing and publishing** (fail closed).
 
 **One lockfile, in site-private: `site.lock`.** It is the only place a
 version is chosen. Everything else is content.
