@@ -604,14 +604,15 @@ check "systemd id positive (backup..daily.service present, -n): not rejected as 
 
 printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"tendcf-test-backup.timer":{"state":"absent"}}}}' > "$work/data/host_specific.json"
 out="$work/pos-systemd-timer-absent.out"
-"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-check "systemd tombstone positive (tendcf-test-backup.timer absent): policy completed" policy_completed "$out"
-check "systemd tombstone positive (tendcf-test-backup.timer absent): no CMDB cross-check refusal" no_crosscheck "$out"
-check "systemd tombstone positive (tendcf-test-backup.timer absent): not rejected as bad id" \
+"$cf_agent" -n -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "systemd tombstone positive (tendcf-test-backup.timer absent, -n): policy completed" \
+    grep -q 'Need to repair reports promise: tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services' "$out"
+check "systemd tombstone positive (tendcf-test-backup.timer absent, -n): no CMDB cross-check refusal" no_crosscheck "$out"
+check "systemd tombstone positive (tendcf-test-backup.timer absent, -n): not rejected as bad id" \
     bash -c "! grep -q 'is not a valid' '$out'"
-check "systemd tombstone positive (tendcf-test-backup.timer absent): not rejected as reserved" \
+check "systemd tombstone positive (tendcf-test-backup.timer absent, -n): not rejected as reserved" \
     bash -c "! grep -q 'installer-owned unit' '$out'"
-check "systemd tombstone positive (tendcf-test-backup.timer absent): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+check "systemd tombstone positive (tendcf-test-backup.timer absent, -n): nothing rendered and no launchctl/systemctl" no_render_start "$out"
 
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
@@ -2003,13 +2004,23 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         execd_sentinel_created=0
         execd_timer_path=/etc/systemd/system/tendcf-execd.timer
         execd_timer_created=0
-        dotdot_unit=backup..daily.service
-        dotdot_unit_path=/etc/systemd/system/$dotdot_unit
-        timer_unit=tendcf-test-backup.timer
-        timer_unit_path=/etc/systemd/system/$timer_unit
+        dotdot_unit="tendcf-test-backup..daily-$$.service"
+        dotdot_unit_path="/etc/systemd/system/$dotdot_unit"
+        dotdot_unit_acquired=0
+        timer_unit="tendcf-test-backup-$$.timer"
+        timer_unit_path="/etc/systemd/system/$timer_unit"
+        timer_unit_acquired=0
         cleanup_unit() {
-            as_root systemctl disable --now "$unit" "$dotdot_unit" "$timer_unit" >/dev/null 2>&1 || true
-            as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path" "$dotdot_unit_path" "$timer_unit_path"
+            as_root systemctl disable --now "$unit" >/dev/null 2>&1 || true
+            as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path"
+            if [ "${dotdot_unit_acquired:-0}" = 1 ]; then
+                as_root systemctl disable --now "$dotdot_unit" >/dev/null 2>&1 || true
+                as_root rm -f "$dotdot_unit_path"
+            fi
+            if [ "${timer_unit_acquired:-0}" = 1 ]; then
+                as_root systemctl disable --now "$timer_unit" >/dev/null 2>&1 || true
+                as_root rm -f "$timer_unit_path"
+            fi
             if [ "${execd_sentinel_created:-0}" = 1 ]; then
                 as_root rm -f "$execd_sentinel_path"
             fi
@@ -2211,42 +2222,58 @@ PYEOF
             execd_sentinel_created=0
         fi
 
-        # 6c positive controls (issue #102 R3 Codex finding):
-        # (1) `backup..daily.service` renders, activates, and tears down cleanly.
-        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"backup..daily.service":{"bundle":"demo","command":["/usr/bin/sleep","3600"],"run_as":"nobody","state":"present","unit":{"systemd":{"enabled":false,"restart":"on-failure","wanted_by":"multi-user.target"}},"working_dir":"/"}}}}' > "$work/data/host_specific.json"
-        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
-            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-present.out" 2>&1 || true
-        as_root chown -R "$(id -u):$(id -g)" "$work"
-        check "systemd positive (backup..daily.service present): not refused as bad id" \
-            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-present.out'"
-        check "systemd positive (backup..daily.service present): unit rendered" \
-            test -f "$dotdot_unit_path"
-        check "systemd positive (backup..daily.service present): unit active" \
-            as_root systemctl is-active --quiet "$dotdot_unit"
+        # 6c positive controls (issue #102 R3/R4 Codex findings):
+        # (1) Per-run embedded-`..` service (`$dotdot_unit`) renders, activates, and tears down cleanly.
+        if [ ! -e "$dotdot_unit_path" ] && [ ! -L "$dotdot_unit_path" ]; then
+            dotdot_unit_acquired=1
+            printf '{"vars":{"tendcf_interlock":{},"tendcf_service":{"%s":{"bundle":"demo","command":["/usr/bin/sleep","3600"],"run_as":"nobody","state":"present","unit":{"systemd":{"enabled":false,"restart":"on-failure","wanted_by":"multi-user.target"}},"working_dir":"/"}}}}\n' "$dotdot_unit" > "$work/data/host_specific.json"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-present.out" 2>&1 || true
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+            check "systemd positive ($dotdot_unit present): not refused as bad id" \
+                bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-present.out'"
+            check "systemd positive ($dotdot_unit present): unit rendered" \
+                test -f "$dotdot_unit_path"
+            check "systemd positive ($dotdot_unit present): unit active" \
+                as_root systemctl is-active --quiet "$dotdot_unit"
 
-        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"backup..daily.service":{"state":"absent"}}}}' > "$work/data/host_specific.json"
-        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
-            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-absent.out" 2>&1 || true
-        as_root chown -R "$(id -u):$(id -g)" "$work"
-        check "systemd positive (backup..daily.service tombstone): not refused as bad id" \
-            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-absent.out'"
-        check "systemd positive (backup..daily.service tombstone): unit file removed" \
-            test ! -e "$dotdot_unit_path"
-        check "systemd positive (backup..daily.service tombstone): unit stopped" \
-            bash -c "! systemctl is-active --quiet '$dotdot_unit'"
+            printf '{"vars":{"tendcf_interlock":{},"tendcf_service":{"%s":{"state":"absent"}}}}\n' "$dotdot_unit" > "$work/data/host_specific.json"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-absent.out" 2>&1 || true
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+            check "systemd positive ($dotdot_unit tombstone): not refused as bad id" \
+                bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-absent.out'"
+            check "systemd positive ($dotdot_unit tombstone): unit file removed" \
+                test ! -e "$dotdot_unit_path"
+            check "systemd positive ($dotdot_unit tombstone): unit stopped" \
+                bash -c "! systemctl is-active --quiet '$dotdot_unit'"
+            if [ ! -e "$dotdot_unit_path" ] && [ ! -L "$dotdot_unit_path" ] && ! as_root systemctl is-active --quiet "$dotdot_unit"; then
+                dotdot_unit_acquired=0
+            fi
+        else
+            check "systemd positive ($dotdot_unit): unit path unused before test" false
+        fi
 
-        # (2) Regular `.timer` tombstone tears down cleanly while `tendcf-execd.timer` stays refused.
-        printf '[Unit]\nDescription=tendcf test backup timer\n[Timer]\nOnCalendar=daily\nUnit=%s\n' "$unit" \
-            | as_root tee "$timer_unit_path" >/dev/null
-        as_root chmod 0644 "$timer_unit_path"
-        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"tendcf-test-backup.timer":{"state":"absent"}}}}' > "$work/data/host_specific.json"
-        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
-            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-timer-absent.out" 2>&1 || true
-        as_root chown -R "$(id -u):$(id -g)" "$work"
-        check "systemd positive (tendcf-test-backup.timer tombstone): not refused as bad id" \
-            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-timer-absent.out'"
-        check "systemd positive (tendcf-test-backup.timer tombstone): regular timer file removed" \
-            test ! -e "$timer_unit_path"
+        # (2) Per-run regular `.timer` tombstone (`$timer_unit`) tears down cleanly while `tendcf-execd.timer` stays refused.
+        if [ ! -e "$timer_unit_path" ] && [ ! -L "$timer_unit_path" ]; then
+            timer_unit_acquired=1
+            printf '[Unit]\nDescription=tendcf test backup timer\n[Timer]\nOnCalendar=daily\nUnit=%s\n' "$unit" \
+                | as_root tee "$timer_unit_path" >/dev/null
+            as_root chmod 0644 "$timer_unit_path"
+            printf '{"vars":{"tendcf_interlock":{},"tendcf_service":{"%s":{"state":"absent"}}}}\n' "$timer_unit" > "$work/data/host_specific.json"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-timer-absent.out" 2>&1 || true
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+            check "systemd positive ($timer_unit tombstone): not refused as bad id" \
+                bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-timer-absent.out'"
+            check "systemd positive ($timer_unit tombstone): regular timer file removed" \
+                test ! -e "$timer_unit_path"
+            if [ ! -e "$timer_unit_path" ] && [ ! -L "$timer_unit_path" ] && ! as_root systemctl is-active --quiet "$timer_unit"; then
+                timer_unit_acquired=0
+            fi
+        else
+            check "systemd positive ($timer_unit): timer path unused before test" false
+        fi
 
         if [ ! -e "$execd_timer_path" ] && [ ! -L "$execd_timer_path" ]; then
             printf '[Unit]\nDescription=tendcf-execd timer sentinel for policy test 6c\n' \
