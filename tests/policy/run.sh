@@ -2104,10 +2104,17 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         if [ ! -e "$execd_sentinel_path" ] && [ ! -L "$execd_sentinel_path" ]; then
             printf '[Unit]\nDescription=tendcf-execd sentinel for policy test 6c\n' \
                 | as_root tee "$execd_sentinel_path" >/dev/null
+            as_root chmod 0644 "$execd_sentinel_path"
             execd_sentinel_created=1
         fi
-        execd_sentinel_hash="$(sha256sum "$execd_sentinel_path" | awk '{print $1}')"
+        execd_sentinel_hash="$(as_root sha256sum "$execd_sentinel_path" | awk '{print $1}')"
         sysd_no_edit() { ! grep -Eq 'Created file|Updated rendering|Edited file' "$1"; }
+        execd_sentinel_unchanged() {
+            local cur_hash
+            [ -f "$execd_sentinel_path" ] || return 1
+            cur_hash="$(as_root sha256sum "$execd_sentinel_path" | awk '{print $1}')"
+            [ "$cur_hash" = "$execd_sentinel_hash" ]
+        }
 
         sysd_run_verbose reserved-systemd-present.json "$work/sysd-reserved-present.out"
         check "systemd reserved present tendcf-execd.service: refused and reported" \
@@ -2117,7 +2124,7 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "systemd reserved present tendcf-execd.service: nothing created or edited" \
             sysd_no_edit "$work/sysd-reserved-present.out"
         check "systemd reserved present tendcf-execd.service: sentinel hash unchanged" \
-            bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
+            execd_sentinel_unchanged
 
         sysd_run_verbose reserved-systemd-absent.json "$work/sysd-reserved-absent.out"
         check "systemd reserved tombstone tendcf-execd.service: refused and reported" \
@@ -2127,7 +2134,7 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "systemd reserved tombstone tendcf-execd.service: nothing deleted" \
             bash -c "! grep -q 'Deleted file' '$work/sysd-reserved-absent.out'"
         check "systemd reserved tombstone tendcf-execd.service: sentinel hash unchanged" \
-            bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
+            execd_sentinel_unchanged
 
         for vm_spec in \
             "nosuffix-present:tendcf-execd:present:tendcf: service 'tendcf-execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
@@ -2163,7 +2170,7 @@ PYEOF
             check "systemd reserved ($vname): nothing created, edited, or deleted" \
                 bash -c "! grep -Eq 'Created file|Updated rendering|Edited file|Deleted file' '$vout'"
             check "systemd reserved ($vname): sentinel hash unchanged" \
-                bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
+                execd_sentinel_unchanged
         done
 
         if [ "$execd_sentinel_created" = 1 ]; then
