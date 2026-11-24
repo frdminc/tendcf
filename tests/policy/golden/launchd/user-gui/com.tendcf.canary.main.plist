@@ -9,6 +9,8 @@
         <string>/bin/sleep</string>
         <string>86400</string>
     </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>WorkingDirectory</key>
     <string>/</string>
     <key>RunAtLoad</key>
