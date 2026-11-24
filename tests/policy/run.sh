@@ -589,6 +589,30 @@ PYEOF
     check "bad systemd id ($bname): nothing rendered and no launchctl/systemctl" no_render_start "$out"
 done
 
+# Positive controls (issue #102 R3 Codex finding): embedded `..` in a single
+# filename (`backup..daily.service`) and `.timer` tombstones (`tendcf-test-backup.timer`)
+# are schema-valid and must NOT be rejected by the systemd bad-id guards.
+printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"backup..daily.service":{"bundle":"demo","command":["/usr/bin/sleep","3600"],"run_as":"nobody","state":"present","unit":{"systemd":{"enabled":false,"restart":"on-failure","wanted_by":"multi-user.target"}},"working_dir":"/"}}}}' > "$work/data/host_specific.json"
+out="$work/pos-systemd-dotdot-present.out"
+"$cf_agent" -n -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "systemd id positive (backup..daily.service present, -n): policy completed" \
+    grep -q 'Need to repair reports promise: tendcf-test-done: the entry policy evaluated tendcf_interlocks and tendcf_services' "$out"
+check "systemd id positive (backup..daily.service present, -n): not rejected as bad systemd id" \
+    bash -c "! grep -q 'is not a valid systemd' '$out'"
+check "systemd id positive (backup..daily.service present, -n): not rejected as reserved" \
+    bash -c "! grep -q 'installer-owned unit' '$out'"
+
+printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"tendcf-test-backup.timer":{"state":"absent"}}}}' > "$work/data/host_specific.json"
+out="$work/pos-systemd-timer-absent.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "systemd tombstone positive (tendcf-test-backup.timer absent): policy completed" policy_completed "$out"
+check "systemd tombstone positive (tendcf-test-backup.timer absent): no CMDB cross-check refusal" no_crosscheck "$out"
+check "systemd tombstone positive (tendcf-test-backup.timer absent): not rejected as bad id" \
+    bash -c "! grep -q 'is not a valid' '$out'"
+check "systemd tombstone positive (tendcf-test-backup.timer absent): not rejected as reserved" \
+    bash -c "! grep -q 'installer-owned unit' '$out'"
+check "systemd tombstone positive (tendcf-test-backup.timer absent): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
     cp "$repo/tests/policy/fixtures/launchd-present.json" "$work/data/host_specific.json"
@@ -1977,11 +2001,20 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
     if declare -F as_root >/dev/null; then
         execd_sentinel_path=/etc/systemd/system/tendcf-execd.service
         execd_sentinel_created=0
+        execd_timer_path=/etc/systemd/system/tendcf-execd.timer
+        execd_timer_created=0
+        dotdot_unit=backup..daily.service
+        dotdot_unit_path=/etc/systemd/system/$dotdot_unit
+        timer_unit=tendcf-test-backup.timer
+        timer_unit_path=/etc/systemd/system/$timer_unit
         cleanup_unit() {
-            as_root systemctl disable --now "$unit" >/dev/null 2>&1 || true
-            as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path"
+            as_root systemctl disable --now "$unit" "$dotdot_unit" "$timer_unit" >/dev/null 2>&1 || true
+            as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path" "$dotdot_unit_path" "$timer_unit_path"
             if [ "${execd_sentinel_created:-0}" = 1 ]; then
                 as_root rm -f "$execd_sentinel_path"
+            fi
+            if [ "${execd_timer_created:-0}" = 1 ]; then
+                as_root rm -f "$execd_timer_path"
             fi
             as_root systemctl daemon-reload >/dev/null 2>&1 || true
         }
@@ -2140,7 +2173,7 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
             "nosuffix-present:tendcf-execd:present:tendcf: service 'tendcf-execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
             "nosuffix-absent:tendcf-execd:absent:tendcf: service 'tendcf-execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
             "dotslash-present:./tendcf-execd.service:present:tendcf: systemd service refused: id is not a valid systemd service unit name" \
-            "dotslash-absent:./tendcf-execd.service:absent:tendcf: systemd tombstone refused: id is not a valid systemd service unit name"; do
+            "dotslash-absent:./tendcf-execd.service:absent:tendcf: systemd tombstone refused: id is not a valid systemd unit name"; do
             vname="${vm_spec%%:*}"; rest="${vm_spec#*:}"
             vid="${rest%%:*}"; rest="${rest#*:}"
             vstate="${rest%%:*}"; vexpected="${rest#*:}"
@@ -2176,6 +2209,71 @@ PYEOF
         if [ "$execd_sentinel_created" = 1 ]; then
             as_root rm -f "$execd_sentinel_path"
             execd_sentinel_created=0
+        fi
+
+        # 6c positive controls (issue #102 R3 Codex finding):
+        # (1) `backup..daily.service` renders, activates, and tears down cleanly.
+        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"backup..daily.service":{"bundle":"demo","command":["/usr/bin/sleep","3600"],"run_as":"nobody","state":"present","unit":{"systemd":{"enabled":false,"restart":"on-failure","wanted_by":"multi-user.target"}},"working_dir":"/"}}}}' > "$work/data/host_specific.json"
+        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-present.out" 2>&1 || true
+        as_root chown -R "$(id -u):$(id -g)" "$work"
+        check "systemd positive (backup..daily.service present): not refused as bad id" \
+            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-present.out'"
+        check "systemd positive (backup..daily.service present): unit rendered" \
+            test -f "$dotdot_unit_path"
+        check "systemd positive (backup..daily.service present): unit active" \
+            as_root systemctl is-active --quiet "$dotdot_unit"
+
+        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"backup..daily.service":{"state":"absent"}}}}' > "$work/data/host_specific.json"
+        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-dotdot-absent.out" 2>&1 || true
+        as_root chown -R "$(id -u):$(id -g)" "$work"
+        check "systemd positive (backup..daily.service tombstone): not refused as bad id" \
+            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-dotdot-absent.out'"
+        check "systemd positive (backup..daily.service tombstone): unit file removed" \
+            test ! -e "$dotdot_unit_path"
+        check "systemd positive (backup..daily.service tombstone): unit stopped" \
+            bash -c "! systemctl is-active --quiet '$dotdot_unit'"
+
+        # (2) Regular `.timer` tombstone tears down cleanly while `tendcf-execd.timer` stays refused.
+        printf '[Unit]\nDescription=tendcf test backup timer\n[Timer]\nOnCalendar=daily\nUnit=%s\n' "$unit" \
+            | as_root tee "$timer_unit_path" >/dev/null
+        as_root chmod 0644 "$timer_unit_path"
+        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"tendcf-test-backup.timer":{"state":"absent"}}}}' > "$work/data/host_specific.json"
+        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+            "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$work/sysd-pos-timer-absent.out" 2>&1 || true
+        as_root chown -R "$(id -u):$(id -g)" "$work"
+        check "systemd positive (tendcf-test-backup.timer tombstone): not refused as bad id" \
+            bash -c "! grep -q 'is not a valid systemd' '$work/sysd-pos-timer-absent.out'"
+        check "systemd positive (tendcf-test-backup.timer tombstone): regular timer file removed" \
+            test ! -e "$timer_unit_path"
+
+        if [ ! -e "$execd_timer_path" ] && [ ! -L "$execd_timer_path" ]; then
+            printf '[Unit]\nDescription=tendcf-execd timer sentinel for policy test 6c\n' \
+                | as_root tee "$execd_timer_path" >/dev/null
+            as_root chmod 0644 "$execd_timer_path"
+            execd_timer_created=1
+        fi
+        execd_timer_hash="$(as_root sha256sum "$execd_timer_path" | awk '{print $1}')"
+        execd_timer_unchanged() {
+            local cur_hash
+            [ -f "$execd_timer_path" ] || return 1
+            cur_hash="$(as_root sha256sum "$execd_timer_path" | awk '{print $1}')"
+            [ "$cur_hash" = "$execd_timer_hash" ]
+        }
+        printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{"tendcf-execd.timer":{"state":"absent"}}}}' > "$work/data/host_specific.json"
+        as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+            "$cf_agent" -K -v -f "$work/inputs/entry.cf" >"$work/sysd-reserved-timer-absent.out" 2>&1 || true
+        as_root chown -R "$(id -u):$(id -g)" "$work"
+        check "systemd reserved (tendcf-execd.timer tombstone): refused as installer-owned unit" \
+            grep -qF "tendcf: service 'tendcf-execd.timer' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" "$work/sysd-reserved-timer-absent.out"
+        check "systemd reserved (tendcf-execd.timer tombstone): zero systemctl commands or probes" \
+            no_systemctl "$work/sysd-reserved-timer-absent.out"
+        check "systemd reserved (tendcf-execd.timer tombstone): sentinel hash unchanged" \
+            execd_timer_unchanged
+        if [ "$execd_timer_created" = 1 ]; then
+            as_root rm -f "$execd_timer_path"
+            execd_timer_created=0
         fi
     fi
 elif [ "${TENDCF_TEST_SYSTEMD:-}" = 1 ]; then
@@ -2863,8 +2961,9 @@ if [ "$fail" != 0 ]; then
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
              reserved-systemd-nosuffix-present reserved-systemd-nosuffix-absent reserved-systemd-timer-present reserved-dry-launchd reserved-dry-systemd \
              bad-systemd-id-dot-slash-present bad-systemd-id-dot-slash-absent bad-systemd-id-parent-trav-present bad-systemd-id-parent-trav-absent bad-systemd-id-dropin-present bad-systemd-id-space-present \
+             pos-systemd-dotdot-present pos-systemd-timer-absent \
              launchd-reserved-sys-present launchd-reserved-sys-case-present launchd-reserved-user-exact-present launchd-reserved-user-case-present launchd-reserved-sys-absent launchd-reserved-sys-case-absent launchd-reserved-user-absent launchd-reserved-sibling \
-             sysd-sim-present sysd-sim-tomb sysd-reserved-present sysd-reserved-absent sysd-reserved-nosuffix-present sysd-reserved-nosuffix-absent sysd-reserved-dotslash-present sysd-reserved-dotslash-absent; do
+             sysd-sim-present sysd-sim-tomb sysd-reserved-present sysd-reserved-absent sysd-reserved-nosuffix-present sysd-reserved-nosuffix-absent sysd-reserved-dotslash-present sysd-reserved-dotslash-absent sysd-pos-dotdot-present sysd-pos-dotdot-absent sysd-pos-timer-absent sysd-reserved-timer-absent; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
