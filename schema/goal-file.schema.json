@@ -7,8 +7,8 @@
   "type": "object",
   "properties": {
     "schema_version": {
-      "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid. v6 (djbclark ruling 2026-11-14, C-policy-01): interlock pre_action.command is held to common.schema.json#/$defs/interlock_argv, a strict subset of v5's acceptance set, bumped because the same version number must mean the same acceptance set. v7 (issue 64): the goal-file shape is unchanged; the family moves with the approval record, which gains `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record (approval-record.schema.json), so one number still names one acceptance set across the three schemas.",
-      "const": 7
+      "description": "Goal-file family version (shared with goal-diff and approval-record). Stricter than contract_version: ANY shape change, additive included, bumps it (E1 §5.6). A const, so a file claiming any other version fails this schema structurally; the validator dispatches on the value first and reports version-above-ceiling distinctly from schema-invalid. v6 (djbclark ruling 2026-11-14, C-policy-01): interlock pre_action.command is held to common.schema.json#/$defs/interlock_argv, a strict subset of v5's acceptance set, bumped because the same version number must mean the same acceptance set. v7 (issue 64): the goal-file shape is unchanged; the family moves with the approval record, which gains `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record (approval-record.schema.json), so one number still names one acceptance set across the three schemas. v8 (issues #99 + #94): `unit.launchd` gains required `domain` (`system` | `user`); launchd `unit-writer` keys admit exact reverse-DNS labels in addition to `.*` prefixes and allow `writer: \"tendcf-install\"` on exact launchd labels (pinned to `org.tendcf.execd` by lint) while keeping it forbidden on `.*` prefixes; systemd `unit-writer` keys remain restricted to v5-v7 unit names, templates and prefixes.",
+      "const": 8
     },
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
@@ -96,7 +96,7 @@
       }
     },
     {
-      "description": "On a launchd host every present service's unit flavour must be launchd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v5 the unit-writer key grammar is wider (systemd unit names), so this member keeps the complete v4 language for launchd (reverse-DNS prefixes only), refuses `tendcf-install` (the installer is Linux-only) and refuses `unit-package` (Debian package claims, systemd only).",
+      "description": "On a launchd host every present service's unit flavour must be launchd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v8 (issue #99), launchd unit-writer keys admit exact reverse-DNS labels in addition to reverse-DNS `.*` prefixes, and `writer: \"tendcf-install\"` is permitted on exact labels only (pinned to `org.tendcf.execd` by lint) and forbidden on `.*` prefixes. `unit-package` remains forbidden (Debian package claims, systemd only).",
       "if": {
         "type": "object",
         "properties": {
@@ -153,10 +153,12 @@
                     "unit-package": false,
                     "unit-writer": {
                       "propertyNames": {
-                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$"
+                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+(\\.\\*)?$"
                       },
-                      "additionalProperties": {
-                        "properties": { "writer": { "not": { "const": "tendcf-install" } } }
+                      "patternProperties": {
+                        "\\*$": {
+                          "properties": { "writer": { "not": { "const": "tendcf-install" } } }
+                        }
                       }
                     }
                   }
@@ -168,7 +170,7 @@
       }
     },
     {
-      "description": "On a systemd host every present service's unit flavour must be systemd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v5 a prefix key (a trailing star) belongs to cfengine alone: a blanket claim over a namespace has no evidence behind it (an exact name may carry any writer, a package its own claim).",
+      "description": "On a systemd host every present service's unit flavour must be systemd (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v5 a prefix key (a trailing star) belongs to cfengine alone: a blanket claim over a namespace has no evidence behind it (an exact name may carry any writer, a package its own claim). Systemd unit-writer keys keep the v5-v7 unit-name/template/prefix grammar and do not admit bare reverse-DNS launchd labels added in v8.",
       "if": {
         "type": "object",
         "properties": {
@@ -223,6 +225,9 @@
                       }
                     },
                     "unit-writer": {
+                      "propertyNames": {
+                        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)$"
+                      },
                       "patternProperties": {
                         "\\*$": { "properties": { "writer": { "const": "cfengine" } } }
                       }
@@ -236,7 +241,7 @@
       }
     },
     {
-      "description": "On a runit host every present service's unit flavour must be runit (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v5 the unit-writer key grammar is wider (systemd unit names), so this member keeps the complete v4 language for runit (reverse-DNS prefixes only), refuses `tendcf-install` (the installer is Linux-only) and refuses `unit-package` (Debian package claims, systemd only).",
+      "description": "On a runit host every present service's unit flavour must be runit (R3): the flavour and the supervisor are one fact, written twice, and the schema checks the equality. device-trust holds no services (trust_domain), so it is skipped by construction. Since v5 the unit-writer key grammar is wider (systemd unit names, and launchd exact labels in v8), so this member keeps the complete v4 language for runit (reverse-DNS prefixes only), refuses `tendcf-install` (systemd and launchd installers only) and refuses `unit-package` (Debian package claims, systemd only).",
       "if": {
         "type": "object",
         "properties": {
@@ -425,10 +430,14 @@
             "launchd": {
               "type": "object",
               "properties": {
+                "domain": {
+                  "description": "Which launchd domain runs the job: `system` (/Library/LaunchDaemons, root) or `user` (~/Library/LaunchAgents, non-root gui/<uid>). Required in the goal file (no hidden default); optional in the Site Model (nix2cf defaults omitted to `system`).",
+                  "enum": ["system", "user"]
+                },
                 "run_at_load": { "type": "boolean" },
                 "keep_alive": { "type": "boolean" }
               },
-              "required": ["run_at_load", "keep_alive"],
+              "required": ["domain", "run_at_load", "keep_alive"],
               "additionalProperties": false
             }
           },
@@ -513,11 +522,11 @@
     },
 
     "unit_writer_map": {
-      "description": "Who may write units, carried in the goal file because the DEVICE runs extra-entry detection and the device does not have the Site Model (Grok opinion §10, adopted). Present-only: a writer declaration is detector data, not actuated state. repo/note prose stays in the Site Model. A key is either an exact name (one of the four unit-type suffixes .service, .socket, .timer, .path; a template such as `getty@.service` is allowed and covers its instances, an instance such as `getty@tty1.service` is not) or a prefix (a trailing star directly after a dot or dash). Since v5 the key language is wider than v4's reverse-DNS prefixes; launchd and runit keep the v4 language (top-level `allOf`), and on systemd a prefix belongs to cfengine alone. Lint: no two keys overlap (an exact name under a prefix, a template under a prefix, a prefix under a prefix), and an exact name does not overlap a prefix merely by sharing a stem (`foo.service` and `foo.service.*` are disjoint). A claim says who may write; it does not prove who did (the device reports that). Two writers on one name stay expressible: a name claim beside a package claim that ships the same name is reported by the device as two-writers, not rejected here, because no lint can know what a package ships.",
+      "description": "Who may write units, carried in the goal file because the DEVICE runs extra-entry detection and the device does not have the Site Model (Grok opinion §10, adopted). Present-only: a writer declaration is detector data, not actuated state. repo/note prose stays in the Site Model. A key is an exact systemd unit name (one of the four unit-type suffixes .service, .socket, .timer, .path; a template such as `getty@.service` is allowed and covers its instances, an instance such as `getty@tty1.service` is not), an exact reverse-DNS launchd label (since v8, issue #99, e.g. `org.tendcf.execd`), or a prefix (a trailing star directly after a dot or dash). Top-level `allOf` restricts each supervisor to its own subset: systemd takes unit names/templates and cfengine-only prefixes, launchd takes reverse-DNS exact labels and `.*` prefixes, and runit keeps v4 reverse-DNS `.*` prefixes only. Lint: no two keys overlap (an exact name under a prefix, a template under a prefix, a prefix under a prefix), and an exact name does not overlap a prefix merely by sharing a stem (`foo.service` and `foo.service.*` are disjoint). A claim says who may write; it does not prove who did (the device reports that). Two writers on one name stay expressible: a name claim beside a package claim that ships the same name is reported by the device as two-writers, not rejected here, because no lint can know what a package ships.",
       "type": "object",
       "propertyNames": {
         "type": "string",
-        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)$"
+        "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)|[a-z][a-z0-9]*(?:\\.[A-Za-z0-9][A-Za-z0-9_-]*)+)$"
       },
       "additionalProperties": { "$ref": "#/$defs/unit_writer_entry" },
       "minProperties": 1
@@ -528,7 +537,7 @@
       "properties": {
         "state": { "const": "present" },
         "writer": {
-          "description": "The one tool allowed to write units under this name or prefix. `nix-darwin` writes labels in the launchd namespace that Apple, Homebrew and CFEngine share, so it takes a prefix like any other writer; CFEngine never renders one. A NixOS host has no unit-writer entries at all: the host-level `supervisor` fact claims its whole unit namespace (schema v4, D2/Q7). `tendcf-install` is tendcf's own installed unit (`tendcf-execd.service`, lint; systemd hosts only). A Debian package's own units are claimed by a `unit-package` entry, never by a writer value here: `dpkg` was removed in v5. `cfengine` is the only writer a comprehensive domain's services may fall under (lint), and the only writer a systemd prefix key may carry.",
+          "description": "The one tool allowed to write units under this name or prefix. `nix-darwin` writes labels in the launchd namespace that Apple, Homebrew and CFEngine share, so it takes a prefix like any other writer; CFEngine never renders one. A NixOS host has no unit-writer entries at all: the host-level `supervisor` fact claims its whole unit namespace (schema v4, D2/Q7). `tendcf-install` is tendcf's own installed unit (`tendcf-execd.service` on systemd hosts, `org.tendcf.execd` on launchd hosts since v8; exact name/label only, never a prefix; lint). A Debian package's own units are claimed by a `unit-package` entry, never by a writer value here: `dpkg` was removed in v5. `cfengine` is the only writer a comprehensive domain's services may fall under (lint), and the only writer a systemd prefix key may carry.",
           "enum": ["cfengine", "mise", "nix-darwin", "tendcf-install", "homebrew", "apple", "third-party"]
         }
       },
@@ -686,7 +695,7 @@
     },
 
     "supervisor_map": {
-      "description": "The host's unit-namespace authority, taken from inventory `supervisor` (schema v4, D2). Singleton, id `host`, and required on every goal file since v4. On `nixos` the NixOS configuration writes every unit, so no domain may carry a service, interlock, unit-writer or (since v5) unit-package entry: tendcf only reports and refuses there (D3), and the top-level `allOf` enforces it. On `launchd`, `systemd` and `runit` the unit-writer entries still govern, and every present service's unit flavour must equal this value; `unit-package` entries and the `tendcf-install` writer are systemd-only (launchd and runit refuse both), and on systemd a prefix key belongs to cfengine alone. Residue: on those three the flavour is now written twice, once here and once in each service's `unit`; the equality is checked, not removed (reconciliation 2026-10-31 §7.1).",
+      "description": "The host's unit-namespace authority, taken from inventory `supervisor` (schema v4, D2). Singleton, id `host`, and required on every goal file since v4. On `nixos` the NixOS configuration writes every unit, so no domain may carry a service, interlock, unit-writer or (since v5) unit-package entry: tendcf only reports and refuses there (D3), and the top-level `allOf` enforces it. On `launchd`, `systemd` and `runit` the unit-writer entries still govern, and every present service's unit flavour must equal this value; `unit-package` entries are systemd-only, `tendcf-install` is systemd and launchd only (exact unit/label, never a prefix; runit refuses both), and on systemd a prefix key belongs to cfengine alone. Residue: on those three the flavour is now written twice, once here and once in each service's `unit`; the equality is checked, not removed (reconciliation 2026-10-31 §7.1).",
       "type": "object",
       "propertyNames": { "const": "host" },
       "additionalProperties": {

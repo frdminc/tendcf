@@ -79,6 +79,7 @@
             "state": "present",
             "unit": {
               "launchd": {
+                "domain": "system",
                 "keep_alive": true,
                 "run_at_load": true
               }
@@ -99,5 +100,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 7
+  "schema_version": 8
 }

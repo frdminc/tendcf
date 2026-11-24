@@ -5,7 +5,7 @@
 # two writers over one namespace is the exact hazard this file prevents, and
 # nesting is how it comes back.
 
-contract_version: 1
+contract_version: 2
 
 domain:
   description: "The launchd label namespace on macOS"
@@ -18,7 +18,7 @@ writers:
     repo: site-shared
     note: "Site services. Rendered from services.yml via nix2cf."
 
-  - prefix: org.tendcf.*
+  - prefix: com.tendcf.example.*
     writer: cfengine
     repo: tendcf
     note: "Engine-owned example services. Fixture only."

@@ -1,7 +1,7 @@
-contract_version: 2
+contract_version: 3
 domains:
   macos-launchd-services:
-    description: launchd jobs on the operator's Mac under com.djbclark.* and org.tendcf.*
+    description: launchd jobs on the operator's Mac under com.djbclark.* and com.tendcf.example.*
     opt_out_reason: not-yet-migrated
   macos-user-daemons:
     description: Third-party login items and vendor updaters
@@ -97,7 +97,7 @@ services:
   - /usr/local/bin/tailscaled
   managed_by: cfengine
   launchd:
-    label: org.tendcf.tailscaled
+    label: com.tendcf.example.tailscaled
   provides:
   - service:tailscaled
   - network:tailnet

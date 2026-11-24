@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the one hundred eighty-six deliberately broken fixtures in examples/broken/
+  6. each of the two hundred ten deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 198
+EXPECTED_BROKEN = 210
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -1585,29 +1585,42 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
     services: list[dict] = services_doc.get("services") or []
     roles = set((roles_doc.get("roles") or {}).keys())
 
-    # --- launchd writer prefixes -------------------------------------------
-    prefixes: list[str] = []
-    seen_prefixes: set[str] = set()
+    # --- launchd writer prefixes and exact labels --------------------------
+    writer_keys: list[str] = []
+    seen_writer_keys: set[str] = set()
     for writer in writers_doc.get("writers") or []:
-        prefix = writer.get("prefix", "")
-        if prefix in seen_prefixes:
+        if not isinstance(writer, dict):
+            continue
+        has_prefix = "prefix" in writer
+        has_label = "label" in writer
+        if has_prefix == has_label:
+            continue  # schema catches missing or both-present
+        key = writer["prefix"] if has_prefix else writer["label"]
+        if not isinstance(key, str) or not key:
+            continue
+        if key in seen_writer_keys:
             fail(
-                f"launchd-writers: prefix {prefix} declared twice — one writer per prefix",
+                f"launchd-writers: {key!r} declared twice — one writer per prefix or exact label",
                 rule=RULE_CROSS_FILE,
             )
-        seen_prefixes.add(prefix)
-        prefixes.append(prefix)
+        seen_writer_keys.add(key)
+        writer_keys.append(key)
+        if has_label and writer.get("writer") == "tendcf-install" and key != "org.tendcf.execd":
+            fail(
+                f"launchd-writers: exact label {key!r} carries writer 'tendcf-install', "
+                "which names exactly one launchd label, org.tendcf.execd",
+                rule=RULE_CROSS_FILE,
+            )
 
-    # A prefix nested inside another puts two writers over one namespace,
-    # which is the hazard this file exists to remove.
-    for outer in prefixes:
-        for inner in prefixes:
-            if outer == inner:
-                continue
-            if inner.removesuffix("*").startswith(outer.removesuffix("*")):
+    # Overlapping prefixes or an exact label under a prefix puts two writers
+    # over one namespace, which is the hazard this file exists to remove.
+    for index, first in enumerate(writer_keys):
+        for second in writer_keys[index + 1 :]:
+            if first != second and unit_keys_overlap(first, second):
                 fail(
-                    f"launchd-writers: prefix {inner} nests inside {outer} — "
-                    "two writers over one label namespace", rule=RULE_CROSS_FILE
+                    f"launchd-writers: {first!r} and {second!r} overlap — "
+                    "two writers over one label namespace",
+                    rule=RULE_CROSS_FILE,
                 )
 
     # --- bundles -----------------------------------------------------------
@@ -1659,11 +1672,11 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
 
         label = (service.get("launchd") or {}).get("label")
         if label is not None:
-            matched = [p for p in prefixes if label.startswith(p.removesuffix("*"))]
+            matched = [k for k in writer_keys if unit_key_covers(k, label)]
             if not matched:
                 fail(
                     f"services: {name} launchd label {label!r} falls under no declared "
-                    "writer prefix (launchd-writers.yml) — this is the two-writers rail",
+                    "writer prefix or exact label (launchd-writers.yml) — this is the two-writers rail",
                     rule=RULE_CROSS_FILE,
                 )
 
@@ -1759,6 +1772,10 @@ def check_unit_claim_selftest() -> None:
         ("foo@.service", "foo@.socket", False),
         ("foo@.service", "foo.service", False),
         ("tendcf.canary.*", "tendcf-execd.service", False),
+        ("org.tendcf.*", "org.tendcf.execd", True),
+        ("com.tendcf.example.*", "org.tendcf.execd", False),
+        ("org.tendcf.execd", "org.tendcf.execd", True),
+        ("org.tendcf.execd", "org.tendcf.other", False),
     )
     for a, b, want in overlap_table:
         for x, y in ((a, b), (b, a)):
@@ -1779,6 +1796,9 @@ def check_unit_claim_selftest() -> None:
         ("foo.*", "foo.service", True),
         ("foo.service.*", "foo.service", False),
         ("foo-*", "foo-w@1.service", True),
+        ("org.tendcf.execd", "org.tendcf.execd", True),
+        ("org.tendcf.execd", "org.tendcf.execd.sub", False),
+        ("com.tendcf.example.*", "com.tendcf.example.tailscaled", True),
     )
     for key, name, want in covers_table:
         if unit_key_covers(key, name) != want:
@@ -1951,9 +1971,10 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
         )
 
     # --- `tendcf-install` names tendcf's own unit and nothing else ----------
-    # §2.2(5). Only on a systemd host: the other supervisors reject the
-    # writer in schema (goal-file.schema.json allOf), and this rule does not
-    # duplicate that, so the launchd and runit cases discriminate.
+    # §2.2(5), extended to launchd in schema v8 (issue #99). Runit and launchd
+    # `.*` prefixes reject `tendcf-install` in schema (goal-file.schema.json
+    # allOf), and this rule does not duplicate those rejections, so the schema
+    # and cross-file cases discriminate.
     supervisor = (
         ((domains.get("device-trust") or {}).get("entries") or {})
         .get("supervisor", {})
@@ -1967,6 +1988,15 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
                     "carries writer 'tendcf-install', which names exactly one "
                     "unit, tendcf-execd.service",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+    elif supervisor == "launchd":
+        for domain_name, key, writer in keys:
+            if writer == "tendcf-install" and not key.endswith("*") and key != "org.tendcf.execd":
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    "carries writer 'tendcf-install', which names exactly one "
+                    "launchd label, org.tendcf.execd",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
 

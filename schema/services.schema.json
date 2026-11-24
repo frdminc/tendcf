@@ -7,9 +7,9 @@
   "type": "object",
   "properties": {
     "contract_version": {
-      "description": "2 since 2026-11-14 (C-policy-01): interlock pre_action.command is held to common.schema.json#/$defs/interlock_argv, a narrowing of what 1 accepted. An exact pin (`const`, as schema_version does): a document declaring 1, 3 or 99 fails here instead of being judged under rules it never claimed, because the same number must mean the same acceptance set. roles.yml and launchd-writers.yml are separate documents on their own axes and are unchanged.",
+      "description": "3 since 2026-11-24 (issue #94): adds optional `launchd.domain` (`system` | `user`; nix2cf defaults omitted to `system`). 2 (2026-11-14, C-policy-01) held interlock pre_action.command to common.schema.json#/$defs/interlock_argv. An exact pin (`const`, as schema_version does): a document declaring any other number fails here instead of being judged under rules it never claimed, because the same number must mean the same acceptance set. roles.yml and launchd-writers.yml are separate documents on their own axes.",
       "$ref": "common.schema.json#/$defs/contract_version",
-      "const": 2
+      "const": 3
     },
 
     "domains": {
@@ -97,9 +97,13 @@
           "type": "object",
           "properties": {
             "label": {
-              "description": "Must fall under a prefix declared in the launchd unit-writers registry — cross-checked by bin/schema_lint.py. One writer per unit prefix; launchd is the first adapter of that generic rule.",
+              "description": "Must fall under a prefix or exact label declared in the launchd unit-writers registry — cross-checked by bin/schema_lint.py. One writer per unit prefix/label; launchd is the first adapter of that generic rule.",
               "type": "string",
               "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$"
+            },
+            "domain": {
+              "description": "Which launchd domain runs the job (`system` or `user`). Optional in the Site Model; nix2cf resolves an omitted value to `system` when rendering the goal file.",
+              "enum": ["system", "user"]
             },
             "run_at_load": { "type": "boolean" },
             "keep_alive": { "type": "boolean" }
