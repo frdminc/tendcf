@@ -550,6 +550,248 @@ class TendcfInstallUpgradeRollbackContract(unittest.TestCase):
             self.assertEqual((prefix / "bin" / "version").read_text(encoding="utf-8"), "new-v2\n")
             self.assertFalse(stage.exists())
 
+    def test_l2_stale_upgrade_dirs_fail_closed(self) -> None:
+        """Issue #99 L2: detect stale /opt/tendcf.old.* or /opt/tendcf.failed.* before installing."""
+        cmd_fn = _extract_func(self.src, "cmd_install")
+        idx_preval = cmd_fn.find('prevalidate_install_inputs "$datafile"')
+        idx_stale = cmd_fn.find("check_no_stale_upgrade_dirs")
+        idx_tarball = cmd_fn.find('install_tarball "$tarball" "$sha256_file"')
+        self.assertNotEqual(idx_stale, -1, "check_no_stale_upgrade_dirs must be called in cmd_install")
+        self.assertLess(idx_preval, idx_stale)
+        self.assertLess(idx_stale, idx_tarball)
+
+        fn = _extract_func(self.src, "check_no_stale_upgrade_dirs")
+
+        def run_check(prefix: Path, *, pre_nullglob: bool = False) -> subprocess.CompletedProcess[str]:
+            pre = "shopt -s nullglob\n" if pre_nullglob else ""
+            post = 'shopt -q nullglob || { echo "nullglob unexpectedly unset" >&2; exit 2; }\n' if pre_nullglob else ""
+            script = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                f'prefix="{prefix}"\n'
+                f"{fn}\n"
+                f"{pre}"
+                "check_no_stale_upgrade_dirs\n"
+                f"{post}"
+            )
+            return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "tendcf"
+            prefix.mkdir()
+            # Clean: passes (both default and with nullglob pre-enabled under set -e)
+            r_clean = run_check(prefix)
+            self.assertEqual(r_clean.returncode, 0, r_clean.stderr)
+            r_pre_ng = run_check(prefix, pre_nullglob=True)
+            self.assertEqual(r_pre_ng.returncode, 0, r_pre_ng.stderr)
+
+            # Stale .old.* fails closed
+            stale_old = root / "tendcf.old.999"
+            stale_old.mkdir()
+            r_old = run_check(prefix)
+            self.assertNotEqual(r_old.returncode, 0)
+            self.assertIn(str(stale_old), r_old.stderr)
+            stale_old.rmdir()
+
+            # Dangling symlink .old.* also fails closed
+            stale_dangling = root / "tendcf.old.dangling"
+            stale_dangling.symlink_to(root / "nonexistent-target")
+            r_dangling = run_check(prefix)
+            self.assertNotEqual(r_dangling.returncode, 0)
+            self.assertIn(str(stale_dangling), r_dangling.stderr)
+            stale_dangling.unlink()
+
+            # Stale .failed.* fails closed
+            stale_failed = root / "tendcf.failed.888"
+            stale_failed.mkdir()
+            r_failed = run_check(prefix)
+            self.assertNotEqual(r_failed.returncode, 0)
+            self.assertIn(str(stale_failed), r_failed.stderr)
+
+            # Both present: lists both
+            stale_old.mkdir()
+            r_both = run_check(prefix)
+            self.assertNotEqual(r_both.returncode, 0)
+            self.assertIn(str(stale_old), r_both.stderr)
+            self.assertIn(str(stale_failed), r_both.stderr)
+
+        # cmd_status also reports stale upgrade artifacts read-only.
+        status_fn = _extract_func(self.src, "cmd_status")
+        self.assertIn('"$prefix".old.*', status_fn)
+        self.assertIn('"$prefix".failed.*', status_fn)
+        self.assertIn("stale:", status_fn)
+
+    def test_r3b_upgrade_rollback_removes_newly_created_plist_only(self) -> None:
+        """Issue #99 R3-b: rollback removes newly created execd plist when absent beforehand."""
+        install_fn = _extract_func(self.src, "install_tarball")
+        idx_had = install_fn.find("upgrade_had_plist=1")
+        idx_arm = install_fn.find("upgrade_rollback_armed=1")
+        self.assertNotEqual(idx_had, -1)
+        self.assertLess(idx_had, idx_arm, "upgrade_had_plist must be recorded before arming rollback")
+
+        cleanup_fn = _extract_func(self.src, "cleanup_stage")
+
+        def run_cleanup(env_setup: str) -> subprocess.CompletedProcess[str]:
+            script = (
+                "set -euo pipefail\n"
+                'label="org.tendcf.execd"\n'
+                f"{env_setup}\n"
+                f"{cleanup_fn}\n"
+                "trap cleanup_stage EXIT\n"
+                "exit 1\n"
+            )
+            return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+        # Case A: No plist existed beforehand (upgrade_had_plist=0, upgrade_was_loaded=0),
+        # failed upgrade created plist and loaded execd -> bootout + remove plist.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "tendcf"
+            backup = root / "tendcf.old.321"
+            stage = root / "stage"
+            plist = root / "org.tendcf.execd.plist"
+            log = root / "events.log"
+            (backup / "bin").mkdir(parents=True)
+            (backup / "bin" / "version").write_text("old-v1\n", encoding="utf-8")
+            (prefix / "bin").mkdir(parents=True)
+            (prefix / "bin" / "version").write_text("new-v2\n", encoding="utf-8")
+            plist.write_text("<plist>new</plist>\n", encoding="utf-8")
+            stage.mkdir()
+
+            r = run_cleanup(
+                f'prefix="{prefix}"\n'
+                f'stage_dir="{stage}"\n'
+                f'plist_path="{plist}"\n'
+                "upgrade_rollback_armed=1\n"
+                f'upgrade_backup_prefix="{backup}"\n'
+                'upgrade_staged_tree=""\n'
+                "upgrade_moved_var=0\n"
+                "upgrade_was_loaded=0\n"
+                "upgrade_had_plist=0\n"
+                "upgrade_snapshot_taken=0\n"
+                'upgrade_saved_workdir=""\n'
+                "upgrade_saved_inputs=0\n"
+                "upgrade_saved_data=0\n"
+                "loaded=1\n"
+                'execd_is_loaded() { [ "$loaded" -eq 1 ]; }\n'
+                f'bootout_execd() {{ echo "bootout" >> "{log}"; loaded=0; }}\n'
+                f'wait_execd_unloaded() {{ echo "wait_unloaded" >> "{log}"; }}\n'
+                f'bootstrap_execd_with_retry() {{ echo "bootstrap" >> "{log}"; }}\n'
+            )
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse(plist.exists(), "newly created plist must be removed on upgrade rollback")
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["bootout", "wait_unloaded"])
+            self.assertEqual((prefix / "bin" / "version").read_text(encoding="utf-8"), "old-v1\n")
+
+        # Case B: Pre-existing plist (upgrade_had_plist=1, upgrade_was_loaded=0) -> preserved.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "tendcf"
+            backup = root / "tendcf.old.322"
+            stage = root / "stage"
+            plist = root / "org.tendcf.execd.plist"
+            (backup / "bin").mkdir(parents=True)
+            (prefix / "bin").mkdir(parents=True)
+            plist.write_text("<plist>preexisting</plist>\n", encoding="utf-8")
+            stage.mkdir()
+
+            r = run_cleanup(
+                f'prefix="{prefix}"\n'
+                f'stage_dir="{stage}"\n'
+                f'plist_path="{plist}"\n'
+                "upgrade_rollback_armed=1\n"
+                f'upgrade_backup_prefix="{backup}"\n'
+                'upgrade_staged_tree=""\n'
+                "upgrade_moved_var=0\n"
+                "upgrade_was_loaded=0\n"
+                "upgrade_had_plist=1\n"
+                "upgrade_snapshot_taken=0\n"
+                'upgrade_saved_workdir=""\n'
+                "upgrade_saved_inputs=0\n"
+                "upgrade_saved_data=0\n"
+                "execd_is_loaded() { return 1; }\n"
+                "bootout_execd() { return 0; }\n"
+                "wait_execd_unloaded() { return 0; }\n"
+                "bootstrap_execd_with_retry() { return 0; }\n"
+            )
+            self.assertEqual(r.returncode, 1)
+            self.assertTrue(plist.exists(), "pre-existing plist must NOT be deleted on rollback")
+            self.assertEqual(plist.read_text(encoding="utf-8"), "<plist>preexisting</plist>\n")
+
+        # Case C: Symlink at plist_path is never deleted even when upgrade_had_plist=0.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "tendcf"
+            backup = root / "tendcf.old.323"
+            stage = root / "stage"
+            target = root / "target.plist"
+            target.write_text("keep\n", encoding="utf-8")
+            plist = root / "org.tendcf.execd.plist"
+            plist.symlink_to(target)
+            (backup / "bin").mkdir(parents=True)
+            (prefix / "bin").mkdir(parents=True)
+            stage.mkdir()
+
+            r = run_cleanup(
+                f'prefix="{prefix}"\n'
+                f'stage_dir="{stage}"\n'
+                f'plist_path="{plist}"\n'
+                "upgrade_rollback_armed=1\n"
+                f'upgrade_backup_prefix="{backup}"\n'
+                'upgrade_staged_tree=""\n'
+                "upgrade_moved_var=0\n"
+                "upgrade_was_loaded=0\n"
+                "upgrade_had_plist=0\n"
+                "upgrade_snapshot_taken=0\n"
+                'upgrade_saved_workdir=""\n'
+                "upgrade_saved_inputs=0\n"
+                "upgrade_saved_data=0\n"
+                "execd_is_loaded() { return 1; }\n"
+                "bootout_execd() { return 0; }\n"
+                "wait_execd_unloaded() { return 0; }\n"
+                "bootstrap_execd_with_retry() { return 0; }\n"
+            )
+            self.assertEqual(r.returncode, 1)
+            self.assertTrue(plist.is_symlink(), "symlink at plist_path must never be deleted")
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep\n")
+
+        # Case D: Empty upgrade_backup_prefix with loaded=1 exercises R3-b's own
+        # bootout_execd + wait_execd_unloaded path (bypassing backup-restore block).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "tendcf"
+            stage = root / "stage"
+            plist = root / "org.tendcf.execd.plist"
+            log = root / "events.log"
+            (prefix / "bin").mkdir(parents=True)
+            plist.write_text("<plist>new-only</plist>\n", encoding="utf-8")
+            stage.mkdir()
+
+            r = run_cleanup(
+                f'prefix="{prefix}"\n'
+                f'stage_dir="{stage}"\n'
+                f'plist_path="{plist}"\n'
+                "upgrade_rollback_armed=1\n"
+                'upgrade_backup_prefix=""\n'
+                'upgrade_staged_tree=""\n'
+                "upgrade_moved_var=0\n"
+                "upgrade_was_loaded=0\n"
+                "upgrade_had_plist=0\n"
+                "upgrade_snapshot_taken=0\n"
+                'upgrade_saved_workdir=""\n'
+                "upgrade_saved_inputs=0\n"
+                "upgrade_saved_data=0\n"
+                "loaded=1\n"
+                'execd_is_loaded() { [ "$loaded" -eq 1 ]; }\n'
+                f'bootout_execd() {{ echo "bootout" >> "{log}"; loaded=0; }}\n'
+                f'wait_execd_unloaded() {{ echo "wait_unloaded" >> "{log}"; }}\n'
+                f'bootstrap_execd_with_retry() {{ echo "bootstrap" >> "{log}"; }}\n'
+            )
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse(plist.exists(), "R3-b must remove newly created plist when backup_prefix is empty")
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["bootout", "wait_unloaded"])
+
 
 if __name__ == "__main__":
     unittest.main()

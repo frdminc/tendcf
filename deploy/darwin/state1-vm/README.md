@@ -4,8 +4,10 @@ Slice A of [issue 70](https://github.com/frdminc/tendcf/issues/70): the scripts 
 build and check state 1's Apple Silicon macOS VM on bigmac (tart 2.42.0). It follows
 the 2026-11-17 answers on the issue: the pinned vanilla image as is, SSH only, key login,
 Gatekeeper on, Recovery and the 50 GB disk kept, python.org Python 3.14.10 system-wide,
-no CI for this image, no guest agent, no runner. **No VM has been run with these scripts
-yet**; the tests use a fake `tart` and `ssh`.
+no CI for this image, no guest agent, no runner. Live macOS 27.2 VM verification
+passed all 25 steps on 2026-11-23 (`macos-fork-build.yml` run `45196778339`,
+commit `e2811834`, closing issue #70); unit tests in `tests/darwin/test_state1_vm.py`
+run hermetically against a fake `tart` and `ssh`.
 
 | File | Role |
 | --- | --- |
@@ -366,7 +368,7 @@ never observed.
 
 ## Status errata: renderer slice hooks
 
-Items 1-3 below are now wired into `state1_vm.py check` when `--tarball FILE` (with `.sha256`) or `--artifact-run RUN_ID` is passed (unit-tested against the fake target in `tests/darwin/test_state1_vm.py`; live VM execution still waits for the djbclark-ade lead's go-ahead):
+Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with `.sha256`) or `--artifact-run RUN_ID` is passed (unit-tested against the fake target in `tests/darwin/test_state1_vm.py`; live macOS 27.2 VM verification passed all 25 steps on 2026-11-23 against `macos-fork-build.yml` run `45196778339` at commit `e2811834`, closing issue #70):
 
 1. Steps 3 and 4-9: `check` stages the PR 95 tarball, `.sha256`, `deploy/darwin/tendcf-install.sh`, `policy/`, and `deploy/darwin/canary/` into the guest over pinned SSH, installs as root, checks `/opt/tendcf` and `<workdir>/inputs` with `check_root_owned(..., tree=True)`, renders `com.tendcf.canary.main`, byte-compares against `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, exercises `launchctl print`/`kickstart -k`, idempotency, drift repair, non-root negatives, and `org.tendcf.execd` (step `9a`).
 2. Step 10b: verifies both `com.tendcf.canary.main` and `org.tendcf.execd` load from disk after reboot (`org.tendcf.execd` running as `root`).

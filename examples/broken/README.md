@@ -1,6 +1,6 @@
 # Negative fixtures
 
-One hundred eighty-six deliberately broken overlays, plus six byte-class fixtures in
+Two hundred eleven deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -57,7 +57,7 @@ no other Site Model files to compose against.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
-| 13 | `13-schema-version-bump` | `schema_version: 8`, one above the current 7 | schema (`const`) |
+| 13 | `13-schema-version-bump` | `schema_version: 9`, one above the current 8 | schema (`const`) |
 | 14 | `14-unknown-kind` | a `file` kind under `entries` | schema (`additionalProperties`) |
 | 15 | `15-empty-entries` | `entries: {}` | schema (`minProperties`) |
 | 16 | `16-entries-under-deliberately-unmanaged` | `deliberately-unmanaged` domain **with** entries | schema (`if/then`) |
@@ -82,7 +82,7 @@ no other Site Model files to compose against.
 | 32 | `32-uppercase-digest-hex` | `sha256:` digest with uppercase hex | schema (`pattern`) |
 | 33 | `33-defaulted-expect-exit` | `pre_action` with no `expect_exit` | schema (`required`) |
 | 34 | `34-silenced-interlock-report` | interlock `report: false` | schema (`const`) |
-| 35 | `35-malformed-writer-prefix` | unit-writer prefix with no trailing `.*` | schema (`pattern`) |
+| 35 | `35-malformed-writer-prefix` | unit-writer prefix `com.tendcf.caddy*` missing `.` before `*` | schema (`pattern`) |
 | 36 | `36-unknown-writer` | `writer: custom-tool` | schema (`enum`) |
 | 37 | `37-uppercase-domain` | domain key `Supervision` | schema (`propertyNames`) |
 | 38 | `38-proposer-set-privileged-flag` | service entry with a `privileged: true` field | schema (`additionalProperties`) |
@@ -394,7 +394,7 @@ The report-row cases (143, 144, 146-154) and 123 overlay a whole Site Model file
 | 117 | `117-unit-writer-non-code-suffix` | key `foo.target` (not one of the four unit types) | schema (`pattern`) |
 | 118 | `118-exact-under-prefix` | `tendcf.canary.service` beside `tendcf.canary.*` | goal cross-file |
 | 119 | `119-template-under-prefix` | `foo-w@.service` beside `foo-*` | goal cross-file |
-| 120 | `120-launchd-single-label-key` | launchd happy file; key `ssh.service` | schema (`if/then`) |
+| 120 | `120-launchd-single-label-key` | launchd happy file; systemd template key `getty@.service` (exact reverse-DNS labels are valid in v8; systemd templates stay rejected) | schema (`if/then`) |
 | 121 | `121-runit-single-label-key` | runit base; key `ssh.service` | schema (`if/then`) |
 | 122 | `122-writer-dpkg-on-name` | `ssh.service` with `writer: dpkg` | schema (`enum`) |
 | 123 | `123-launchd-writers-dpkg-writer` | `launchd-writers.yml` with `writer: dpkg` | schema (`enum`) |
@@ -439,7 +439,7 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 157 | `157-interlock-argv-space` | one element, `validate --config`, holds a space: the joined string would split it into two arguments | schema (`pattern`) |
 | 158 | `158-interlock-argv-shell-char` | an element ends `;/usr/bin/id` | schema (`pattern`) |
 | 159 | `159-interlock-argv-newline` | an element `validate\n` with a trailing newline, which a `$`-anchored pattern alone accepts in Python's regex engine | schema (`not`) |
-| 160 | `160-services-contract-version-stale` | `services.yml` still declaring `contract_version: 1`, not the pinned 2 that came with the argv alphabet | schema (`const`) |
+| 160 | `160-services-contract-version-stale` | `services.yml` still declaring `contract_version: 2`, not the pinned 3 | schema (`const`) |
 | 161 | `161-interlock-argv-leading-quote` | an element starting with `'`: ArgSplitCommand would read it as an opening quote and merge the elements after it | schema (`pattern`) |
 | 162 | `162-interlock-argv-leading-backtick` | an element starting with a backtick, the third quote character ArgSplitCommand knows | schema (`pattern`) |
 | 163 | `163-interlock-argv-tab` | an element holding a tab, which the splitter treats as a separator | schema (`pattern`) |
@@ -454,7 +454,7 @@ Measured in slice S2, one clause at a time. The goal cross-file rules: disabling
 | 172 | `172-interlock-command-substitution` | `command[0]` is `/opt/homebrew/bin/$(id)` | schema (`pattern`) |
 | 173 | `173-interlock-command-non-ascii` | `command[0]` is `/opt/homebrew/bin/càddy` (ASCII only) | schema (`pattern`) |
 | 174 | `174-site-interlock-command-space` | the Site Model interlock with `command[0]` `/usr/local/bin/tail scale`: the authoring-time half for the executable | schema (`pattern`) |
-| 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 3`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
+| 175 | `175-services-contract-version-ahead` | `services.yml` declaring `contract_version: 4`: an exact pin, so a number ahead of the validator fails as well as one behind | schema (`const`) |
 | 176 | `176-interlock-command-newline` | `command[0]` is `/opt/homebrew/bin/caddy\n` with a trailing newline, which the `$`-anchored pattern alone accepts: only `prefixItems[0]`'s `not` refuses it | schema (`not`) |
 
 ## Approval-record v7 cases (177-228)
@@ -515,6 +515,26 @@ Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-c
 | 226 | `226-goal-file-no-owner-key` | a goal file that requires a local yes and holds only `covered-signer` keys: nobody can sign a per-change record | schema (`not`) |
 | 227 | `227-enrollment-covered-signer-not-in-trust-root` | an enrollment listing a covered signer the trust root does not hold, outside developer mode | approval roles (role) |
 | 228 | `228-application-names-no-enrollment` | an application whose `grant_id` names no active enrollment | approval roles (grant) |
+
+## Schema v8 launchd cases (229-241)
+
+Schema v8 (issues #99 + #94) adds required `unit.launchd.domain` (`system` | `user`) to `goal-file.schema.json` (optional in `services.schema.json` v3, defaulting to `system`), admits exact reverse-DNS launchd unit-writer labels and `writer: "tendcf-install"` on exact launchd labels (pinned to `org.tendcf.execd` by lint, forbidden on `.*` prefixes) in `goal-file.schema.json` v8 and `launchd-writers.schema.json` v2, and keeps systemd unit-writer keys restricted to v5-v7 unit names, templates and prefixes.
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 229 | `229-launchd-tendcf-install-wrong-label` | launchd goal file with `org.tendcf.other` carrying `writer: tendcf-install` | goal cross-file |
+| 230 | `230-launchd-exact-label-overlap-prefix` | launchd goal file with exact `org.tendcf.execd` overlapping prefix `org.tendcf.*` | goal cross-file |
+| 231 | `231-systemd-bare-reverse-dns-writer` | systemd goal file carrying bare reverse-DNS key `org.tendcf.execd` | schema (`if/then`) |
+| 232 | `232-launchd-missing-domain` | launchd service missing required `unit.launchd.domain` | schema (`required`) |
+| 233 | `233-launchd-invalid-domain` | launchd service with `unit.launchd.domain: "gui"` | schema (`enum`) |
+| 234 | `234-launchd-writers-contract-version-stale` | `launchd-writers.yml` declaring `contract_version: 1`, not the pinned 2 | schema (`const`) |
+| 235 | `235-launchd-writers-contract-version-ahead` | `launchd-writers.yml` declaring `contract_version: 3`, ahead of pinned 2 | schema (`const`) |
+| 236 | `236-launchd-writers-tendcf-install-prefix` | `launchd-writers.yml` with `prefix: org.tendcf.*` and `writer: tendcf-install` | schema (`oneOf`) |
+| 237 | `237-launchd-writers-tendcf-install-wrong-label` | `launchd-writers.yml` with exact `label: org.tendcf.other` and `writer: tendcf-install` | cross-file |
+| 238 | `238-launchd-writers-prefix-and-label` | `launchd-writers.yml` entry carrying both `prefix` and `label` | schema (`oneOf`) |
+| 239 | `239-launchd-writers-exact-label-overlap-prefix` | `launchd-writers.yml` with exact `label: org.tendcf.execd` overlapping `prefix: org.tendcf.*` | cross-file |
+| 240 | `240-services-invalid-launchd-domain` | `services.yml` service with `launchd.domain: gui` | schema (`enum`) |
+| 241 | `241-runit-exact-launchd-label` | runit goal file carrying bare exact reverse-DNS key `org.tendcf.execd` (`writer: cfengine`) | schema (`if/then`) |
 
 ## Every class has a fixture
 

@@ -10,8 +10,10 @@
         <string>{{.}}</string>
 {{/command}}
     </array>
+{{#launchd_include_username}}
     <key>UserName</key>
     <string>{{run_as}}</string>
+{{/launchd_include_username}}
     <key>WorkingDirectory</key>
     <string>{{working_dir}}</string>
     <key>RunAtLoad</key>

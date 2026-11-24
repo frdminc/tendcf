@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
   "domains": {
     "device-trust": {
@@ -54,7 +54,8 @@
             "unit": {
               "launchd": {
                 "run_at_load": true,
-                "keep_alive": true
+                "keep_alive": true,
+                "domain": "system"
               }
             }
           },

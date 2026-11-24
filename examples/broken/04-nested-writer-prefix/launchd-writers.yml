@@ -1,4 +1,4 @@
-contract_version: 1
+contract_version: 2
 domain:
   description: The launchd label namespace on macOS
 writers:
@@ -6,7 +6,7 @@ writers:
   writer: cfengine
   repo: site-shared
   note: Site services. Rendered from services.yml via nix2cf.
-- prefix: org.tendcf.*
+- prefix: com.tendcf.example.*
   writer: cfengine
   repo: tendcf
   note: Engine-owned example services. Fixture only.

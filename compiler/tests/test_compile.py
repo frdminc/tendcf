@@ -121,14 +121,16 @@ def test_site_model_inputs_validate(schemas: Schemas) -> None:
 def test_example_site_mac_golden(schemas: Schemas) -> None:
     result = compile_host(_model(SITE), _host(SITE), schemas)
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 7
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 8
     assert doc["host"] == HOST_KEY
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "launchd", "state": "present"}}
     sup = doc["domains"]["supervision"]
     assert sup["coverage"] == "comprehensive"
     assert set(sup["entries"]["service"]) == {
-        "com.djbclark.caddy", "com.djbclark.litellm", "org.tendcf.tailscaled"
+        "com.djbclark.caddy", "com.djbclark.litellm", "com.tendcf.example.tailscaled"
     }
+    for svc in sup["entries"]["service"].values():
+        assert svc["unit"]["launchd"]["domain"] == "system"
     # The fleet-vpn interlock renders because tailscaled is on this host, with
     # the common-schema defaults stated rather than implied.
     ilk = sup["entries"]["interlock"]["tailscale-authenticated-before-lockdown"]
@@ -141,8 +143,9 @@ def test_example_site_mac_golden(schemas: Schemas) -> None:
         "report": True,
     }
     assert set(sup["entries"]["unit-writer"]) == {
-        "com.djbclark.*", "org.tendcf.*", "dev.mise.*", "org.nixos.*", "com.apple.*"
+        "com.djbclark.*", "com.tendcf.example.*", "org.tendcf.execd", "dev.mise.*", "org.nixos.*", "com.apple.*"
     }
+    assert sup["entries"]["unit-writer"]["org.tendcf.execd"] == {"state": "present", "writer": "tendcf-install"}
     # env carries secret NAMES only, and only when non-empty.
     assert sup["entries"]["service"]["com.djbclark.litellm"]["env"] == {
         "LITELLM_MASTER_KEY": "LITELLM_MASTER_KEY", "OPENAI_API_KEY": "OPENAI_API_KEY"
@@ -194,7 +197,8 @@ def test_projects_through_tendcf_projector(schemas: Schemas, projector) -> None:
     assert projector.validate_projection(raw) == []
     vars_ = json.loads(raw)["vars"]
     assert set(vars_) == {"tendcf_service", "tendcf_interlock"}
-    assert vars_["tendcf_service"]["org.tendcf.tailscaled"]["state"] == "present"
+    assert vars_["tendcf_service"]["com.tendcf.example.tailscaled"]["state"] == "present"
+    assert vars_["tendcf_service"]["com.tendcf.example.tailscaled"]["unit"]["launchd"]["domain"] == "system"
 
 
 def test_pure_and_order_independent(schemas: Schemas) -> None:
@@ -303,7 +307,7 @@ def test_nixos_host_without_services_is_deliberately_unmanaged(tendcf: Path, sch
     # no-op on a file with no entries): drift in either repo shows up here.
     assert result.canonical == (tendcf / "deploy" / "linux" / "passthrough" / "goal-file.json").read_bytes()
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 7
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 8
     assert doc["domains"]["supervision"] == {"coverage": "deliberately-unmanaged"}
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "nixos", "state": "present"}}
     assert set(doc["domains"]) == {"device-trust", "supervision"}  # no unit-writer registry travels
@@ -345,8 +349,18 @@ def test_nixos_refused_below_schema_v4() -> None:
             compile_host(_model(SITE), _nixos_host(), None, schema_version=version)
 
 
+def _v7_model(site: Path) -> SiteModel:
+    """Example site without v8-only exact-label/tendcf-install launchd writers."""
+    model = _model(site)
+    model.launchd_writers.data["writers"] = [
+        w for w in model.launchd_writers.data["writers"]
+        if "prefix" in w and w.get("writer") != "tendcf-install"
+    ]
+    return model
+
+
 def test_schema_v3_drops_the_supervisor_entry_for_other_hosts() -> None:
-    result = compile_host(_model(SITE), _host(SITE), None, schema_version=3)
+    result = compile_host(_v7_model(SITE), _host(SITE), None, schema_version=3)
     doc = result.goal_file
     assert doc["schema_version"] == 3
     assert "supervisor" not in doc["domains"]["device-trust"]["entries"]
@@ -354,7 +368,7 @@ def test_schema_v3_drops_the_supervisor_entry_for_other_hosts() -> None:
 
 
 def test_schema_v3_with_schema_is_noted_not_validated(schemas: Schemas) -> None:
-    result = compile_host(_model(SITE), _host(SITE), schemas, schema_version=3)
+    result = compile_host(_v7_model(SITE), _host(SITE), schemas, schema_version=3)
     assert result.goal_file["schema_version"] == 3
     assert any("NOT validated" in d for d in result.diagnostics)
 
@@ -372,27 +386,26 @@ def _host_shapes() -> dict[str, HostSpec]:
     }
 
 
-@pytest.mark.parametrize("old_version", [4, 5, 6])
+@pytest.mark.parametrize("old_version", [4, 5, 6, 7])
 @pytest.mark.parametrize("shape", ["launchd", "nixos", "systemd", "runit"])
 def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str, old_version: int) -> None:
-    """For inputs valid under the current Site Model contract, the v4, v5 and v6
-    files are the current file with the old version number, for every host shape.
-    The current file is validated against tendcf's schemas (an older file cannot
-    be: the schema is a const). v6 differs from v7 only by the number because v7
-    changed the approval record alone (issue 64). v5 differs from v6 only by the
-    number because v6
-    narrowed the interlock pre_action argv (a strict subset of v5's acceptance
-    set): any Site Model valid now was valid at v5, so its v5 rendering is the
-    same file; v4 differs from v5 only by the unit-writer key language, the
-    `dpkg` retirement and the new kinds, none of which nix2cf emits. Not a
-    claim about arbitrary historical v4 output: see
-    test_dpkg_writer_renders_at_v4_but_is_refused_at_v5."""
+    """For service-free hosts (nixos, systemd, runit), v4..v7 differ from v8 only in
+    `schema_version`. For launchd hosts with prefix-only writers and default
+    `domain: "system"`, v4..v7 omit `unit.launchd.domain` while v8 states it explicitly."""
     host = _host_shapes()[shape]
-    old = compile_host(_model(SITE), host, None, schema_version=old_version).goal_file
-    new = compile_host(_model(SITE), host, schemas).goal_file  # validates against the current schema
+    model_old = _v7_model(SITE) if shape == "launchd" else _model(SITE)
+    model_new = _v7_model(SITE) if shape == "launchd" else _model(SITE)
+    old = compile_host(model_old, host, None, schema_version=old_version).goal_file
+    new = compile_host(model_new, host, schemas).goal_file  # validates against the current schema
     assert old["schema_version"] == old_version and new["schema_version"] == GOAL_FILE_SCHEMA_VERSION
     assert new["domains"]["device-trust"]["entries"]["supervisor"]["host"]["name"] == host.supervisor
-    assert {**old, "schema_version": GOAL_FILE_SCHEMA_VERSION} == new
+    normalized_old = copy.deepcopy(old)
+    normalized_old["schema_version"] = GOAL_FILE_SCHEMA_VERSION
+    if shape == "launchd":
+        for svc in normalized_old["domains"]["supervision"]["entries"]["service"].values():
+            assert "domain" not in svc["unit"]["launchd"]
+            svc["unit"]["launchd"]["domain"] = "system"
+    assert normalized_old == new
     assert schemas.errors("goal-file.schema.json", new) == []
 
 
@@ -400,14 +413,92 @@ def test_dpkg_writer_renders_at_v4_but_is_refused_at_v5(schemas: Schemas) -> Non
     """`dpkg` left the unit-writer enum in v5 (a package claim is its only spelling).
     v4 permitted it, so an unused `dpkg` writer in an old Site Model still renders
     at v4 (unvalidated, as every older version is) and is refused at v5."""
-    model = _model(SITE)
-    writer = next(w for w in model.launchd_writers.data["writers"] if w["prefix"] == "dev.mise.*")
+    model = _v7_model(SITE)
+    writer = next(w for w in model.launchd_writers.data["writers"] if w.get("prefix") == "dev.mise.*")
     writer["writer"] = "dpkg"
     assert validate_site_model(model, schemas) != []  # launchd-writers.schema.json dropped it too
     old = compile_host(model, _host(SITE), None, schema_version=4).goal_file
     assert old["domains"]["supervision"]["entries"]["unit-writer"]["dev.mise.*"]["writer"] == "dpkg"
     with pytest.raises(CompileError, match="dpkg"):
         compile_host(model, _host(SITE), schemas)
+
+
+def test_launchd_domain_user_and_system_default(schemas: Schemas, lint) -> None:
+    model = _model(SITE)
+    model.services.data["services"][0]["launchd"]["domain"] = "user"
+    model.services.data["services"][1]["launchd"]["domain"] = "system"
+    # service[2] (tailscaled) leaves domain omitted -> resolves to "system"
+    assert validate_site_model(model, schemas) == []
+    doc = compile_host(model, _host(SITE), schemas).goal_file
+    svcs = doc["domains"]["supervision"]["entries"]["service"]
+    assert svcs["com.djbclark.caddy"]["unit"]["launchd"]["domain"] == "user"
+    assert svcs["com.djbclark.litellm"]["unit"]["launchd"]["domain"] == "system"
+    assert svcs["com.tendcf.example.tailscaled"]["unit"]["launchd"]["domain"] == "system"
+    assert _cross_file_findings(lint, doc) == []
+
+
+def test_launchd_domain_user_refused_below_v8() -> None:
+    model = _v7_model(SITE)
+    model.services.data["services"][0]["launchd"]["domain"] = "user"
+    with pytest.raises(CompileError, match="launchd.domain='user'"):
+        compile_host(model, _host(SITE), None, schema_version=7)
+
+
+def test_launchd_exact_label_and_tendcf_install_refused_below_v8() -> None:
+    with pytest.raises(CompileError, match="org.tendcf.execd"):
+        compile_host(_model(SITE), _host(SITE), None, schema_version=7)
+
+
+def test_exact_cfengine_label_covers_service(schemas: Schemas, lint) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"label": "org.example.exactsvc", "writer": "cfengine", "note": "Exact label witness."}
+    )
+    model.services.data["services"][0]["launchd"]["label"] = "org.example.exactsvc"
+    assert validate_site_model(model, schemas) == []
+    doc = compile_host(model, _host(SITE), schemas).goal_file
+    assert doc["domains"]["supervision"]["entries"]["unit-writer"]["org.example.exactsvc"] == {
+        "state": "present",
+        "writer": "cfengine",
+    }
+    assert _cross_file_findings(lint, doc) == []
+
+
+def test_duplicate_launchd_writer_key_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"prefix": "com.djbclark.*", "writer": "third-party", "note": "Duplicate prefix."}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "launchd unit-writer 'com.djbclark.*' is declared twice" in msg
+    assert "launchd-writers.yml" in msg
+    assert "Resolution:" in msg
+
+
+def test_overlapping_launchd_writer_prefix_and_label_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"label": "com.djbclark.caddy", "writer": "cfengine", "note": "Overlaps com.djbclark.*"}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "overlaps 'com.djbclark.*'" in msg
+    assert "matches 2 launchd unit-writers" in msg
+
+
+def test_launchd_tendcf_install_wrong_label_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"label": "org.tendcf.other", "writer": "tendcf-install", "note": "Wrong exact label."}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "org.tendcf.other" in msg
+    assert "reserved exclusively for exact label 'org.tendcf.execd'" in msg
 
 
 def test_render_goal_file_alone_refuses_nixos_below_v4() -> None:

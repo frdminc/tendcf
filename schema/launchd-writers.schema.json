@@ -2,14 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/launchd-writers.schema.json",
   "title": "Site Model — launchd unit-writers (macOS adapter)",
-  "description": "The launchd instance of generic unit-writers (guide §3 / map §4.1, D36): exactly one writer per unit-name prefix. Two writers on one prefix is a lint failure. On systemd the goal file's own unit-writer map takes exact names, template keys and cfengine-only prefixes, and a unit-package map claims a Debian package's units (schema v5); this file is the first adapter, not the model.",
+  "description": "The launchd instance of generic unit-writers (guide §3 / map §4.1, D36): exactly one writer per unit-name prefix or exact reverse-DNS label. Overlapping prefixes or an exact label under a prefix is a lint failure. On systemd the goal file's own unit-writer map takes exact names, template keys and cfengine-only prefixes, and a unit-package map claims a Debian package's units (schema v5); this file is the launchd Site Model adapter.",
 
   "type": "object",
   "properties": {
-    "contract_version": { "$ref": "common.schema.json#/$defs/contract_version" },
+    "contract_version": {
+      "description": "2 since 2026-11-24 (issue #99): adds exact `label` entries (mutually exclusive with `prefix`) and `writer: \"tendcf-install\"` on exact `label` entries only (pinned to `org.tendcf.execd` by lint). Exact pin (`const`), matching services.schema.json.",
+      "$ref": "common.schema.json#/$defs/contract_version",
+      "const": 2
+    },
 
     "domain": {
-      "description": "The launchd label namespace, as a domain of device state (D16(d)). Comprehensive means: any loaded launchd job that is absent from the domain's description is reported as an extra entry (a label under no declared prefix is how a job is absent here).",
+      "description": "The launchd label namespace, as a domain of device state (D16(d)). Comprehensive means: any loaded launchd job that is absent from the domain's description is reported as an extra entry (a label matching no declared prefix or exact label is how a job is absent here).",
       "$ref": "common.schema.json#/$defs/domain_coverage"
     },
 
@@ -27,13 +31,18 @@
       "type": "object",
       "properties": {
         "prefix": {
-          "description": "Reverse-DNS label prefix ending in `.*`, e.g. `org.tendcf.*`. bin/schema_lint.py additionally rejects a prefix nested inside another — two writers over one namespace is exactly the hazard this file exists to prevent, and nesting is how it comes back.",
+          "description": "Reverse-DNS label prefix ending in `.*`, e.g. `com.tendcf.example.*`. Mutually exclusive with `label`. bin/schema_lint.py additionally rejects a prefix nested inside another or overlapping an exact `label` — two writers over one namespace is exactly the hazard this file exists to prevent.",
           "type": "string",
           "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$"
         },
+        "label": {
+          "description": "Exact reverse-DNS launchd label, e.g. `org.tendcf.execd`. Mutually exclusive with `prefix`. Required for `writer: \"tendcf-install\"` (which bin/schema_lint.py pins to `org.tendcf.execd`).",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$"
+        },
         "writer": {
-          "description": "The single tool permitted to write labels under this prefix.",
-          "enum": ["cfengine", "mise", "nix-darwin", "homebrew", "apple", "third-party"]
+          "description": "The single tool permitted to write labels under this prefix or exact label. `tendcf-install` is permitted only on an exact `label` entry (never a `prefix`) and is pinned to `org.tendcf.execd` by lint.",
+          "enum": ["cfengine", "mise", "nix-darwin", "tendcf-install", "homebrew", "apple", "third-party"]
         },
         "repo": {
           "description": "Where that writer's definition lives, when it is ours.",
@@ -41,8 +50,21 @@
         },
         "note": { "type": "string" }
       },
-      "required": ["prefix", "writer"],
-      "additionalProperties": false
+      "required": ["writer"],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": ["prefix"],
+          "not": { "required": ["label"] },
+          "properties": {
+            "writer": { "not": { "const": "tendcf-install" } }
+          }
+        },
+        {
+          "required": ["label"],
+          "not": { "required": ["prefix"] }
+        }
+      ]
     }
   }
 }

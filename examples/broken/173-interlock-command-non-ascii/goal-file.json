@@ -47,7 +47,7 @@
             "defines_class": "caddy_config_ok",
             "pre_action": {
               "command": [
-                "/opt/homebrew/bin/càddy",
+                "/opt/homebrew/bin/c\u00e0ddy",
                 "validate",
                 "--config",
                 "/etc/caddy/Caddyfile"
@@ -76,7 +76,8 @@
             "unit": {
               "launchd": {
                 "keep_alive": true,
-                "run_at_load": true
+                "run_at_load": true,
+                "domain": "system"
               }
             },
             "working_dir": "/"
@@ -95,5 +96,5 @@
     }
   },
   "host": "ed25519:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-  "schema_version": 7
+  "schema_version": 8
 }
