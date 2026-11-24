@@ -15,10 +15,9 @@
 # workflow, not a fork PR) is enforced by the caller (`state1_vm.py
 # --artifact-run` checks the GitHub Actions run metadata before downloading).
 #
-# Note on org.tendcf.execd in v7 goal files: `schema_version: 7` currently
-# restricts `writer: "tendcf-install"` to systemd and requires `.*` prefixes on
-# launchd, so `deploy/darwin/canary/goal-file*.json` omits a unit-writer claim
-# for `org.tendcf.execd` (schema v8 + launchd-writers ruling tracked separately).
+# Schema v8 declares `org.tendcf.execd` as an exact launchd unit-writer entry
+# under `writer: "tendcf-install"` (`deploy/darwin/canary/goal-file*.json`,
+# `examples/launchd-writers.yml`, issue #99).
 #
 #   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--enable]
 #                    verify and extract the PR 95 macOS fork tarball (clearing
@@ -92,6 +91,7 @@ upgrade_backup_prefix=""
 upgrade_staged_tree=""
 upgrade_moved_var=0
 upgrade_was_loaded=0
+upgrade_had_plist=0
 upgrade_snapshot_taken=0
 upgrade_saved_workdir=""
 upgrade_saved_inputs=0
@@ -150,6 +150,14 @@ cleanup_stage() {
                     /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" || true
                 fi
             fi
+        fi
+        if [ "${upgrade_had_plist:-0}" -eq 0 ] && [ "$upgrade_was_loaded" -eq 0 ] \
+            && [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
+            if execd_is_loaded; then
+                bootout_execd >/dev/null 2>&1 || true
+                wait_execd_unloaded || true
+            fi
+            /bin/rm -f "$plist_path" || true
         fi
         if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
             bootstrap_execd_with_retry >/dev/null 2>&1 || true
@@ -964,6 +972,11 @@ install_tarball() {
         if [ -L "$prefix/var" ]; then
             die "existing $prefix/var is a symlink; refusing upgrade"
         fi
+        if [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
+            upgrade_had_plist=1
+        else
+            upgrade_had_plist=0
+        fi
         local was_loaded=0
         if execd_is_loaded; then
             was_loaded=1
@@ -1398,6 +1411,22 @@ enable_execd() {
     fi
 }
 
+# L2 (issue #99): fail closed if a previous interrupted upgrade (SIGKILL or
+# power loss) left /opt/tendcf.old.* or /opt/tendcf.failed.* behind, so var/
+# identity is never stranded or overwritten silently.
+check_no_stale_upgrade_dirs() {
+    local had_nullglob=0 stale=() p
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    for p in "$prefix".old.* "$prefix".failed.*; do
+        stale+=("$p")
+    done
+    [ "$had_nullglob" -eq 0 ] && shopt -u nullglob
+    if [ "${#stale[@]}" -gt 0 ]; then
+        die "stale upgrade directory(ies) found (possible interrupted upgrade): ${stale[*]}; inspect and recover/remove manually before installing"
+    fi
+}
+
 prevalidate_install_inputs() {
     local datafile="$1"
     [ ! -L "$policy_src" ] && [ -d "$policy_src" ] \
@@ -1428,8 +1457,10 @@ cmd_install() {
     if [ -n "$sha256_file" ] && [ -z "$tarball" ]; then
         die "install: --sha256 requires --tarball"
     fi
-    # Fail fast on bad --policy-src or --data before booting out org.tendcf.execd.
+    # Fail fast on bad --policy-src or --data, or stale interrupted-upgrade dirs,
+    # before booting out org.tendcf.execd.
     prevalidate_install_inputs "$datafile"
+    check_no_stale_upgrade_dirs
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
             sha256_file="${tarball}.sha256"
@@ -1477,6 +1508,7 @@ cmd_install() {
     upgrade_staged_tree=""
     upgrade_moved_var=0
     upgrade_was_loaded=0
+    upgrade_had_plist=0
     upgrade_snapshot_taken=0
     upgrade_saved_workdir=""
     upgrade_saved_inputs=0
