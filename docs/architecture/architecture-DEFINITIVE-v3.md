@@ -188,7 +188,7 @@ checkouts that must share one tag.
 
 | Layer | Holds | Local repo convention (issue #98) | Visibility |
 | --- | --- | --- | --- |
-| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt, the compiler (`compiler/`) and its plugins (`plugins/`, D46) | `tendcf/` (optional local checkout; informational/dev-only, never auto-loaded as schema or projector authority during builds) | Public product |
+| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt, the compiler (`compiler/`) and its plugins (`plugins/`, D46) | `tendcf/` (optional local checkout; informational/dev-only, never auto-loaded by workspace discovery as schema or projector authority during builds) | Public product |
 | ~~**nix2cf**~~ | ~~Compiler tool only (Site Model → CFEngine JSON)~~ Folded into tendcf (D46). `nix2cf` now names the Nix frontend plugin | — | Repository archived 2026-11-13, right after the import ([#45](https://github.com/frdminc/tendcf/pull/45)) merged |
 | **site-shared** | Reusable recipes | `tendcf-public-<site>/` (optional) | Public or shared |
 | **site-private** | Inventory, allocations, secret *names*, trust policy, extra prompt, lockfile | `tendcf-private-<site>/` (required primary site root) | Private |
@@ -236,8 +236,9 @@ Development happens in task worktrees, not in a deploy checkout.
 - **Workspace root:** `~/tendcf-ops` (overridable via `--ops-root` or
   `TENDCF_OPS_ROOT`), separate from legacy ops layouts. It holds an optional
   `tendcf/` checkout (strictly informational/development-only — never
-  auto-loaded as schema or projector authority during builds, aligning with
-  D46(9a)), matched site pairs `tendcf-private-<site>/` (required primary site
+  auto-loaded by workspace discovery as schema or projector authority during
+  builds, aligning with D46 amendment (9)(a) (D-a)), matched site pairs
+  `tendcf-private-<site>/` (required primary site
   root, corresponding to logical role `site-private`) and optional
   `tendcf-public-<site>/` (corresponding to `site-shared`), plus optional
   read-only clones of other operators' public sites (`tendcf-public-<other>/`).
@@ -264,8 +265,9 @@ Development happens in task worktrees, not in a deploy checkout.
   writes without `--allow-tainted`, and fails `--check-releasable` /
   `assert_releasable()`, while foreign-input substitution awaits `site.lock`
   composition. Future release/signing pipelines (§9.11) MUST call the release
-  gate and MUST NOT accept artifacts from an override build (dev overrides are
-  also refused in release/CI builds per D46(9b)).
+  gate and MUST NOT accept artifacts from an override build (an override path
+  is unpinned, and D46 amendment (9)(b) (D-b) requires release compiles to
+  evaluate only pinned, verdict-bound recipes).
 - **XDG runtime state:** mutable runtime state lives under XDG
   (`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`, exposed by
   `state_dir()` / `cache_dir()` in `compiler/nix2cf/workspace.py`), never

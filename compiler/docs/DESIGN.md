@@ -152,8 +152,9 @@ establish the local workspace resolver (`nix2cf/workspace.py`) and
   `refuse_release_if_tainted()` / `assert_releasable()` / `--check-releasable`.
   Foreign-input substitution itself awaits `site.lock` composition; future
   release/signing pipelines (§9.11) must enforce the release gate and refuse
-  artifacts from override builds (also refused in release/CI builds per
-  D46(9b)).
+  artifacts from override builds (an override path is unpinned, and D46
+  amendment (9)(b) (D-b) requires release compiles to evaluate only pinned,
+  verdict-bound recipes).
 - **XDG runtime state:** `state_dir()` (`$XDG_STATE_HOME/tendcf` or
   `~/.local/state/tendcf`) and `cache_dir()` (`$XDG_CACHE_HOME/tendcf` or
   `~/.cache/tendcf`) keep mutable state out of git checkouts.
