@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the two hundred twenty-eight deliberately broken fixtures in examples/broken/
+  6. each of the two hundred thirty-two deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 228
+EXPECTED_BROKEN = 232
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -264,8 +264,36 @@ TRUST_DOMAIN = "device-trust"
 # Installer-owned scheduler units reserved exclusively for `tendcf-install`
 # (issue #102): no other unit-writer may cover them (case-insensitively on
 # launchd for APFS safety), and no service or tombstone entry may target them.
+# On systemd, bare `tendcf-execd` (systemctl implicitly appends `.service`) and
+# same-stem companion units (`.timer`, `.socket`, `.path`, which default `Unit=`
+# to `tendcf-execd.service`) are reserved alongside `tendcf-execd.service`.
 RESERVED_LAUNCHD_UNIT = "org.tendcf.execd"
 RESERVED_SYSTEMD_UNIT = "tendcf-execd.service"
+RESERVED_SYSTEMD_COMPANION_UNITS = (
+    "tendcf-execd.timer",
+    "tendcf-execd.socket",
+    "tendcf-execd.path",
+)
+RESERVED_SYSTEMD_SERVICE_IDS = frozenset(
+    {
+        RESERVED_SYSTEMD_UNIT,
+        "tendcf-execd",
+        *RESERVED_SYSTEMD_COMPANION_UNITS,
+    }
+)
+
+
+def _is_reserved_systemd_service_id(service_id: str) -> bool:
+    """True if `service_id` targets tendcf-execd.service (explicit, suffixless, or same-stem companion)."""
+    return service_id in RESERVED_SYSTEMD_SERVICE_IDS
+
+
+def _systemd_writer_reserved_target(key: str) -> str | None:
+    """Return the first reserved systemd unit covered by unit-writer `key`, if any."""
+    for unit in (RESERVED_SYSTEMD_UNIT, *RESERVED_SYSTEMD_COMPANION_UNITS):
+        if unit_key_covers(key, unit):
+            return unit
+    return None
 
 
 class Finding(NamedTuple):
@@ -1687,13 +1715,14 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
                 rule=RULE_CROSS_FILE,
             )
 
-        label = (service.get("launchd") or {}).get("label")
-        if label is not None:
-            if label.lower() == RESERVED_LAUNCHD_UNIT:
+        launchd_cfg = service.get("launchd")
+        label = launchd_cfg.get("label") if isinstance(launchd_cfg, dict) else None
+        if isinstance(label, str):
+            if label.lower() == RESERVED_LAUNCHD_UNIT or _is_reserved_systemd_service_id(label):
                 fail(
-                    f"services: {name} launchd label {label!r} targets "
-                    f"{RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is reserved "
-                    "exclusively for 'tendcf-install' and cannot be declared as a service",
+                    f"services: {name} launchd label {label!r} targets reserved "
+                    "installer-owned unit (owned exclusively by 'tendcf-install') "
+                    "and cannot be declared as a service",
                     rule=RULE_CROSS_FILE,
                 )
             else:
@@ -1705,12 +1734,16 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
                         rule=RULE_CROSS_FILE,
                     )
 
-        systemd_unit = (service.get("systemd") or {}).get("unit")
-        if systemd_unit == RESERVED_SYSTEMD_UNIT:
+        systemd_cfg = service.get("systemd")
+        systemd_unit = systemd_cfg.get("unit") if isinstance(systemd_cfg, dict) else None
+        if isinstance(systemd_unit, str) and (
+            _is_reserved_systemd_service_id(systemd_unit)
+            or systemd_unit.lower() == RESERVED_LAUNCHD_UNIT
+        ):
             fail(
-                f"services: {name} systemd unit {systemd_unit!r} targets "
-                f"{RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively for "
-                "'tendcf-install' and cannot be declared as a service",
+                f"services: {name} systemd unit {systemd_unit!r} targets reserved "
+                "installer-owned unit (owned exclusively by 'tendcf-install') "
+                "and cannot be declared as a service",
                 rule=RULE_CROSS_FILE,
             )
 
@@ -1834,7 +1867,9 @@ def check_unit_claim_selftest() -> None:
         ("org.tendcf.execd", "org.tendcf.execd.sub", False),
         ("org.tendcf.*", "org.tendcf.execd", True),
         ("tendcf-*", "tendcf-execd.service", True),
+        ("tendcf-*", "tendcf-execd.timer", True),
         ("tendcf-execd.*", "tendcf-execd.service", True),
+        ("tendcf-execd.timer", "tendcf-execd.timer", True),
         ("tendcf.canary.*", "tendcf-execd.service", False),
         ("com.tendcf.example.*", "com.tendcf.example.tailscaled", True),
     )
@@ -2008,6 +2043,45 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
             rule=RULE_GOAL_CROSS_FILE,
         )
 
+    # --- reserved installer-owned service/tombstone ids (all supervisors) ---
+    # Enforced unconditionally across every supervisor (launchd, systemd,
+    # runit, nixos, or missing/unknown) and every domain so no service or
+    # tombstone entry can target tendcf's own installer-owned scheduler units.
+    for domain_name, ids in service_ids_by_domain.items():
+        for service_id in ids:
+            if service_id.lower() == RESERVED_LAUNCHD_UNIT:
+                fail(
+                    f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                    f"targets {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
+                    "reserved exclusively for 'tendcf-install' and cannot be managed as a service",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif _is_reserved_systemd_service_id(service_id):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                    f"targets reserved systemd installer unit ({RESERVED_SYSTEMD_UNIT!r} / "
+                    "bare stem or companion unit), which is reserved exclusively for "
+                    "'tendcf-install' and cannot be managed as a service",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+    for domain_name, ids in tombstones_by_domain.items():
+        for service_id in ids:
+            if service_id.lower() == RESERVED_LAUNCHD_UNIT:
+                fail(
+                    f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                    f"tombstones {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
+                    "reserved exclusively for 'tendcf-install' and cannot be removed by cfengine",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif _is_reserved_systemd_service_id(service_id):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/service/{service_id} "
+                    f"tombstones reserved systemd installer unit ({RESERVED_SYSTEMD_UNIT!r} / "
+                    "bare stem or companion unit), which is reserved exclusively for "
+                    "'tendcf-install' and cannot be removed by cfengine",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+
     # --- `tendcf-install` names tendcf's own unit and nothing else ----------
     # §2.2(5), extended to launchd in schema v8 (issue #99). Runit and launchd
     # `.*` prefixes reject `tendcf-install` in schema (goal-file.schema.json
@@ -2023,14 +2097,22 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
         for domain_name, key, writer in keys:
             if key.endswith("*") and writer != "cfengine":
                 continue  # schema if/then already forbids non-cfengine systemd prefixes
-            if unit_key_covers(key, RESERVED_SYSTEMD_UNIT) and not (
+            reserved_target = _systemd_writer_reserved_target(key)
+            if reserved_target is not None and not (
                 key == RESERVED_SYSTEMD_UNIT and writer == "tendcf-install"
             ):
                 fail(
                     f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
-                    f"(writer {writer!r}) covers {RESERVED_SYSTEMD_UNIT!r}, "
+                    f"(writer {writer!r}) covers {reserved_target!r}, "
                     f"which is reserved exclusively for exact unit {RESERVED_SYSTEMD_UNIT!r} "
                     "with writer 'tendcf-install'",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), "
+                    "which is reserved exclusively for 'tendcf-install'",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
             elif writer == "tendcf-install" and key != RESERVED_SYSTEMD_UNIT:
@@ -2040,24 +2122,6 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     "unit, tendcf-execd.service",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
-        for domain_name, ids in service_ids_by_domain.items():
-            for service_id in ids:
-                if service_id == RESERVED_SYSTEMD_UNIT:
-                    fail(
-                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                        f"targets {RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively "
-                        "for 'tendcf-install' and cannot be managed as a service",
-                        rule=RULE_GOAL_CROSS_FILE,
-                    )
-        for domain_name, ids in tombstones_by_domain.items():
-            for service_id in ids:
-                if service_id == RESERVED_SYSTEMD_UNIT:
-                    fail(
-                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                        f"tombstones {RESERVED_SYSTEMD_UNIT!r}, which is reserved exclusively "
-                        "for 'tendcf-install' and cannot be removed by cfengine",
-                        rule=RULE_GOAL_CROSS_FILE,
-                    )
     elif supervisor == "launchd":
         for domain_name, key, writer in keys:
             if key.endswith("*") and writer == "tendcf-install":
@@ -2072,6 +2136,13 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     "with writer 'tendcf-install'",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
+            elif _systemd_writer_reserved_target(key) is not None:
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers reserved systemd installer unit "
+                    f"{_systemd_writer_reserved_target(key)!r}",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
             elif writer == "tendcf-install" and key != RESERVED_LAUNCHD_UNIT:
                 fail(
                     f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
@@ -2079,24 +2150,23 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
                     "launchd label, org.tendcf.execd",
                     rule=RULE_GOAL_CROSS_FILE,
                 )
-        for domain_name, ids in service_ids_by_domain.items():
-            for service_id in ids:
-                if service_id.lower() == RESERVED_LAUNCHD_UNIT:
-                    fail(
-                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                        f"targets {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
-                        "reserved exclusively for 'tendcf-install' and cannot be managed as a service",
-                        rule=RULE_GOAL_CROSS_FILE,
-                    )
-        for domain_name, ids in tombstones_by_domain.items():
-            for service_id in ids:
-                if service_id.lower() == RESERVED_LAUNCHD_UNIT:
-                    fail(
-                        f"{label}: domains/{domain_name}/entries/service/{service_id} "
-                        f"tombstones {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), which is "
-                        "reserved exclusively for 'tendcf-install' and cannot be removed by cfengine",
-                        rule=RULE_GOAL_CROSS_FILE,
-                    )
+    else:
+        for domain_name, key, writer in keys:
+            if unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT):
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), "
+                    "which is reserved exclusively for 'tendcf-install' on launchd hosts",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
+            elif _systemd_writer_reserved_target(key) is not None:
+                fail(
+                    f"{label}: domains/{domain_name}/entries/unit-writer/{key} "
+                    f"(writer {writer!r}) covers reserved systemd installer unit "
+                    f"{_systemd_writer_reserved_target(key)!r}, which is reserved exclusively "
+                    "for 'tendcf-install' on systemd hosts",
+                    rule=RULE_GOAL_CROSS_FILE,
+                )
 
 
 def canonical_sha256(doc: Any) -> str:

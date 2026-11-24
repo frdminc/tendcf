@@ -540,10 +540,48 @@ def test_launchd_writer_prefix_covering_reserved_execd_refused_below_v8() -> Non
     )
     with pytest.raises(CompileError) as exc:
         compile_host(model, _host(SITE), None, schema_version=7)
-    assert "reserved installer-owned label 'org.tendcf.execd'" in str(exc.value)
+    msg = str(exc.value)
+    assert "reserved installer-owned label 'org.tendcf.execd'" in msg
+    assert "upgrade to schema_version 8" in msg
 
 
-@pytest.mark.parametrize("bad_label", ["org.tendcf.execd", "ORG.TENDCF.EXECD", "org.tendcf.EXECD", "tendcf-execd.service"])
+@pytest.mark.parametrize(
+    "bad_writer",
+    [
+        {"prefix": "org.tendcf.*", "label": "org.tendcf.execd", "writer": "tendcf-install"},
+        {"prefix": "com.other.*", "label": "org.tendcf.execd", "writer": "tendcf-install"},
+        {"writer": "cfengine"},
+    ],
+)
+def test_launchd_writer_dual_or_missing_key_refused(bad_writer: dict[str, str]) -> None:
+    from nix2cf.compile import render_goal_file, select_services
+
+    model = _model_without_execd_writer(SITE)
+    model.launchd_writers.data["writers"].append(bad_writer)
+    host = _host(SITE)
+
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, host, None)
+    assert "must declare exactly one of 'prefix' or 'label'" in str(exc.value)
+
+    selected, _, _ = select_services(model, host)
+    _, errs = render_goal_file(model, host, selected)
+    assert any("must declare exactly one of 'prefix' or 'label'" in e for e in errs)
+
+
+@pytest.mark.parametrize(
+    "bad_label",
+    [
+        "org.tendcf.execd",
+        "ORG.TENDCF.EXECD",
+        "org.tendcf.EXECD",
+        "tendcf-execd.service",
+        "tendcf-execd",
+        "tendcf-execd.timer",
+        "tendcf-execd.socket",
+        "tendcf-execd.path",
+    ],
+)
 def test_service_targeting_reserved_installer_unit_refused(schemas: Schemas, bad_label: str) -> None:
     from nix2cf.compile import render_goal_file, select_services
 
@@ -564,15 +602,19 @@ def test_service_targeting_reserved_installer_unit_refused(schemas: Schemas, bad
     assert any("reserved installer-owned unit" in e and bad_label in e for e in errs)
 
 
-def test_service_targeting_reserved_systemd_unit_refused_in_conflict_check() -> None:
+@pytest.mark.parametrize(
+    "bad_unit",
+    ["tendcf-execd.service", "tendcf-execd", "tendcf-execd.timer", "tendcf-execd.socket", "tendcf-execd.path"],
+)
+def test_service_targeting_reserved_systemd_unit_refused_in_conflict_check(bad_unit: str) -> None:
     from nix2cf.compile import conflict_check, select_services
 
     model = _model(SITE)
-    model.services.data["services"][0]["systemd"] = {"unit": "tendcf-execd.service"}
+    model.services.data["services"][0]["systemd"] = {"unit": bad_unit}
     host = _host(SITE)
     selected, _, _ = select_services(model, host)
     errs, _ = conflict_check(model, host, selected)
-    assert any("tendcf-execd.service" in e and "reserved installer-owned unit" in e for e in errs)
+    assert any(bad_unit in e and "reserved installer-owned unit" in e for e in errs)
 
 
 def test_launchd_exact_execd_tendcf_install_v8_positive_control(schemas: Schemas, lint) -> None:

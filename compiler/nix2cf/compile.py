@@ -84,6 +84,15 @@ SUPERVISION_DOMAIN = "supervision"
 # (issue #102): never emitted as a cfengine service or covered by any other writer.
 RESERVED_LAUNCHD_UNIT = "org.tendcf.execd"
 RESERVED_SYSTEMD_UNIT = "tendcf-execd.service"
+RESERVED_SYSTEMD_SERVICE_IDS = frozenset(
+    {
+        RESERVED_SYSTEMD_UNIT,
+        "tendcf-execd",
+        "tendcf-execd.timer",
+        "tendcf-execd.socket",
+        "tendcf-execd.path",
+    }
+)
 
 HOST_KEY = re.compile(r"^ed25519:[0-9a-f]{64}\Z")
 # The closed set of `device-trust.entries.supervisor.host.name`
@@ -208,11 +217,17 @@ def _writer_key(writer: dict[str, Any]) -> str:
 def _writer_matches(writer: dict[str, Any], label: str) -> bool:
     """Prefix `com.tendcf.example.*` matches `com.tendcf.example.x`, not `com.tendcf.examplex`;
     exact `label` matches only itself."""
-    if "prefix" in writer:
+    has_prefix = "prefix" in writer
+    has_label = "label" in writer
+    if has_prefix == has_label:
+        return False
+    if has_prefix:
         prefix = writer["prefix"]
-        assert prefix.endswith(".*")
+        if not isinstance(prefix, str) or not prefix.endswith(".*"):
+            return False
         return label.startswith(prefix[:-1])
-    return label == writer["label"]
+    wlabel = writer["label"]
+    return isinstance(wlabel, str) and label == wlabel
 
 
 def _keys_overlap(a: str, b: str) -> bool:
@@ -240,24 +255,34 @@ def _unit_key_covers(key: str, name: str) -> bool:
     return name == key
 
 
+def _is_reserved_systemd_service_id(service_id: str) -> bool:
+    """True if `service_id` targets tendcf-execd.service (explicit, suffixless, or companion unit)."""
+    return service_id in RESERVED_SYSTEMD_SERVICE_IDS
+
+
 def _reserved_service_errors(selected: list[Selected]) -> list[str]:
     """Refuse any selected service targeting an installer-owned scheduler unit."""
     errors: list[str] = []
     for sel in selected:
         rec = sel.record
         name = rec.get("name", "<unnamed>")
-        launchd_label = (rec.get("launchd") or {}).get("label")
+        launchd_cfg = rec.get("launchd")
+        launchd_label = launchd_cfg.get("label") if isinstance(launchd_cfg, dict) else None
         if isinstance(launchd_label, str) and (
             launchd_label.lower() == RESERVED_LAUNCHD_UNIT
-            or launchd_label == RESERVED_SYSTEMD_UNIT
+            or _is_reserved_systemd_service_id(launchd_label)
         ):
             errors.append(
                 f"{sel.where}: service {name!r} targets reserved installer-owned unit "
                 f"{launchd_label!r} (owned exclusively by 'tendcf-install'). "
                 "Resolution: remove this service or choose a non-reserved launchd label"
             )
-        systemd_unit = (rec.get("systemd") or {}).get("unit")
-        if systemd_unit == RESERVED_SYSTEMD_UNIT:
+        systemd_cfg = rec.get("systemd")
+        systemd_unit = systemd_cfg.get("unit") if isinstance(systemd_cfg, dict) else None
+        if isinstance(systemd_unit, str) and (
+            _is_reserved_systemd_service_id(systemd_unit)
+            or systemd_unit.lower() == RESERVED_LAUNCHD_UNIT
+        ):
             errors.append(
                 f"{sel.where}: service {name!r} targets reserved installer-owned unit "
                 f"{systemd_unit!r} (owned exclusively by 'tendcf-install'). "
@@ -704,11 +729,27 @@ def render_goal_file(
     writers: list[dict[str, Any]] = model.launchd_writers.data.get("writers", [])
     writer_entries: dict[str, Any] = {}
     seen_writers: list[tuple[str, str]] = []  # (key, source location)
+    valid_writers: list[dict[str, Any]] = []
     for w in writers:
-        key = _writer_key(w)
         where = model.launchd_writers.where(w)
+        has_prefix = "prefix" in w
+        has_label = "label" in w
+        if has_prefix == has_label:
+            errors.append(
+                f"{where}: launchd unit-writer must declare exactly one of "
+                "'prefix' or 'label'. Resolution: keep either `prefix` or `label`, "
+                "not both or neither"
+            )
+            continue
+        key = w["prefix"] if has_prefix else w["label"]
+        if not isinstance(key, str) or not key:
+            errors.append(
+                f"{where}: launchd unit-writer key {key!r} must be a non-empty string. "
+                "Resolution: provide a valid reverse-DNS prefix or exact label"
+            )
+            continue
         if schema_version < LAUNCHD_V8_SCHEMA_VERSION and (
-            "label" in w or w["writer"] == "tendcf-install"
+            has_label or w["writer"] == "tendcf-install"
         ):
             errors.append(
                 f"{where}: launchd unit-writer {key!r} "
@@ -720,26 +761,38 @@ def render_goal_file(
             continue
         if _unit_key_covers(key.lower(), RESERVED_LAUNCHD_UNIT) and not (
             schema_version >= LAUNCHD_V8_SCHEMA_VERSION
-            and "label" in w
-            and w["label"] == RESERVED_LAUNCHD_UNIT
+            and not has_prefix
+            and has_label
+            and key == RESERVED_LAUNCHD_UNIT
             and w["writer"] == "tendcf-install"
         ):
+            if schema_version < LAUNCHD_V8_SCHEMA_VERSION:
+                resolution = (
+                    "narrow the prefix, or upgrade to schema_version "
+                    f"{LAUNCHD_V8_SCHEMA_VERSION} and declare exact "
+                    f"`label: {RESERVED_LAUNCHD_UNIT}` with `writer: tendcf-install`"
+                )
+            else:
+                resolution = (
+                    "narrow the prefix or declare exact "
+                    f"`label: {RESERVED_LAUNCHD_UNIT}` with `writer: tendcf-install`"
+                )
             errors.append(
                 f"{where}: launchd unit-writer {key!r} (writer {w['writer']!r}) covers "
                 f"reserved installer-owned label {RESERVED_LAUNCHD_UNIT!r} (case-insensitively), "
                 f"which is reserved exclusively for exact label {RESERVED_LAUNCHD_UNIT!r} "
-                "with writer 'tendcf-install'. Resolution: narrow the prefix or declare "
-                f"exact `label: {RESERVED_LAUNCHD_UNIT}` with `writer: tendcf-install`"
+                f"with writer 'tendcf-install'. Resolution: {resolution}"
             )
             continue
         if schema_version >= LAUNCHD_V8_SCHEMA_VERSION and w["writer"] == "tendcf-install":
-            if not ("label" in w and w["label"] == RESERVED_LAUNCHD_UNIT):
+            if not (not has_prefix and has_label and key == RESERVED_LAUNCHD_UNIT):
                 errors.append(
                     f"{where}: launchd unit-writer {key!r} declares writer 'tendcf-install', "
                     f"which is reserved exclusively for exact label {RESERVED_LAUNCHD_UNIT!r}. "
                     f"Resolution: use exact `label: {RESERVED_LAUNCHD_UNIT}` or choose another writer"
                 )
                 continue
+        valid_writers.append(w)
         conflict = False
         for prior_key, prior_where in seen_writers:
             if key == prior_key:
@@ -761,7 +814,7 @@ def render_goal_file(
         seen_writers.append((key, where))
         writer_entries[key] = {"state": "present", "writer": w["writer"]}
     for entry_id in service_entries:
-        owners = [w for w in writers if _writer_matches(w, entry_id)]
+        owners = [w for w in valid_writers if _writer_matches(w, entry_id)]
         if not owners:
             errors.append(
                 f"service entry {entry_id!r} falls under no prefix or exact label declared in "

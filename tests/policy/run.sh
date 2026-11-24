@@ -491,6 +491,104 @@ check "reserved (malformed state): dedicated refusal reported" \
     grep -qF "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be managed by cfengine" "$out"
 check "reserved (malformed state): nothing rendered and no launchctl/systemctl" no_render_start "$out"
 
+# Bare `tendcf-execd` (present & absent) and companion `tendcf-execd.timer` (present) reserved checks (Opus H1 / Adv B1).
+for spec in \
+    "systemd-nosuffix-present:tendcf-execd:present:tendcf: service 'tendcf-execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-nosuffix-absent:tendcf-execd:absent:tendcf: service 'tendcf-execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
+    "systemd-timer-present:tendcf-execd.timer:present:tendcf: service 'tendcf-execd.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
+    cname="${spec%%:*}"; rest="${spec#*:}"
+    cid="${rest%%:*}"; rest="${rest#*:}"
+    cstate="${rest%%:*}"; expected="${rest#*:}"
+    python3 - "$work/data/host_specific.json" "$cid" "$cstate" <<'PYEOF'
+import json, pathlib, sys
+out_path, cid, state = sys.argv[1], sys.argv[2], sys.argv[3]
+if state == "present":
+    entry = {
+        "bundle": "demo",
+        "command": ["/usr/bin/sleep", "3600"],
+        "run_as": "nobody",
+        "state": "present",
+        "unit": {"systemd": {"enabled": True, "restart": "on-failure", "wanted_by": "multi-user.target"}},
+        "working_dir": "/",
+    }
+else:
+    entry = {"state": "absent"}
+doc = {"vars": {"tendcf_interlock": {}, "tendcf_service": {cid: entry}}}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    out="$work/reserved-$cname.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "reserved ($cname): policy completed" policy_completed "$out"
+    check "reserved ($cname): no CMDB cross-check refusal" no_crosscheck "$out"
+    check "reserved ($cname): dedicated refusal reported" grep -qF "$expected" "$out"
+    check "reserved ($cname): no generic flavour/host/bad-id refusal" \
+        bash -c "! grep -Eq \"refused: (unit flavour|launchd domain|missing or invalid|system-domain|user-domain|/etc/systemd/system)|is not a valid|tombstone not actuated\" '$out'"
+    check "reserved ($cname): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+done
+
+# Dry-run (-n) reserved-unit check (Opus L3): dedicated refusal previewed, zero mutations.
+for dry_spec in \
+    "launchd:reserved-launchd-present.json:tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd:reserved-systemd-present.json:tendcf: service 'tendcf-execd.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
+    dname="${dry_spec%%:*}"; rest="${dry_spec#*:}"
+    dfx="${rest%%:*}"; dexpected="${rest#*:}"
+    cp "$repo/tests/policy/fixtures/$dfx" "$work/data/host_specific.json"
+    out="$work/reserved-dry-$dname.out"
+    "$cf_agent" -n -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "reserved dry-run ($dname): dedicated refusal reported" grep -qF "$dexpected" "$out"
+    check "reserved dry-run ($dname): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+done
+
+# Path-traversal / bad systemd service IDs refused fail-closed without echoing raw untrusted ID (Opus M1 / Neon #1 / Adv B2).
+for bad_spec in \
+    "dot-slash-present:./tendcf-execd.service:present" \
+    "dot-slash-absent:./tendcf-execd.service:absent" \
+    "parent-trav-present:../system/tendcf-execd.service:present" \
+    "parent-trav-absent:../system/tendcf-execd.service:absent" \
+    "dropin-present:tendcf-execd.service.d/override.conf:present" \
+    "space-present:foo bar.service:present"; do
+    bname="${bad_spec%%:*}"; rest="${bad_spec#*:}"
+    bid="${rest%%:*}"; bstate="${rest#*:}"
+    python3 - "$work/data/host_specific.json" "$bid" "$bstate" <<'PYEOF'
+import json, pathlib, sys
+out_path, bid, state = sys.argv[1], sys.argv[2], sys.argv[3]
+if state == "present":
+    entry = {
+        "bundle": "demo",
+        "command": ["/usr/bin/sleep", "3600"],
+        "run_as": "nobody",
+        "state": "present",
+        "unit": {"systemd": {"enabled": True, "restart": "on-failure", "wanted_by": "multi-user.target"}},
+        "working_dir": "/",
+    }
+else:
+    entry = {"state": "absent"}
+doc = {"vars": {"tendcf_interlock": {}, "tendcf_service": {bid: entry}}}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    out="$work/bad-systemd-id-$bname.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "bad systemd id ($bname): policy completed" policy_completed "$out"
+    check "bad systemd id ($bname): no CMDB cross-check refusal" no_crosscheck "$out"
+    if [ "$bstate" = present ]; then
+        check "bad systemd id ($bname): dedicated systemd bad-id refusal reported" \
+            grep -qF "tendcf: systemd service refused: id is not a valid systemd service unit name" "$out"
+        check "bad systemd id ($bname): no generic flavour refusal" \
+            bash -c "! grep -q 'refused: unit flavour' '$out'"
+    else
+        check "bad systemd id ($bname): tombstone bad-id refusal reported" \
+            grep -Eq "tendcf: (launchd|systemd) tombstone refused: id is not a valid " "$out"
+    fi
+    check "bad systemd id ($bname): raw untrusted id not echoed in reports" \
+        python3 - "$out" "$bid" <<'PYEOF'
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+bad_id = sys.argv[2]
+assert not any(bad_id in line for line in lines if line.startswith("R:")), f"raw id leaked in R: line: {lines}"
+PYEOF
+    check "bad systemd id ($bname): nothing rendered and no launchctl/systemctl" no_render_start "$out"
+done
+
 if [ "$(uname)" != Darwin ]; then
     echo "# 5. host guard: launchd entries refused on $(uname)"
     cp "$repo/tests/policy/fixtures/launchd-present.json" "$work/data/host_specific.json"
@@ -1877,9 +1975,14 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
         check "root or passwordless sudo available for the systemd lifecycle" false
     fi
     if declare -F as_root >/dev/null; then
+        execd_sentinel_path=/etc/systemd/system/tendcf-execd.service
+        execd_sentinel_created=0
         cleanup_unit() {
             as_root systemctl disable --now "$unit" >/dev/null 2>&1 || true
             as_root rm -f "$unit_path" "$alias_path" "$mask_path" "$dangling_path"
+            if [ "${execd_sentinel_created:-0}" = 1 ]; then
+                as_root rm -f "$execd_sentinel_path"
+            fi
             as_root systemctl daemon-reload >/dev/null 2>&1 || true
         }
         trap cleanup_unit EXIT
@@ -1994,15 +2097,27 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
             bash -c "[ \"\$(readlink '$dangling_path')\" = /nonexistent/tendcf-test ]"
 
         # 6c. Installer-owned unit defence-in-depth on a real systemd host (issue #102):
-        # refuse present and tombstone tendcf-execd.service with zero systemctl calls
-        # and zero unit file render/delete (without touching real /etc/systemd/system/tendcf-execd.service).
+        # plant a regular sentinel at /etc/systemd/system/tendcf-execd.service (only if
+        # absent beforehand; removed in cleanup_unit and after 6c) and prove present &
+        # tombstone for tendcf-execd.service, bare tendcf-execd, and ./tendcf-execd.service
+        # leave it byte-identical with zero systemctl calls and zero file edits (Opus L1 / Neon Note 3).
+        if [ ! -e "$execd_sentinel_path" ] && [ ! -L "$execd_sentinel_path" ]; then
+            printf '[Unit]\nDescription=tendcf-execd sentinel for policy test 6c\n' \
+                | as_root tee "$execd_sentinel_path" >/dev/null
+            execd_sentinel_created=1
+        fi
+        execd_sentinel_hash="$(sha256sum "$execd_sentinel_path" | awk '{print $1}')"
+        sysd_no_edit() { ! grep -Eq 'Created file|Updated rendering|Edited file' "$1"; }
+
         sysd_run_verbose reserved-systemd-present.json "$work/sysd-reserved-present.out"
         check "systemd reserved present tendcf-execd.service: refused and reported" \
             grep -qF "tendcf: service 'tendcf-execd.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" "$work/sysd-reserved-present.out"
         check "systemd reserved present tendcf-execd.service: zero systemctl commands or probes" \
             no_systemctl "$work/sysd-reserved-present.out"
-        check "systemd reserved present tendcf-execd.service: nothing rendered" \
-            bash -c "! grep -q 'Created file' '$work/sysd-reserved-present.out'"
+        check "systemd reserved present tendcf-execd.service: nothing created or edited" \
+            sysd_no_edit "$work/sysd-reserved-present.out"
+        check "systemd reserved present tendcf-execd.service: sentinel hash unchanged" \
+            bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
 
         sysd_run_verbose reserved-systemd-absent.json "$work/sysd-reserved-absent.out"
         check "systemd reserved tombstone tendcf-execd.service: refused and reported" \
@@ -2011,6 +2126,50 @@ if [ "$(uname)" = Linux ] && [ -d /run/systemd/system ]; then
             no_systemctl "$work/sysd-reserved-absent.out"
         check "systemd reserved tombstone tendcf-execd.service: nothing deleted" \
             bash -c "! grep -q 'Deleted file' '$work/sysd-reserved-absent.out'"
+        check "systemd reserved tombstone tendcf-execd.service: sentinel hash unchanged" \
+            bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
+
+        for vm_spec in \
+            "nosuffix-present:tendcf-execd:present:tendcf: service 'tendcf-execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+            "nosuffix-absent:tendcf-execd:absent:tendcf: service 'tendcf-execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
+            "dotslash-present:./tendcf-execd.service:present:tendcf: systemd service refused: id is not a valid systemd service unit name" \
+            "dotslash-absent:./tendcf-execd.service:absent:tendcf: systemd tombstone refused: id is not a valid systemd service unit name"; do
+            vname="${vm_spec%%:*}"; rest="${vm_spec#*:}"
+            vid="${rest%%:*}"; rest="${rest#*:}"
+            vstate="${rest%%:*}"; vexpected="${rest#*:}"
+            python3 - "$work/data/host_specific.json" "$vid" "$vstate" <<'PYEOF'
+import json, pathlib, sys
+out_path, vid, state = sys.argv[1], sys.argv[2], sys.argv[3]
+if state == "present":
+    entry = {
+        "bundle": "demo",
+        "command": ["/usr/bin/sleep", "3600"],
+        "run_as": "nobody",
+        "state": "present",
+        "unit": {"systemd": {"enabled": True, "restart": "on-failure", "wanted_by": "multi-user.target"}},
+        "working_dir": "/",
+    }
+else:
+    entry = {"state": "absent"}
+doc = {"vars": {"tendcf_interlock": {}, "tendcf_service": {vid: entry}}}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+            vout="$work/sysd-reserved-$vname.out"
+            as_root env CFENGINE_TEST_OVERRIDE_WORKDIR="$work" \
+                "$cf_agent" -K -v -f "$work/inputs/entry.cf" >"$vout" 2>&1 || true
+            as_root chown -R "$(id -u):$(id -g)" "$work"
+            check "systemd reserved ($vname): expected refusal reported" grep -qF "$vexpected" "$vout"
+            check "systemd reserved ($vname): zero systemctl commands or probes" no_systemctl "$vout"
+            check "systemd reserved ($vname): nothing created, edited, or deleted" \
+                bash -c "! grep -Eq 'Created file|Updated rendering|Edited file|Deleted file' '$vout'"
+            check "systemd reserved ($vname): sentinel hash unchanged" \
+                bash -c "[ -f '$execd_sentinel_path' ] && [ \"\$(sha256sum '$execd_sentinel_path' | awk '{print \$1}')\" = '$execd_sentinel_hash' ]"
+        done
+
+        if [ "$execd_sentinel_created" = 1 ]; then
+            as_root rm -f "$execd_sentinel_path"
+            execd_sentinel_created=0
+        fi
     fi
 elif [ "${TENDCF_TEST_SYSTEMD:-}" = 1 ]; then
     check "TENDCF_TEST_SYSTEMD=1 needs a host booted by systemd" false
@@ -2695,8 +2854,10 @@ if [ "$fail" != 0 ]; then
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
+             reserved-systemd-nosuffix-present reserved-systemd-nosuffix-absent reserved-systemd-timer-present reserved-dry-launchd reserved-dry-systemd \
+             bad-systemd-id-dot-slash-present bad-systemd-id-dot-slash-absent bad-systemd-id-parent-trav-present bad-systemd-id-parent-trav-absent bad-systemd-id-dropin-present bad-systemd-id-space-present \
              launchd-reserved-sys-present launchd-reserved-sys-case-present launchd-reserved-user-exact-present launchd-reserved-user-case-present launchd-reserved-sys-absent launchd-reserved-sys-case-absent launchd-reserved-user-absent launchd-reserved-sibling \
-             sysd-sim-present sysd-sim-tomb sysd-reserved-present sysd-reserved-absent; do
+             sysd-sim-present sysd-sim-tomb sysd-reserved-present sysd-reserved-absent sysd-reserved-nosuffix-present sysd-reserved-nosuffix-absent sysd-reserved-dotslash-present sysd-reserved-dotslash-absent; do
         [ -f "$work/$f.out" ] || continue
         echo; echo "--- cf-agent output ($f) ---"; cat "$work/$f.out"
     done
