@@ -674,36 +674,19 @@ def render_goal_file(
                 "Resolution: set launchd.domain to 'system', 'user-gui', or 'user-background'"
             )
             continue
+        if schema_version < LAUNCHD_V9_SCHEMA_VERSION and launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
+            errors.append(
+                f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
+                f"which schema_version {schema_version} cannot state (it exists from "
+                f"{LAUNCHD_V9_SCHEMA_VERSION}). Resolution: render at "
+                f"schema_version {LAUNCHD_V9_SCHEMA_VERSION}"
+            )
+            continue
+        launchd_bools = {k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()}
         if schema_version < LAUNCHD_V8_SCHEMA_VERSION:
-            if launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
-                errors.append(
-                    f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
-                    f"which schema_version {schema_version} cannot state (it exists from "
-                    f"{LAUNCHD_V9_SCHEMA_VERSION}). Resolution: render at "
-                    f"schema_version {LAUNCHD_V9_SCHEMA_VERSION}"
-                )
-                continue
-            launchd_unit: dict[str, Any] = {
-                k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()
-            }
-        elif schema_version < LAUNCHD_V9_SCHEMA_VERSION:
-            if launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
-                errors.append(
-                    f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
-                    f"which schema_version {schema_version} cannot state (it exists from "
-                    f"{LAUNCHD_V9_SCHEMA_VERSION}). Resolution: render at "
-                    f"schema_version {LAUNCHD_V9_SCHEMA_VERSION}"
-                )
-                continue
-            launchd_unit = {
-                "domain": launchd_domain,
-                **{k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()},
-            }
+            launchd_unit: dict[str, Any] = launchd_bools
         else:
-            launchd_unit = {
-                "domain": launchd_domain,
-                **{k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()},
-            }
+            launchd_unit = {"domain": launchd_domain, **launchd_bools}
         entry: dict[str, Any] = {
             "state": "present",
             "bundle": bundle,

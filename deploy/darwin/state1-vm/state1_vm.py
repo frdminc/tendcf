@@ -3779,6 +3779,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                                     "Permission denied",
                                     "CMDB cross-check failed",
                                     "refused",
+                                    "skipped: belongs to launchd 'system' domain",
                                 )
                             ):
                                 raise StepFail(

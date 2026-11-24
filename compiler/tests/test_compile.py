@@ -469,6 +469,28 @@ def test_launchd_invalid_domain_refused() -> None:
         compile_host(model, _host(SITE), None)
 
 
+def test_render_goal_file_alone_refuses_stale_user_and_v9_domains_below_v9() -> None:
+    from nix2cf.compile import render_goal_file, select_services
+
+    host = _host(SITE)
+    for version in (7, 8, 9):
+        model = _v7_model(SITE) if version < 8 else _model(SITE)
+        model.services.data["services"][0]["launchd"]["domain"] = "user"
+        selected, _, _ = select_services(model, host)
+        doc, errs = render_goal_file(model, host, selected, schema_version=version)
+        assert "com.djbclark.caddy" not in doc["domains"]["supervision"]["entries"].get("service", {})
+        assert any("stale v8 launchd.domain='user'" in e for e in errs)
+
+    for version in (7, 8):
+        for domain in ("user-gui", "user-background"):
+            model = _v7_model(SITE) if version < 8 else _model(SITE)
+            model.services.data["services"][0]["launchd"]["domain"] = domain
+            selected, _, _ = select_services(model, host)
+            doc, errs = render_goal_file(model, host, selected, schema_version=version)
+            assert "com.djbclark.caddy" not in doc["domains"]["supervision"]["entries"].get("service", {})
+            assert any(f"launchd.domain={domain!r}" in e and "render at schema_version 9" in e for e in errs)
+
+
 def test_launchd_exact_label_and_tendcf_install_refused_below_v8() -> None:
     with pytest.raises(CompileError, match="org.tendcf.execd"):
         compile_host(_model(SITE), _host(SITE), None, schema_version=7)

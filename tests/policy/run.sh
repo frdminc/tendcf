@@ -1713,8 +1713,14 @@ EOF
     check "launchd user mode with uid 0: no plist written" test ! -e "$user_plist"
     check "launchd user mode with uid 0: zero launchctl calls" test ! -s "$launchctl_log"
 
-    # (6)-(7) user mode must reject system-wide /Library/LaunchAgents and //Library/LaunchAgents (Neon HIGH #1).
-    for sys_agents_case in "single:/Library/LaunchAgents" "double://Library/LaunchAgents"; do
+    # (6)-(7) user mode must reject system-wide /Library/LaunchAgents variants (Neon HIGH #1, Adversary Note B).
+    for sys_agents_case in \
+        "single:/Library/LaunchAgents" \
+        "double://Library/LaunchAgents" \
+        "case:/library/launchagents" \
+        "dotslash:/./Library/LaunchAgents" \
+        "syslib:/System/Library/LaunchAgents" \
+        "trailing:/Library/LaunchAgents/."; do
         cname="${sys_agents_case%%:*}"
         cdir="${sys_agents_case#*:}"
         cat > "$work/inputs/launchd-user-sysdir-$cname.cf" <<EOF
@@ -1958,6 +1964,25 @@ EOF
     check "launchd user LaunchAgents symlink negative: refused fail-closed" \
         grep -q "tendcf: service 'com.tendcf.canary.main' refused: launchd domain/identity invalid" "$work/launchd-ensure-sym.out"
     check "launchd user LaunchAgents symlink negative: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # Adversary Note B: home_dir = "/." must be rejected by tendcf_user_home_ok.
+    cat > "$work/inputs/launchd-ensure-dot.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_test_ensure_dot", "tendcf_test_done" };
+}
+bundle agent tendcf_test_ensure_dot
+{
+  methods:
+      "ensure"
+        usebundle => tendcf_ensure_user_launchagents("/.", "$test_user");
+}
+EOF
+    printf '%s\n' '{"vars":{}}' > "$work/data/host_specific.json"
+    "$cf_agent" -K -v -n -f "$work/inputs/launchd-ensure-dot.cf" >"$work/launchd-ensure-dot.out" 2>&1 || true
+    check "launchd user LaunchAgents '/.' home_dir negative: tendcf_user_home_ok NOT defined" \
+        bash -c "! grep -q 'Private class: tendcf_user_home_ok' '$work/launchd-ensure-dot.out'"
 
     # 5m.19h Mixed goal file in non-root user mode: converges BOTH user-gui AND user-background
     # while informationally skipping a system entry, all in ONE cf-agent invocation!
@@ -2238,7 +2263,46 @@ PYEOF
         bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
     rm -f "$user_plist" "$launchctl_state/user.com.tendcf.canary.main"
 
-    # 5m.19n Dry-run (`-n`) in user mode across user-gui, user-background, headless, and dual-loaded tombstone.
+    # 5m.19m2 Peer bootout (`0d`) must NOT clear target's persisted reload_pending (Neon M2 / Macroscope 4683466167):
+    # persist user_background reload_pending via drifted plist + fail-user-bootout, then plant a stale
+    # gui/<uid> peer and run normal -> peer bootout runs AND target reload (bootout + bootstrap user/<uid>) still runs!
+    cp "$golden_user_bg_dir/com.tendcf.canary.main.plist" "$user_plist"
+    : > "$launchctl_state/user.com.tendcf.canary.main"
+    rm -f "$launchctl_state/gui.com.tendcf.canary.main"
+    python3 - "$user_plist" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+p.write_text(p.read_text().replace("<string>86400</string>", "<string>54321</string>", 1))
+PYEOF
+    : > "$launchctl_log"
+    printf 'fail-user-bootout\n' > "$launchctl_mode"
+    cp "$user_bg_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-r1-peer-preserves-reload-fail.out" 2>&1 || true
+    check "launchd peer-preserves-reload (step 1 fail-user-bootout): plist repaired and target bootout failed" \
+        bash -c "cmp -s '$golden_user_bg_dir/com.tendcf.canary.main.plist' '$user_plist' && grep -qF \"tendcf: service 'com.tendcf.canary.main' failed: launchctl bootout user/$test_uid/com.tendcf.canary.main exited non-zero; bootstrap not run\" '$work/launchd-r1-peer-preserves-reload-fail.out'"
+    : > "$launchctl_state/gui.com.tendcf.canary.main"
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-r1-peer-preserves-reload-recover.out" 2>&1 || true
+    check "launchd peer-preserves-reload (step 2 normal): peer bootout did not wipe target reload_pending (peer bootout < target bootout < target bootstrap)" \
+        python3 - "$launchctl_log" "$test_uid" "$user_plist" <<'PYEOF'
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+uid, plist = sys.argv[2], sys.argv[3]
+pbo = f"bootout\tgui/{uid}/com.tendcf.canary.main"
+tbo = f"bootout\tuser/{uid}/com.tendcf.canary.main"
+tbs = f"bootstrap\tuser/{uid}\t{plist}"
+assert lines.count(pbo) == 1, f"expected 1 peer bootout: {lines}"
+assert lines.count(tbo) == 1, f"expected 1 target bootout: {lines}"
+assert lines.count(tbs) == 1, f"expected 1 target bootstrap: {lines}"
+assert lines.index(pbo) < lines.index(tbo) < lines.index(tbs), f"wrong order: {lines}"
+PYEOF
+    check "launchd peer-preserves-reload (step 2 normal): gui peer unloaded and user target loaded" \
+        bash -c "[ ! -e '$launchctl_state/gui.com.tendcf.canary.main' ] && [ -f '$launchctl_state/user.com.tendcf.canary.main' ]"
+    rm -f "$user_plist" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.canary.main"
+
+    # 5m.19n Dry-run (`-n`) in user mode across user-gui, user-background, headless, dual-loaded tombstone,
+    # domain-switch preview (Neon H1), and real probe error reporting under -n (Neon M3).
     cp "$golden_user_gui_dir/com.tendcf.canary.main.plist" "$headless_tomb_p"
     : > "$launchctl_state/gui.com.tendcf.headless.tomb"
     : > "$launchctl_state/user.com.tendcf.headless.tomb"
@@ -2282,7 +2346,167 @@ PYEOF
         check "launchd user dry-run ($dry_mode): no new plists created and tombstone plist preserved" \
             bash -c "[ ! -e '$launchd_agents/com.tendcf.dry.gui.plist' ] && [ ! -e '$launchd_agents/com.tendcf.dry.bg.plist' ] && [ -f '$headless_tomb_p' ]"
     done
+
+    # Neon M3: real preview=>"true" domain probe failure IS reported under -n (never suppressed).
+    : > "$launchctl_log"
+    printf 'fail-gui-domain\n' > "$launchctl_mode"
+    "$cf_agent" -n -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-dry-fail-gui-domain.out" 2>&1 || true
+    check "launchd user dry-run (fail-gui-domain): real probe error reported under -n" \
+        grep -qF "tendcf: service 'com.tendcf.dry.bg' failed: launchctl print gui/$test_uid exited with unexpected error; user-domain convergence skipped" "$work/launchd-user-dry-fail-gui-domain.out"
+    check "launchd user dry-run (fail-gui-domain): tombstone probe error reported under -n" \
+        grep -qF "tendcf: service 'com.tendcf.headless.tomb' tombstone failed: launchctl print gui/$test_uid exited with unexpected error; plist left in place" "$work/launchd-user-dry-fail-gui-domain.out"
     rm -f "$headless_tomb_p" "$launchctl_state/gui.com.tendcf.headless.tomb" "$launchctl_state/user.com.tendcf.headless.tomb"
+
+    # Neon H1: dry-run (-n) domain-switch preview (loaded in gui/<uid>, switching to user-background)
+    # must preview BOTH peer bootout AND target bootstrap while leaving disk and loaded state untouched.
+    # Strip interlock so `-n` reaches launchd files:/commands: preview paths directly.
+    cp "$golden_user_gui_dir/com.tendcf.canary.main.plist" "$user_plist"
+    : > "$launchctl_state/gui.com.tendcf.canary.main"
+    rm -f "$launchctl_state/user.com.tendcf.canary.main"
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    python3 - "$user_bg_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    "$cf_agent" -n -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-dry-switch.out" 2>&1 || true
+    check "launchd user dry-run domain switch: policy completed" dry_policy_completed "$work/launchd-user-dry-switch.out"
+    check "launchd user dry-run domain switch: zero failed reports" no_failed_reports "$work/launchd-user-dry-switch.out"
+    check "launchd user dry-run domain switch: previews peer bootout gui/<uid>/<id>" \
+        grep -Eq "Would execute script .*bootout gui/$test_uid/com\\.tendcf\\.canary\\.main" "$work/launchd-user-dry-switch.out"
+    check "launchd user dry-run domain switch: previews target bootstrap user/<uid> <plist>" \
+        grep -Eq "Would execute script .*bootstrap user/$test_uid $user_plist" "$work/launchd-user-dry-switch.out"
+    check "launchd user dry-run domain switch: zero launchctl write calls" \
+        bash -c "! grep -Eq '^(bootstrap|bootout)[[:space:]]' '$launchctl_log'"
+    check "launchd user dry-run domain switch: plist and loaded state untouched" \
+        bash -c "cmp -s '$golden_user_gui_dir/com.tendcf.canary.main.plist' '$user_plist' && [ -f '$launchctl_state/gui.com.tendcf.canary.main' ] && [ ! -e '$launchctl_state/user.com.tendcf.canary.main' ]"
+    rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.canary.main"
+
+    # 5m.19o Adversary Blocker #1: forged class `tendcf_launchd_user_needs_domain_probes`
+    # via CMDB `"classes"` (`"any::"`) AND via `def.json` (`["any"]`) must NEVER trigger
+    # non-iterating domain probes 0a/0b in either user or system harness.
+    printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{}},"classes":{"tendcf_launchd_user_needs_domain_probes":"any::"}}' > "$work/data/host_specific.json"
+    printf 'normal\n' > "$launchctl_mode"
+    for hspec in "user:launchd-user-harness.cf" "sys:launchd-harness.cf"; do
+        hname="${hspec%%:*}"
+        hcf="${hspec#*:}"
+        : > "$launchctl_log"
+        "$cf_agent" -K -I -f "$work/inputs/$hcf" >"$work/launchd-r1-probe-class-$hname.out" 2>&1 || true
+        check "launchd forged needs_domain_probes CMDB class ($hname): CMDB refusal reported" \
+            refusal_reported "$work/launchd-r1-probe-class-$hname.out"
+        check "launchd forged needs_domain_probes CMDB class ($hname): foreign class reported" \
+            foreign_class_reported "$work/launchd-r1-probe-class-$hname.out"
+        check "launchd forged needs_domain_probes CMDB class ($hname): zero launchctl calls" \
+            test ! -s "$launchctl_log"
+    done
+    printf '%s\n' '{"vars":{"tendcf_interlock":{},"tendcf_service":{}}}' > "$work/data/host_specific.json"
+    printf '%s\n' '{"classes":{"tendcf_launchd_user_needs_domain_probes":["any"]}}' > "$work/inputs/def.json"
+    for hspec in "user:launchd-user-harness.cf" "sys:launchd-harness.cf"; do
+        hname="${hspec%%:*}"
+        hcf="${hspec#*:}"
+        : > "$launchctl_log"
+        "$cf_agent" -K -I -f "$work/inputs/$hcf" >"$work/launchd-r1-probe-def-$hname.out" 2>&1 || true
+        check "launchd forged needs_domain_probes def.json class ($hname): CMDB refusal reported" \
+            refusal_reported "$work/launchd-r1-probe-def-$hname.out"
+        check "launchd forged needs_domain_probes def.json class ($hname): foreign class reported" \
+            foreign_class_reported "$work/launchd-r1-probe-def-$hname.out"
+        check "launchd forged needs_domain_probes def.json class ($hname): zero launchctl calls" \
+            test ! -s "$launchctl_log"
+    done
+    rm -f "$work/inputs/def.json"
+
+    # 5m.19p Adversary Blocker #2: present render must refuse case-mismatched regular plist on APFS.
+    case_upper_p="$launchd_agents/COM.TENDCF.CASE.TEST.plist"
+    case_lower_p="$launchd_agents/com.tendcf.case.test.plist"
+    rm -f "$case_upper_p" "$case_lower_p" "$launchctl_state/user.com.tendcf.case.test" "$launchctl_state/gui.com.tendcf.case.test"
+    printf 'sentinel-case-mismatch-plist\n' > "$case_upper_p"
+    case_upper_hash="$(shasum -a 256 "$case_upper_p" | awk '{print $1}')"
+    python3 - "$work/data/host_specific.json" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {},
+        "tendcf_service": {
+            "com.tendcf.case.test": {
+                "bundle": "case",
+                "command": ["/bin/sleep", "86400"],
+                "run_as": sys.argv[2],
+                "state": "present",
+                "unit": {"launchd": {"domain": "user-background", "keep_alive": True, "run_at_load": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-r1-present-case-mismatch.out" 2>&1 || true
+    if [ -f "$case_lower_p" ]; then
+        check "launchd present case mismatch (case-insensitive FS): refusal reported" \
+            grep -qF "tendcf: service 'com.tendcf.case.test' refused: no exact-case entry 'com.tendcf.case.test.plist' in $launchd_agents (case-insensitive filesystem mismatch)" "$work/launchd-r1-present-case-mismatch.out"
+        check "launchd present case mismatch (case-insensitive FS): zero launchctl calls" \
+            test ! -s "$launchctl_log"
+        check "launchd present case mismatch (case-insensitive FS): existing file untouched" \
+            bash -c "[ \"\$(shasum -a 256 '$case_upper_p' | awk '{print \$1}')\" = '$case_upper_hash' ]"
+    fi
+    rm -f "$case_upper_p" "$case_lower_p" "$launchctl_state/user.com.tendcf.case.test" "$launchctl_state/gui.com.tendcf.case.test"
+
+    # 5m.19q Neon M1: consecutive user-mode runs WITHOUT `-K` (production cf-execd omits -K)
+    # must NOT lock-skip read-only domain probes 0a/0b (`ifelapsed => "0"`).
+    cat > "$work/inputs/launchd-user-nok-harness.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_user_nok_harness", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_user_nok_harness
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("user", "$launchd_agents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid"),
+        action => tendcf_probe_always;
+}
+EOF
+    rm -f "$user_plist" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.canary.main"
+    : > "$launchctl_log"
+    printf 'normal\n' > "$launchctl_mode"
+    python3 - "$user_bg_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    "$cf_agent" -I -f "$work/inputs/launchd-user-nok-harness.cf" >"$work/launchd-r1-nok-run1.out" 2>&1 || true
+    check "launchd no -K run 1: domain probes 0a/0b ran and service bootstrapped" \
+        bash -c "grep -qxF \"\$(printf 'print\tgui/%s' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'print\tuser/%s' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'bootstrap\tuser/%s\t%s' '$test_uid' '$user_plist')\" '$launchctl_log'"
+    # Immediately run a 2nd invocation within 1s without -K adding a second user-background service:
+    nok2_p="$launchd_agents/com.tendcf.nok.second.plist"
+    rm -f "$nok2_p" "$launchctl_state/user.com.tendcf.nok.second" "$launchctl_state/gui.com.tendcf.nok.second"
+    python3 - "$user_bg_canary_fx" "$work/data/host_specific.json" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_interlock"] = {}
+doc["vars"]["tendcf_service"]["com.tendcf.nok.second"] = {
+    "bundle": "canary",
+    "command": ["/bin/sleep", "86400"],
+    "run_as": sys.argv[3],
+    "state": "present",
+    "unit": {"launchd": {"domain": "user-background", "keep_alive": True, "run_at_load": True}},
+    "working_dir": "/",
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -I -f "$work/inputs/launchd-user-nok-harness.cf" >"$work/launchd-r1-nok-run2.out" 2>&1 || true
+    check "launchd no -K run 2 (within 60s): domain probes 0a/0b re-ran (not lock-skipped)" \
+        bash -c "grep -qxF \"\$(printf 'print\tgui/%s' '$test_uid')\" '$launchctl_log' && grep -qxF \"\$(printf 'print\tuser/%s' '$test_uid')\" '$launchctl_log'"
+    check "launchd no -K run 2 (within 60s): second service rendered and bootstrapped cleanly" \
+        bash -c "[ -f '$nok2_p' ] && grep -qxF \"\$(printf 'bootstrap\tuser/%s\t%s' '$test_uid' '$nok2_p')\" '$launchctl_log'"
+    rm -f "$user_plist" "$nok2_p" "$launchctl_state/user.com.tendcf.canary.main" "$launchctl_state/user.com.tendcf.nok.second"
 
     # Darwin entry.cf safety guard: no repo fixture fed to entry.cf may match
     # unprivileged user-domain actuation (domain in user/user-gui/user-background && run_as==$test_user),
@@ -3447,7 +3671,7 @@ check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_ac
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
-             launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-entry-nonroot \
+             launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \

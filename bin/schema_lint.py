@@ -480,7 +480,7 @@ def check_family_canonical_bytes() -> None:
 
 BROKEN_README = BROKEN_DIR / "README.md"
 
-# | 13 | `13-schema-version-bump` | `schema_version: 8`, one above the current 7 | schema (`const`) |
+# | 13 | `13-schema-version-bump` | `schema_version: 10`, one above the current 9 | schema (`const`) |
 _README_ROW = re.compile(r"^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|.*\|\s*(.+?)\s*\|\s*$")
 
 

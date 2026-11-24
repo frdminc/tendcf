@@ -43,6 +43,7 @@ import os
 import plistlib
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -165,8 +166,8 @@ def _run_single_user_render(
         stub.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
-            f"log={str(stub_log)!r}\n"
-            f"state={str(work / 'loaded')!r}\n"
+            f"log={shlex.quote(str(stub_log))}\n"
+            f"state={shlex.quote(str(work / 'loaded'))}\n"
             'printf "%s" "$1" >> "$log"\n'
             'for a in "${@:2}"; do printf "\\t%s" "$a" >> "$log"; done\n'
             'printf "\\n" >> "$log"\n'
