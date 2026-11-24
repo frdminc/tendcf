@@ -70,9 +70,9 @@ device seven releases behind still computes one true diff (guide §7).
 
 | Layer (map §3) | Repository / local workspace convention | What a release takes from it |
 | --- | --- | --- |
-| tendcf | `frdminc/tendcf` (optional local checkout `~/tendcf-ops/tendcf`) | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import (#45); its one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
+| tendcf | `frdminc/tendcf` (optional local checkout `~/tendcf-ops/tendcf`, informational/dev-only; never auto-loaded as schema or projector authority during builds) | schemas, `bin/projector.py`, generic bundles under `policy/`, the upstream overlay (`overlay/`, see [`upstream-overlay.md`](upstream-overlay.md)), and the compiler with its plugins (Step 3; in `compiler/` since map D46's import (#45); its one compilation command is `buildfile`; `plugins/` after the restructure, [`plugin-layout.md`](plugin-layout.md) §5 step 4) |
 | site-shared | `tendcf-public-<site>` under `~/tendcf-ops` (optional; not yet created) | recipes |
-| foreign site-shared | `tendcf-public-<other>` (optional read-only local clone; builds read `site.lock` only) | recipes, namespaced |
+| foreign site-shared | `tendcf-public-<other>` (optional read-only local clone; builds take only what `site.lock` pins) | recipes, namespaced |
 | site-private | `tendcf-private-<site>` under `~/tendcf-ops` (`TENDCF_OPS_ROOT`; primary site root; migrating from legacy `~/ops/site-private`, [frdminc/tendcf#98](https://github.com/frdminc/tendcf/issues/98)) | inventory, allocations, secret *names*, trust policy, the lockfile |
 | tool forks | `djbclark/core`, `djbclark/libntech`, `frdminc/ShizukuTendCF` | reached only through tendcf's overlay or as digests of built artifacts |
 
@@ -84,15 +84,23 @@ checkouts live under `~/tendcf-ops` (`TENDCF_OPS_ROOT`) as
 `tendcf-private-<site>` (primary site root) and optional
 `tendcf-public-<site>` (paired deterministically by a single `--site-name` /
 `TENDCF_SITE` / XDG `active-site` selector, failing closed with no sole-dir
-glob or legacy aliases), alongside optional `tendcf/` and read-only
-`tendcf-public-<other>` clones; mutable runtime state lives under XDG
-(`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`), never inside git
-checkouts, and multi-item site inputs are designed around `*.d/` directories.
-**The composition boundary above is unchanged:** no device and no release build
-ever reads a sibling checkout — releases compose solely from `site.lock`. For
-local preview/test compiles only, `--override-input <ns>=<path>` may bind a
-local directory; any active override marks the compile and workspace tainted
-and **refuses release signing and publishing** (fail closed).
+glob or legacy aliases; on `nix2cf buildfile`, reading XDG `active-site`
+requires explicit workspace opt-in via `--workspace`, `--ops-root`, or
+`TENDCF_SITE`), alongside optional `tendcf/` (strictly informational/dev-only,
+never auto-loaded as schema or projector authority during builds, aligning with
+D46(9a)) and read-only `tendcf-public-<other>` clones; mutable runtime state
+lives under XDG (`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`, exposed by
+`state_dir()` / `cache_dir()` in `compiler/nix2cf/workspace.py`), never inside
+git checkouts. **The composition boundary above is unchanged:** no device and
+no release build ever reads a sibling checkout — builds take only what
+`site.lock` pins. For local preview/test compiles only,
+`--override-input <ns>=<path>` validates paths, warns loudly, records taint on
+`CompileResult`/`WorkspaceResolution`, blocks `-o` artifact writes without
+`--allow-tainted`, and fails `--check-releasable` / `assert_releasable()`
+(foreign-input substitution itself awaits `site.lock` composition). Future
+release/signing pipelines (§3, §6, map §9.11) MUST call the release gate and
+MUST NOT accept artifacts from an override build (dev overrides are also
+refused in release/CI builds per D46(9b)).
 
 **One lockfile, in site-private: `site.lock`.** It is the only place a
 version is chosen. Everything else is content.

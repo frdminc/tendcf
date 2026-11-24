@@ -188,11 +188,11 @@ checkouts that must share one tag.
 
 | Layer | Holds | Local repo convention (issue #98) | Visibility |
 | --- | --- | --- | --- |
-| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt, the compiler (`compiler/`) and its plugins (`plugins/`, D46) | `tendcf/` (optional local engine checkout) | Public product |
+| **tendcf** | Engine, **schemas/types**, generic adapters, default advisor prompt, the compiler (`compiler/`) and its plugins (`plugins/`, D46) | `tendcf/` (optional local checkout; informational/dev-only, never auto-loaded as schema or projector authority during builds) | Public product |
 | ~~**nix2cf**~~ | ~~Compiler tool only (Site Model → CFEngine JSON)~~ Folded into tendcf (D46). `nix2cf` now names the Nix frontend plugin | — | Repository archived 2026-11-13, right after the import ([#45](https://github.com/frdminc/tendcf/pull/45)) merged |
 | **site-shared** | Reusable recipes | `tendcf-public-<site>/` (optional) | Public or shared |
 | **site-private** | Inventory, allocations, secret *names*, trust policy, extra prompt, lockfile | `tendcf-private-<site>/` (required primary site root) | Private |
-| **foreign shared** | Other sites' recipes | `tendcf-public-<other>/` (optional read-only clone; builds still read `site.lock` only) | Read-only inputs |
+| **foreign shared** | Other sites' recipes | `tendcf-public-<other>/` (optional read-only clone; builds take only what `site.lock` pins) | Read-only inputs |
 | **tool forks** | sudo-secretspec, Shizuku, … | Optional | Optional |
 
 **Schemas live in tendcf**, in `schema/`, not in the compiler's code
@@ -235,31 +235,41 @@ Development happens in task worktrees, not in a deploy checkout.
 
 - **Workspace root:** `~/tendcf-ops` (overridable via `--ops-root` or
   `TENDCF_OPS_ROOT`), separate from legacy ops layouts. It holds an optional
-  `tendcf/` engine checkout, matched site pairs `tendcf-private-<site>/`
-  (required primary site root, corresponding to logical role `site-private`)
-  and optional `tendcf-public-<site>/` (corresponding to `site-shared`), plus
-  optional read-only clones of other operators' public sites
-  (`tendcf-public-<other>/`).
+  `tendcf/` checkout (strictly informational/development-only — never
+  auto-loaded as schema or projector authority during builds, aligning with
+  D46(9a)), matched site pairs `tendcf-private-<site>/` (required primary site
+  root, corresponding to logical role `site-private`) and optional
+  `tendcf-public-<site>/` (corresponding to `site-shared`), plus optional
+  read-only clones of other operators' public sites (`tendcf-public-<other>/`).
 - **Site slug and worktree hygiene:** `<site>` allows `<operator>` or
-  `<operator>-<name>` (lowercase ASCII `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, max
-  64 chars, never ending in `-wt`). Development worktrees MUST live outside the
-  site scan namespace (`~/src/` or `~/tendcf-ops/.worktrees/`). Zero legacy
-  aliases (`tendcf-private`, `site-private`, `.mysite`) are accepted.
+  `<operator>-<name>` (lowercase ASCII `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z`, no
+  trailing newline, max 64 chars, never ending in `-wt`). Development worktrees
+  MUST live outside the site scan namespace (`~/src/` or
+  `~/tendcf-ops/.worktrees/`). Zero legacy aliases (`tendcf-private`,
+  `site-private`, `.mysite`) are accepted.
 - **Pair-bound, fail-closed selection:** one selector (`--site-name` >
   `TENDCF_SITE` > XDG active-site file `$XDG_CONFIG_HOME/tendcf/active-site`
   when absolute, else `~/.config/tendcf/active-site`, plain single-line
   non-symlink regular file) resolves `(tendcf-private-<site>,
-  tendcf-public-<site>)` together and fails closed when unset or missing. There
-  is no silent sole-directory glob and no uncoupled public/private selector.
+  tendcf-public-<site>)` together and fails closed when unset or missing (on
+  `nix2cf buildfile`, reading XDG `active-site` requires explicit workspace
+  opt-in via `--workspace`, `--ops-root`, or `TENDCF_SITE`). There is no silent
+  sole-directory glob and no uncoupled public/private selector.
 - **Lockfile isolation preserved (D21/D34/D35/D46):** local sibling clones
   exist for human/agent reading, diffing, and development; no device and no
-  release build ever reads a sibling checkout. Preview/test builds may pass an
-  explicit dev-only `--override-input <ns>=<path>`, which taints the build and
-  **refuses release signing and publishing** whenever any override is active.
-- **Runtime state and `*.d/` inputs:** mutable runtime state lives under XDG
-  (`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`), never inside git
-  checkouts, and multi-item site inputs are designed around `*.d/` directories
-  rather than single-file inventory assumptions.
+  release build ever reads a sibling checkout — builds take only what
+  `site.lock` pins. Preview/test builds may pass an explicit dev-only
+  `--override-input <ns>=<path>`: today it validates paths, warns loudly,
+  records taint on `CompileResult`/`WorkspaceResolution`, blocks `-o` artifact
+  writes without `--allow-tainted`, and fails `--check-releasable` /
+  `assert_releasable()`, while foreign-input substitution awaits `site.lock`
+  composition. Future release/signing pipelines (§9.11) MUST call the release
+  gate and MUST NOT accept artifacts from an override build (dev overrides are
+  also refused in release/CI builds per D46(9b)).
+- **XDG runtime state:** mutable runtime state lives under XDG
+  (`$XDG_STATE_HOME/tendcf`, `$XDG_CACHE_HOME/tendcf`, exposed by
+  `state_dir()` / `cache_dir()` in `compiler/nix2cf/workspace.py`), never
+  inside git checkouts.
 
 ---
 

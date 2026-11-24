@@ -3,7 +3,8 @@
     nix2cf buildfile --host mac --platform macos --supervisor launchd \
         --host-key ed25519:… --device-trust trust.json \
         (--site DIR | --site-name SLUG [--ops-root DIR] | --workspace [--ops-root DIR]) \
-        [--override-input NS=PATH ...] [--tendcf DIR] [--project] [-o OUT]
+        [--override-input NS=PATH ...] [--allow-tainted] [--check-releasable] \
+        [--tendcf DIR] [--project] [-o OUT]
 
 Renders exactly what one host would receive — the Bcfg2 `buildfile` shape the
 guide (§4) and the paper (§6.2) say to build first — without touching the
@@ -51,6 +52,7 @@ from .workspace import (
     format_overrides_summary,
     list_sites,
     parse_override_inputs,
+    refuse_release_if_tainted,
     resolve_site_input_dir,
     resolve_workspace,
 )
@@ -78,13 +80,12 @@ def _in_tree_tendcf() -> Path | None:
     return root if ok else None
 
 
-def _tendcf_dir(arg: str | None, fallback: Path | None = None) -> Path | None:
-    """--tendcf, else $TENDCF_DIR, else the enclosing tendcf checkout, else optional fallback."""
-    raw = arg or os.environ.get("TENDCF_DIR")
-    if raw:
-        return Path(raw).expanduser()
-    in_tree = _in_tree_tendcf()
-    return in_tree if in_tree is not None else fallback
+def _tendcf_dir(arg: str | None) -> Path | None:
+    """--tendcf, else $TENDCF_DIR, else the enclosing tendcf checkout."""
+    if arg is not None:
+        return Path(arg).expanduser()
+    raw = os.environ.get("TENDCF_DIR")
+    return Path(raw).expanduser() if raw else _in_tree_tendcf()
 
 
 def load_projector(tendcf: Path) -> Any:
@@ -99,9 +100,34 @@ def load_projector(tendcf: Path) -> Any:
 
 
 def cmd_buildfile(args: argparse.Namespace) -> int:
-    if args.site and (args.site_name is not None or args.ops_root is not None or args.workspace):
+    for flag, val in (
+        ("--site", args.site),
+        ("--services", args.services),
+        ("--roles", args.roles),
+        ("--launchd-writers", args.launchd_writers),
+        ("--tendcf", args.tendcf),
+        ("--output", args.output),
+        ("--device-trust", args.device_trust),
+    ):
+        if val is not None and not str(val).strip():
+            print(f"nix2cf: ERROR: {flag} must not be empty", file=sys.stderr)
+            return 2
+
+    has_site_dir = args.site is not None
+    has_explicit_files = any(getattr(args, attr) is not None for attr in SITE_FILES)
+    has_workspace_flags = (
+        args.site_name is not None or args.ops_root is not None or args.workspace
+    )
+    if has_site_dir and has_workspace_flags:
         print(
             "nix2cf: ERROR: --site cannot be combined with --site-name, --ops-root, or --workspace",
+            file=sys.stderr,
+        )
+        return 2
+    if has_explicit_files and has_workspace_flags:
+        print(
+            "nix2cf: ERROR: explicit --services/--roles/--launchd-writers cannot be combined "
+            "with --site-name, --ops-root, or --workspace",
             file=sys.stderr,
         )
         return 2
@@ -112,14 +138,28 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
         print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
         return 2
 
+    if args.check_releasable and overrides:
+        try:
+            refuse_release_if_tainted(overrides)
+        except WorkspaceError as exc:
+            print(f"nix2cf: REFUSED: {exc}", file=sys.stderr)
+            return 1
+
+    if args.output is not None and overrides and not args.allow_tainted:
+        print(
+            f"nix2cf: REFUSED: refusing to write artifact {args.output!r} while dev-only "
+            f"--override-input is active ({format_overrides_summary(overrides)}); pass "
+            "--allow-tainted for dev-only local preview output (never for release signing)",
+            file=sys.stderr,
+        )
+        return 1
+
     workspace: WorkspaceResolution | None = None
-    site: Path | None = Path(args.site) if args.site else None
-    explicit_files_complete = all(getattr(args, attr) for attr in SITE_FILES)
-    use_workspace = site is None and (
-        args.site_name is not None
-        or args.ops_root is not None
-        or args.workspace
-        or (not explicit_files_complete and "TENDCF_SITE" in os.environ)
+    site: Path | None = Path(args.site) if args.site is not None else None
+    use_workspace = (
+        not has_site_dir
+        and not has_explicit_files
+        and (has_workspace_flags or "TENDCF_SITE" in os.environ)
     )
     if use_workspace:
         try:
@@ -140,15 +180,17 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
 
     if overrides:
         print(
-            f"nix2cf: WARNING: dev-only local override active ({format_overrides_summary(overrides)}); "
-            "output is TAINTED and not releasable",
+            f"nix2cf: WARNING: dev-only --override-input active ({format_overrides_summary(overrides)}): "
+            "paths validated and build marked TAINTED (not releasable); site.lock foreign-input "
+            "substitution is not yet wired into compile_host (Site Model inputs are not substituted "
+            "from the override path)",
             file=sys.stderr,
         )
 
     paths = {}
     for attr, default_name in SITE_FILES.items():
         override = getattr(args, attr)
-        if override:
+        if override is not None:
             paths[attr] = Path(override)
         elif site is not None:
             paths[attr] = site / default_name
@@ -168,7 +210,7 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
         return 2
 
     schemas: Schemas | None = None
-    tendcf = _tendcf_dir(args.tendcf, fallback=workspace.tendcf_dir if workspace else None)
+    tendcf = _tendcf_dir(args.tendcf)
     if tendcf is not None:
         try:
             schemas = Schemas(tendcf / "schema")
@@ -213,7 +255,7 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
             print(f"nix2cf: REFUSED by tendcf projector: {exc}", file=sys.stderr)
             return 1
 
-    if args.output:
+    if args.output is not None:
         Path(args.output).write_bytes(out)
     else:
         sys.stdout.buffer.write(out)
@@ -260,6 +302,13 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             for warn in inventory.warnings:
                 print(f"warning: {warn}")
         return 0
+
+    if args.config is not None and not args.config.strip():
+        print("nix2cf: ERROR: --config must not be empty", file=sys.stderr)
+        return 2
+    if args.config is not None and args.site_name is not None:
+        print("nix2cf: ERROR: --config cannot be combined with --site-name", file=sys.stderr)
+        return 2
 
     try:
         overrides = parse_override_inputs(args.override_input)
@@ -377,7 +426,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="override_input",
         action="append",
         metavar="NS=PATH",
-        help="repeatable dev-only local checkout binding; taints output and refuses release signing/publishing",
+        help="repeatable dev-only local checkout binding; validates path, marks output TAINTED, blocks -o without --allow-tainted, and fails --check-releasable",
+    )
+    b.add_argument(
+        "--allow-tainted",
+        dest="allow_tainted",
+        action="store_true",
+        help="explicitly allow writing -o/--output when --override-input is active (dev-only preview; never releasable)",
+    )
+    b.add_argument(
+        "--check-releasable",
+        dest="check_releasable",
+        action="store_true",
+        help="refuse with exit 1 if any dev-only --override-input is active",
     )
     b.add_argument("--services")
     b.add_argument("--roles")

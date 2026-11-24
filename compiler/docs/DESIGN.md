@@ -125,24 +125,35 @@ establish the local workspace resolver (`nix2cf/workspace.py`) and
 `nix2cf workspace` subcommand:
 
 - **Base directory:** `~/tendcf-ops`, overridden by `--ops-root` >
-  `TENDCF_OPS_ROOT` > `~/tendcf-ops`. Holds optional `tendcf/`, required
-  `tendcf-private-<site>/`, optional `tendcf-public-<site>/`, and read-only
-  foreign `tendcf-public-<other>/` clones. Development worktrees live outside
-  the site scan namespace (`~/src/` or `~/tendcf-ops/.worktrees/`); `-wt`
-  suffixes are rejected as site slugs and flagged by `workspace --list`.
+  `TENDCF_OPS_ROOT` > `~/tendcf-ops`. Holds optional `tendcf/` (strictly
+  informational in `nix2cf workspace`; `buildfile` never auto-loads schemas or
+  `bin/projector.py` from it), required `tendcf-private-<site>/`, optional
+  `tendcf-public-<site>/`, and read-only foreign `tendcf-public-<other>/`
+  clones. Development worktrees live outside the site scan namespace (`~/src/`
+  or `~/tendcf-ops/.worktrees/`); `-wt` suffixes are rejected as site slugs and
+  flagged by `workspace --list`.
 - **Fail-closed, pair-bound selection:** `--site-name` > `TENDCF_SITE` >
   XDG `active-site` (`$XDG_CONFIG_HOME/tendcf/active-site` if absolute, else
-  `~/.config/tendcf/active-site`; plain single-line non-symlink regular file).
-  There is no sole-directory glob, no legacy alias (`tendcf-private`,
-  `site-private`, `.mysite`), and no uncoupled public/private selector.
-  `--site DIR` stays backward compatible for explicit paths and is mutually
-  exclusive with workspace flags.
+  `~/.config/tendcf/active-site`; plain single-line non-symlink regular file
+  opened with `O_NOFOLLOW | O_NONBLOCK`, <= 4096 bytes), or explicit `--config`
+  on `workspace` (mutually exclusive with `--site-name`, taking precedence over
+  ambient `TENDCF_SITE`, failing closed if missing). There is no sole-directory
+  glob, no legacy alias (`tendcf-private`, `site-private`, `.mysite`), and no
+  uncoupled public/private selector. On `buildfile`, XDG `active-site` requires
+  explicit opt-in (`--workspace`, `--ops-root`, or ambient `TENDCF_SITE` with
+  no `--site` or explicit file flags). `--site DIR` and explicit file flags
+  stay backward compatible and are mutually exclusive with workspace flags.
 - **Dev-only `--override-input <ns>=<path>`:** repeatable on `buildfile` and
-  `workspace`, validates `<ns>` as a strict slug, refuses duplicate namespaces
-  (never last-wins), verifies `<path>` exists as a directory, records the
-  canonical path on `WorkspaceResolution` and `CompileResult` (`tainted = True`),
-  warns loudly on stderr, and blocks release signing/publishing via
+  `workspace`. Today it validates `<ns>` as a strict slug, refuses duplicate
+  namespaces (never last-wins), verifies `<path>` exists as a directory,
+  records the canonical path on `WorkspaceResolution` and `CompileResult`
+  (`tainted = True`), warns loudly on stderr, blocks `buildfile -o` artifact
+  writes unless `--allow-tainted` is passed, and fails
   `refuse_release_if_tainted()` / `assert_releasable()` / `--check-releasable`.
+  Foreign-input substitution itself awaits `site.lock` composition; future
+  release/signing pipelines (§9.11) must enforce the release gate and refuse
+  artifacts from override builds (also refused in release/CI builds per
+  D46(9b)).
 - **XDG runtime state:** `state_dir()` (`$XDG_STATE_HOME/tendcf` or
   `~/.local/state/tendcf`) and `cache_dir()` (`$XDG_CACHE_HOME/tendcf` or
   `~/.cache/tendcf`) keep mutable state out of git checkouts.

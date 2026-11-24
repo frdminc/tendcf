@@ -99,17 +99,30 @@ uv run nix2cf buildfile \
 
 - **Selector precedence:** `--site-name` > `TENDCF_SITE` > XDG `active-site`
   file (`$XDG_CONFIG_HOME/tendcf/active-site` when absolute, else
-  `~/.config/tendcf/active-site`). Fails closed when unset (never globs a sole
-  checkout; zero legacy aliases).
-- **`--site DIR`** remains available for explicit directory paths and is
-  mutually exclusive with `--site-name`, `--ops-root`, and `--workspace`.
+  `~/.config/tendcf/active-site`), or explicit `--config PATH` on `workspace`
+  (mutually exclusive with `--site-name`, honored ahead of ambient
+  `TENDCF_SITE`, and failing closed if missing). Fails closed when unset (never
+  globs a sole checkout; zero legacy aliases). On `buildfile`, XDG `active-site`
+  is read only when workspace mode is explicitly opted in (`--workspace`,
+  `--ops-root`, or ambient `TENDCF_SITE` with no `--site` or explicit file
+  flags), keeping omitted-`--site` invocations hermetic.
+- **`--site DIR`** and explicit `--services`/`--roles`/`--launchd-writers`
+  remain available and are mutually exclusive with `--site-name`, `--ops-root`,
+  and `--workspace`.
+- **`<ops_root>/tendcf`** is reported by `nix2cf workspace` strictly as
+  informational metadata; `buildfile` never auto-loads schemas or
+  `bin/projector.py` from a sibling `<ops_root>/tendcf` checkout.
 - **Dev-only `--override-input NS=PATH`** (repeatable on `buildfile` and
-  `workspace`) binds a local directory during preview/test builds, emits a
-  stderr warning, marks the result tainted, and refuses release
-  signing/publishing (`workspace --check-releasable`, `assert_releasable()`).
-- **XDG runtime state:** mutable state and cache live under
-  `$XDG_STATE_HOME/tendcf` and `$XDG_CACHE_HOME/tendcf`, never inside git
-  checkouts.
+  `workspace`): today it validates the namespace and target directory, warns
+  loudly on stderr, records taint on `WorkspaceResolution` and `CompileResult`,
+  refuses `-o`/`--output` writes unless `--allow-tainted` is also passed, and
+  fails `--check-releasable` / `assert_releasable()`. Actual `site.lock`
+  foreign-input substitution is not yet wired into `compile_host`; future
+  release/signing pipelines must call the release gate and refuse override
+  builds.
+- **XDG runtime state:** `workspace.state_dir()` (`$XDG_STATE_HOME/tendcf` or
+  `~/.local/state/tendcf`) and `workspace.cache_dir()` (`$XDG_CACHE_HOME/tendcf`
+  or `~/.cache/tendcf`) keep mutable state out of git checkouts.
 
 ## Not here yet
 

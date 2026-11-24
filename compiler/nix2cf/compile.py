@@ -30,14 +30,21 @@ from __future__ import annotations
 import copy
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import rfc8785
 
 from .sitemodel import GOAL_FILE_SCHEMA, Document, Schemas, SiteModel
-from .workspace import OverrideInput, format_overrides_summary, refuse_release_if_tainted
+from .workspace import (
+    OverrideInput,
+    WorkspaceError,
+    format_overrides_summary,
+    normalize_overrides,
+    refuse_release_if_tainted,
+)
 
 # Must equal the `const` of `tendcf/schema/goal-file.schema.json`
 # `schema_version`; CI fails when it does not (.github/workflows/check.yml).
@@ -766,7 +773,7 @@ def compile_host(
     host: HostSpec,
     schemas: Schemas | None = None,
     schema_version: int = GOAL_FILE_SCHEMA_VERSION,
-    overrides: Sequence[OverrideInput] = (),
+    overrides: Iterable[OverrideInput] | Mapping[str, Path | str] | None = None,
 ) -> CompileResult:
     """The whole path for one host. Raises CompileError; never emits a wrong file.
 
@@ -777,14 +784,20 @@ def compile_host(
 
     `overrides` records any explicit dev-only `--override-input` bindings on the
     returned `CompileResult` (setting `tainted = True` and blocking release via
-    `assert_releasable()`).
+    `assert_releasable()`). Note: `site.lock` foreign-input substitution is not
+    yet wired into `compile_host`, so overrides record taint only today.
     """
-    override_tuple = tuple(overrides)
+    try:
+        override_tuple = normalize_overrides(overrides)
+    except WorkspaceError as exc:
+        raise CompileError([str(exc)]) from exc
     errors: list[str] = host_errors(host, schema_version)
     diagnostics: list[str] = []
     if override_tuple:
         diagnostics.append(
-            f"TAINTED (not releasable): dev-only local override active ({format_overrides_summary(override_tuple)})"
+            f"TAINTED (not releasable): dev-only --override-input active "
+            f"({format_overrides_summary(override_tuple)}); foreign-input substitution "
+            "is not yet wired into compile_host"
         )
 
     selected, diag, errs = select_services(model, host)

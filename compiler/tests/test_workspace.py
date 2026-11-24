@@ -11,13 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from nix2cf.compile import HostSpec, compile_host
+from nix2cf.compile import CompileError, HostSpec, compile_host
 from nix2cf.sitemodel import Schemas, load_document, load_site_model
 from nix2cf.workspace import (
     OverrideInput,
     WorkspaceError,
+    _expand_path,
     active_site_config_path,
     cache_dir,
+    is_tendcf_checkout,
     list_sites,
     parse_override_inputs,
     refuse_release_if_tainted,
@@ -566,8 +568,9 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     assert ws_proc.stdout == baseline.stdout
     err = ws_proc.stderr.decode()
     assert "nix2cf: workspace: site=djbclark-lab source=cli" in err
-    assert "WARNING: dev-only local override active" in err
-    assert "TAINTED and not releasable" in err
+    assert "WARNING: dev-only --override-input active" in err
+    assert "TAINTED (not releasable)" in err
+    assert "not yet wired into compile_host" in err
 
     # Mutual exclusion: --site with --site-name or --ops-root or --workspace exits 2
     for extra in (["--site-name", "djbclark-lab"], ["--ops-root", str(ops)], ["--workspace"]):
@@ -695,18 +698,90 @@ def test_extra_edge_cases_symlinks_oversized_and_fallback_tendcf(
     with pytest.raises(WorkspaceError, match="exceeds 4096 bytes"):
         resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=big)
 
+    # Exact byte-limit check: multi-byte UTF-8 > 4096 bytes even with < 4096 chars fails closed.
+    utf8_over = tmp_path / "utf8-over"
+    utf8_over.write_bytes(b"#" + ("é".encode("utf-8") * 2048) + b"\ndjbclark\n")  # > 4096 bytes, < 2060 chars
+    with pytest.raises(WorkspaceError, match="exceeds 4096 bytes"):
+        resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=utf8_over)
+
+    # Exact 4096-byte file succeeds.
+    slug_bytes = b"\ndjbclark\n"
+    pad_len = 4096 - 1 - len(slug_bytes)
+    utf8_exact = tmp_path / "utf8-exact"
+    utf8_exact.write_bytes(b"#" + (b"x" * pad_len) + slug_bytes)
+    assert len(utf8_exact.read_bytes()) == 4096
+    assert resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=utf8_exact)[0] == "djbclark"
+
+    # CRLF is accepted; bare CR, NUL byte in comment, and U+2028 line separator are rejected.
+    crlf = tmp_path / "crlf-site"
+    crlf.write_bytes(b"# comment\r\n  djbclark \t\r\n")
+    assert resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=crlf)[0] == "djbclark"
+
+    bare_cr = tmp_path / "bare-cr"
+    bare_cr.write_bytes(b"djbclark\ralice\n")
+    with pytest.raises(WorkspaceError, match="bare CR"):
+        resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=bare_cr)
+
+    nul_comment = tmp_path / "nul-comment"
+    nul_comment.write_bytes(b"# comment\x00hidden\ndjbclark\n")
+    with pytest.raises(WorkspaceError, match="NUL byte"):
+        resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=nul_comment)
+
+    u2028 = tmp_path / "u2028-site"
+    u2028.write_text("djbclark\u2028alice\n", encoding="utf-8")
+    with pytest.raises(WorkspaceError, match="invalid site slug"):
+        resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=u2028)
+
     bad_utf8 = tmp_path / "bad-utf8"
-    bad_utf8.write_bytes(b"\xff\xfe\x00")
+    bad_utf8.write_bytes(b"\xff\xfe")
     with pytest.raises(WorkspaceError, match="valid UTF-8"):
         resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=bad_utf8)
 
-    # Dangling symlink and empty path in --override-input fail closed.
+    # Real FIFO active-site file fails closed immediately via O_NONBLOCK + S_ISREG (never hangs).
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "fifo-site"
+        os.mkfifo(fifo)
+        with pytest.raises(WorkspaceError, match="regular file"):
+            resolve_site_slug(None, {"HOME": str(tmp_path)}, config_path=fifo)
+
+    # Relative XDG_CONFIG_HOME is ignored end-to-end by resolve_site_slug, falling back to $HOME/.config.
+    home = tmp_path / "rel-home"
+    fallback_cfg = home / ".config" / "tendcf" / "active-site"
+    fallback_cfg.parent.mkdir(parents=True)
+    fallback_cfg.write_text("djbclark\n", encoding="utf-8")
+    assert resolve_site_slug(
+        None, {"HOME": str(home), "XDG_CONFIG_HOME": "relative/config"}
+    ) == ("djbclark", f"config:{fallback_cfg}")
+
+    # _expand_path: `~//etc` stays under $HOME (never drops $HOME to `/etc`), and `~root/foo` is refused.
+    assert _expand_path("~//etc", {"HOME": str(home)}) == home / "etc"
+    with pytest.raises(WorkspaceError, match="unsupported tilde user expansion"):
+        _expand_path("~root/foo", {"HOME": str(home)})
+
+    # Dangling symlink, symlink loop, and empty path in --override-input fail closed as WorkspaceError.
     dangling = tmp_path / "dangling-ov"
     dangling.symlink_to(tmp_path / "does-not-exist")
     with pytest.raises(WorkspaceError, match="does not exist"):
         parse_override_inputs([f"alice={dangling}"])
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    with pytest.raises(WorkspaceError, match="does not exist or is unreadable"):
+        parse_override_inputs([f"alice={loop_a}"])
     with pytest.raises(WorkspaceError, match="must not be empty"):
         parse_override_inputs(["alice="])
+
+    # Unreadable 0o000 ops_root raises WorkspaceError, not raw PermissionError.
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        locked = tmp_path / "locked-ops"
+        locked.mkdir()
+        locked.chmod(0o000)
+        try:
+            with pytest.raises(WorkspaceError, match="cannot read"):
+                list_sites(ops_root=locked, env={"HOME": str(tmp_path)})
+        finally:
+            locked.chmod(0o755)
 
     # Symlinked `site/` inside private_dir fails closed.
     priv = tmp_path / "tendcf-private-sym"
@@ -717,7 +792,7 @@ def test_extra_edge_cases_symlinks_oversized_and_fallback_tendcf(
     with pytest.raises(WorkspaceError, match="is a symlink"):
         resolve_site_input_dir(priv)
 
-    # list_sites flags symlinked and non-directory site entries.
+    # list_sites flags symlinked and non-directory site entries and symlinked tendcf/.
     ops = tmp_path / "ops-warn"
     ops.mkdir()
     (ops / "tendcf-private-link").symlink_to(outside)
@@ -729,8 +804,304 @@ def test_extra_edge_cases_symlinks_oversized_and_fallback_tendcf(
     assert any("symlink" in w for w in inv.warnings)
     assert any("non-directory" in w for w in inv.warnings)
 
-    # _tendcf_dir falls back to workspace tendcf_dir only when no flag/env/in-tree checkout exists.
+    # _tendcf_dir has NO workspace fallback: returns None when --tendcf, TENDCF_DIR, and in-tree are absent.
     monkeypatch.delenv("TENDCF_DIR", raising=False)
     monkeypatch.setattr(cli, "_in_tree_tendcf", lambda: None)
-    assert cli._tendcf_dir(None, fallback=ops / "tendcf") == ops / "tendcf"
-    assert cli._tendcf_dir(None, fallback=None) is None
+    assert cli._tendcf_dir(None) is None
+
+
+def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from nix2cf import cli
+
+    ops = tmp_path / "ops-no-fallback"
+    ops.mkdir()
+    priv = _plant_site(ops, "alice", with_public=False)
+    # Plant a fake <ops_root>/tendcf whose projector.py would raise if ever imported!
+    fake_tendcf = _plant_tendcf_checkout(ops / "tendcf")
+    (fake_tendcf / "bin" / "projector.py").write_text(
+        "raise AssertionError('ops_root/tendcf projector must NEVER be auto-loaded')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("TENDCF_DIR", raising=False)
+    monkeypatch.setattr(cli, "_in_tree_tendcf", lambda: None)
+    out_file = tmp_path / "out.json"
+    rc = cli.main(
+        [
+            "buildfile",
+            "--host", "mac",
+            "--platform", "macos",
+            "--supervisor", "launchd",
+            "--host-key", HOST_KEY,
+            "--device-trust", str(priv / "device-trust.json"),
+            "--ops-root", str(ops),
+            "--site-name", "alice",
+            "-o", str(out_file),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    # Because <ops_root>/tendcf is never auto-loaded, schema validation was NOT run from it.
+    assert "NOT validated" in err
+
+    # With --project and no --tendcf / TENDCF_DIR / in-tree checkout, buildfile fails closed (exit 2).
+    rc_proj = cli.main(
+        [
+            "buildfile",
+            "--host", "mac",
+            "--platform", "macos",
+            "--supervisor", "launchd",
+            "--host-key", HOST_KEY,
+            "--device-trust", str(priv / "device-trust.json"),
+            "--ops-root", str(ops),
+            "--site-name", "alice",
+            "--project",
+        ]
+    )
+    err_proj = capsys.readouterr().err
+    assert rc_proj == 2
+    assert "--project needs a tendcf checkout" in err_proj
+
+    # Hardening of <ops_root>/tendcf discovery: symlinks on tendcf/ or bin/projector.py fail closed.
+    outside_tendcf = _plant_tendcf_checkout(tmp_path / "outside-tendcf")
+    ops_link = tmp_path / "ops-tendcf-link"
+    ops_link.mkdir()
+    _plant_site(ops_link, "alice", with_public=False)
+    (ops_link / "tendcf").symlink_to(outside_tendcf)
+    assert is_tendcf_checkout(ops_link / "tendcf") is False
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_workspace(ops_root=ops_link, site_name="alice", env={"HOME": str(tmp_path)})
+    inv_link = list_sites(ops_root=ops_link, env={"HOME": str(tmp_path)})
+    assert inv_link.tendcf_dir is None
+    assert any("local tendcf entry" in w for w in inv_link.warnings)
+
+    # Symlinked bin/projector.py inside real <ops_root>/tendcf fails closed.
+    ops_proj_link = tmp_path / "ops-proj-link"
+    ops_proj_link.mkdir()
+    _plant_site(ops_proj_link, "alice", with_public=False)
+    td = _plant_tendcf_checkout(ops_proj_link / "tendcf")
+    (td / "bin" / "projector.py").unlink()
+    (td / "bin" / "projector.py").symlink_to(outside_tendcf / "bin" / "projector.py")
+    assert is_tendcf_checkout(td) is False
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_workspace(ops_root=ops_proj_link, site_name="alice", env={"HOME": str(tmp_path)})
+    inv_proj = list_sites(ops_root=ops_proj_link, env={"HOME": str(tmp_path)})
+    assert inv_proj.tendcf_dir is None
+    assert any("local tendcf entry" in w for w in inv_proj.warnings)
+
+
+def test_resolve_site_input_dir_refuses_symlinked_and_dangling_model_files(tmp_path: Path) -> None:
+    ops = tmp_path / "ops-sitemodel-sym"
+    ops.mkdir()
+    bob = _plant_site(ops, "bob", with_public=False)
+
+    # 1. Cross-site symlink at private_dir/services.yml -> refused.
+    alice = _plant_site(ops, "alice", with_public=False)
+    (alice / "services.yml").unlink()
+    (alice / "services.yml").symlink_to(bob / "services.yml")
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_site_input_dir(alice)
+
+    # 2. Cross-site symlink inside private_dir/site/services.yml -> refused.
+    carol = _plant_site(ops, "carol", with_public=False, in_subdir=True)
+    (carol / "site" / "services.yml").unlink()
+    (carol / "site" / "services.yml").symlink_to(bob / "services.yml")
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_site_input_dir(carol)
+
+    # 3. Cross-site symlink inside private_dir/site/ EVEN when root files are regular -> refused.
+    dave = _plant_site(ops, "dave", with_public=False)
+    (dave / "site").mkdir()
+    (dave / "site" / "roles.yml").symlink_to(bob / "roles.yml")
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_site_input_dir(dave)
+
+    # 4. Dangling symlink at private_dir/roles.yml and private_dir/site/roles.yml -> refused.
+    eve = _plant_site(ops, "eve", with_public=False)
+    (eve / "roles.yml").unlink()
+    (eve / "roles.yml").symlink_to(tmp_path / "nonexistent.yml")
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_site_input_dir(eve)
+
+    frank = _plant_site(ops, "frank", with_public=False, in_subdir=True)
+    (frank / "site" / "roles.yml").unlink()
+    (frank / "site" / "roles.yml").symlink_to(tmp_path / "nonexistent.yml")
+    with pytest.raises(WorkspaceError, match="is a symlink"):
+        resolve_site_input_dir(frank)
+
+    # 5. Non-regular file (directory) at services.yml -> refused.
+    grace = _plant_site(ops, "grace", with_public=False)
+    (grace / "services.yml").unlink()
+    (grace / "services.yml").mkdir()
+    with pytest.raises(WorkspaceError, match="not a regular file"):
+        resolve_site_input_dir(grace)
+
+
+def test_apfs_exact_case_site_directory_refusal(tmp_path: Path) -> None:
+    ops = tmp_path / "ops-case"
+    ops.mkdir()
+    (ops / "tendcf-private-Alice").mkdir()
+    # Requesting lowercase `alice` must fail closed even on case-insensitive APFS.
+    with pytest.raises(WorkspaceError, match="wrong directory casing"):
+        resolve_workspace(ops_root=ops, site_name="alice", env={"HOME": str(tmp_path)})
+
+    # Same for public companion with wrong casing.
+    _plant_site(ops, "bob", with_public=False)
+    (ops / "tendcf-public-Bob").mkdir()
+    with pytest.raises(WorkspaceError, match="wrong directory casing"):
+        resolve_workspace(ops_root=ops, site_name="bob", env={"HOME": str(tmp_path)})
+
+
+def test_override_taint_output_gate_check_releasable_and_compile_host_mapping(tmp_path: Path) -> None:
+    tendcf = _tendcf_root()
+    schemas = Schemas(tendcf / "schema")
+    model = load_site_model(SITE / "services.yml", SITE / "roles.yml", SITE / "launchd-writers.yml")
+    host = HostSpec(
+        name="mac",
+        platform="macos",
+        supervisor="launchd",
+        key=HOST_KEY,
+        device_trust=load_document(SITE / "device-trust.json").data,
+    )
+    ov_dir = tmp_path / "local-alice"
+    ov_dir.mkdir()
+
+    # compile_host normalizes Mapping[str, Path] cleanly.
+    res_map = compile_host(model, host, schemas, overrides={"alice": ov_dir})
+    assert res_map.tainted is True
+    assert res_map.overrides == (OverrideInput(namespace="alice", path=ov_dir),)
+    assert any("not yet wired" in d for d in res_map.diagnostics)
+
+    # Invalid overrides raise CompileError (never AttributeError).
+    with pytest.raises(CompileError):
+        compile_host(model, host, schemas, overrides="alice=/tmp")  # type: ignore[arg-type]
+    with pytest.raises(CompileError):
+        compile_host(model, host, schemas, overrides={"BadCaps": ov_dir})
+    with pytest.raises(CompileError):
+        compile_host(
+            model,
+            host,
+            schemas,
+            overrides=[OverrideInput("alice", ov_dir), OverrideInput("alice", ov_dir)],
+        )
+
+    # CLI buildfile -o taint gate and --check-releasable
+    env = _clean_env(tmp_path, TENDCF_DIR=str(tendcf))
+    out_file = tmp_path / "tainted-goal.json"
+    base_cmd = [
+        "buildfile",
+        "--host", "mac",
+        "--platform", "macos",
+        "--supervisor", "launchd",
+        "--host-key", HOST_KEY,
+        "--device-trust", str(SITE / "device-trust.json"),
+        "--site", str(SITE),
+    ]
+
+    # -o with --override-input WITHOUT --allow-tainted -> exit 1, file not written!
+    refused_out = _run_cli([*base_cmd, "--override-input", f"alice={ov_dir}", "-o", str(out_file)], env)
+    assert refused_out.returncode == 1
+    assert b"REFUSED:" in refused_out.stderr and b"--allow-tainted" in refused_out.stderr
+    assert not out_file.exists()
+
+    # -o with --override-input WITH --allow-tainted -> exit 0, file written, loud honest warning!
+    allowed_out = _run_cli(
+        [*base_cmd, "--override-input", f"alice={ov_dir}", "-o", str(out_file), "--allow-tainted"],
+        env,
+    )
+    assert allowed_out.returncode == 0, allowed_out.stderr.decode()
+    assert out_file.is_file()
+    assert b"not yet wired into compile_host" in allowed_out.stderr
+
+    # --check-releasable with --override-input -> exit 1!
+    refused_rel = _run_cli([*base_cmd, "--override-input", f"alice={ov_dir}", "--check-releasable"], env)
+    assert refused_rel.returncode == 1
+    assert b"REFUSED:" in refused_rel.stderr and refused_rel.stdout == b""
+
+    # --check-releasable without overrides -> exit 0!
+    ok_rel = _run_cli([*base_cmd, "--check-releasable"], env)
+    assert ok_rel.returncode == 0, ok_rel.stderr.decode()
+
+
+def test_cli_hermetic_flag_checks_config_precedence_and_sole_checkout_workspace(tmp_path: Path) -> None:
+    tendcf = _tendcf_root()
+    ops = tmp_path / "tendcf-ops"
+    ops.mkdir()
+    priv = _plant_site(ops, "alice", with_public=False)
+    env = _clean_env(tmp_path, TENDCF_DIR=str(tendcf))
+
+    base = [
+        "buildfile",
+        "--host", "mac",
+        "--platform", "macos",
+        "--supervisor", "launchd",
+        "--host-key", HOST_KEY,
+        "--device-trust", str(SITE / "device-trust.json"),
+    ]
+
+    # Empty string flags fail closed with exit 2 (is not None checks).
+    for bad_args in (
+        [*base, "--site", ""],
+        [*base, "--site", "", "--site-name", "alice"],
+        [*base, "--site", str(SITE), "--tendcf", ""],
+        [*base, "--services", "", "--roles", str(SITE / "roles.yml"), "--launchd-writers", str(SITE / "launchd-writers.yml")],
+    ):
+        proc = _run_cli(bad_args, env)
+        assert proc.returncode == 2, (bad_args, proc.stderr.decode())
+
+    # Ambient TENDCF_SITE + partial explicit file flags MUST NOT pull missing files from workspace.
+    env_site = _clean_env(tmp_path, TENDCF_DIR=str(tendcf), TENDCF_OPS_ROOT=str(ops), TENDCF_SITE="alice")
+    partial = _run_cli([*base, "--services", str(SITE / "services.yml")], env_site)
+    assert partial.returncode == 2
+    assert b"--roles or --site is required" in partial.stderr
+    assert b"workspace:" not in partial.stderr
+
+    # Explicit file flags + workspace flags are mutually exclusive (exit 2).
+    for ws_flag in (["--site-name", "alice"], ["--ops-root", str(ops)], ["--workspace"]):
+        mixed = _run_cli([*base, "--services", str(SITE / "services.yml"), *ws_flag], env)
+        assert mixed.returncode == 2
+        assert b"cannot be combined" in mixed.stderr
+
+    # All three explicit files + ambient TENDCF_SITE succeeds without touching workspace.
+    all_explicit = _run_cli(
+        [
+            *base,
+            "--services", str(SITE / "services.yml"),
+            "--roles", str(SITE / "roles.yml"),
+            "--launchd-writers", str(SITE / "launchd-writers.yml"),
+        ],
+        _clean_env(tmp_path, TENDCF_DIR=str(tendcf), TENDCF_SITE="nonexistent-site"),
+    )
+    assert all_explicit.returncode == 0, all_explicit.stderr.decode()
+    assert b"workspace:" not in all_explicit.stderr
+
+    # nix2cf workspace: explicit --config beats ambient TENDCF_SITE, fails closed if missing,
+    # and is mutually exclusive with --site-name.
+    cfg = tmp_path / "explicit-active-site"
+    cfg.write_text("alice\n", encoding="utf-8")
+    env_bob = _clean_env(tmp_path, TENDCF_SITE="nonexistent-bob")
+    ws_cfg = _run_cli(["workspace", "--ops-root", str(ops), "--config", str(cfg), "--json"], env_bob)
+    assert ws_cfg.returncode == 0, ws_cfg.stderr.decode()
+    assert json.loads(ws_cfg.stdout)["site_slug"] == "alice"
+
+    ws_missing_cfg = _run_cli(
+        ["workspace", "--ops-root", str(ops), "--config", str(tmp_path / "missing-cfg")],
+        env_bob,
+    )
+    assert ws_missing_cfg.returncode == 2
+    assert b"not found" in ws_missing_cfg.stderr
+
+    ws_conflict = _run_cli(
+        ["workspace", "--ops-root", str(ops), "--config", str(cfg), "--site-name", "alice"],
+        env,
+    )
+    assert ws_conflict.returncode == 2
+    assert b"cannot be combined" in ws_conflict.stderr
+
+    # CLI nix2cf workspace with no selector and a sole checkout exits 2 (no sole-dir glob).
+    ws_sole = _run_cli(["workspace", "--ops-root", str(ops)], env)
+    assert ws_sole.returncode == 2
+    assert b"no site selected" in ws_sole.stderr
+    assert priv.is_dir()
