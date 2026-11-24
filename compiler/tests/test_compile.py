@@ -121,7 +121,7 @@ def test_site_model_inputs_validate(schemas: Schemas) -> None:
 def test_example_site_mac_golden(schemas: Schemas) -> None:
     result = compile_host(_model(SITE), _host(SITE), schemas)
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 8
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 9
     assert doc["host"] == HOST_KEY
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "launchd", "state": "present"}}
     sup = doc["domains"]["supervision"]
@@ -307,7 +307,7 @@ def test_nixos_host_without_services_is_deliberately_unmanaged(tendcf: Path, sch
     # no-op on a file with no entries): drift in either repo shows up here.
     assert result.canonical == (tendcf / "deploy" / "linux" / "passthrough" / "goal-file.json").read_bytes()
     doc = result.goal_file
-    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 8
+    assert doc["schema_version"] == GOAL_FILE_SCHEMA_VERSION == 9
     assert doc["domains"]["supervision"] == {"coverage": "deliberately-unmanaged"}
     assert doc["domains"]["device-trust"]["entries"]["supervisor"] == {"host": {"name": "nixos", "state": "present"}}
     assert set(doc["domains"]) == {"device-trust", "supervision"}  # no unit-writer registry travels
@@ -386,22 +386,24 @@ def _host_shapes() -> dict[str, HostSpec]:
     }
 
 
-@pytest.mark.parametrize("old_version", [4, 5, 6, 7])
+@pytest.mark.parametrize("old_version", [4, 5, 6, 7, 8])
 @pytest.mark.parametrize("shape", ["launchd", "nixos", "systemd", "runit"])
 def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str, old_version: int) -> None:
-    """For service-free hosts (nixos, systemd, runit), v4..v7 differ from v8 only in
-    `schema_version`. For launchd hosts with prefix-only writers and default
-    `domain: "system"`, v4..v7 omit `unit.launchd.domain` while v8 states it explicitly."""
+    """For service-free hosts (nixos, systemd, runit), v4..v8 differ from v9 only in
+    `schema_version`. For launchd hosts with default `domain: "system"`, v8 differs
+    from v9 only in `schema_version` (including exact writers), while v4..v7 with
+    prefix-only writers omit `unit.launchd.domain`."""
     host = _host_shapes()[shape]
-    model_old = _v7_model(SITE) if shape == "launchd" else _model(SITE)
-    model_new = _v7_model(SITE) if shape == "launchd" else _model(SITE)
+    use_v7 = shape == "launchd" and old_version < 8
+    model_old = _v7_model(SITE) if use_v7 else _model(SITE)
+    model_new = _v7_model(SITE) if use_v7 else _model(SITE)
     old = compile_host(model_old, host, None, schema_version=old_version).goal_file
     new = compile_host(model_new, host, schemas).goal_file  # validates against the current schema
     assert old["schema_version"] == old_version and new["schema_version"] == GOAL_FILE_SCHEMA_VERSION
     assert new["domains"]["device-trust"]["entries"]["supervisor"]["host"]["name"] == host.supervisor
     normalized_old = copy.deepcopy(old)
     normalized_old["schema_version"] = GOAL_FILE_SCHEMA_VERSION
-    if shape == "launchd":
+    if shape == "launchd" and old_version < 8:
         for svc in normalized_old["domains"]["supervision"]["entries"]["service"].values():
             assert "domain" not in svc["unit"]["launchd"]
             svc["unit"]["launchd"]["domain"] = "system"
@@ -423,25 +425,48 @@ def test_dpkg_writer_renders_at_v4_but_is_refused_at_v5(schemas: Schemas) -> Non
         compile_host(model, _host(SITE), schemas)
 
 
-def test_launchd_domain_user_and_system_default(schemas: Schemas, lint) -> None:
+def test_launchd_domain_three_values_and_system_default(schemas: Schemas, lint) -> None:
     model = _model(SITE)
-    model.services.data["services"][0]["launchd"]["domain"] = "user"
-    model.services.data["services"][1]["launchd"]["domain"] = "system"
+    model.services.data["services"][0]["launchd"]["domain"] = "user-gui"
+    model.services.data["services"][1]["launchd"]["domain"] = "user-background"
     # service[2] (tailscaled) leaves domain omitted -> resolves to "system"
     assert validate_site_model(model, schemas) == []
     doc = compile_host(model, _host(SITE), schemas).goal_file
     svcs = doc["domains"]["supervision"]["entries"]["service"]
-    assert svcs["com.djbclark.caddy"]["unit"]["launchd"]["domain"] == "user"
-    assert svcs["com.djbclark.litellm"]["unit"]["launchd"]["domain"] == "system"
+    assert svcs["com.djbclark.caddy"]["unit"]["launchd"]["domain"] == "user-gui"
+    assert svcs["com.djbclark.litellm"]["unit"]["launchd"]["domain"] == "user-background"
     assert svcs["com.tendcf.example.tailscaled"]["unit"]["launchd"]["domain"] == "system"
     assert _cross_file_findings(lint, doc) == []
 
 
-def test_launchd_domain_user_refused_below_v8() -> None:
-    model = _v7_model(SITE)
+@pytest.mark.parametrize("version", [7, 8, 9])
+def test_launchd_stale_v8_user_domain_refused(version: int) -> None:
+    model = _v7_model(SITE) if version < 8 else _model(SITE)
     model.services.data["services"][0]["launchd"]["domain"] = "user"
-    with pytest.raises(CompileError, match="launchd.domain='user'"):
-        compile_host(model, _host(SITE), None, schema_version=7)
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), None, schema_version=version)
+    msg = str(exc.value)
+    assert "stale v8 launchd.domain='user'" in msg
+    assert "'user-gui'" in msg and "'user-background'" in msg
+
+
+@pytest.mark.parametrize("version", [7, 8])
+@pytest.mark.parametrize("domain", ["user-gui", "user-background"])
+def test_launchd_v9_user_domains_refused_below_v9(version: int, domain: str) -> None:
+    model = _v7_model(SITE) if version < 8 else _model(SITE)
+    model.services.data["services"][0]["launchd"]["domain"] = domain
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), None, schema_version=version)
+    msg = str(exc.value)
+    assert f"launchd.domain={domain!r}" in msg
+    assert "render at schema_version 9" in msg
+
+
+def test_launchd_invalid_domain_refused() -> None:
+    model = _model(SITE)
+    model.services.data["services"][0]["launchd"]["domain"] = "gui"
+    with pytest.raises(CompileError, match="invalid launchd.domain='gui'"):
+        compile_host(model, _host(SITE), None)
 
 
 def test_launchd_exact_label_and_tendcf_install_refused_below_v8() -> None:
