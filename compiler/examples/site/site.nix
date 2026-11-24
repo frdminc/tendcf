@@ -12,7 +12,7 @@
 #
 # FIXTURE, not site data (D21).
 {
-  contract_version = 3;
+  contract_version = 4;
 
   domains = {
     macos-launchd-services = {

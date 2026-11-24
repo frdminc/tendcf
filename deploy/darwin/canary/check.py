@@ -5,25 +5,28 @@
 # ///
 """Hold the darwin canary goal files, projections, and committed plist goldens to the same rails as deploy/linux/canary/.
 
-The darwin canary (`com.tendcf.canary.main`) is enforced in both the system
-LaunchDaemon domain (`domain: "system"`, state-1 macOS VM, issue #70) and the
-unprivileged user LaunchAgent domain (`domain: "user"`, issue #94). Each
-goal file (`schema_version: 8`, declaring `org.tendcf.execd` under
-`writer: "tendcf-install"`, issue #99) is canonical JCS bytes that validates
-against `goal-file.schema.json` and passes cross-file lint, with CMDB data
+The darwin canary (`com.tendcf.canary.main`) is enforced across all three
+launchd domains (`schema_version: 9`, declaring `org.tendcf.execd` under
+`writer: "tendcf-install"`, issues #99, #94, #103):
+  - `system` (`/Library/LaunchDaemons`, `UserName`, no `LimitLoadToSessionType`),
+  - `user-gui` (`~/Library/LaunchAgents`, `gui/<uid>`, `LimitLoadToSessionType=Aqua`, no `UserName`),
+  - `user-background` (`~/Library/LaunchAgents`, `user/<uid>`, `LimitLoadToSessionType=Background`, no `UserName`).
+
+Each goal file is canonical JCS bytes that validates against
+`goal-file.schema.json` and passes cross-file lint, with CMDB data
 byte-identical to `project(goal-file*.json)`.
 
-Both committed per-domain goldens
-(`tests/policy/golden/launchd/system/com.tendcf.canary.main.plist` and
-`tests/policy/golden/launchd/user/com.tendcf.canary.main.plist`) are
-byte-compared against rendered `policy/templates/launchd.plist.mustache`,
-parsed with `plistlib`, verified to differ ONLY in `UserName` (present in
-`system`, omitted in `user`), and checked with `plutil -lint` when available
+All three committed per-domain goldens
+(`tests/policy/golden/launchd/{system,user-gui,user-background}/com.tendcf.canary.main.plist`)
+are byte-compared against rendered `policy/templates/launchd.plist.mustache`,
+parsed with `plistlib`, verified for exact domain-specific keys (`UserName` vs
+`LimitLoadToSessionType`), and checked with `plutil -lint` when available
 (explicit SKIP on Linux where `plutil` is absent).
 
-Pass `--user-render [--bindir DIR]` on macOS to additionally execute a real
-unprivileged `cf-agent` render (not `-n`) into a scratch LaunchAgents directory
-and byte-compare the rendered plist against the committed `user` golden.
+Pass `--user-render [--bindir DIR]` on macOS to additionally execute real
+unprivileged `cf-agent` renders (not `-n`) into a scratch LaunchAgents
+directory for BOTH `user-gui` (`gui/<uid>`) and `user-background` (`user/<uid>`)
+and byte-compare the rendered plists against both committed user goldens.
 
 Run from anywhere:
   deploy/darwin/canary/check.py                          (exit 0 clean, 1 findings)
@@ -40,6 +43,7 @@ import os
 import plistlib
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -51,13 +55,21 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 CANARY_LABEL = "com.tendcf.canary.main"
 GOLDEN_SYSTEM_PLIST = REPO / "tests" / "policy" / "golden" / "launchd" / "system" / f"{CANARY_LABEL}.plist"
-GOLDEN_USER_PLIST = REPO / "tests" / "policy" / "golden" / "launchd" / "user" / f"{CANARY_LABEL}.plist"
+GOLDEN_USER_GUI_PLIST = REPO / "tests" / "policy" / "golden" / "launchd" / "user-gui" / f"{CANARY_LABEL}.plist"
+GOLDEN_USER_BG_PLIST = REPO / "tests" / "policy" / "golden" / "launchd" / "user-background" / f"{CANARY_LABEL}.plist"
 MUSTACHE_TEMPLATE = REPO / "policy" / "templates" / "launchd.plist.mustache"
+
+SESSION_TYPE_BY_DOMAIN = {
+    "system": None,
+    "user-gui": "Aqua",
+    "user-background": "Background",
+}
 
 PAIRS = (
     (HERE / "goal-file.json", HERE / "host_specific.json"),
     (HERE / "goal-file-absent.json", HERE / "host_specific-absent.json"),
-    (HERE / "goal-file-user.json", HERE / "host_specific-user.json"),
+    (HERE / "goal-file-user-gui.json", HERE / "host_specific-user-gui.json"),
+    (HERE / "goal-file-user-background.json", HERE / "host_specific-user-background.json"),
 )
 
 
@@ -72,11 +84,21 @@ def load(name: str, path: Path):
 def render_launchd_mustache(template_text: str, service_id: str, svc: dict) -> bytes:
     """Render `policy/templates/launchd.plist.mustache` identically to CFEngine mustache."""
     launchd = svc["unit"]["launchd"]
-    include_username = launchd["domain"] == "system"
+    domain = launchd["domain"]
+    include_username = domain == "system"
+    session_type = SESSION_TYPE_BY_DOMAIN[domain]
     out = template_text
     out = re.sub(
         r"\{\{#launchd_include_username\}\}\n(.*?)\{\{/launchd_include_username\}\}\n",
         lambda m: m.group(1) if include_username else "",
+        out,
+        flags=re.DOTALL,
+    )
+    out = re.sub(
+        r"\{\{#launchd_include_session_type\}\}\n(.*?)\{\{/launchd_include_session_type\}\}\n",
+        lambda m: m.group(1).replace("{{launchd_session_type}}", html.escape(session_type, quote=True))
+        if session_type
+        else "",
         out,
         flags=re.DOTALL,
     )
@@ -110,10 +132,159 @@ def render_launchd_mustache(template_text: str, service_id: str, svc: dict) -> b
     return out.encode("utf-8")
 
 
-def run_user_render_check(bindir: str | None) -> list[str]:
-    """Execute a real unprivileged `cf-agent` render (not `-n`) into a scratch
-    LaunchAgents dir and byte-compare against the committed user-domain golden."""
+def _run_single_user_render(
+    *,
+    bdir: Path,
+    domain: str,
+    ctl_domain_prefix: str,
+    session_type: str,
+    data_path: Path,
+    golden_path: Path,
+    user: str,
+    uid: str,
+    gid: str,
+) -> list[str]:
     problems: list[str] = []
+    cf_agent = bdir / "cf-agent"
+    cf_key = bdir / "cf-key"
+    ctl_target = f"{ctl_domain_prefix}/{uid}"
+
+    with tempfile.TemporaryDirectory(prefix=f"tendcf-user-render-{domain}.") as td:
+        work = Path(td)
+        for sub in ("data", "inputs", "state", "ppkeys", "tmp", "bin", "agents", "loaded"):
+            (work / sub).mkdir()
+        (work / "ppkeys").chmod(0o700)
+        for src in bdir.glob("cf-*"):
+            (work / "bin" / src.name).symlink_to(src)
+
+        env = dict(os.environ, CFENGINE_TEST_OVERRIDE_WORKDIR=str(work))
+        subprocess.run([str(cf_key)], env=env, capture_output=True, check=False)
+
+        stub_log = work / "launchctl.log"
+        stub_log.write_text("", encoding="utf-8")
+        stub = work / "launchctl-stub"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"log={shlex.quote(str(stub_log))}\n"
+            f"state={shlex.quote(str(work / 'loaded'))}\n"
+            'printf "%s" "$1" >> "$log"\n'
+            'for a in "${@:2}"; do printf "\\t%s" "$a" >> "$log"; done\n'
+            'printf "\\n" >> "$log"\n'
+            'case "${1:-}" in\n'
+            f'  print)\n'
+            f'    case "${{2:-}}" in\n'
+            f'      gui/{uid}|user/{uid}) exit 0 ;;\n'
+            f'      gui/{uid}/{CANARY_LABEL}) [ -f "$state/gui.{CANARY_LABEL}" ] && exit 0 || exit 113 ;;\n'
+            f'      user/{uid}/{CANARY_LABEL}) [ -f "$state/user.{CANARY_LABEL}" ] && exit 0 || exit 113 ;;\n'
+            f'      *) exit 64 ;;\n'
+            f'    esac ;;\n'
+            f'  bootstrap)\n'
+            f'    [ "${{2:-}}" = "{ctl_target}" ] && [ -f "${{3:-}}" ] || exit 64\n'
+            f'    grep -q "<string>{session_type}</string>" "${{3:-}}" || exit 5\n'
+            f'    : > "$state/{ctl_domain_prefix}.{CANARY_LABEL}"; exit 0 ;;\n'
+            '  *) exit 64 ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o700)
+
+        user_data = json.loads(data_path.read_text(encoding="utf-8"))
+        user_data["vars"]["tendcf_service"][CANARY_LABEL]["run_as"] = user
+        (work / "data" / "host_specific.json").write_text(
+            json.dumps(user_data, separators=(",", ":"), sort_keys=True), encoding="utf-8"
+        )
+
+        harness = work / "inputs" / "user-render.cf"
+        harness.write_text(
+            "body common control\n"
+            "{\n"
+            f'      inputs => {{ "{REPO / "policy" / "tendcf_services.cf"}" }};\n'
+            '      bundlesequence => { "tendcf_interlocks", "tendcf_user_render" };\n'
+            "}\n"
+            "bundle agent tendcf_user_render\n"
+            "{\n"
+            "  methods:\n"
+            '      "run"\n'
+            f'        usebundle => tendcf_services_apply("user", "{work / "agents"}", "{stub}", "{user}", "{gid}", "{user}", "{uid}");\n'
+            "}\n",
+            encoding="utf-8",
+        )
+
+        r = subprocess.run(
+            [str(cf_agent), "-K", "-I", "-f", str(harness)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        combined_out = r.stdout + r.stderr
+        if r.returncode != 0:
+            problems.append(
+                f"user-render ({domain}): cf-agent exited {r.returncode}: {combined_out.strip()}"
+            )
+        if "failed:" in combined_out or "refused:" in combined_out or "deferred:" in combined_out:
+            problems.append(
+                f"user-render ({domain}): unexpected refusal/failure/deferral in cf-agent output: {combined_out.strip()}"
+            )
+        rendered = work / "agents" / f"{CANARY_LABEL}.plist"
+        if not rendered.is_file():
+            problems.append(
+                f"user-render ({domain}): cf-agent did not render {rendered.name} "
+                f"(rc={r.returncode}): {combined_out.strip()}"
+            )
+            return problems
+        if not (work / "loaded" / f"{ctl_domain_prefix}.{CANARY_LABEL}").is_file():
+            problems.append(
+                f"user-render ({domain}): launchctl stub did not record loaded state for {ctl_target}/{CANARY_LABEL}"
+            )
+
+        rendered_bytes = rendered.read_bytes()
+        golden_bytes = golden_path.read_bytes()
+        if rendered_bytes != golden_bytes:
+            problems.append(
+                f"user-render ({domain}): rendered {rendered.name} ({len(rendered_bytes)} bytes) "
+                f"is not byte-identical to {golden_path.relative_to(REPO)} ({len(golden_bytes)} bytes)"
+            )
+
+        mode = stat.S_IMODE(rendered.stat().st_mode)
+        if mode != 0o644:
+            problems.append(f"user-render ({domain}): rendered plist mode is {oct(mode)}, expected 0o644")
+
+        backups = list((work / "agents").glob("*.cf-*-edit"))
+        if backups:
+            problems.append(f"user-render ({domain}): unexpected backup files left behind: {backups}")
+
+        log_lines = stub_log.read_text(encoding="utf-8").splitlines()
+        want_print = f"print\t{ctl_target}/{CANARY_LABEL}"
+        want_boot = f"bootstrap\t{ctl_target}\t{rendered}"
+        if want_print not in log_lines or want_boot not in log_lines:
+            problems.append(
+                f"user-render ({domain}): expected {want_print!r} and {want_boot!r} in launchctl log, got {log_lines!r}"
+            )
+
+        plutil = shutil.which("plutil")
+        if plutil:
+            pr = subprocess.run([plutil, "-lint", str(rendered)], capture_output=True, text=True)
+            if pr.returncode != 0:
+                problems.append(
+                    f"user-render ({domain}): plutil -lint failed: {(pr.stderr or pr.stdout).strip()}"
+                )
+
+        if not problems:
+            ver = subprocess.run([str(cf_agent), "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+            print(
+                f"darwin-canary-user-render ({domain}): OK ({ver}, user={user} uid={uid}, "
+                f"rendered byte-identical to {golden_path.relative_to(REPO)}, "
+                f"mode=0644, {ctl_target} bootstrap verified, plutil -lint OK)"
+            )
+    return problems
+
+
+def run_user_render_check(bindir: str | None) -> list[str]:
+    """Execute real unprivileged `cf-agent` renders (not `-n`) into scratch
+    LaunchAgents dirs for BOTH `user-gui` and `user-background` and byte-compare
+    against the committed goldens."""
     if sys.platform != "darwin":
         return ["`--user-render` requires macOS (darwin)"]
     if os.geteuid() == 0:
@@ -131,10 +302,8 @@ def run_user_render_check(bindir: str | None) -> list[str]:
                 return ["cf-agent not found; pass --bindir DIR"]
             bdir = Path(found).resolve().parent
 
-    cf_agent = bdir / "cf-agent"
-    cf_promises = bdir / "cf-promises"
-    cf_key = bdir / "cf-key"
-    for tool in (cf_agent, cf_promises, cf_key):
+    for tool_name in ("cf-agent", "cf-promises", "cf-key"):
+        tool = bdir / tool_name
         if not tool.is_file():
             return [f"missing CFEngine binary: {tool}"]
 
@@ -142,131 +311,26 @@ def run_user_render_check(bindir: str | None) -> list[str]:
     uid = str(os.getuid())
     gid = str(os.getgid())
 
+    problems: list[str] = []
     old_umask = os.umask(0o077)
     try:
-        with tempfile.TemporaryDirectory(prefix="tendcf-user-render.") as td:
-            work = Path(td)
-            for sub in ("data", "inputs", "state", "ppkeys", "tmp", "bin", "agents", "loaded"):
-                (work / sub).mkdir()
-            (work / "ppkeys").chmod(0o700)
-            for src in bdir.glob("cf-*"):
-                (work / "bin" / src.name).symlink_to(src)
-
-            env = dict(os.environ, CFENGINE_TEST_OVERRIDE_WORKDIR=str(work))
-            subprocess.run([str(cf_key)], env=env, capture_output=True, check=False)
-
-            stub_log = work / "launchctl.log"
-            stub_log.write_text("", encoding="utf-8")
-            stub = work / "launchctl-stub"
-            stub.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -euo pipefail\n"
-                f"log={str(stub_log)!r}\n"
-                f"state={str(work / 'loaded')!r}\n"
-                'printf "%s" "$1" >> "$log"\n'
-                'for a in "${@:2}"; do printf "\\t%s" "$a" >> "$log"; done\n'
-                'printf "\\n" >> "$log"\n'
-                'case "${1:-}" in\n'
-                f'  print) [ "${{2:-}}" = "gui/{uid}/{CANARY_LABEL}" ] || exit 64; '
-                f'[ -f "$state/{CANARY_LABEL}" ] && exit 0 || exit 113 ;;\n'
-                f'  bootstrap) [ "${{2:-}}" = "gui/{uid}" ] && [ -f "${{3:-}}" ] || exit 64; '
-                f': > "$state/{CANARY_LABEL}"; exit 0 ;;\n'
-                '  *) exit 64 ;;\n'
-                'esac\n',
-                encoding="utf-8",
+        for domain, ctl_prefix, sess, data_path, golden_path in (
+            ("user-gui", "gui", "Aqua", HERE / "host_specific-user-gui.json", GOLDEN_USER_GUI_PLIST),
+            ("user-background", "user", "Background", HERE / "host_specific-user-background.json", GOLDEN_USER_BG_PLIST),
+        ):
+            problems.extend(
+                _run_single_user_render(
+                    bdir=bdir,
+                    domain=domain,
+                    ctl_domain_prefix=ctl_prefix,
+                    session_type=sess,
+                    data_path=data_path,
+                    golden_path=golden_path,
+                    user=user,
+                    uid=uid,
+                    gid=gid,
+                )
             )
-            stub.chmod(0o700)
-
-            # Copy committed user-domain projection with run_as set to the running user.
-            user_data = json.loads((HERE / "host_specific-user.json").read_text(encoding="utf-8"))
-            user_data["vars"]["tendcf_service"][CANARY_LABEL]["run_as"] = user
-            (work / "data" / "host_specific.json").write_text(
-                json.dumps(user_data, separators=(",", ":"), sort_keys=True), encoding="utf-8"
-            )
-
-            harness = work / "inputs" / "user-render.cf"
-            harness.write_text(
-                "body common control\n"
-                "{\n"
-                f'      inputs => {{ "{REPO / "policy" / "tendcf_services.cf"}" }};\n'
-                '      bundlesequence => { "tendcf_interlocks", "tendcf_user_render" };\n'
-                "}\n"
-                "bundle agent tendcf_user_render\n"
-                "{\n"
-                "  methods:\n"
-                '      "run"\n'
-                f'        usebundle => tendcf_services_apply("user", "{work / "agents"}", "{stub}", "{user}", "{gid}", "{user}", "{uid}");\n'
-                "}\n",
-                encoding="utf-8",
-            )
-
-            r = subprocess.run(
-                [str(cf_agent), "-K", "-I", "-f", str(harness)],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            combined_out = r.stdout + r.stderr
-            if r.returncode != 0:
-                problems.append(
-                    f"user-render: cf-agent exited {r.returncode}: {combined_out.strip()}"
-                )
-            if "failed:" in combined_out or "refused:" in combined_out:
-                problems.append(
-                    f"user-render: unexpected refusal/failure in cf-agent output: {combined_out.strip()}"
-                )
-            rendered = work / "agents" / f"{CANARY_LABEL}.plist"
-            if not rendered.is_file():
-                problems.append(
-                    f"user-render: cf-agent did not render {rendered.name} "
-                    f"(rc={r.returncode}): {combined_out.strip()}"
-                )
-                return problems
-            if not (work / "loaded" / CANARY_LABEL).is_file():
-                problems.append(
-                    f"user-render: launchctl stub did not record loaded state for {CANARY_LABEL}"
-                )
-
-            rendered_bytes = rendered.read_bytes()
-            golden_bytes = GOLDEN_USER_PLIST.read_bytes()
-            if rendered_bytes != golden_bytes:
-                problems.append(
-                    f"user-render: rendered {rendered.name} ({len(rendered_bytes)} bytes) "
-                    f"is not byte-identical to {GOLDEN_USER_PLIST.relative_to(REPO)} ({len(golden_bytes)} bytes)"
-                )
-
-            mode = stat.S_IMODE(rendered.stat().st_mode)
-            if mode != 0o644:
-                problems.append(f"user-render: rendered plist mode is {oct(mode)}, expected 0o644")
-
-            backups = list((work / "agents").glob("*.cf-*-edit"))
-            if backups:
-                problems.append(f"user-render: unexpected backup files left behind: {backups}")
-
-            log_lines = stub_log.read_text(encoding="utf-8").splitlines()
-            want_print = f"print\tgui/{uid}/{CANARY_LABEL}"
-            want_boot = f"bootstrap\tgui/{uid}\t{rendered}"
-            if want_print not in log_lines or want_boot not in log_lines:
-                problems.append(
-                    f"user-render: expected {want_print!r} and {want_boot!r} in launchctl log, got {log_lines!r}"
-                )
-
-            plutil = shutil.which("plutil")
-            if plutil:
-                pr = subprocess.run([plutil, "-lint", str(rendered)], capture_output=True, text=True)
-                if pr.returncode != 0:
-                    problems.append(
-                        f"user-render: plutil -lint failed: {(pr.stderr or pr.stdout).strip()}"
-                    )
-
-            if not problems:
-                ver = subprocess.run([str(cf_agent), "--version"], capture_output=True, text=True).stdout.splitlines()[0]
-                print(
-                    f"darwin-canary-user-render: OK ({ver}, user={user} uid={uid}, "
-                    f"rendered byte-identical to {GOLDEN_USER_PLIST.relative_to(REPO)}, "
-                    f"mode=0644, gui/{uid} bootstrap verified, plutil -lint OK)"
-                )
     finally:
         os.umask(old_umask)
     return problems
@@ -277,7 +341,7 @@ def main() -> int:
     parser.add_argument(
         "--user-render",
         action="store_true",
-        help="run a real unprivileged cf-agent user-domain render into a scratch dir and compare to user golden",
+        help="run real unprivileged cf-agent user-gui and user-background renders into scratch dirs and compare to goldens",
     )
     parser.add_argument(
         "--bindir",
@@ -308,7 +372,8 @@ def main() -> int:
     parsed_goldens: dict[str, dict] = {}
     for domain, goal_key, golden_path in (
         ("system", "goal-file.json", GOLDEN_SYSTEM_PLIST),
-        ("user", "goal-file-user.json", GOLDEN_USER_PLIST),
+        ("user-gui", "goal-file-user-gui.json", GOLDEN_USER_GUI_PLIST),
+        ("user-background", "goal-file-user-background.json", GOLDEN_USER_BG_PLIST),
     ):
         if not golden_path.is_file():
             problems.append(f"missing committed golden: {golden_path.relative_to(REPO)}")
@@ -346,6 +411,8 @@ def main() -> int:
             }
             if domain == "system":
                 expected["UserName"] = svc["run_as"]
+            else:
+                expected["LimitLoadToSessionType"] = SESSION_TYPE_BY_DOMAIN[domain]
             if parsed != expected:
                 problems.append(
                     f"{golden_path.relative_to(REPO)} does not match deploy/darwin/canary/{goal_key} "
@@ -363,16 +430,22 @@ def main() -> int:
         else:
             print(f"SKIP (plutil not available): plutil -lint {golden_path.relative_to(REPO)}")
 
-    if "system" in parsed_goldens and "user" in parsed_goldens:
-        sys_p, usr_p = parsed_goldens["system"], parsed_goldens["user"]
-        if "UserName" not in sys_p or "UserName" in usr_p:
-            problems.append("system golden must carry UserName and user golden must omit UserName")
-        else:
-            sys_without_user = {k: v for k, v in sys_p.items() if k != "UserName"}
-            if sys_without_user != usr_p:
-                problems.append(
-                    f"system and user goldens differ beyond UserName: {sys_without_user!r} != {usr_p!r}"
-                )
+    if set(parsed_goldens) == {"system", "user-gui", "user-background"}:
+        sys_p = parsed_goldens["system"]
+        gui_p = parsed_goldens["user-gui"]
+        bg_p = parsed_goldens["user-background"]
+        if "UserName" not in sys_p or "LimitLoadToSessionType" in sys_p:
+            problems.append("system golden must carry UserName and omit LimitLoadToSessionType")
+        if "UserName" in gui_p or gui_p.get("LimitLoadToSessionType") != "Aqua":
+            problems.append("user-gui golden must omit UserName and set LimitLoadToSessionType=Aqua")
+        if "UserName" in bg_p or bg_p.get("LimitLoadToSessionType") != "Background":
+            problems.append("user-background golden must omit UserName and set LimitLoadToSessionType=Background")
+        base_keys = lambda d: {k: v for k, v in d.items() if k not in ("UserName", "LimitLoadToSessionType")}
+        if not (base_keys(sys_p) == base_keys(gui_p) == base_keys(bg_p)):
+            problems.append(
+                f"domain goldens differ beyond UserName/LimitLoadToSessionType: "
+                f"sys={base_keys(sys_p)!r}, gui={base_keys(gui_p)!r}, bg={base_keys(bg_p)!r}"
+            )
 
     if args.user_render:
         problems.extend(run_user_render_check(args.bindir))
@@ -383,7 +456,7 @@ def main() -> int:
         for problem in problems:
             print(f"darwin-canary-check: FAIL: {problem}")
         return 1
-    print(f"darwin-canary-check: OK ({len(PAIRS)} goal files, projections byte-identical, system+user goldens byte-identical)")
+    print(f"darwin-canary-check: OK ({len(PAIRS)} goal files, projections byte-identical, system+user-gui+user-background goldens byte-identical)")
     return 0
 
 

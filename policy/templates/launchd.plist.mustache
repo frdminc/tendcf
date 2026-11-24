@@ -14,6 +14,10 @@
     <key>UserName</key>
     <string>{{run_as}}</string>
 {{/launchd_include_username}}
+{{#launchd_include_session_type}}
+    <key>LimitLoadToSessionType</key>
+    <string>{{launchd_session_type}}</string>
+{{/launchd_include_session_type}}
     <key>WorkingDirectory</key>
     <string>{{working_dir}}</string>
     <key>RunAtLoad</key>

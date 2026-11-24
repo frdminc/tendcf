@@ -48,7 +48,7 @@ from .workspace import (
 
 # Must equal the `const` of `tendcf/schema/goal-file.schema.json`
 # `schema_version`; CI fails when it does not (.github/workflows/check.yml).
-GOAL_FILE_SCHEMA_VERSION = 8
+GOAL_FILE_SCHEMA_VERSION = 9
 # `supervisor` entered the device-trust domain at v4 (schema-v4 spec §2.1).
 # The `nixos` host exists only from v4 on (spec §6.2 item 6): the one v3
 # spelling, a `nixos` unit-writer, described nothing.
@@ -56,17 +56,21 @@ SUPERVISOR_SCHEMA_VERSION = 4
 # `unit.launchd.domain`, exact launchd unit-writer labels, and launchd
 # `writer: "tendcf-install"` entered at v8 (issues #99 + #94).
 LAUNCHD_V8_SCHEMA_VERSION = 8
-# Older versions this compiler can still state: 3, 4, 5, 6 and 7. For
-# service-free hosts (nixos, systemd, runit), v4..v7 differ from v8 only in
-# `schema_version`; for launchd hosts with `domain: "system"` and prefix-only
-# writers, v4..v7 omit `unit.launchd.domain` (refusing `domain: "user"` and
+# 3-value `unit.launchd.domain` (`system` | `user-gui` | `user-background`)
+# entered at v9 (issue #103), replacing v8's `"user"` fail-closed.
+LAUNCHD_V9_SCHEMA_VERSION = 9
+# Older versions this compiler can still state: 3, 4, 5, 6, 7 and 8. For
+# service-free hosts (nixos, systemd, runit), v4..v8 differ from v9 only in
+# `schema_version`; for launchd hosts with `domain: "system"`, v8 differs from
+# v9 only in `schema_version` (refusing v9's `user-gui`/`user-background` with
+# no silent rewrite), while v4..v7 omit `unit.launchd.domain` (and refuse
 # exact-label/`tendcf-install` launchd writers, which exist only from v8).
 # v3 also omits `supervisor`. Older-version output is never schema-validated.
 # The current version is derived, so a bump of GOAL_FILE_SCHEMA_VERSION cannot
-# leave the renderer refusing its own version. The literals 3..7 are NOT
+# leave the renderer refusing its own version. The literals 3..8 are NOT
 # derived: re-justify them (is that still a shape a device may hold?) at every
 # bump.
-SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, 7, GOAL_FILE_SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, 7, 8, GOAL_FILE_SCHEMA_VERSION)
 
 # The one state domain the reference projector reads
 # (`tendcf/bin/projector.py:PROJECTING_DOMAIN`). The Site Model's own domain
@@ -131,9 +135,11 @@ INTERLOCK_TIMEOUT_DEFAULT = 30
 # takes launchd's own (RunAtLoad and KeepAlive are false when the plist omits
 # them) — the supervisor default, per the same reasoning as working_dir.
 LAUNCHD_BOOL_DEFAULTS = {"run_at_load": False, "keep_alive": False}
-# Site Model `launchd.domain` is optional (services.schema.json v3); goal file
-# v8 requires it. Omitted resolves to `"system"` (operator ruling 2026-11-23, #94).
+# Site Model `launchd.domain` is optional (services.schema.json v4); goal file
+# v9 requires one of `system` | `user-gui` | `user-background`. Omitted resolves
+# to `"system"` (operator rulings 2026-11-23 #94 and 2026-11-24 #103).
 LAUNCHD_DOMAIN_DEFAULT = "system"
+LAUNCHD_DOMAINS_V9 = ("system", "user-gui", "user-background")
 
 TOKEN = re.compile(r"^(service|port|path|class|package|device|network|secret):(.+)\Z")
 # Token kinds whose providers are site registries (paths, secret names), not
@@ -653,23 +659,34 @@ def render_goal_file(
         used_bundles.add(bundle)
         launchd = rec["launchd"]
         launchd_domain = launchd.get("domain", LAUNCHD_DOMAIN_DEFAULT)
+        if launchd_domain == "user":
+            errors.append(
+                f"{sel.where}: service {rec['name']!r} sets stale v8 launchd.domain='user', "
+                f"which schema_version {LAUNCHD_V9_SCHEMA_VERSION} removed. "
+                "Resolution: choose 'user-gui' (Aqua GUI/Keychain) or "
+                "'user-background' (headless/logout-surviving user/<uid>)"
+            )
+            continue
+        if launchd_domain not in LAUNCHD_DOMAINS_V9:
+            errors.append(
+                f"{sel.where}: service {rec['name']!r} sets invalid launchd.domain={launchd_domain!r} "
+                f"(expected one of {list(LAUNCHD_DOMAINS_V9)}). "
+                "Resolution: set launchd.domain to 'system', 'user-gui', or 'user-background'"
+            )
+            continue
+        if schema_version < LAUNCHD_V9_SCHEMA_VERSION and launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
+            errors.append(
+                f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
+                f"which schema_version {schema_version} cannot state (it exists from "
+                f"{LAUNCHD_V9_SCHEMA_VERSION}). Resolution: render at "
+                f"schema_version {LAUNCHD_V9_SCHEMA_VERSION}"
+            )
+            continue
+        launchd_bools = {k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()}
         if schema_version < LAUNCHD_V8_SCHEMA_VERSION:
-            if launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
-                errors.append(
-                    f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
-                    f"which schema_version {schema_version} cannot state (it exists from "
-                    f"{LAUNCHD_V8_SCHEMA_VERSION}). Resolution: render at "
-                    f"schema_version {LAUNCHD_V8_SCHEMA_VERSION}"
-                )
-                continue
-            launchd_unit: dict[str, Any] = {
-                k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()
-            }
+            launchd_unit: dict[str, Any] = launchd_bools
         else:
-            launchd_unit = {
-                "domain": launchd_domain,
-                **{k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()},
-            }
+            launchd_unit = {"domain": launchd_domain, **launchd_bools}
         entry: dict[str, Any] = {
             "state": "present",
             "bundle": bundle,
