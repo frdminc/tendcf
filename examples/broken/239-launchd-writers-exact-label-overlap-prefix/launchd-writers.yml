@@ -40,5 +40,5 @@ writers:
     writer: apple
     note: "Not ours. Declared so it is not reported as an extra entry."
 
-  - prefix: org.tendcf.*
-    writer: cfengine
+  - label: com.djbclark.caddy
+    writer: third-party
