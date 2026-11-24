@@ -12,11 +12,11 @@
 #
 # FIXTURE, not site data (D21).
 {
-  contract_version = 2;
+  contract_version = 3;
 
   domains = {
     macos-launchd-services = {
-      description = "launchd jobs on the operator's Mac under com.djbclark.* and org.tendcf.*";
+      description = "launchd jobs on the operator's Mac under com.djbclark.* and com.tendcf.example.*";
     };
     macos-user-daemons = {
       description = "Third-party login items and vendor updaters";
@@ -105,7 +105,7 @@
       runs_as = "root";
       command = [ "/usr/local/bin/tailscaled" ];
       managed_by = "cfengine";
-      launchd = { label = "org.tendcf.tailscaled"; };
+      launchd = { label = "com.tendcf.example.tailscaled"; };
       provides = [ "service:tailscaled" "network:tailnet" ];
     }
   ];

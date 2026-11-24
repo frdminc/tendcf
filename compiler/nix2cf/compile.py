@@ -39,30 +39,25 @@ from .sitemodel import GOAL_FILE_SCHEMA, Document, Schemas, SiteModel
 
 # Must equal the `const` of `tendcf/schema/goal-file.schema.json`
 # `schema_version`; CI fails when it does not (.github/workflows/check.yml).
-GOAL_FILE_SCHEMA_VERSION = 7
+GOAL_FILE_SCHEMA_VERSION = 8
 # `supervisor` entered the device-trust domain at v4 (schema-v4 spec §2.1).
 # The `nixos` host exists only from v4 on (spec §6.2 item 6): the one v3
 # spelling, a `nixos` unit-writer, described nothing.
 SUPERVISOR_SCHEMA_VERSION = 4
-# Older versions this compiler can still state: 3, 4, 5 and 6. For inputs valid
-# under the current Site Model contract, rendering at v4, v5, v6 and v7 differs only
-# in `schema_version` (v7 changed the approval record only: the goal-file shape is
-# the same as v6's, so the family moved with it, issue 64; v6 narrowed the interlock `pre_action.command` argv to an
-# alphabet with an absolute command[0], a strict subset of v5's acceptance set,
-# so every Site Model that renders at v6 also renders at v5; v5 changed the unit-writer key language, which is a
-# superset of every launchd prefix nix2cf emits, retired the `dpkg` writer and
-# added `tendcf-install` and `unit-package`), and v3 differs by lacking the
-# `supervisor` entry. This does not establish migration compatibility for
-# arbitrary historical v4 output: v4 permitted `dpkg` unit-writer claims,
-# which v5 rejects. Older-version output is never schema-validated. The spec
-# names no downgrade path at v5 and no device holds a baseline (spec §4 item
-# 1); 3, 4, 5 and 6 stay as the shapes a not-yet-migrated device could still hold
-# (the deploy/linux/canary goal files were v5, then v6).
+# `unit.launchd.domain`, exact launchd unit-writer labels, and launchd
+# `writer: "tendcf-install"` entered at v8 (issues #99 + #94).
+LAUNCHD_V8_SCHEMA_VERSION = 8
+# Older versions this compiler can still state: 3, 4, 5, 6 and 7. For
+# service-free hosts (nixos, systemd, runit), v4..v7 differ from v8 only in
+# `schema_version`; for launchd hosts with `domain: "system"` and prefix-only
+# writers, v4..v7 omit `unit.launchd.domain` (refusing `domain: "user"` and
+# exact-label/`tendcf-install` launchd writers, which exist only from v8).
+# v3 also omits `supervisor`. Older-version output is never schema-validated.
 # The current version is derived, so a bump of GOAL_FILE_SCHEMA_VERSION cannot
-# leave the renderer refusing its own version. The literals 3, 4, 5 and 6 are NOT
+# leave the renderer refusing its own version. The literals 3..7 are NOT
 # derived: re-justify them (is that still a shape a device may hold?) at every
 # bump.
-SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, GOAL_FILE_SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (3, 4, 5, 6, 7, GOAL_FILE_SCHEMA_VERSION)
 
 # The one state domain the reference projector reads
 # (`tendcf/bin/projector.py:PROJECTING_DOMAIN`). The Site Model's own domain
@@ -114,6 +109,9 @@ INTERLOCK_TIMEOUT_DEFAULT = 30
 # takes launchd's own (RunAtLoad and KeepAlive are false when the plist omits
 # them) — the supervisor default, per the same reasoning as working_dir.
 LAUNCHD_BOOL_DEFAULTS = {"run_at_load": False, "keep_alive": False}
+# Site Model `launchd.domain` is optional (services.schema.json v3); goal file
+# v8 requires it. Omitted resolves to `"system"` (operator ruling 2026-11-23, #94).
+LAUNCHD_DOMAIN_DEFAULT = "system"
 
 TOKEN = re.compile(r"^(service|port|path|class|package|device|network|secret):(.+)\Z")
 # Token kinds whose providers are site registries (paths, secret names), not
@@ -178,11 +176,21 @@ def _by_name(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {s["name"]: s for s in items}
 
 
-def _prefix_matches(prefix: str, label: str) -> bool:
-    """`org.tendcf.*` matches `org.tendcf.x` and `org.tendcf.x.y`, not `org.tendcfx`."""
-    assert prefix.endswith(".*")
-    stem = prefix[:-2]
-    return label == stem or label.startswith(stem + ".")
+def _writer_key(writer: dict[str, Any]) -> str:
+    """The unit-writer map key for a launchd-writers.yml entry (`prefix` or exact `label`)."""
+    if "prefix" in writer:
+        return writer["prefix"]
+    return writer["label"]
+
+
+def _writer_matches(writer: dict[str, Any], label: str) -> bool:
+    """Prefix `com.tendcf.example.*` matches `com.tendcf.example.x`, not `com.tendcf.examplex`;
+    exact `label` matches only itself."""
+    if "prefix" in writer:
+        prefix = writer["prefix"]
+        assert prefix.endswith(".*")
+        return label.startswith(prefix[:-1])
+    return label == writer["label"]
 
 
 # --------------------------------------------------------------------------
@@ -537,6 +545,24 @@ def render_goal_file(
             continue
         used_bundles.add(bundle)
         launchd = rec["launchd"]
+        launchd_domain = launchd.get("domain", LAUNCHD_DOMAIN_DEFAULT)
+        if schema_version < LAUNCHD_V8_SCHEMA_VERSION:
+            if launchd_domain != LAUNCHD_DOMAIN_DEFAULT:
+                errors.append(
+                    f"{sel.where}: service {rec['name']!r} sets launchd.domain={launchd_domain!r}, "
+                    f"which schema_version {schema_version} cannot state (it exists from "
+                    f"{LAUNCHD_V8_SCHEMA_VERSION}). Resolution: render at "
+                    f"schema_version {LAUNCHD_V8_SCHEMA_VERSION}"
+                )
+                continue
+            launchd_unit: dict[str, Any] = {
+                k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()
+            }
+        else:
+            launchd_unit = {
+                "domain": launchd_domain,
+                **{k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()},
+            }
         entry: dict[str, Any] = {
             "state": "present",
             "bundle": bundle,
@@ -544,9 +570,7 @@ def render_goal_file(
             "command": list(rec["command"]),
             "working_dir": rec.get("working_dir", WORKING_DIR_DEFAULT[supervisor]),
             "unit": {
-                "launchd": {
-                    k: launchd.get(k, default) for k, default in LAUNCHD_BOOL_DEFAULTS.items()
-                }
+                "launchd": launchd_unit
             },
         }
         env = rec.get("env") or {}
@@ -594,23 +618,36 @@ def render_goal_file(
 
     # The unit-writer registry travels in the file because the DEVICE runs
     # extra-entry detection and does not have the Site Model (reconciliation
-    # §8). Every declared prefix is carried; repo/note prose is not.
+    # §8). Every declared prefix or exact label is carried; repo/note prose is not.
     writers: list[dict[str, Any]] = model.launchd_writers.data.get("writers", [])
-    writer_entries: dict[str, Any] = {
-        w["prefix"]: {"state": "present", "writer": w["writer"]} for w in writers
-    }
+    writer_entries: dict[str, Any] = {}
+    for w in writers:
+        key = _writer_key(w)
+        if schema_version < LAUNCHD_V8_SCHEMA_VERSION and (
+            "label" in w or w["writer"] == "tendcf-install"
+        ):
+            errors.append(
+                f"{model.launchd_writers.where(w)}: launchd unit-writer {key!r} "
+                f"(writer {w['writer']!r}) cannot be stated at schema_version "
+                f"{schema_version} (exact launchd labels and launchd `tendcf-install` "
+                f"exist from {LAUNCHD_V8_SCHEMA_VERSION}). Resolution: render at "
+                f"schema_version {LAUNCHD_V8_SCHEMA_VERSION}"
+            )
+            continue
+        writer_entries[key] = {"state": "present", "writer": w["writer"]}
     for entry_id in service_entries:
-        owners = [w for w in writers if _prefix_matches(w["prefix"], entry_id)]
+        owners = [w for w in writers if _writer_matches(w, entry_id)]
         if not owners:
             errors.append(
-                f"service entry {entry_id!r} falls under no prefix declared in "
-                f"{model.launchd_writers.path}. Resolution: declare its prefix with "
+                f"service entry {entry_id!r} falls under no prefix or exact label declared in "
+                f"{model.launchd_writers.path}. Resolution: declare its prefix or exact label with "
                 "writer `cfengine`, or relabel the service"
             )
         elif coverage == "comprehensive" and owners[0]["writer"] != "cfengine":
+            owner_key = _writer_key(owners[0])
             errors.append(
-                f"service entry {entry_id!r} falls under prefix "
-                f"{owners[0]['prefix']!r} whose writer is {owners[0]['writer']!r}, "
+                f"service entry {entry_id!r} falls under unit-writer "
+                f"{owner_key!r} whose writer is {owners[0]['writer']!r}, "
                 f"but domain {site_domain!r} is comprehensive and cfengine would be "
                 "a second writer. Resolution: change the writer or the label"
             )
