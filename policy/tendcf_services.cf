@@ -664,6 +664,38 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]+); the loader would read it as a variable reference";
 }
 
+bundle agent tendcf_ensure_user_launchagents(home_dir, owner)
+{
+  classes:
+      # Safe creation guard for ~/Library/LaunchAgents (Codex Bot P2 / Opus L8):
+      # require a non-root absolute home_dir without `..` traversal, a valid
+      # owner name, a real non-symlink Library directory, and that LaunchAgents
+      # does not already exist (and is not a symlink, including a dangling one).
+      "tendcf_user_home_ok"
+        expression => and(regcmp("/[^/].*", "$(home_dir)"),
+                          not(regcmp("(^|.*/)\\.\\.(/.*|$)", "$(home_dir)")));
+
+      "tendcf_user_owner_ok"
+        expression => and(regcmp("[a-z_][a-z0-9_-]*", "$(owner)"),
+                          islessthan(string_length("$(owner)"), 33));
+
+      "tendcf_user_library_dir_ok"
+        expression => and(isdir("$(home_dir)/Library"),
+                          not(islink("$(home_dir)/Library"))),
+        ifvarclass => "tendcf_user_home_ok";
+
+      "tendcf_user_launchagents_missing"
+        expression => and(not(fileexists("$(home_dir)/Library/LaunchAgents")),
+                          not(islink("$(home_dir)/Library/LaunchAgents"))),
+        ifvarclass => "tendcf_user_home_ok";
+
+  files:
+      "$(home_dir)/Library/LaunchAgents/."
+        create => "true",
+        perms => tendcf_user_dir_perms("$(owner)"),
+        ifvarclass => "darwin.!tendcf_cmdb_refused.tendcf_user_home_ok.tendcf_user_owner_ok.tendcf_user_library_dir_ok.tendcf_user_launchagents_missing";
+}
+
 bundle agent tendcf_services
 {
   classes:
@@ -676,6 +708,15 @@ bundle agent tendcf_services
 
       "tendcf_running_as_nonroot"
         expression => regcmp("[1-9][0-9]*", "$(sys.user_data[uid])");
+
+      # Validate sys.user_data[home_dir] before constructing
+      # `$(sys.user_data[home_dir])/Library/LaunchAgents`: reject empty, `/`,
+      # `//...`, or any `..` path component so a malformed passwd entry can
+      # never alias system-wide `/Library/LaunchAgents`.
+      "tendcf_user_home_valid"
+        expression => and(isvariable("sys.user_data[home_dir]"),
+                          regcmp("/[^/].*", "$(sys.user_data[home_dir])"),
+                          not(regcmp("(^|.*/)\\.\\.(/.*|$)", "$(sys.user_data[home_dir])")));
 
   methods:
       # Production entry point: binds the launchd adapter to its fixed system
@@ -694,7 +735,16 @@ bundle agent tendcf_services
                                            "0"),
         ifvarclass => "!tendcf_cmdb_refused.tendcf_running_as_root";
 
-      "services_user"
+      # Runs to completion before `services_user_darwin` enters
+      # tendcf_services_apply, so a freshly created ~/Library/LaunchAgents is
+      # visible to pass-1 isdir("$(launchd_dir)"). Symlinks and regular files
+      # at ~/Library/LaunchAgents are never touched and fail closed downstream.
+      "ensure_user_launchagents"
+        usebundle => tendcf_ensure_user_launchagents("$(sys.user_data[home_dir])",
+                                                     "$(sys.user_data[username])"),
+        ifvarclass => "darwin.!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root.tendcf_user_home_valid";
+
+      "services_user_darwin"
         usebundle => tendcf_services_apply("user",
                                            "$(sys.user_data[home_dir])/Library/LaunchAgents",
                                            "/bin/launchctl",
@@ -702,9 +752,32 @@ bundle agent tendcf_services
                                            "$(sys.user_data[gid])",
                                            "$(sys.user_data[username])",
                                            "$(sys.user_data[uid])"),
-        ifvarclass => "!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root";
+        ifvarclass => "darwin.!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root.tendcf_user_home_valid";
+
+      # Non-Darwin non-root runs (e.g. Linux CI flavour/host checks) do not
+      # depend on sys.user_data[home_dir]; launchd_dir is unused off Darwin.
+      "services_user_nondarwin"
+        usebundle => tendcf_services_apply("user",
+                                           "",
+                                           "/bin/launchctl",
+                                           "$(sys.user_data[username])",
+                                           "$(sys.user_data[gid])",
+                                           "$(sys.user_data[username])",
+                                           "$(sys.user_data[uid])"),
+        ifvarclass => "!darwin.!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root";
+
+  reports:
+      "!tendcf_cmdb_refused.!tendcf_running_as_root.!tendcf_running_as_nonroot"::
+        "tendcf: service actuation refused: sys.user_data[uid] is unavailable or invalid; refusing all service actuation";
+
+      "darwin.!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root.!tendcf_user_home_valid"::
+        "tendcf: service actuation refused: sys.user_data[home_dir] is unavailable or invalid for non-root launchd user domain; refusing all service actuation";
 }
 
+# Note: `launchd_group` is applied only in system mode (`tendcf_plist_perms`).
+# In user mode, `tendcf_user_plist_perms` intentionally omits `groups` because
+# non-root users cannot chgrp arbitrary BSD-inherited groups and
+# `sys.user_data[gid]` is numeric.
 bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, launchd_owner, launchd_group, launchd_run_user, launchd_uid)
 {
   vars:
@@ -769,6 +842,14 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "service_run_as[$(service_ids)]"
         string => "$(data:variables.tendcf_service[$(service_ids)][run_as])",
         ifvarclass => isvariable("data:variables.tendcf_service[$(service_ids)][run_as]");
+
+      "service_run_as_display[$(service_ids)]"
+        string => "$(service_run_as[$(service_ids)])",
+        ifvarclass => isvariable("service_run_as[$(service_ids)]");
+
+      "service_run_as_display[$(service_ids)]"
+        string => "<missing>",
+        ifvarclass => not(isvariable("data:variables.tendcf_service[$(service_ids)][run_as]"));
 
       # Collision detection across service_ids (H1 / Adversary #1): the schema
       # admits '.', '-', '_' and '@', all of which canonify() maps to '_'.
@@ -845,11 +926,18 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # state dispatch -- the one place this bundle inspects an entry's
       # value to pick a promise, which C-1 says belongs here and nowhere
       # upstream of it.
-      "service_$(service_canon[$(service_ids)])_present"
+      #
+      # Per-service class naming (Adversary M1): every per-service class puts
+      # its fixed semantic tag FIRST, terminated by `__`, with
+      # `$(service_canon[$(service_ids)])` LAST. No fixed tag contains `__`, so
+      # splitting on the first `__` uniquely identifies (tag, service_canon)
+      # and two distinct canonical IDs (e.g. `com.x.a` vs `com.x.a.launchd`)
+      # can never alias on any class name.
+      "tendcf_svc_present__$(service_canon[$(service_ids)])"
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
                               "present");
 
-      "service_$(service_canon[$(service_ids)])_absent"
+      "tendcf_svc_absent__$(service_canon[$(service_ids)])"
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
                               "absent");
 
@@ -869,12 +957,13 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # adapter (a systemd entry would otherwise become a LaunchDaemons
       # plist, and a launchd entry on Linux would be written to /Library
       # and handed to a launchctl that is not there). A later adapter adds
-      # its own `service_*_supported` disjunct; nothing here is removed.
+      # its own `tendcf_svc_*_supported__*` disjunct; nothing here is removed.
       #
       # launchd host guard: darwin with valid domain/identity parameters, an
-      # absolute, real (non-symlink) directory and an absolute, executable
-      # launchctl binary. Operand order is load-bearing (same reason as systemd
-      # below).
+      # absolute, real (non-symlink) directory (never system-wide
+      # `/Library/LaunchAgents` or `/Library/LaunchDaemons` in user mode) and
+      # an absolute, executable launchctl binary. Operand order is load-bearing
+      # (same reason as systemd below).
       "tendcf_launchd_mode_system"
         expression => strcmp("$(launchd_domain)", "system");
 
@@ -888,8 +977,11 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => and(regcmp("[a-z_][a-z0-9_-]*", "$(launchd_run_user)"),
                           islessthan(string_length("$(launchd_run_user)"), 33));
 
+      "tendcf_launchd_dir_is_system_agents"
+        expression => regcmp("/+Library/Launch(Agents|Daemons)/?", "$(launchd_dir)");
+
       "tendcf_launchd_mode_valid"
-        expression => "tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid)";
+        expression => "tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_uid_valid_user.tendcf_launchd_run_user_valid.!tendcf_launchd_dir_is_system_agents)";
 
       "tendcf_launchd_dir_abs"
         expression => regcmp("/.*", "$(launchd_dir)");
@@ -949,84 +1041,95 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # on the launchd path so a projection that skipped the schema cannot
       # traverse out of launchd_dir (via `/`) or inject spaces/quotes into
       # the returnszero() probe command string.
-      "service_$(service_canon[$(service_ids)])_launchd_id_valid"
+      "tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])"
         expression => and(regcmp("[A-Za-z0-9][A-Za-z0-9@._-]*", "$(service_ids)"),
                           islessthan(string_length("$(service_ids)"), 129));
 
-      "service_$(service_canon[$(service_ids)])_launchd"
+      "tendcf_svc_launchd__$(service_canon[$(service_ids)])"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "launchd");
 
-      "service_$(service_canon[$(service_ids)])_launchd_domain_valid"
+      "tendcf_svc_launchd_domain_valid__$(service_canon[$(service_ids)])"
         expression => or(strcmp("$(service_launchd_domain[$(service_ids)])", "system"),
                          strcmp("$(service_launchd_domain[$(service_ids)])", "user")),
         ifvarclass => isvariable("service_launchd_domain[$(service_ids)]");
 
-      "service_$(service_canon[$(service_ids)])_launchd_domain_match"
+      "tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)])"
         expression => strcmp("$(service_launchd_domain[$(service_ids)])", "$(launchd_domain)"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_domain_valid";
+        ifvarclass => "tendcf_svc_launchd_domain_valid__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_run_as_match"
+      # Re-enforce the schema's run_as alphabet (`^[a-z_][a-z0-9_-]*$`, <=32)
+      # in both system and user modes so an unvalidated projection cannot omit
+      # or corrupt UserName in system mode; user mode additionally requires an
+      # exact match with the running user.
+      "tendcf_svc_launchd_run_as_valid__$(service_canon[$(service_ids)])"
+        expression => and(isvariable("data:variables.tendcf_service[$(service_ids)][run_as]"),
+                          regcmp("[a-z_][a-z0-9_-]*", "$(service_run_as[$(service_ids)])"),
+                          islessthan(string_length("$(service_run_as[$(service_ids)])"), 33)),
+        ifvarclass => isvariable("service_run_as[$(service_ids)]");
+
+      "tendcf_svc_launchd_run_as_match__$(service_canon[$(service_ids)])"
         expression => strcmp("$(service_run_as[$(service_ids)])", "$(launchd_run_user)"),
         ifvarclass => isvariable("service_run_as[$(service_ids)]");
 
-      "service_$(service_canon[$(service_ids)])_launchd_run_as_ok"
-        expression => "tendcf_launchd_mode_system|(tendcf_launchd_mode_user.tendcf_launchd_run_user_valid.service_$(service_canon[$(service_ids)])_launchd_run_as_match)";
+      "tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"
+        expression => "(tendcf_launchd_mode_system.tendcf_svc_launchd_run_as_valid__$(service_canon[$(service_ids)]))|(tendcf_launchd_mode_user.tendcf_launchd_run_user_valid.tendcf_svc_launchd_run_as_valid__$(service_canon[$(service_ids)]).tendcf_svc_launchd_run_as_match__$(service_canon[$(service_ids)]))";
 
-      "service_$(service_canon[$(service_ids)])_systemd"
+      "tendcf_svc_systemd__$(service_canon[$(service_ids)])"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "systemd");
 
-      "service_$(service_canon[$(service_ids)])_launchd_supported"
-        expression => "service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_domain_match.service_$(service_canon[$(service_ids)])_launchd_run_as_ok";
+      "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_systemd_supported"
-        expression => "service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_host";
+      "tendcf_svc_systemd_supported__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_host";
 
-      "service_$(service_canon[$(service_ids)])_supported"
-        expression => "service_$(service_canon[$(service_ids)])_launchd_supported|service_$(service_canon[$(service_ids)])_systemd_supported";
+      "tendcf_svc_supported__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)])|tendcf_svc_systemd_supported__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_refused"
-        expression => "service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_supported.!tendcf_service_id_collision";
+      "tendcf_svc_refused__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_svc_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
-      # A tombstone has no unit, so it has no flavour and `_refused` (which
-      # needs `_present`) cannot see it. Where the units are the system
-      # configuration's, a tombstone is reported and never actuated (D3).
-      "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"
-        expression => "tendcf_systemd_units_elsewhere.!service_$(service_canon[$(service_ids)])_present.!tendcf_service_id_collision";
+      # A tombstone has no unit, so it has no flavour and `tendcf_svc_refused`
+      # (which needs `tendcf_svc_present`) cannot see it. Where the units are
+      # the system configuration's, a tombstone is reported and never actuated
+      # (D3).
+      "tendcf_svc_tombstone_elsewhere__$(service_canon[$(service_ids)])"
+        expression => "tendcf_systemd_units_elsewhere.!tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
       # launchd path-type snapshot (C-policy-04, plus symlink safety on
       # present): `isplain` is true only for a regular file and does not
       # follow symlinks. Evaluated only on a valid launchd host and valid id
       # when no service-id collision is present.
-      "service_$(service_canon[$(service_ids)])_plist_plain"
+      "tendcf_svc_plist_plain__$(service_canon[$(service_ids)])"
         expression => isplain("$(launchd_dir)/$(service_ids).plist"),
-        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_launchd_host.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
-      "service_$(service_canon[$(service_ids)])_plist_exists"
+      "tendcf_svc_plist_exists__$(service_canon[$(service_ids)])"
         expression => fileexists("$(launchd_dir)/$(service_ids).plist"),
-        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_launchd_host.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
-      "service_$(service_canon[$(service_ids)])_plist_linked"
+      "tendcf_svc_plist_linked__$(service_canon[$(service_ids)])"
         expression => islink("$(launchd_dir)/$(service_ids).plist"),
-        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_launchd_host.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
-      "service_$(service_canon[$(service_ids)])_plist_nonregular"
-        expression => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.!tendcf_service_id_collision.(service_$(service_canon[$(service_ids)])_plist_exists|service_$(service_canon[$(service_ids)])_plist_linked).!service_$(service_canon[$(service_ids)])_plist_plain";
+      "tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)])"
+        expression => "tendcf_launchd_host.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).!tendcf_service_id_collision.(tendcf_svc_plist_exists__$(service_canon[$(service_ids)])|tendcf_svc_plist_linked__$(service_canon[$(service_ids)])).!tendcf_svc_plist_plain__$(service_canon[$(service_ids)])";
 
       # Exact-case directory entry check for tombstones on case-insensitive
       # APFS (H1): readdir (`lsdir`) preserves on-disk case, so a tombstone
       # whose case differs from the file on disk does not match.
-      "service_$(service_canon[$(service_ids)])_plist_exact_case"
+      "tendcf_svc_plist_exact_case__$(service_canon[$(service_ids)])"
         expression => reglist("launchd_dir_entries", "$(service_plist_exact_re[$(service_ids)])"),
-        ifvarclass => "tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_launchd_host.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
       # launchd present actuation gate: flavour+host+id match, no id collision,
       # interlock bundle met, and target path is either absent or a regular
       # file (never a symlink or directory).
-      "service_$(service_canon[$(service_ids)])_launchd_go"
-        expression => "service_$(service_canon[$(service_ids)])_launchd_supported.!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).!service_$(service_canon[$(service_ids)])_plist_nonregular";
+      "tendcf_svc_launchd_go__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).!tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_present_nonregular"
-        expression => "service_$(service_canon[$(service_ids)])_launchd_supported.!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).service_$(service_canon[$(service_ids)])_plist_nonregular";
+      "tendcf_svc_launchd_present_nonregular__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)]).tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)])";
 
       # launchd tombstone gate (C-policy-04): explicit state == "absent",
       # !present, no id collision, valid label id, regular plist file at
@@ -1036,51 +1139,52 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # paths are a silent no-op. Same caveat as systemd below: `isplain` does
       # not prove tendcf wrote the regular file; unit-writer prefix ownership
       # is checked by lint/validator before projection.
-      "service_$(service_canon[$(service_ids)])_launchd_teardown"
-        expression => "tendcf_launchd_host.!tendcf_service_id_collision.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_plist_plain.!service_$(service_canon[$(service_ids)])_plist_nonregular.service_$(service_canon[$(service_ids)])_plist_exact_case";
+      "tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)])"
+        expression => "tendcf_launchd_host.!tendcf_service_id_collision.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).tendcf_svc_plist_plain__$(service_canon[$(service_ids)]).!tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)]).tendcf_svc_plist_exact_case__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_case_mismatch"
-        expression => "tendcf_launchd_host.!tendcf_service_id_collision.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_plist_plain.!service_$(service_canon[$(service_ids)])_plist_nonregular.!service_$(service_canon[$(service_ids)])_plist_exact_case";
+      "tendcf_svc_launchd_tombstone_case_mismatch__$(service_canon[$(service_ids)])"
+        expression => "tendcf_launchd_host.!tendcf_service_id_collision.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).tendcf_svc_plist_plain__$(service_canon[$(service_ids)]).!tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)]).!tendcf_svc_plist_exact_case__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_teardown_refused"
-        expression => "tendcf_launchd_host.!tendcf_service_id_collision.service_$(service_canon[$(service_ids)])_launchd_id_valid.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_plist_nonregular";
+      "tendcf_svc_launchd_teardown_refused__$(service_canon[$(service_ids)])"
+        expression => "tendcf_launchd_host.!tendcf_service_id_collision.tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).tendcf_svc_plist_nonregular__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_bad_id"
-        expression => "tendcf_launchd_host.!tendcf_service_id_collision.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.!service_$(service_canon[$(service_ids)])_launchd_id_valid";
+      "tendcf_svc_launchd_tombstone_bad_id__$(service_canon[$(service_ids)])"
+        expression => "tendcf_launchd_host.!tendcf_service_id_collision.tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_host_refused"
-        expression => "darwin.!tendcf_launchd_host.!tendcf_service_id_collision.service_$(service_canon[$(service_ids)])_absent.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_launchd_id_valid";
+      "tendcf_svc_launchd_tombstone_host_refused__$(service_canon[$(service_ids)])"
+        expression => "darwin.!tendcf_launchd_host.!tendcf_service_id_collision.tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])";
 
       # Pre-run snapshot of whether launchd has this PRESENT label loaded in
       # the active domain (`system` or `gui/<uid>`; C-policy-03, issue #94).
       # returnszero() is cached for the whole run while cache_system_functions
-      # is true (reload bootout also guards on !_launchd_bootstrapped).
+      # is true (reload bootout also guards on !tendcf_svc_launchd_bootstrapped).
       # Tombstones do NOT use returnszero(); they run a dedicated read-only
       # `commands:` probe below so non-113/3 IPC errors fail closed instead of
       # deleting a running daemon's plist.
-      "service_$(service_canon[$(service_ids)])_launchd_loaded"
+      "tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)])"
         expression => returnszero("$(launchctl_bin) print $(launchd_ctl_target)/$(service_ids)", "noshell"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go";
+        ifvarclass => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)])";
 
-      # Persistent reload-pending marker (M1): if a loaded plist was repaired
-      # in pass 1 but bootstrap did not complete (e.g. bootout failed or was
-      # lock-skipped), persist a namespace class across runs (24 h TTL) so the
-      # next run retries bootout+bootstrap even when the plist on disk is now
-      # unchanged. Cancelled on successful bootstrap or tombstone teardown.
-      "tendcf_launchd_reload_pending_$(service_canon[$(service_ids)])"
-        expression => "service_$(service_canon[$(service_ids)])_launchd_go.service_$(service_canon[$(service_ids)])_launchd_loaded.service_$(service_canon[$(service_ids)])_plist_changed.!service_$(service_canon[$(service_ids)])_launchd_bootstrapped.!opt_dry_run",
+      # Persistent reload-pending marker (M1, domain-scoped per Neon L7): if a
+      # loaded plist was repaired in pass 1 but bootstrap did not complete
+      # (e.g. bootout failed or was lock-skipped), persist a namespace class
+      # across runs (24 h TTL) scoped by `$(launchd_domain)` so the next run
+      # retries bootout+bootstrap even when the plist on disk is now unchanged.
+      # Cancelled on successful bootstrap or tombstone teardown.
+      "tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).tendcf_svc_plist_changed__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrapped__$(service_canon[$(service_ids)]).!opt_dry_run",
         scope => "namespace",
         persistence => "1440";
 
       # systemd actuation gate: the entry's own interlock bundle is met and no
       # service-id collision is present.
-      "service_$(service_canon[$(service_ids)])_systemd_go"
-        expression => "service_$(service_canon[$(service_ids)])_systemd_supported.!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
+      "tendcf_svc_systemd_go__$(service_canon[$(service_ids)])"
+        expression => "tendcf_svc_systemd_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision.!interlock_blocked_$(service_bundle_canon[$(service_ids)])";
 
       # `enabled` is the boot symlink (systemctl enable/disable); a present
       # service is started either way, as launchd's bootstrap starts it when
       # RunAtLoad is true.
-      "service_$(service_canon[$(service_ids)])_enabled"
+      "tendcf_svc_enabled__$(service_canon[$(service_ids)])"
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][unit][systemd][enabled])", "true");
 
       # Pre-run snapshots of the manager's state. returnszero() results are
@@ -1089,13 +1193,13 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # lets one run converge without a second restart: a unit that was
       # inactive is started, not started and then restarted because pass 2
       # sees it active.
-      "service_$(service_canon[$(service_ids)])_active"
+      "tendcf_svc_active__$(service_canon[$(service_ids)])"
         expression => returnszero("/usr/bin/systemctl is-active --quiet $(service_ids)", "noshell"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_supported.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_svc_systemd_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
-      "service_$(service_canon[$(service_ids)])_boot_enabled"
+      "tendcf_svc_boot_enabled__$(service_canon[$(service_ids)])"
         expression => returnszero("/usr/bin/systemctl is-enabled --quiet $(service_ids)", "noshell"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_supported.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_svc_systemd_supported__$(service_canon[$(service_ids)]).!tendcf_service_id_collision";
 
       # Tombstone on a systemd host: tear down only a REGULAR file of that
       # name, which is what this adapter renders. Anything else at the path
@@ -1111,26 +1215,26 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # does not stop `systemctl disable` from touching other links of the
       # unit (schema-v5-dpkg-reconciliation-2026-11-02.md section 6, S0).
       # launchd labels and runit names fall through untouched.
-      "service_$(service_canon[$(service_ids)])_unit_plain"
+      "tendcf_svc_unit_plain__$(service_canon[$(service_ids)])"
         expression => isplain("/etc/systemd/system/$(service_ids)"),
-        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!service_$(service_canon[$(service_ids)])_present";
+        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!tendcf_svc_present__$(service_canon[$(service_ids)])";
 
       # Something is at the path and it is not a regular file: refused and
       # reported below, nothing run. `islink` is read as well, so a link is
       # refused whatever fileexists says about its target.
-      "service_$(service_canon[$(service_ids)])_unit_exists"
+      "tendcf_svc_unit_exists__$(service_canon[$(service_ids)])"
         expression => fileexists("/etc/systemd/system/$(service_ids)"),
-        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!service_$(service_canon[$(service_ids)])_present";
+        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!tendcf_svc_present__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_unit_linked"
+      "tendcf_svc_unit_linked__$(service_canon[$(service_ids)])"
         expression => islink("/etc/systemd/system/$(service_ids)"),
-        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!service_$(service_canon[$(service_ids)])_present";
+        ifvarclass => "tendcf_systemd_host.!tendcf_service_id_collision.!tendcf_svc_present__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_teardown"
-        expression => "tendcf_systemd_host.!tendcf_service_id_collision.!service_$(service_canon[$(service_ids)])_present.service_$(service_canon[$(service_ids)])_unit_plain";
+      "tendcf_svc_teardown__$(service_canon[$(service_ids)])"
+        expression => "tendcf_systemd_host.!tendcf_service_id_collision.!tendcf_svc_present__$(service_canon[$(service_ids)]).tendcf_svc_unit_plain__$(service_canon[$(service_ids)])";
 
-      "service_$(service_canon[$(service_ids)])_teardown_refused"
-        expression => "tendcf_systemd_host.!tendcf_service_id_collision.!service_$(service_canon[$(service_ids)])_present.(service_$(service_canon[$(service_ids)])_unit_exists|service_$(service_canon[$(service_ids)])_unit_linked).!service_$(service_canon[$(service_ids)])_unit_plain";
+      "tendcf_svc_teardown_refused__$(service_canon[$(service_ids)])"
+        expression => "tendcf_systemd_host.!tendcf_service_id_collision.!tendcf_svc_present__$(service_canon[$(service_ids)]).(tendcf_svc_unit_exists__$(service_canon[$(service_ids)])|tendcf_svc_unit_linked__$(service_canon[$(service_ids)])).!tendcf_svc_unit_plain__$(service_canon[$(service_ids)])";
 
   files:
       # launchd plist render (C-policy-05, C-policy-03, Neon MH2, issue #94):
@@ -1142,7 +1246,6 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # `launchd_include_username` includes <key>UserName</key> in system mode
       # only and omits it cleanly in user mode.
       "$(launchd_dir)/$(service_ids).plist"
-        handle => "tendcf_launchd_render_system",
         perms => tendcf_plist_perms("$(launchd_owner)", "$(launchd_group)"),
         edit_defaults => tendcf_no_backup,
         edit_template => "$(this.promise_dirname)/templates/launchd.plist.mustache",
@@ -1150,13 +1253,12 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)", "launchd_include_username": true}'),
         classes => tendcf_plist_rendered(
-          "service_$(service_canon[$(service_ids)])_plist_changed",
-          "service_$(service_canon[$(service_ids)])_plist_ready",
-          "service_$(service_canon[$(service_ids)])_plist_failed"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.tendcf_launchd_mode_system";
+          "tendcf_svc_plist_changed__$(service_canon[$(service_ids)])",
+          "tendcf_svc_plist_ready__$(service_canon[$(service_ids)])",
+          "tendcf_svc_plist_failed__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_mode_system";
 
       "$(launchd_dir)/$(service_ids).plist"
-        handle => "tendcf_launchd_render_user",
         perms => tendcf_user_plist_perms("$(launchd_owner)"),
         edit_defaults => tendcf_no_backup,
         edit_template => "$(this.promise_dirname)/templates/launchd.plist.mustache",
@@ -1164,10 +1266,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)", "launchd_include_username": false}'),
         classes => tendcf_plist_rendered(
-          "service_$(service_canon[$(service_ids)])_plist_changed",
-          "service_$(service_canon[$(service_ids)])_plist_ready",
-          "service_$(service_canon[$(service_ids)])_plist_failed"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.tendcf_launchd_mode_user";
+          "tendcf_svc_plist_changed__$(service_canon[$(service_ids)])",
+          "tendcf_svc_plist_ready__$(service_canon[$(service_ids)])",
+          "tendcf_svc_plist_failed__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_mode_user";
 
       "/etc/systemd/system/$(service_ids)"
         create => "true",
@@ -1177,51 +1279,52 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         template_method => "mustache",
         template_data => mergedata("data:variables.tendcf_service[$(service_ids)]",
                                     '{"id": "$(service_ids)"}'),
-        classes => tendcf_unit_rendered("service_$(service_canon[$(service_ids)])_unit_changed"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go";
+        classes => tendcf_unit_rendered("tendcf_svc_unit_changed__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_systemd_go__$(service_canon[$(service_ids)])";
 
       # launchd tombstone delete (C-policy-04, Adversary #2, Neon L6): gated on
-      # a regular, exact-case plist file (`_launchd_teardown`). Waits for pass 2
-      # after the read-only tombstone probe confirms unloaded (exit 113/3) OR
-      # `launchctl bootout system/<label>` exits 0 (`_launchd_torn_down`). Any
-      # unexpected probe error or bootout failure keeps the plist on disk.
+      # a regular, exact-case plist file (`tendcf_svc_launchd_teardown`). Waits
+      # for pass 2 after the read-only tombstone probe confirms unloaded (exit
+      # 113/3) OR `launchctl bootout <target>/<label>` exits 0
+      # (`tendcf_svc_launchd_torn_down`). Any unexpected probe error or bootout
+      # failure keeps the plist on disk.
       "$(launchd_dir)/$(service_ids).plist"
         delete => tendcf_file_delete,
         classes => tendcf_launchd_delete(
-          "service_$(service_canon[$(service_ids)])_launchd_delete_failed",
-          "tendcf_launchd_reload_pending_$(service_canon[$(service_ids)])"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_teardown.(service_$(service_canon[$(service_ids)])_tombstone_unloaded|service_$(service_canon[$(service_ids)])_launchd_torn_down).!service_$(service_canon[$(service_ids)])_tombstone_probe_failed.!service_$(service_canon[$(service_ids)])_launchd_teardown_failed";
+          "tendcf_svc_launchd_delete_failed__$(service_canon[$(service_ids)])",
+          "tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)]).(tendcf_svc_tombstone_unloaded__$(service_canon[$(service_ids)])|tendcf_svc_launchd_torn_down__$(service_canon[$(service_ids)])).!tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_teardown_failed__$(service_canon[$(service_ids)])";
 
       # Removal waits for the teardown command below (pass 2), because
       # `systemctl disable` needs the unit file still in place.
       "/etc/systemd/system/$(service_ids)"
         delete => tendcf_tidy,
         classes => tendcf_unit_removed,
-        ifvarclass => "service_$(service_canon[$(service_ids)])_torn_down";
+        ifvarclass => "tendcf_svc_torn_down__$(service_canon[$(service_ids)])";
 
   commands:
       # launchd (C-policy-03). The files section ran first in this pass, so a
       # rendered plist is on disk with 0644 and expected ownership before
       # launchd is called. Only exit 0 is treated as success (launchctl(1)
       # EXIT STATUS). Under `-n` (`opt_dry_run`), CFEngine emits WARN on a
-      # file promise that would change (setting `_plist_failed` via
+      # file promise that would change (setting `tendcf_svc_plist_failed` via
       # SetPromiseOutcomeClasses); the `opt_dry_run` branch lets CFEngine
       # log `Would execute script ...` previews without executing launchctl,
       # while normal (`!opt_dry_run`) runs stay strictly fail-closed on
-      # `_plist_ready.!_plist_failed`.
+      # `tendcf_svc_plist_ready.!tendcf_svc_plist_failed`.
       #
       # 1. Reload on drift/repair (or persisted reload-pending): already loaded
       #    AND plist was repaired (or a prior reload did not finish) -> bootout
       #    $(launchd_ctl_target)/<label> first; bootstrap below runs only if bootout exits 0.
-      #    `!_launchd_bootstrapped` keeps this safe even if cache_system_functions
-      #    were disabled (L1).
+      #    `!tendcf_svc_launchd_bootstrapped` keeps this safe even if
+      #    cache_system_functions were disabled (L1).
       "$(launchctl_bin)"
         arglist => { "bootout", "$(launchd_ctl_target)/$(service_ids)" },
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd(
-          "service_$(service_canon[$(service_ids)])_launchd_booted_out",
-          "service_$(service_canon[$(service_ids)])_launchd_bootout_failed"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.service_$(service_canon[$(service_ids)])_launchd_loaded.!service_$(service_canon[$(service_ids)])_launchd_booted_out.!service_$(service_canon[$(service_ids)])_launchd_bootout_failed.!service_$(service_canon[$(service_ids)])_launchd_bootstrapped.((!opt_dry_run.service_$(service_canon[$(service_ids)])_plist_ready.!service_$(service_canon[$(service_ids)])_plist_failed.(service_$(service_canon[$(service_ids)])_plist_changed|tendcf_launchd_reload_pending_$(service_canon[$(service_ids)])))|(opt_dry_run.(service_$(service_canon[$(service_ids)])_plist_failed|tendcf_launchd_reload_pending_$(service_canon[$(service_ids)]))))";
+          "tendcf_svc_launchd_booted_out__$(service_canon[$(service_ids)])",
+          "tendcf_svc_launchd_bootout_failed__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_booted_out__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootout_failed__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrapped__$(service_canon[$(service_ids)]).((!opt_dry_run.tendcf_svc_plist_ready__$(service_canon[$(service_ids)]).!tendcf_svc_plist_failed__$(service_canon[$(service_ids)]).(tendcf_svc_plist_changed__$(service_canon[$(service_ids)])|tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)])))|(opt_dry_run.(tendcf_svc_plist_failed__$(service_canon[$(service_ids)])|tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)]))))";
 
       # 2. Load: not loaded before the run, OR just booted out after a repair.
       #    When unchanged and loaded, neither condition holds and no write
@@ -1231,10 +1334,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         arglist => { "bootstrap", "$(launchd_ctl_target)", "$(launchd_dir)/$(service_ids).plist" },
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
-          "service_$(service_canon[$(service_ids)])_launchd_bootstrapped",
-          "service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed",
-          "tendcf_launchd_reload_pending_$(service_canon[$(service_ids)])"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_go.!service_$(service_canon[$(service_ids)])_launchd_bootstrapped.!service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed.((!opt_dry_run.service_$(service_canon[$(service_ids)])_plist_ready.!service_$(service_canon[$(service_ids)])_plist_failed.(!service_$(service_canon[$(service_ids)])_launchd_loaded|service_$(service_canon[$(service_ids)])_launchd_booted_out))|(opt_dry_run.((!service_$(service_canon[$(service_ids)])_launchd_loaded.(service_$(service_canon[$(service_ids)])_plist_ready|service_$(service_canon[$(service_ids)])_plist_failed))|(service_$(service_canon[$(service_ids)])_launchd_loaded.(service_$(service_canon[$(service_ids)])_plist_failed|tendcf_launchd_reload_pending_$(service_canon[$(service_ids)]))))))";
+          "tendcf_svc_launchd_bootstrapped__$(service_canon[$(service_ids)])",
+          "tendcf_svc_launchd_bootstrap_failed__$(service_canon[$(service_ids)])",
+          "tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrapped__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_bootstrap_failed__$(service_canon[$(service_ids)]).((!opt_dry_run.tendcf_svc_plist_ready__$(service_canon[$(service_ids)]).!tendcf_svc_plist_failed__$(service_canon[$(service_ids)]).(!tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)])|tendcf_svc_launchd_booted_out__$(service_canon[$(service_ids)])))|(opt_dry_run.((!tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).(tendcf_svc_plist_ready__$(service_canon[$(service_ids)])|tendcf_svc_plist_failed__$(service_canon[$(service_ids)])))|(tendcf_svc_launchd_loaded__$(service_canon[$(service_ids)]).(tendcf_svc_plist_failed__$(service_canon[$(service_ids)])|tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)]))))))";
 
       # 3a. Tombstone read-only loaded-state probe (Adversary #2): classifies
       #     exit 0 as loaded, exit 113 ("Could not find specified service") or
@@ -1246,10 +1349,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         arglist => { "print", "$(launchd_ctl_target)/$(service_ids)" },
         contain => tendcf_noshell_readonly,
         classes => tendcf_launchd_tombstone_probe(
-          "service_$(service_canon[$(service_ids)])_tombstone_loaded",
-          "service_$(service_canon[$(service_ids)])_tombstone_unloaded",
-          "service_$(service_canon[$(service_ids)])_tombstone_probe_failed"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_teardown.!service_$(service_canon[$(service_ids)])_tombstone_loaded.!service_$(service_canon[$(service_ids)])_tombstone_unloaded.!service_$(service_canon[$(service_ids)])_tombstone_probe_failed";
+          "tendcf_svc_tombstone_loaded__$(service_canon[$(service_ids)])",
+          "tendcf_svc_tombstone_unloaded__$(service_canon[$(service_ids)])",
+          "tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)]).!tendcf_svc_tombstone_loaded__$(service_canon[$(service_ids)]).!tendcf_svc_tombstone_unloaded__$(service_canon[$(service_ids)]).!tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)])";
 
       # 3b. Tombstone teardown (C-policy-04): regular exact-case plist exists
       #     and probe confirmed job is loaded -> bootout first; pass 2 deletes
@@ -1258,10 +1361,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         arglist => { "bootout", "$(launchd_ctl_target)/$(service_ids)" },
         contain => tendcf_noshell,
         classes => tendcf_launchd_cmd_clear(
-          "service_$(service_canon[$(service_ids)])_launchd_torn_down",
-          "service_$(service_canon[$(service_ids)])_launchd_teardown_failed",
-          "tendcf_launchd_reload_pending_$(service_canon[$(service_ids)])"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_launchd_teardown.service_$(service_canon[$(service_ids)])_tombstone_loaded.!service_$(service_canon[$(service_ids)])_tombstone_probe_failed.!service_$(service_canon[$(service_ids)])_launchd_torn_down.!service_$(service_canon[$(service_ids)])_launchd_teardown_failed";
+          "tendcf_svc_launchd_torn_down__$(service_canon[$(service_ids)])",
+          "tendcf_svc_launchd_teardown_failed__$(service_canon[$(service_ids)])",
+          "tendcf_launchd_$(launchd_domain)_reload_pending__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)]).tendcf_svc_tombstone_loaded__$(service_canon[$(service_ids)]).!tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_torn_down__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_teardown_failed__$(service_canon[$(service_ids)])";
 
       # systemd. The files section ran first in this pass, so a rendered
       # unit is on disk before the manager is told about it.
@@ -1271,25 +1374,25 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
 
       "/usr/bin/systemctl"
         arglist => { "enable", "$(service_ids)" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.service_$(service_canon[$(service_ids)])_enabled.!service_$(service_canon[$(service_ids)])_boot_enabled";
+        ifvarclass => "tendcf_svc_systemd_go__$(service_canon[$(service_ids)]).tendcf_svc_enabled__$(service_canon[$(service_ids)]).!tendcf_svc_boot_enabled__$(service_canon[$(service_ids)])";
 
       "/usr/bin/systemctl"
         arglist => { "disable", "$(service_ids)" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.!service_$(service_canon[$(service_ids)])_enabled.service_$(service_canon[$(service_ids)])_boot_enabled";
+        ifvarclass => "tendcf_svc_systemd_go__$(service_canon[$(service_ids)]).!tendcf_svc_enabled__$(service_canon[$(service_ids)]).tendcf_svc_boot_enabled__$(service_canon[$(service_ids)])";
 
       "/usr/bin/systemctl"
         arglist => { "start", "$(service_ids)" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.!service_$(service_canon[$(service_ids)])_active";
+        ifvarclass => "tendcf_svc_systemd_go__$(service_canon[$(service_ids)]).!tendcf_svc_active__$(service_canon[$(service_ids)])";
 
       # Changed unit, already running: restart so the new definition runs.
       "/usr/bin/systemctl"
         arglist => { "restart", "$(service_ids)" },
-        ifvarclass => "service_$(service_canon[$(service_ids)])_systemd_go.service_$(service_canon[$(service_ids)])_active.service_$(service_canon[$(service_ids)])_unit_changed";
+        ifvarclass => "tendcf_svc_systemd_go__$(service_canon[$(service_ids)]).tendcf_svc_active__$(service_canon[$(service_ids)]).tendcf_svc_unit_changed__$(service_canon[$(service_ids)])";
 
       "/usr/bin/systemctl"
         arglist => { "disable", "--now", "$(service_ids)" },
-        classes => tendcf_command_done("service_$(service_canon[$(service_ids)])_torn_down"),
-        ifvarclass => "service_$(service_canon[$(service_ids)])_teardown";
+        classes => tendcf_command_done("tendcf_svc_torn_down__$(service_canon[$(service_ids)])"),
+        ifvarclass => "tendcf_svc_teardown__$(service_canon[$(service_ids)])";
 
       # After a removal. Spelled differently from the first daemon-reload
       # so a run that already reloaded for a render still reloads again.
@@ -1307,64 +1410,67 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
         "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.!service_$(service_canon[$(service_ids)])_launchd_id_valid"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])"::
         "tendcf: launchd service refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.!tendcf_launchd_host"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host"::
         "tendcf: service '$(service_ids)' refused: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.tendcf_launchd_host.!service_$(service_canon[$(service_ids)])_launchd_domain_valid"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.!tendcf_svc_launchd_domain_valid__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' refused: missing or invalid unit.launchd.domain (expected 'system' or 'user')";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_domain_valid.!service_$(service_canon[$(service_ids)])_launchd_domain_match"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_valid__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' refused: unit.launchd.domain '$(service_launchd_domain[$(service_ids)])' does not match running launchd agent domain '$(launchd_domain)'";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.tendcf_launchd_host.service_$(service_canon[$(service_ids)])_launchd_domain_match.!service_$(service_canon[$(service_ids)])_launchd_run_as_ok"::
-        "tendcf: service '$(service_ids)' refused: user-domain service run_as '$(service_run_as[$(service_ids)])' does not match running user '$(launchd_run_user)'";
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_launchd_mode_system.!tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"::
+        "tendcf: service '$(service_ids)' refused: system-domain service run_as '$(service_run_as_display[$(service_ids)])' is missing or invalid ([a-z_][a-z0-9_-]*, <=32 chars)";
 
-      "service_$(service_canon[$(service_ids)])_refused.!(service_$(service_canon[$(service_ids)])_launchd.!service_$(service_canon[$(service_ids)])_launchd_id_valid).!(service_$(service_canon[$(service_ids)])_launchd.darwin.!tendcf_launchd_host).!(service_$(service_canon[$(service_ids)])_launchd.service_$(service_canon[$(service_ids)])_launchd_id_valid.darwin.tendcf_launchd_host).!(service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere)"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_launchd_mode_user.!tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"::
+        "tendcf: service '$(service_ids)' refused: user-domain service run_as '$(service_run_as_display[$(service_ids)])' does not match running user '$(launchd_run_user)'";
+
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere)"::
         "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 
-      "service_$(service_canon[$(service_ids)])_refused.service_$(service_canon[$(service_ids)])_systemd.tendcf_systemd_units_elsewhere"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere"::
         "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
 
-      "service_$(service_canon[$(service_ids)])_launchd_present_nonregular"::
+      "tendcf_svc_launchd_present_nonregular__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' refused: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter writes only a regular plist";
 
-      "service_$(service_canon[$(service_ids)])_plist_failed.!opt_dry_run"::
+      "tendcf_svc_plist_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' failed: could not render or set permissions on $(launchd_dir)/$(service_ids).plist; launchctl not run";
 
-      "service_$(service_canon[$(service_ids)])_launchd_bootout_failed.!opt_dry_run"::
+      "tendcf_svc_launchd_bootout_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' failed: launchctl bootout $(launchd_ctl_target)/$(service_ids) exited non-zero; bootstrap not run";
 
-      "service_$(service_canon[$(service_ids)])_launchd_bootstrap_failed.!opt_dry_run"::
+      "tendcf_svc_launchd_bootstrap_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' failed: launchctl bootstrap $(launchd_ctl_target) $(launchd_dir)/$(service_ids).plist exited non-zero";
 
-      "service_$(service_canon[$(service_ids)])_launchd_teardown_refused"::
+      "tendcf_svc_launchd_teardown_refused__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' tombstone not actuated: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter removes only a file it could have rendered";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_case_mismatch"::
+      "tendcf_svc_launchd_tombstone_case_mismatch__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' tombstone not actuated: no exact-case entry '$(service_ids).plist' in $(launchd_dir) (case-insensitive filesystem mismatch)";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_host_refused"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: $(launchd_dir) is not a real directory or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
+      "tendcf_svc_launchd_tombstone_host_refused__$(service_canon[$(service_ids)])"::
+        "tendcf: service '$(service_ids)' tombstone not actuated: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
 
-      "service_$(service_canon[$(service_ids)])_tombstone_probe_failed.!opt_dry_run"::
+      "tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' tombstone failed: launchctl print $(launchd_ctl_target)/$(service_ids) exited with unexpected error; plist left in place";
 
-      "service_$(service_canon[$(service_ids)])_launchd_teardown_failed.!opt_dry_run"::
+      "tendcf_svc_launchd_teardown_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' tombstone failed: launchctl bootout $(launchd_ctl_target)/$(service_ids) exited non-zero; plist left in place";
 
-      "service_$(service_canon[$(service_ids)])_launchd_delete_failed.!opt_dry_run"::
+      "tendcf_svc_launchd_delete_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
         "tendcf: service '$(service_ids)' tombstone failed: could not delete $(launchd_dir)/$(service_ids).plist";
 
-      "service_$(service_canon[$(service_ids)])_launchd_tombstone_bad_id"::
+      "tendcf_svc_launchd_tombstone_bad_id__$(service_canon[$(service_ids)])"::
         "tendcf: launchd tombstone refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
 
-      "service_$(service_canon[$(service_ids)])_tombstone_elsewhere"::
+      "tendcf_svc_tombstone_elsewhere__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
 
-      "service_$(service_canon[$(service_ids)])_teardown_refused"::
+      "tendcf_svc_teardown_refused__$(service_canon[$(service_ids)])"::
         "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system/$(service_ids) is not a regular file (an alias, mask, dangling link or directory); this adapter removes only a file it could have rendered";
 }
 
@@ -1408,6 +1514,13 @@ body perms tendcf_plist_perms(owner, group)
 body perms tendcf_user_plist_perms(owner)
 {
       mode   => "0644";
+      owners => { "$(owner)" };
+      rxdirs => "false";
+}
+
+body perms tendcf_user_dir_perms(owner)
+{
+      mode   => "0755";
       owners => { "$(owner)" };
       rxdirs => "false";
 }

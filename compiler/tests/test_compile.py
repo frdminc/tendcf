@@ -464,6 +464,43 @@ def test_exact_cfengine_label_covers_service(schemas: Schemas, lint) -> None:
     assert _cross_file_findings(lint, doc) == []
 
 
+def test_duplicate_launchd_writer_key_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"prefix": "com.djbclark.*", "writer": "third-party", "note": "Duplicate prefix."}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "launchd unit-writer 'com.djbclark.*' is declared twice" in msg
+    assert "launchd-writers.yml" in msg
+    assert "Resolution:" in msg
+
+
+def test_overlapping_launchd_writer_prefix_and_label_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"label": "com.djbclark.caddy", "writer": "cfengine", "note": "Overlaps com.djbclark.*"}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "overlaps 'com.djbclark.*'" in msg
+    assert "matches 2 launchd unit-writers" in msg
+
+
+def test_launchd_tendcf_install_wrong_label_refused(schemas: Schemas) -> None:
+    model = _model(SITE)
+    model.launchd_writers.data["writers"].append(
+        {"label": "org.tendcf.other", "writer": "tendcf-install", "note": "Wrong exact label."}
+    )
+    with pytest.raises(CompileError) as exc:
+        compile_host(model, _host(SITE), schemas)
+    msg = str(exc.value)
+    assert "org.tendcf.other" in msg
+    assert "reserved exclusively for exact label 'org.tendcf.execd'" in msg
+
+
 def test_render_goal_file_alone_refuses_nixos_below_v4() -> None:
     from nix2cf.compile import render_goal_file
 

@@ -193,6 +193,24 @@ def _writer_matches(writer: dict[str, Any], label: str) -> bool:
     return label == writer["label"]
 
 
+def _keys_overlap(a: str, b: str) -> bool:
+    """Do two launchd unit-writer keys overlap by literal text?
+
+    Mirrors `bin/schema_lint.py:unit_keys_overlap`: two prefixes overlap when
+    one starts with the other; a prefix and an exact label when the label starts
+    with the prefix (including its trailing dot); two exact labels only when
+    equal.
+    """
+    a_star, b_star = a.endswith("*"), b.endswith("*")
+    if a_star and b_star:
+        return a[:-1].startswith(b[:-1]) or b[:-1].startswith(a[:-1])
+    if a_star:
+        return b.startswith(a[:-1])
+    if b_star:
+        return _keys_overlap(b, a)
+    return a == b
+
+
 # --------------------------------------------------------------------------
 # Stage 1: merge — which services, with which resolved values, on this host
 # --------------------------------------------------------------------------
@@ -621,19 +639,48 @@ def render_goal_file(
     # §8). Every declared prefix or exact label is carried; repo/note prose is not.
     writers: list[dict[str, Any]] = model.launchd_writers.data.get("writers", [])
     writer_entries: dict[str, Any] = {}
+    seen_writers: list[tuple[str, str]] = []  # (key, source location)
     for w in writers:
         key = _writer_key(w)
+        where = model.launchd_writers.where(w)
         if schema_version < LAUNCHD_V8_SCHEMA_VERSION and (
             "label" in w or w["writer"] == "tendcf-install"
         ):
             errors.append(
-                f"{model.launchd_writers.where(w)}: launchd unit-writer {key!r} "
+                f"{where}: launchd unit-writer {key!r} "
                 f"(writer {w['writer']!r}) cannot be stated at schema_version "
                 f"{schema_version} (exact launchd labels and launchd `tendcf-install` "
                 f"exist from {LAUNCHD_V8_SCHEMA_VERSION}). Resolution: render at "
                 f"schema_version {LAUNCHD_V8_SCHEMA_VERSION}"
             )
             continue
+        if schema_version >= LAUNCHD_V8_SCHEMA_VERSION and w["writer"] == "tendcf-install":
+            if not ("label" in w and w["label"] == "org.tendcf.execd"):
+                errors.append(
+                    f"{where}: launchd unit-writer {key!r} declares writer 'tendcf-install', "
+                    "which is reserved exclusively for exact label 'org.tendcf.execd'. "
+                    "Resolution: use exact `label: org.tendcf.execd` or choose another writer"
+                )
+                continue
+        conflict = False
+        for prior_key, prior_where in seen_writers:
+            if key == prior_key:
+                errors.append(
+                    f"launchd unit-writer {key!r} is declared twice: {prior_where} and "
+                    f"{where}. Resolution: keep one declaration per unit-writer key"
+                )
+                conflict = True
+                break
+            if _keys_overlap(key, prior_key):
+                errors.append(
+                    f"launchd unit-writer {key!r} ({where}) overlaps {prior_key!r} "
+                    f"({prior_where}). Resolution: make prefixes and exact labels disjoint"
+                )
+                conflict = True
+                break
+        if conflict:
+            continue
+        seen_writers.append((key, where))
         writer_entries[key] = {"state": "present", "writer": w["writer"]}
     for entry_id in service_entries:
         owners = [w for w in writers if _writer_matches(w, entry_id)]
@@ -642,6 +689,14 @@ def render_goal_file(
                 f"service entry {entry_id!r} falls under no prefix or exact label declared in "
                 f"{model.launchd_writers.path}. Resolution: declare its prefix or exact label with "
                 "writer `cfengine`, or relabel the service"
+            )
+        elif len(owners) > 1:
+            claimed = ", ".join(
+                f"{_writer_key(w)!r} ({model.launchd_writers.where(w)})" for w in owners
+            )
+            errors.append(
+                f"service entry {entry_id!r} matches {len(owners)} launchd unit-writers: "
+                f"{claimed}. Resolution: keep unit-writer prefixes and exact labels disjoint"
             )
         elif coverage == "comprehensive" and owners[0]["writer"] != "cfengine":
             owner_key = _writer_key(owners[0])

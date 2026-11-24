@@ -25,9 +25,9 @@ writers:
 
   - prefix: org.tendcf.*
     label: org.tendcf.execd
-    writer: tendcf-install
+    writer: cfengine
     repo: tendcf
-    note: "tendcf's own root cf-execd LaunchDaemon installed by deploy/darwin/tendcf-install.sh."
+    note: "Negative fixture: carrying both prefix and label must fail schema oneOf."
 
   - prefix: dev.mise.*
     writer: mise

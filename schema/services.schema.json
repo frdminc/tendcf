@@ -103,7 +103,8 @@
             },
             "domain": {
               "description": "Which launchd domain runs the job (`system` or `user`). Optional in the Site Model; nix2cf resolves an omitted value to `system` when rendering the goal file.",
-              "enum": ["system", "user"]
+              "enum": ["system", "user"],
+              "default": "system"
             },
             "run_at_load": { "type": "boolean" },
             "keep_alive": { "type": "boolean" }

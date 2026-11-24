@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred ten deliberately broken overlays, plus six byte-class fixtures in
+Two hundred eleven deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -516,7 +516,7 @@ Schema v7 (issue 64) gives `approval-record.schema.json` a `record_kind` (`per-c
 | 227 | `227-enrollment-covered-signer-not-in-trust-root` | an enrollment listing a covered signer the trust root does not hold, outside developer mode | approval roles (role) |
 | 228 | `228-application-names-no-enrollment` | an application whose `grant_id` names no active enrollment | approval roles (grant) |
 
-## Schema v8 launchd cases (229-240)
+## Schema v8 launchd cases (229-241)
 
 Schema v8 (issues #99 + #94) adds required `unit.launchd.domain` (`system` | `user`) to `goal-file.schema.json` (optional in `services.schema.json` v3, defaulting to `system`), admits exact reverse-DNS launchd unit-writer labels and `writer: "tendcf-install"` on exact launchd labels (pinned to `org.tendcf.execd` by lint, forbidden on `.*` prefixes) in `goal-file.schema.json` v8 and `launchd-writers.schema.json` v2, and keeps systemd unit-writer keys restricted to v5-v7 unit names, templates and prefixes.
 
@@ -534,6 +534,7 @@ Schema v8 (issues #99 + #94) adds required `unit.launchd.domain` (`system` | `us
 | 238 | `238-launchd-writers-prefix-and-label` | `launchd-writers.yml` entry carrying both `prefix` and `label` | schema (`oneOf`) |
 | 239 | `239-launchd-writers-exact-label-overlap-prefix` | `launchd-writers.yml` with exact `label: org.tendcf.execd` overlapping `prefix: org.tendcf.*` | cross-file |
 | 240 | `240-services-invalid-launchd-domain` | `services.yml` service with `launchd.domain: gui` | schema (`enum`) |
+| 241 | `241-runit-exact-launchd-label` | runit goal file carrying bare exact reverse-DNS key `org.tendcf.execd` (`writer: cfengine`) | schema (`if/then`) |
 
 ## Every class has a fixture
 

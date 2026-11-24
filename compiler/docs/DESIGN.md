@@ -95,7 +95,7 @@ Each of these is marked `TODO(operator)` in `nix2cf/compile.py` at the spot.
 | `launchd.domain` omitted | `system` (schema v8 / services v3; operator ruling 2026-11-23, #94). | Resolved explicitly into `unit.launchd.domain`; `user` is refused below v8. |
 | Interlock `expect_exit` / `timeout_seconds` omitted | `0` / `30`. | Stated as `default` in `common.schema.json`. Not open. |
 | Interlock without `defines_class` | Compile error. | Optional in the Site Model, required in the goal file; deriving one would be a second spelling of identity. |
-| Unit-writer registry | Every declared prefix is carried (the device runs extra-entry detection without the Site Model, reconciliation §8). | — |
+| Unit-writer registry | Every declared prefix or exact label is carried (the device runs extra-entry detection without the Site Model, reconciliation §8). | — |
 | Unmatched `requires` | A note, and `path:`/`secret:` kinds only counted (their providers are site registries, not Site Model records). | Guide §15 says a compile error with near-misses once the lookup exists. |
 | `device-trust`, host key, platform | Supplied by the caller (`--device-trust`, `--host-key`, `--platform`). | Inventory and trust-policy shapes are "Step 0 remaining". |
 | `supervisor` | A required host input (`--supervisor launchd\|systemd\|runit\|nixos`) next to `platform`, **no default** (house rule; spec Q1/Q8). Written into `device-trust.entries.supervisor` as `{"host":{"name":X,"state":"present"}}`. A supplied `device-trust` document whose `supervisor` entry differs is refused; one that omits it is fine. | No inventory schema exists (spec Q8); the flag goes when it does. |

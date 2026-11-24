@@ -1308,7 +1308,7 @@ EOF
     cp "$repo/tests/policy/fixtures/launchd-absent.json" "$work/data/host_specific.json"
     "$cf_agent" -K -I -f "$work/inputs/launchd-badhost.cf" >"$work/launchd-tomb-badhost.out" 2>&1 || true
     check "launchd tombstone on !tendcf_launchd_host: refused and reported" \
-        grep -q "tendcf: service 'com.tendcf.demo.main' tombstone not actuated: .* is not a real directory or .* is not executable" "$work/launchd-tomb-badhost.out"
+        grep -q "tendcf: service 'com.tendcf.demo.main' tombstone not actuated: launchd domain/identity invalid, .* is not a real directory, or .* is not executable" "$work/launchd-tomb-badhost.out"
     check "launchd tombstone on !tendcf_launchd_host: zero launchctl calls" test ! -s "$launchctl_log"
     check "launchd tombstone on !tendcf_launchd_host: plist untouched" \
         test -f "$launchd_daemons/com.tendcf.demo.main.plist"
@@ -1423,6 +1423,271 @@ EOF
         grep -q "tendcf: service 'com.tendcf.canary.main' refused: launchd domain/identity invalid" "$work/launchd-user-uid0.out"
     check "launchd user mode with uid 0: no plist written" test ! -e "$user_plist"
     check "launchd user mode with uid 0: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # (6)-(7) user mode must reject system-wide /Library/LaunchAgents and //Library/LaunchAgents (Neon HIGH #1).
+    for sys_agents_case in "single:/Library/LaunchAgents" "double://Library/LaunchAgents"; do
+        cname="${sys_agents_case%%:*}"
+        cdir="${sys_agents_case#*:}"
+        cat > "$work/inputs/launchd-user-sysdir-$cname.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_launchd_user_sysdir", "tendcf_test_done" };
+}
+bundle agent tendcf_launchd_user_sysdir
+{
+  methods:
+      "run"
+        usebundle => tendcf_services_apply("user", "$cdir", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid");
+}
+EOF
+        : > "$launchctl_log"
+        cp "$user_canary_fx" "$work/data/host_specific.json"
+        "$cf_agent" -K -I -f "$work/inputs/launchd-user-sysdir-$cname.cf" >"$work/launchd-user-sysdir-$cname.out" 2>&1 || true
+        check "launchd user mode rejecting $cdir: refused fail-closed" \
+            grep -q "tendcf: service 'com.tendcf.canary.main' refused: launchd domain/identity invalid" "$work/launchd-user-sysdir-$cname.out"
+        check "launchd user mode rejecting $cdir: zero launchctl calls" test ! -s "$launchctl_log"
+    done
+
+    # (8)-(10) missing/invalid run_as refused cleanly in both system and user modes (Adversary L2, Neon M3).
+    rm -f "$canary_sys_p" "$launchctl_state/com.tendcf.canary.main" "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main"
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+del doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["run_as"]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-sys-missing-runas.out" 2>&1 || true
+    check "launchd system mode missing run_as: refused with <missing>" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: system-domain service run_as '<missing>' is missing or invalid" "$work/launchd-sys-missing-runas.out"
+    check "launchd system mode missing run_as: no plist written" test ! -e "$canary_sys_p"
+    check "launchd system mode missing run_as: zero launchctl calls" test ! -s "$launchctl_log"
+
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["run_as"] = "Bad User!"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-sys-bad-runas.out" 2>&1 || true
+    check "launchd system mode invalid run_as: refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: system-domain service run_as 'Bad User!' is missing or invalid" "$work/launchd-sys-bad-runas.out"
+    check "launchd system mode invalid run_as: no plist written" test ! -e "$canary_sys_p"
+    check "launchd system mode invalid run_as: zero launchctl calls" test ! -s "$launchctl_log"
+
+    python3 - "$user_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+del doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]["run_as"]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-user-missing-runas.out" 2>&1 || true
+    check "launchd user mode missing run_as: refused with <missing>" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: user-domain service run_as '<missing>' does not match running user '$test_user'" "$work/launchd-user-missing-runas.out"
+    check "launchd user mode missing run_as: no plist written" test ! -e "$user_plist"
+    check "launchd user mode missing run_as: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # 5m.19e Adversary M1 regression: class-suffix aliasing (`com.tendcf.canary.main`
+    # vs `com.tendcf.canary.main.launchd`) must NEVER bypass domain/run_as refusal.
+    alias_sys_p="$launchd_daemons/com.tendcf.canary.main.launchd.plist"
+    alias_usr_p="$launchd_agents/com.tendcf.canary.main.launchd.plist"
+    rm -f "$canary_sys_p" "$alias_sys_p" "$user_plist" "$alias_usr_p" \
+        "$launchctl_state/com.tendcf.canary.main" "$launchctl_state/com.tendcf.canary.main.launchd" \
+        "$launchctl_state/gui.com.tendcf.canary.main" "$launchctl_state/gui.com.tendcf.canary.main.launchd"
+
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$user_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+sys_doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+usr_doc = json.loads(pathlib.Path(sys.argv[2]).read_text())
+doc = {
+    "vars": {
+        "tendcf_interlock": sys_doc["vars"]["tendcf_interlock"],
+        "tendcf_service": {
+            "com.tendcf.canary.main": usr_doc["vars"]["tendcf_service"]["com.tendcf.canary.main"],
+            "com.tendcf.canary.main.launchd": sys_doc["vars"]["tendcf_service"]["com.tendcf.canary.main"],
+        },
+    }
+}
+pathlib.Path(sys.argv[3]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-alias-sys.out" 2>&1 || true
+    check "launchd class-alias regression (system): user entry refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: unit.launchd.domain 'user' does not match running launchd agent domain 'system'" "$work/launchd-alias-sys.out"
+    check "launchd class-alias regression (system): refused entry wrote no plist" test ! -e "$canary_sys_p"
+    check "launchd class-alias regression (system): zero launchctl calls for refused entry" \
+        bash -c "! grep -Eq '(system/com\\.tendcf\\.canary\\.main$|com\\.tendcf\\.canary\\.main\\.plist$)' '$launchctl_log'"
+    check "launchd class-alias regression (system): valid .launchd sibling rendered" test -f "$alias_sys_p"
+    check "launchd class-alias regression (system): valid .launchd sibling bootstrapped" \
+        grep -qxF "$(printf 'bootstrap\tsystem\t%s' "$alias_sys_p")" "$launchctl_log"
+
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$user_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+sys_doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+usr_doc = json.loads(pathlib.Path(sys.argv[2]).read_text())
+doc = {
+    "vars": {
+        "tendcf_interlock": usr_doc["vars"]["tendcf_interlock"],
+        "tendcf_service": {
+            "com.tendcf.canary.main": sys_doc["vars"]["tendcf_service"]["com.tendcf.canary.main"],
+            "com.tendcf.canary.main.launchd": usr_doc["vars"]["tendcf_service"]["com.tendcf.canary.main"],
+        },
+    }
+}
+pathlib.Path(sys.argv[3]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-alias-user.out" 2>&1 || true
+    check "launchd class-alias regression (user): system entry refused and reported" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: unit.launchd.domain 'system' does not match running launchd agent domain 'user'" "$work/launchd-alias-user.out"
+    check "launchd class-alias regression (user): refused entry wrote no plist" test ! -e "$user_plist"
+    check "launchd class-alias regression (user): zero launchctl calls for refused entry" \
+        bash -c "! grep -Eq '(gui/[0-9]+/com\\.tendcf\\.canary\\.main$|com\\.tendcf\\.canary\\.main\\.plist$)' '$launchctl_log'"
+    check "launchd class-alias regression (user): valid .launchd sibling rendered" test -f "$alias_usr_p"
+    check "launchd class-alias regression (user): valid .launchd sibling bootstrapped" \
+        grep -qxF "$(printf 'bootstrap\tgui/%s\t%s' "$test_uid" "$alias_usr_p")" "$launchctl_log"
+    rm -f "$alias_sys_p" "$alias_usr_p" \
+        "$launchctl_state/com.tendcf.canary.main.launchd" "$launchctl_state/gui.com.tendcf.canary.main.launchd"
+
+    # 5m.19f mergedata() precedence regression (Opus M2, Adversary L3.1):
+    # injected `launchd_include_username` or `id` inside a service entry must
+    # NEVER override the trailing literal object in mergedata().
+    python3 - "$repo/deploy/darwin/canary/host_specific.json" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+svc = doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]
+svc["launchd_include_username"] = False
+svc["id"] = "evil"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-mergedata-sys.out" 2>&1 || true
+    check "launchd mergedata precedence (system): policy overrides injected id and launchd_include_username" \
+        python3 - "$canary_sys_p" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    doc = plistlib.load(f)
+assert doc["Label"] == "com.tendcf.canary.main", doc
+assert doc.get("UserName") == "nobody", doc
+PYEOF
+    rm -f "$canary_sys_p" "$launchctl_state/com.tendcf.canary.main"
+
+    python3 - "$user_canary_fx" "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
+svc = doc["vars"]["tendcf_service"]["com.tendcf.canary.main"]
+svc["launchd_include_username"] = True
+svc["id"] = "evil"
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    : > "$launchctl_log"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$work/launchd-mergedata-user.out" 2>&1 || true
+    check "launchd mergedata precedence (user): policy overrides injected id and omits UserName" \
+        python3 - "$user_plist" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    doc = plistlib.load(f)
+assert doc["Label"] == "com.tendcf.canary.main", doc
+assert "UserName" not in doc, doc
+PYEOF
+    rm -f "$user_plist" "$launchctl_state/gui.com.tendcf.canary.main"
+
+    # 5m.19g Safe ~/Library/LaunchAgents creation guard (Codex Bot P2 + Opus L8)
+    # and Darwin unprivileged entry.cf safety checks (Opus L5, Adversary L3.3).
+    fake_home_ok="$work/fake-home-ok"
+    mkdir -p "$fake_home_ok/Library"
+    cat > "$work/inputs/launchd-ensure-ok.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_test_ensure_ok", "tendcf_test_done" };
+}
+bundle agent tendcf_test_ensure_ok
+{
+  methods:
+      "ensure"
+        usebundle => tendcf_ensure_user_launchagents("$fake_home_ok", "$test_user");
+      "apply"
+        usebundle => tendcf_services_apply("user", "$fake_home_ok/Library/LaunchAgents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid");
+}
+EOF
+    : > "$launchctl_log"
+    cp "$user_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-ensure-ok.cf" >"$work/launchd-ensure-ok.out" 2>&1 || true
+    ensure_ok_plist="$fake_home_ok/Library/LaunchAgents/com.tendcf.canary.main.plist"
+    check "launchd user LaunchAgents creation: created real directory" \
+        bash -c "[ -d '$fake_home_ok/Library/LaunchAgents' ] && [ ! -L '$fake_home_ok/Library/LaunchAgents' ]"
+    check "launchd user LaunchAgents creation: directory mode is 0755" \
+        bash -c "[ \"\$(stat -f '%Lp' '$fake_home_ok/Library/LaunchAgents')\" = 755 ]"
+    check "launchd user LaunchAgents creation: plist rendered in same run" \
+        cmp -s "$golden_user_dir/com.tendcf.canary.main.plist" "$ensure_ok_plist"
+    check "launchd user LaunchAgents creation: bootstrap ran" \
+        grep -qxF "$(printf 'bootstrap\tgui/%s\t%s' "$test_uid" "$ensure_ok_plist")" "$launchctl_log"
+    rm -f "$launchctl_state/gui.com.tendcf.canary.main"
+
+    fake_home_sym="$work/fake-home-sym"
+    sym_agents_target="$work/sym-agents-target"
+    mkdir -p "$fake_home_sym/Library" "$sym_agents_target"
+    ln -s "$sym_agents_target" "$fake_home_sym/Library/LaunchAgents"
+    cat > "$work/inputs/launchd-ensure-sym.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_test_ensure_sym", "tendcf_test_done" };
+}
+bundle agent tendcf_test_ensure_sym
+{
+  methods:
+      "ensure"
+        usebundle => tendcf_ensure_user_launchagents("$fake_home_sym", "$test_user");
+      "apply"
+        usebundle => tendcf_services_apply("user", "$fake_home_sym/Library/LaunchAgents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid");
+}
+EOF
+    : > "$launchctl_log"
+    cp "$user_canary_fx" "$work/data/host_specific.json"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-ensure-sym.cf" >"$work/launchd-ensure-sym.out" 2>&1 || true
+    check "launchd user LaunchAgents symlink negative: symlink left intact" \
+        test -L "$fake_home_sym/Library/LaunchAgents"
+    check "launchd user LaunchAgents symlink negative: target dir untouched" \
+        bash -c "[ -z \"\$(ls -A '$sym_agents_target')\" ]"
+    check "launchd user LaunchAgents symlink negative: refused fail-closed" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: launchd domain/identity invalid" "$work/launchd-ensure-sym.out"
+    check "launchd user LaunchAgents symlink negative: zero launchctl calls" test ! -s "$launchctl_log"
+
+    # Darwin entry.cf safety guard: no repo fixture fed to entry.cf may match
+    # unprivileged user-domain actuation (domain=="user" && run_as==$test_user),
+    # and unprivileged tendcf_services must select tendcf_running_as_nonroot only.
+    check "darwin entry.cf safety: no tests/policy/fixtures/*.json actuates user domain for $test_user" \
+        python3 - "$repo/tests/policy/fixtures" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+fdir, user = pathlib.Path(sys.argv[1]), sys.argv[2]
+for p in sorted(fdir.glob("*.json")):
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    svcs = (doc.get("vars") or {}).get("tendcf_service") or {}
+    if not isinstance(svcs, dict):
+        continue
+    for sid, svc in svcs.items():
+        if not isinstance(svc, dict):
+            continue
+        dom = ((svc.get("unit") or {}).get("launchd") or {}).get("domain")
+        if dom == "user" and svc.get("run_as") == user:
+            raise SystemExit(f"{p.name}: service {sid!r} has domain=user and run_as={user!r}")
+PYEOF
+    if [ "$test_uid" != 0 ]; then
+        printf '%s\n' '{"vars":{}}' > "$work/data/host_specific.json"
+        "$cf_agent" -K -v -n -f "$work/inputs/entry.cf" >"$work/launchd-entry-nonroot.out" 2>&1 || true
+        check "darwin entry.cf safety: unprivileged tendcf_services defines tendcf_running_as_nonroot" \
+            grep -q "Private class: tendcf_running_as_nonroot" "$work/launchd-entry-nonroot.out"
+        check "darwin entry.cf safety: unprivileged tendcf_services does NOT define tendcf_running_as_root" \
+            bash -c "! grep -q 'Private class: tendcf_running_as_root' '$work/launchd-entry-nonroot.out'"
+    fi
 else
     for name in \
         "launchd first render: byte-identical to committed golden, perms 0644, no backup, bootstrap" \
@@ -2251,6 +2516,7 @@ check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_ac
 if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
+             launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-mismatch-user-in-sys launchd-mismatch-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user launchd-ensure-ok launchd-ensure-sym launchd-entry-nonroot \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \

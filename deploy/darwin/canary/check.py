@@ -33,11 +33,12 @@ Run from anywhere:
 from __future__ import annotations
 
 import argparse
-import getpass
+import html
 import importlib.util
 import json
 import os
 import plistlib
+import pwd
 import re
 import shutil
 import stat
@@ -79,13 +80,13 @@ def render_launchd_mustache(template_text: str, service_id: str, svc: dict) -> b
         out,
         flags=re.DOTALL,
     )
-    out = out.replace("{{id}}", service_id)
-    out = out.replace("{{run_as}}", svc["run_as"])
-    out = out.replace("{{working_dir}}", svc["working_dir"])
+    out = out.replace("{{id}}", html.escape(service_id, quote=True))
+    out = out.replace("{{run_as}}", html.escape(svc["run_as"], quote=True))
+    out = out.replace("{{working_dir}}", html.escape(svc["working_dir"], quote=True))
 
     def repl_cmd(m: re.Match[str]) -> str:
         inner = m.group(1)
-        return "".join(inner.replace("{{.}}", arg) for arg in svc["command"])
+        return "".join(inner.replace("{{.}}", html.escape(arg, quote=True)) for arg in svc["command"])
 
     out = re.sub(r"\{\{#command\}\}\n(.*?)\{\{/command\}\}\n", repl_cmd, out, flags=re.DOTALL)
 
@@ -137,7 +138,7 @@ def run_user_render_check(bindir: str | None) -> list[str]:
         if not tool.is_file():
             return [f"missing CFEngine binary: {tool}"]
 
-    user = getpass.getuser()
+    user = pwd.getpwuid(os.getuid()).pw_name
     uid = str(os.getuid())
     gid = str(os.getgid())
 
@@ -206,13 +207,26 @@ def run_user_render_check(bindir: str | None) -> list[str]:
                 text=True,
                 check=False,
             )
+            combined_out = r.stdout + r.stderr
+            if r.returncode != 0:
+                problems.append(
+                    f"user-render: cf-agent exited {r.returncode}: {combined_out.strip()}"
+                )
+            if "failed:" in combined_out or "refused:" in combined_out:
+                problems.append(
+                    f"user-render: unexpected refusal/failure in cf-agent output: {combined_out.strip()}"
+                )
             rendered = work / "agents" / f"{CANARY_LABEL}.plist"
             if not rendered.is_file():
                 problems.append(
                     f"user-render: cf-agent did not render {rendered.name} "
-                    f"(rc={r.returncode}): {(r.stdout + r.stderr).strip()}"
+                    f"(rc={r.returncode}): {combined_out.strip()}"
                 )
                 return problems
+            if not (work / "loaded" / CANARY_LABEL).is_file():
+                problems.append(
+                    f"user-render: launchctl stub did not record loaded state for {CANARY_LABEL}"
+                )
 
             rendered_bytes = rendered.read_bytes()
             golden_bytes = GOLDEN_USER_PLIST.read_bytes()

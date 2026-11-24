@@ -1421,7 +1421,9 @@ check_no_stale_upgrade_dirs() {
     for p in "$prefix".old.* "$prefix".failed.*; do
         stale+=("$p")
     done
-    [ "$had_nullglob" -eq 0 ] && shopt -u nullglob
+    if [ "$had_nullglob" -eq 0 ]; then
+        shopt -u nullglob
+    fi
     if [ "${#stale[@]}" -gt 0 ]; then
         die "stale upgrade directory(ies) found (possible interrupted upgrade): ${stale[*]}; inspect and recover/remove manually before installing"
     fi
@@ -1584,10 +1586,22 @@ cmd_status() {
     if execd_is_loaded; then
         loaded_state="loaded"
     fi
+    local had_nullglob=0 stale=() p
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    for p in "$prefix".old.* "$prefix".failed.*; do
+        stale+=("$p")
+    done
+    if [ "$had_nullglob" -eq 0 ]; then
+        shopt -u nullglob
+    fi
     echo "tree:     $tree_str"
     echo "entry:    $entry_str"
     echo "data:     $data_str"
     echo "$label: $plist_str / $loaded_state"
+    if [ "${#stale[@]}" -gt 0 ]; then
+        echo "stale:    ${stale[*]} (interrupted upgrade artifact; inspect before installing)"
+    fi
 }
 
 [ $# -ge 1 ] || die "usage: $0 install|data|run-once|enable|disable|status|workdir ..."
