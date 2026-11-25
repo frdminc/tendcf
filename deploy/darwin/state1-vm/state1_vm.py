@@ -62,6 +62,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 DEFAULT_IMAGE_JSON = HERE / "image.json"
 DARWIN_INSTALLER = REPO_ROOT / "deploy" / "darwin" / "tendcf-install.sh"
+PROJECTOR_SCRIPT = REPO_ROOT / "bin" / "projector.py"
 POLICY_DIR = REPO_ROOT / "policy"
 DARWIN_CANARY_DIR = REPO_ROOT / "deploy" / "darwin" / "canary"
 FORK_PIN_JSON = REPO_ROOT / "overlay" / "fork.json"
@@ -2497,6 +2498,7 @@ def build_stage_bundle(tarball: Path, sha_path: Path) -> bytes:
             tf.addfile(ti, io.BytesIO(data))
 
         add_file(DARWIN_INSTALLER, "tendcf-install.sh", 0o755)
+        add_file(PROJECTOR_SCRIPT, "bin/projector.py", 0o644)
         add_file(tarball, f"artifact/{tarball.name}", 0o644)
         add_file(sha_path, f"artifact/{sha_path.name}", 0o644)
         for p in sorted(POLICY_DIR.rglob("*")):
@@ -4297,6 +4299,7 @@ def cmd_check(ctx: Ctx, args) -> int:
     if has_artifact:
         for req_label, req_path in (
             ("darwin installer", DARWIN_INSTALLER),
+            ("projector script", PROJECTOR_SCRIPT),
             ("policy file", POLICY_DIR / "tendcf_services.cf"),
             ("darwin canary data", DARWIN_CANARY_DIR / "host_specific.json"),
             ("darwin canary tombstone", DARWIN_CANARY_DIR / "host_specific-absent.json"),
@@ -4428,6 +4431,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                             ctx, t, resolved_tarball, resolved_sha
                         )
                         installer = f"{guest_stage}/tendcf-install.sh"
+                        projector_sha = hashlib.sha256(
+                            PROJECTOR_SCRIPT.read_bytes()
+                        ).hexdigest()
                         r = rssh(
                             ctx,
                             t,
@@ -4442,6 +4448,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                                 f"{guest_stage}/artifact/{sha_name}",
                                 "--policy-src",
                                 f"{guest_stage}/policy",
+                                "--projector-src",
+                                f"{guest_stage}/bin/projector.py",
+                                "--projector-sha256",
+                                projector_sha,
                                 "--data",
                                 f"{guest_stage}/canary/host_specific.json",
                             ],
@@ -4731,6 +4741,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                                     f"{guest_stage}/artifact/{sha_name}",
                                     "--policy-src",
                                     f"{guest_stage}/policy",
+                                    "--projector-src",
+                                    f"{guest_stage}/bin/projector.py",
+                                    "--projector-sha256",
+                                    hashlib.sha256(PROJECTOR_SCRIPT.read_bytes()).hexdigest(),
                                     "--data",
                                     f"{guest_stage}/canary/host_specific.json",
                                 ],

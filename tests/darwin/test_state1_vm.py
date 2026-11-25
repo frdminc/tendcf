@@ -7740,6 +7740,7 @@ class CheckRenderer(Base):
         with tarfile.open(fileobj=io.BytesIO(self.world.stage_bundles[0]), mode="r:gz") as tf:
             names = set(tf.getnames())
         self.assertIn("tendcf-install.sh", names)
+        self.assertIn("bin/projector.py", names)
         self.assertIn(f"artifact/{self.tarball.name}", names)
         self.assertIn(f"artifact/{self.sha_file.name}", names)
         self.assertIn("policy/tendcf_services.cf", names)
@@ -7934,7 +7935,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         text = self.INSTALLER.read_text(encoding="utf-8")
-        self.assertTrue(text.startswith("#!/bin/bash\n"))
+        self.assertTrue(text.startswith("#!/bin/bash -p\n"))
         self.assertIn("set -euo pipefail", text)
         self.assertIn("/usr/bin/env -i TENDCF_CLEAN_ENV=1", text)
         self.assertIn("compgen -e", text)
@@ -7945,7 +7946,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
         self.assertIn("/bin/chmod -RN", text)
         self.assertIn("/usr/bin/chflags -R 0", text)
         self.assertIn("/bin/chmod -R a-s,go-w", text)
-        self.assertIn('"$py" -I -', text)
+        self.assertIn('"$py" -I -S -', text)
         self.assertIn("LC_DYLD_ENVIRONMENT", text)
         self.assertIn("LC_LOAD_DYLINKER", text)
         self.assertIn("com.apple.quarantine", text)
@@ -7978,7 +7979,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
     def test_embedded_macho_parser_accepts_valid_and_rejects_bad_deps(self):
         text = self.INSTALLER.read_text(encoding="utf-8")
         m = re.search(
-            r'"\$py" -I - "\$prefix" "\$canon_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY',
+            r'"\$py" -I -S - "\$prefix" "\$canon_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY',
             text,
             re.DOTALL,
         )

@@ -13,7 +13,7 @@ What lands on the host:
 
 | Path | Owner | Content |
 | --- | --- | --- |
-| `/opt/tendcf` | root:root, no group/other write | the CI-built CFEngine fork (`--prefix=/opt/tendcf`), plus `share/tendcf/{policy,deploy,REVISION}` |
+| `/opt/tendcf` | root:root, no group/other write | the CI-built CFEngine fork (`--prefix=/opt/tendcf`), plus `share/tendcf/{policy,deploy,bin/projector.py,REVISION}` |
 | `/opt/tendcf/var/libntech` | root | the work directory this fork build compiles in (libntech's configure names it; `tendcf-install.sh workdir` prints it): keys (0700), `inputs/`, `data/` (0700), state |
 | `<workdir>/inputs/{promises.cf,tendcf/}` | root | the entry policy and the generic bundle, copied by the installer |
 | `<workdir>/data/host_specific.json` | root, 0600 | the CMDB data: `deploy/linux/canary/host_specific.json`, a projection of pastebin's goal file (the canary, plus pastebin's v5 unit claims, which are detector data and do not project) |
@@ -46,9 +46,19 @@ systemctl status tendcf.canary.service           # active, enabled, User=nobody
 sudo $T/tendcf-install.sh status
 ```
 
-`install` refuses a binary that loads a library from outside `/opt/tendcf` and
-the system library directories, and rejects data `cf-promises` does not accept
-(restoring the previous file). `run-once` is `cf-agent -K -I` over the
+`install` runs directly under `/bin/bash -p` (callers must invoke the script
+directly via a trusted parent/loader so `BASH_ENV` and exported shell functions
+are suppressed before the script's own `env -i` re-exec). It refuses a binary
+that loads a library from outside `/opt/tendcf` and the system library
+directories, installs `/opt/tendcf/share/tendcf/bin/projector.py` as root-owned
+(requiring either a root-owned non-writable source or an explicit
+`--projector-sha256` digest), and validates CMDB data before publishing it to
+live `host_specific.json` (running `python3 -I -S projector.py --check` and
+`cf-promises --show-classes` to require `tendcf_cmdb_evaluated` (`source=promise`)
+and refuse `tendcf_cmdb_refused` / `tendcf_cmdb_problem_*`, serialized with
+`flock` and atomic rollback on any post-publish failure or catchable
+interruption (`SIGTERM`/`SIGINT`; uncatchable `SIGKILL`/power loss does not run
+traps)). `run-once` is `cf-agent -K -I` over the
 installed `promises.cf`; run it again and it prints no repairs.
 
 ## Stage B: let cf-execd run it
