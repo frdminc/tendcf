@@ -111,14 +111,174 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
+import math
 import re
 import sys
 import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import rfc8785
+try:
+    import rfc8785 as _rfc8785
+except ModuleNotFoundError:
+    _rfc8785 = None  # type: ignore[assignment]
+
+
+# Pure-stdlib RFC 8785 (JCS) serializer fallback for bare target hosts that
+# ship stdlib python3 without uv or third-party rfc8785 (issue #53).
+# When `import rfc8785` succeeds (dev / CI / uv run), `_jcs_dumps` delegates
+# directly to `rfc8785.dumps`. Both paths enforce identical RFC 8785 §3.2.2–
+# §3.2.3 rules (IEEE-754 safe integer bounds, ES6 number serialization,
+# lowercase \u00xx control escapes, lone-surrogate rejection, UTF-16BE key sort).
+_JCS_INT_MAX = 2**53 - 1
+_JCS_INT_MIN = -(2**53) + 1
+_JCS_ESCAPE_RE = re.compile(r'[\x00-\x1f\\"]')
+_JCS_ESCAPE_MAP: dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+for _cp in range(0x20):
+    _JCS_ESCAPE_MAP.setdefault(chr(_cp), f"\\u{_cp:04x}")
+
+
+def _jcs_write_str(s: str, sink: io.BytesIO) -> None:
+    """Serialize a JSON string per RFC 8785 §3.2.2.2."""
+    sink.write(b'"')
+    escaped = _JCS_ESCAPE_RE.sub(lambda m: _JCS_ESCAPE_MAP[m.group(0)], s)
+    try:
+        sink.write(escaped.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("input contains lone surrogate or non-UTF-8 codepoints") from exc
+    sink.write(b'"')
+
+
+def _jcs_write_float(f: float, sink: io.BytesIO) -> None:
+    """Serialize a finite IEEE-754 float per ES6 / RFC 8785 §3.2.2.3."""
+    if math.isnan(f) or math.isinf(f):
+        raise ValueError(f"{f} is not representable in JCS")
+    if f == 0:
+        sink.write(b"0")
+        return
+    if f < 0:
+        sink.write(b"-")
+        _jcs_write_float(-f, sink)
+        return
+
+    stringified = str(f)
+    exponent_str = ""
+    exponent_value = 0
+    q = stringified.find("e")
+    if q > 0:
+        exponent_str = stringified[q:]
+        if exponent_str[2:3] == "0":
+            exponent_str = exponent_str[:2] + exponent_str[3:]
+        stringified = stringified[:q]
+        exponent_value = int(exponent_str[1:])
+
+    first = stringified
+    dot = ""
+    last = ""
+    q = stringified.find(".")
+    if q > 0:
+        dot = "."
+        first = stringified[:q]
+        last = stringified[q + 1 :]
+
+    if last == "0":
+        dot = ""
+        last = ""
+
+    if 0 < exponent_value < 21:
+        first += last
+        last = ""
+        dot = ""
+        exponent_str = ""
+        q = exponent_value - len(first)
+        while q >= 0:
+            q -= 1
+            first += "0"
+    elif -7 < exponent_value < 0:
+        last = first + last
+        first = "0"
+        dot = "."
+        exponent_str = ""
+        q = exponent_value
+        while q < -1:
+            q += 1
+            last = "0" + last
+
+    sink.write(f"{first}{dot}{last}{exponent_str}".encode("ascii"))
+
+
+def _jcs_write_value(obj: Any, sink: io.BytesIO) -> None:
+    if obj is None:
+        sink.write(b"null")
+    elif isinstance(obj, bool):
+        sink.write(b"true" if bool(obj) else b"false")
+    elif isinstance(obj, int):
+        n = int(obj)
+        if n < _JCS_INT_MIN or n > _JCS_INT_MAX:
+            raise ValueError(f"{n} exceeds safe integer domain for JSON floats")
+        sink.write(str(n).encode("ascii"))
+    elif isinstance(obj, str):
+        _jcs_write_str(obj, sink)
+    elif isinstance(obj, float):
+        _jcs_write_float(float(obj), sink)
+    elif isinstance(obj, (list, tuple)):
+        if not obj:
+            sink.write(b"[]")
+            return
+        sink.write(b"[")
+        for idx, elem in enumerate(obj):
+            if idx > 0:
+                sink.write(b",")
+            _jcs_write_value(elem, sink)
+        sink.write(b"]")
+    elif isinstance(obj, dict):
+        if not obj:
+            sink.write(b"{}")
+            return
+        keyed: list[tuple[bytes, str, Any]] = []
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise ValueError("object keys must be strings")
+            try:
+                sort_key = k.encode("utf-16-be")
+            except UnicodeEncodeError as exc:
+                raise ValueError("object key contains lone surrogate or non-UTF-8 codepoints") from exc
+            keyed.append((sort_key, k, v))
+        keyed.sort(key=lambda item: item[0])
+        sink.write(b"{")
+        for idx, (_, key, value) in enumerate(keyed):
+            if idx > 0:
+                sink.write(b",")
+            _jcs_write_str(key, sink)
+            sink.write(b":")
+            _jcs_write_value(value, sink)
+        sink.write(b"}")
+    else:
+        raise ValueError(f"unsupported type for JCS: {type(obj).__name__}")
+
+
+def _stdlib_jcs_dumps(obj: Any) -> bytes:
+    """Pure-stdlib RFC 8785 JCS serializer returning canonical UTF-8 bytes."""
+    sink = io.BytesIO()
+    _jcs_write_value(obj, sink)
+    return sink.getvalue()
+
+
+def _jcs_dumps(obj: Any) -> bytes:
+    """Serialize `obj` to RFC 8785 JCS bytes (prefer `rfc8785`, else stdlib fallback)."""
+    if _rfc8785 is not None:
+        return _rfc8785.dumps(obj)
+    return _stdlib_jcs_dumps(obj)
 
 # P-1: the one domain and the two kinds that project. A future kind decides
 # whether it projects at schema-authoring time, in the open, by editing this
@@ -378,8 +538,8 @@ def project(goal_file: dict) -> bytes:
     # uncaught FloatDomainError device-side is not the refusal this
     # docstring promises.
     try:
-        raw = rfc8785.dumps({"vars": containers})
-    except Exception as exc:  # noqa: BLE001 - rfc8785 raises several types
+        raw = _jcs_dumps({"vars": containers})
+    except Exception as exc:  # noqa: BLE001 - rfc8785 / stdlib JCS raise several types
         raise ProjectionRefused(
             f"the goal file carries a value JCS cannot represent: "
             f"{type(exc).__name__}: {exc} (N-6, P-6.1)"
@@ -433,8 +593,8 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
     # whole lint before the coverage checks ran. Un-canonicalizable bytes are
     # a refusal like any other, not a crash.
     try:
-        canonical = rfc8785.dumps(doc)
-    except Exception as exc:  # noqa: BLE001 - rfc8785 raises several types
+        canonical = _jcs_dumps(doc)
+    except Exception as exc:  # noqa: BLE001 - rfc8785 / stdlib JCS raise several types
         flag(
             RULE_PROJECTION_BYTES,
             f"not representable in JCS: {type(exc).__name__}: {exc}. "
