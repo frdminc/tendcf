@@ -117,14 +117,22 @@ LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
-# Exact binary path reported by `ps -axo comm=` for every running macOS Virtualization.framework VM
-# (Tart, UTM-VZ, OrbStack, Lima-VZ, Parallels-VZ, another user's Tart VM; observed on macOS 27.2).
+# Exact binary path reported by `/bin/ps -axww -o comm=` for every running macOS
+# Virtualization.framework VM (Tart, UTM-VZ, OrbStack, Lima-VZ, Parallels-VZ, another user's or
+# TART_HOME's Tart VM; observed on macOS 27.2).
 VZ_VM_COMM = (
     "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/"
     "com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/"
     "com.apple.Virtualization.VirtualMachine"
 )
-ADMIN_UID_RE = re.compile(r"^[0-9]+\Z")
+ADMIN_UID_OUT_RE = re.compile(r"^[1-9][0-9]{0,9}\n?\Z")
+LAUNCHCTL_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+LAUNCHCTL_BLANK_RE = re.compile(r"^[ \t]*\Z")
+LAUNCHCTL_OPEN_RE = re.compile(r"^[ \t]*(?:disabled services = )?\{[ \t]*\Z")
+LAUNCHCTL_CLOSE_RE = re.compile(r"^[ \t]*\}[ \t]*\Z")
+LAUNCHCTL_ENTRY_RE = re.compile(
+    r'^[ \t]*"([^"]+)"[ \t]*=>[ \t]*(disabled|enabled|true|false)[ \t]*\Z'
+)
 # All 25 unused launchd hygiene jobs disabled by guest/prep.sh (6 system + 19 gui);
 # verified 2026-11-25 on macOS 27.2 (26B123): PREP-RESULT disabled=25 absent=0 failed=0.
 HYGIENE_DISABLE_LIST: tuple[tuple[str, str], ...] = (
@@ -851,19 +859,19 @@ def oci_names(ctx: Ctx) -> set[str]:
 
 
 def vz_vm_count(ctx: Ctx) -> int:
-    """Count running macOS Virtualization.framework VM XPC processes (non-tart included)."""
-    r = ctx.run(["ps", "-axo", "comm="], timeout=15)
+    """Count running macOS Virtualization.framework VM XPC processes (other VZ guests included)."""
+    r = ctx.run(["/bin/ps", "-axww", "-o", "comm="], timeout=15, raw_newlines=True)
     if r.rc != 0:
         raise ToolError(
-            f"ps -axo comm= failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+            f"/bin/ps -axww -o comm= failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
         )
-    return sum(1 for ln in r.stdout.splitlines() if ln.strip() == VZ_VM_COMM)
+    return sum(1 for ln in r.stdout.split("\n") if ln == VZ_VM_COMM)
 
 
 def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
     """Refuse when `limit` VMs are already running. Counts both running local tart VMs
     and macOS Virtualization.framework VM processes (`com.apple.Virtualization.VirtualMachine`),
-    catching non-tart VZ hypervisors too (F23).
+    catching other VZ hypervisors and other users'/TART_HOME Tart VMs too (F23).
 
     The default is Apple's licence cap. golden passes limit=1: it needs the vmnet to itself
     (no other guest on it while the host key is pinned), so any running VM refuses it.
@@ -882,7 +890,7 @@ def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
         extra_vz = max(0, vz - len(running))
         if extra_vz:
             parts.append(
-                f"{extra_vz} non-tart Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+                f"{extra_vz} other Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
             )
         raise Refusal(f"{total} VMs already running ({', '.join(parts)}); {why}")
     return running
@@ -903,7 +911,7 @@ def assert_no_other_vm(ctx: Ctx, allowed: str | None = None) -> None:
         extra_vz = max(0, vz - (len(others) + allowed_running))
         if extra_vz:
             parts.append(
-                f"{extra_vz} non-tart Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+                f"{extra_vz} other Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
             )
         raise StepFail(
             f"another VM is running ({', '.join(parts)}); golden needs the host network "
@@ -2057,57 +2065,117 @@ def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
     return ok, " ".join(ev)
 
 
-def _launchctl_label_disabled(text: str, label: str) -> bool:
-    return (
-        re.search(
-            rf'^[ \t]*"{re.escape(label)}"[ \t]*=>[ \t]*(?:disabled|true)\b',
-            text,
-            re.MULTILINE,
+def parse_launchctl_disabled(text: str) -> dict[str, str]:
+    """Strictly parse `launchctl print-disabled` output into `{label: state}` (fail-closed).
+
+    Rejects NUL, CR, or any ASCII control byte other than tab/newline, splits on `\\n` only,
+    requires a single `{ ... }` block with exact `"label" => disabled|enabled|true|false` entries,
+    and rejects duplicate entries for any label.
+    """
+    if LAUNCHCTL_CTRL_RE.search(text):
+        raise StepFail(
+            f"launchctl print-disabled output contains control character: {clip(repr(text), 200)}"
         )
-        is not None
-    )
+    state = "before"
+    entries: dict[str, str] = {}
+    for lineno, line in enumerate(text.split("\n"), 1):
+        if state == "before":
+            if LAUNCHCTL_BLANK_RE.match(line):
+                continue
+            if LAUNCHCTL_OPEN_RE.match(line):
+                state = "in"
+                continue
+            raise StepFail(
+                f"unexpected line {lineno} before launchctl print-disabled block: {clip(line, 120)!r}"
+            )
+        if state == "in":
+            if LAUNCHCTL_BLANK_RE.match(line):
+                continue
+            if LAUNCHCTL_CLOSE_RE.match(line):
+                state = "after"
+                continue
+            m = LAUNCHCTL_ENTRY_RE.match(line)
+            if m is None:
+                raise StepFail(
+                    f"malformed line {lineno} inside launchctl print-disabled block: {clip(line, 120)!r}"
+                )
+            label, val = m.group(1), m.group(2)
+            if label in entries:
+                raise StepFail(
+                    f"duplicate launchctl print-disabled entry for {label!r} on line {lineno}"
+                )
+            entries[label] = val
+            continue
+        if LAUNCHCTL_BLANK_RE.match(line):
+            continue
+        raise StepFail(
+            f"unexpected line {lineno} after launchctl print-disabled block: {clip(line, 120)!r}"
+        )
+    if state == "before":
+        raise StepFail("launchctl print-disabled output missing opening '{'")
+    if state == "in":
+        raise StepFail("launchctl print-disabled output missing closing '}'")
+    return entries
 
 
 def check_hygiene_disabled(ctx: Ctx, target: vmssh.Target) -> str:
     """Assert every unused launchd hygiene job in HYGIENE_DISABLE_LIST is disabled (F20).
 
     Queries `sudo -n launchctl print-disabled system`, `id -u admin`, and
-    `sudo -n launchctl print-disabled gui/<uid>`, failing closed with StepFail on any
-    non-zero exit, invalid UID, or label not reported as disabled/true.
+    `sudo -n launchctl print-disabled user/<uid>` (reading `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`,
+    shared with `gui/<uid>`, because headless post-rotation check clones have no Aqua `gui/<uid>`
+    session), failing closed with StepFail on any non-zero exit, invalid UID, malformed output,
+    or label not reported as disabled/true.
     """
-    r_sys = rssh(ctx, target, ["sudo", "-n", "launchctl", "print-disabled", "system"])
+    r_sys = rssh(
+        ctx,
+        target,
+        ["sudo", "-n", "launchctl", "print-disabled", "system"],
+        raw_newlines=True,
+    )
     if r_sys.rc != 0:
         raise StepFail(
             f"launchctl print-disabled system failed (rc {r_sys.rc}): "
             f"{clip((r_sys.stderr or r_sys.stdout).strip(), 200)}"
         )
-    r_uid = rssh(ctx, target, ["id", "-u", "admin"])
-    uid = r_uid.stdout.strip()
-    if r_uid.rc != 0 or not ADMIN_UID_RE.match(uid):
+    sys_map = parse_launchctl_disabled(r_sys.stdout)
+    r_uid = rssh(ctx, target, ["id", "-u", "admin"], raw_newlines=True)
+    if (
+        r_uid.rc != 0
+        or LAUNCHCTL_CTRL_RE.search(r_uid.stdout)
+        or not ADMIN_UID_OUT_RE.fullmatch(r_uid.stdout)
+    ):
         raise StepFail(
-            f"id -u admin failed or returned non-numeric UID (rc {r_uid.rc}): "
+            f"id -u admin failed or returned invalid UID (rc {r_uid.rc}): "
             f"{clip((r_uid.stdout + ' ' + r_uid.stderr).strip(), 200)!r}"
         )
-    r_gui = rssh(
-        ctx, target, ["sudo", "-n", "launchctl", "print-disabled", f"gui/{uid}"]
+    uid = r_uid.stdout.rstrip("\n")
+    if int(uid) >= 2**32:
+        raise StepFail(f"id -u admin returned out-of-range UID: {uid!r}")
+    r_user = rssh(
+        ctx,
+        target,
+        ["sudo", "-n", "launchctl", "print-disabled", f"user/{uid}"],
+        raw_newlines=True,
     )
-    if r_gui.rc != 0:
+    if r_user.rc != 0:
         raise StepFail(
-            f"launchctl print-disabled gui/{uid} failed (rc {r_gui.rc}): "
-            f"{clip((r_gui.stderr or r_gui.stdout).strip(), 200)}"
+            f"launchctl print-disabled user/{uid} failed (rc {r_user.rc}): "
+            f"{clip((r_user.stderr or r_user.stdout).strip(), 200)}"
         )
+    user_map = parse_launchctl_disabled(r_user.stdout)
     missing: list[str] = []
     n_sys = 0
-    n_gui = 0
+    n_user = 0
     for domain, label in HYGIENE_DISABLE_LIST:
         if domain == "system":
             n_sys += 1
-            if not _launchctl_label_disabled(r_sys.stdout, label):
+            if sys_map.get(label) not in ("disabled", "true"):
                 missing.append(f"system/{label}")
         elif domain == "gui":
-            n_gui += 1
-            if not _launchctl_label_disabled(r_gui.stdout, label):
-                missing.append(f"gui/{uid}/{label}")
+            n_user += 1
+            if user_map.get(label) not in ("disabled", "true"):
+                missing.append(f"user/{uid}/{label}")
         else:
             raise StepFail(f"unknown hygiene domain {domain!r} for {label!r}")
     if missing:
@@ -2117,7 +2185,7 @@ def check_hygiene_disabled(ctx: Ctx, target: vmssh.Target) -> str:
         )
     return (
         f"{len(HYGIENE_DISABLE_LIST)}/{len(HYGIENE_DISABLE_LIST)} hygiene jobs disabled "
-        f"({n_sys} system, {n_gui} gui; uid={uid})"
+        f"({n_sys} system, {n_user} user/{uid})"
     )
 
 
@@ -2195,25 +2263,32 @@ def persistent_assertions(
     # Screen Sharing: the vanilla image has it on with the published admin password, a
     # network login that bypasses the pinned ssh key. Off in the launchd database, and
     # nothing listening on 5900.
-    r = rssh(ctx, t, ["sudo", "-n", "launchctl", "print-disabled", "system"])
-    out.append(
-        (
-            "2j",
-            "Screen Sharing (com.apple.screensharing) disabled",
-            r.rc == 0
-            and re.search(
-                r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)\b', r.stdout
+    r = rssh(
+        ctx,
+        t,
+        ["sudo", "-n", "launchctl", "print-disabled", "system"],
+        raw_newlines=True,
+    )
+    if r.rc != 0:
+        ok_2j = False
+        ev_2j = f"rc {r.rc}; {clip((r.stderr or r.stdout).strip(), 200) or 'launchctl print-disabled system failed'}"
+    else:
+        try:
+            sys_disabled = parse_launchctl_disabled(r.stdout)
+        except StepFail as e:
+            ok_2j = False
+            ev_2j = f"rc {r.rc}; {e}"
+        else:
+            ss_val = sys_disabled.get("com.apple.screensharing")
+            ok_2j = ss_val in ("disabled", "true")
+            ev_2j = (
+                f"rc {r.rc}; disabled entry present ({ss_val})"
+                if ok_2j
+                else f"rc {r.rc}; no disabled entry for com.apple.screensharing"
+                + (f" (got {ss_val!r})" if ss_val is not None else "")
             )
-            is not None,
-            f"rc {r.rc}; "
-            + (
-                "disabled entry present"
-                if re.search(
-                    r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)', r.stdout
-                )
-                else "no disabled entry for com.apple.screensharing"
-            ),
-        )
+    out.append(
+        ("2j", "Screen Sharing (com.apple.screensharing) disabled", ok_2j, ev_2j)
     )
     r = rssh(ctx, t, ["netstat", "-an", "-p", "tcp"])
     listening = [

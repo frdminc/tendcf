@@ -229,13 +229,15 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
 - **Two-VM cap.** Before every `tart run` (including the restart after a reboot) the driver
   reads `tart list --source local --format json` **and** counts running macOS
   `Virtualization.framework` VM XPC processes (exact `com.apple.Virtualization.VirtualMachine`
-  path via `ps -axo comm=`), refusing when `max(tart_running, vz_running) >= 2` (Apple's
-  licence allows two macOS VMs per host). This catches both local Tart VMs and non-Tart
-  `Virtualization.framework` hypervisors (UTM-VZ, OrbStack, Lima-VZ, Parallels-VZ, or another
-  user's Tart VM). Non-`Virtualization.framework` hypervisors (e.g. QEMU or VMware Fusion)
-  remain outside `ps` VZ visibility. `golden` is stricter: it needs the host to itself and
-  refuses when any Tart or `Virtualization.framework` VM is running (checked at preflight,
-  `boot()`, and `pin()`).
+  line via `/bin/ps -axww -o comm=` with `raw_newlines=True`), refusing when
+  `max(tart_running, vz_running) >= 2` (Apple's licence allows two macOS VMs per host). This
+  conservatively counts all `Virtualization.framework` guests (macOS or Linux), catching both
+  local Tart VMs and other `Virtualization.framework` guests (UTM-VZ, OrbStack, Lima-VZ,
+  Parallels-VZ, or another user's or `TART_HOME`'s Tart VM). Because `comm=` reads `argv[0]`,
+  local process-name spoofing can only trigger a fail-closed refusal, never a cap bypass.
+  Non-`Virtualization.framework` hypervisors (e.g. QEMU or VMware Fusion) remain outside `ps`
+  VZ visibility. `golden` is stricter: it needs the host to itself and refuses when any Tart
+  or `Virtualization.framework` VM is running (checked at preflight, `boot()`, and `pin()`).
 - **One driver at a time per account** (`flock` on one fixed file,
   `<passwd home>/.local/state/tendcf-state1-vm/driver.lock`, opened without following a
   symlink, whatever `--state-dir` and the tart home say; the path follows the passwd home, not
@@ -344,7 +346,7 @@ Recovery.
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
-| 2m | unused launchd hygiene jobs disabled: every one of the 25 labels in `prep.sh` `DISABLE_LIST` (6 `system` via `sudo -n launchctl print-disabled system` and 19 `gui` via `id -u admin` + `sudo -n launchctl print-disabled gui/<uid>`) reports `disabled` or `true`; any missing/enabled label, non-zero exit, or non-numeric UID fails closed | live |
+| 2m | unused launchd hygiene jobs disabled: every one of the 25 labels in `prep.sh` `DISABLE_LIST` (6 `system` via `sudo -n launchctl print-disabled system` and 19 per-user via `id -u admin` + `sudo -n launchctl print-disabled user/<uid>`) reports `disabled` or `true` under strict block parsing (`raw_newlines=True`, rejecting control chars, malformed lines, or duplicate entries). `check` queries `user/<uid>` rather than `gui/<uid>` because `prep.sh` rotates `admin`'s console password and invalidates `/etc/kcpassword`, so headless `check` clones have no Aqua `gui/<uid>` session (`gui/<uid>` exits 125) while `user/<uid>` reads the same `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` database over SSH | live |
 | 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
 | 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
 | 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
@@ -409,8 +411,11 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
 - **Observed (2026-11-25, macOS 27.2 build 26B123, `golden --rebuild` on `79a620a5`):**
   `prep.sh` reported `PREP-RESULT disabled=25 absent=0 failed=0`: all 25 labels in
   `DISABLE_LIST` (6 `system`, 19 `gui`) ship on macOS 27.2 and confirm disabled in
-  `launchctl print-disabled`. `check` asserts all 25 in step `2m` and again after reboot in
-  step `10a`.
+  `launchctl print-disabled`. On headless post-rotation `check` clones (no Aqua `gui/<uid>`
+  session after `prep.sh` rotates `admin`'s console password), `launchctl print-disabled
+  gui/<uid>` exits 125 while `launchctl print-disabled user/<uid>` reads the same persistent
+  `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` database; `check` asserts all 25 via
+  `system` and `user/<uid>` in step `2m` and again after reboot in step `10a`.
 - **Observed on the first real run (2026-11-21, macOS 27.2 build 26B123, OpenSSH_10.5p1,
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
