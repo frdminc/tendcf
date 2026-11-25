@@ -433,6 +433,13 @@ def _walk_state_dir_links(
                     f"{which} {str(link_ref)!r}{extra} is a symlink that points nowhere: "
                     "refusing to create its target (make the directory or pass a real path)",
                 )
+            if ".." in parts[i + 1 :]:
+                return (
+                    None,
+                    hops,
+                    f"the state dir path uses '..' after missing component {str(cand)!r}: "
+                    "refusing to collapse '..' past a missing component (pass a real path)",
+                )
             return cand, hops, ""  # missing tail of a real path (made later)
         except NotADirectoryError:
             if in_symlink:
@@ -443,7 +450,12 @@ def _walk_state_dir_links(
                     f"cannot resolve symlink {str(link_ref)!r} for the state dir: "
                     "Not a directory (make the directory or pass a real path)",
                 )
-            return cand, hops, ""
+            return (
+                None,
+                hops,
+                f"ancestor {str(cur)!r} of the state dir is not a directory "
+                "(pass a real directory)",
+            )
         except OSError as e:
             if in_symlink:
                 link_ref = origin_link or cand
@@ -460,6 +472,13 @@ def _walk_state_dir_links(
                 f"{e.strerror or e}",
             )
         if not stat.S_ISLNK(st.st_mode):
+            if not stat.S_ISDIR(st.st_mode) and i < len(parts) - 1:
+                return (
+                    None,
+                    hops,
+                    f"ancestor {str(cand)!r} of the state dir is not a directory "
+                    "(pass a real directory)",
+                )
             cur = cand
             continue
         err = _symlink_owner_refusal(cand, st.st_uid, euid, is_final=leaf_here)

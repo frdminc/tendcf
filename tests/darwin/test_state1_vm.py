@@ -3353,6 +3353,25 @@ class Golden(Base):
         self.assertIn("Too many levels of symbolic links", msg)
         self.assertNotIn("points nowhere", msg)
 
+        # 4) Macroscope 4696228708: `..` after a missing component or regular file must not
+        # bypass symlink checks via later os.path.realpath() lexical collapse.
+        msg = drv.state_dir_link_problem(
+            self.tmp / "missing-dir" / ".." / "foreign-anc-link" / "state"
+        )
+        self.assertIn("missing component", msg)
+        msg = drv.state_dir_link_problem(self.tmp / "missing-dir" / "..")
+        self.assertIn("missing component", msg)
+        reg_file = self.tmp / "regular-file"
+        reg_file.write_text("x")
+        msg = drv.state_dir_link_problem(
+            reg_file / ".." / "foreign-anc-link" / "state"
+        )
+        self.assertIn("not a directory", msg)
+        # Normal missing tail with no `..` after missing still passes
+        self.assertEqual(
+            drv.state_dir_link_problem(self.tmp / "new_parent" / "new_state"), ""
+        )
+
         # PR 112 R1 Group 8c: driver_lock refuses a non-sticky world-writable lock ancestor
         bad_lock_parent = self.tmp / "bad-lock-anc"
         bad_lock_parent.mkdir(mode=0o700)
