@@ -50,7 +50,7 @@ BOOTSTRAP_PW_ENV = "TENDCF_VM_BOOTSTRAP_PW"
 DEFAULT_BOOTSTRAP_PW = "admin"
 ASKPASS = Path(__file__).resolve().parent / "guest" / "bootstrap-askpass.sh"
 
-_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _BAD_PATH_RE = re.compile(r"[\s%$]")
 
 

@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the two hundred forty-four deliberately broken fixtures in examples/broken/
+  6. each of the two hundred forty-six deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,9 +88,9 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 244
+EXPECTED_BROKEN = 246
 EXPECTED_BYTE_CLASS = 6
-EXPECTED_PROJECTION = 31
+EXPECTED_PROJECTION = 38
 
 # example file -> schema file. report-rows.yml is a sequence of rows, each
 # validated individually against the row schema. The goal-file family is
@@ -1096,6 +1096,115 @@ def check_projector_properties(projector: Any, loaded: dict[str, Any]) -> None:
                 "project() altered inert metacharacters in systemd service",
                 rule=RULE_PROJECTION,
             )
+
+    # Issue #54 R1: negative property assertions covering projector hardening
+    # beyond single-fault fixtures (interlock argv & pre_action shape, systemd
+    # command[0] prefixes/trailing slash/relative path, systemd arg hazards,
+    # systemd working_dir/run_as/restart/wanted_by, and non-\n control chars +
+    # XML 1.0 noncharacters U+FFFE/U+FFFF in both values and keys).
+    def assert_refused(label: str, doc: dict[str, Any]) -> None:
+        try:
+            projector.project(doc)
+        except projector.ProjectionRefused:
+            return
+        fail(
+            f"project() unexpectedly accepted {label} (issue #54)",
+            rule=RULE_PROJECTION,
+        )
+
+    def make_interlock_goal(pre_action: Any) -> dict[str, Any]:
+        return {
+            "domains": {
+                "supervision": {
+                    "entries": {
+                        "interlock": {
+                            "guard-one": {
+                                "blocks": "enclosing-bundle",
+                                "bundle": "meta",
+                                "defines_class": "guard_ok",
+                                "pre_action": pre_action,
+                                "report": True,
+                                "state": "present",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    for il_label, bad_pa in (
+        ("relative interlock command[0]", {"command": ["true"], "expect_exit": 0, "timeout_seconds": 5}),
+        ("whitespace in interlock arg", {"command": ["/usr/bin/true", "a b"], "expect_exit": 0, "timeout_seconds": 5}),
+        ("non-dict pre_action", ["not-a-dict"]),
+        ("missing pre_action.command", {"expect_exit": 0, "timeout_seconds": 5}),
+    ):
+        assert_refused(il_label, make_interlock_goal(bad_pa))
+
+    def make_systemd_goal(**overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "bundle": "meta",
+            "command": ["/usr/bin/sleep", "1"],
+            "run_as": "nobody",
+            "state": "present",
+            "unit": {
+                "systemd": {
+                    "enabled": False,
+                    "restart": "no",
+                    "wanted_by": "multi-user.target",
+                }
+            },
+            "working_dir": "/",
+        }
+        for k, v in overrides.items():
+            if k in ("enabled", "restart", "wanted_by"):
+                entry["unit"]["systemd"][k] = v
+            else:
+                entry[k] = v
+        return {"domains": {"supervision": {"entries": {"service": {"tendcf.meta.service": entry}}}}}
+
+    for sd_label, ov in (
+        ("systemd command backslash", {"command": ["/usr/bin/sleep", "a\\b"]}),
+        ("systemd command $", {"command": ["/usr/bin/sleep", "$HOME"]}),
+        ("systemd command %", {"command": ["/usr/bin/sleep", "%n"]}),
+        ("systemd command[0] leading |", {"command": ["|/usr/bin/id"]}),
+        ("systemd command[0] leading +", {"command": ["+/usr/bin/id"]}),
+        ("systemd command[0] leading !", {"command": ["!/usr/bin/id"]}),
+        ("systemd command[0] leading ;", {"command": [";/usr/bin/id"]}),
+        ("systemd command[0] trailing /", {"command": ["/usr/bin/"]}),
+        ("systemd command[0] bare /", {"command": ["/"]}),
+        ("systemd command[0] relative", {"command": ["sleep", "1"]}),
+        ("systemd working_dir trailing \\", {"working_dir": "/srv\\"}),
+        ("systemd working_dir % specifier", {"working_dir": "/srv/%u"}),
+        ("systemd run_as trailing \\", {"run_as": "nobody\\"}),
+        ("systemd run_as numeric 0", {"run_as": "0"}),
+        ("systemd run_as %u", {"run_as": "%u"}),
+        ("systemd restart trailing \\", {"restart": "always\\"}),
+        ("systemd wanted_by trailing \\", {"wanted_by": "multi-user.target\\"}),
+        ("systemd wanted_by whitespace/%n", {"wanted_by": "multi-user.target %n"}),
+    ):
+        assert_refused(sd_label, make_systemd_goal(**ov))
+
+    for cc_label, bad_ch in (
+        ("BEL \\x07 in launchd command", "\x07"),
+        ("CR \\r in launchd command", "\r"),
+        ("DEL \\x7f in launchd command", "\x7f"),
+        ("U+FFFE nonchar in launchd command", "\ufffe"),
+        ("U+FFFF nonchar in launchd command", "\uffff"),
+    ):
+        g_cc = copy.deepcopy(goal)
+        g_cc["domains"]["supervision"]["entries"]["service"][target]["command"] = [
+            "/bin/echo",
+            f"x{bad_ch}y",
+        ]
+        assert_refused(cc_label, g_cc)
+
+    for key_label, bad_ch in (
+        ("BEL \\x07 in key", "\x07"),
+        ("U+FFFE nonchar in key", "\ufffe"),
+    ):
+        g_k = copy.deepcopy(goal)
+        g_k["domains"]["supervision"]["entries"]["service"][target][f"k{bad_ch}"] = "v"
+        assert_refused(key_label, g_k)
 
 
 def _differing_pointers(before: Any, after: Any, path: str = "") -> list[str]:
@@ -2621,46 +2730,93 @@ def _has_unescaped_dollar_anchor(pattern: str) -> bool:
 
 
 def _node_forbids_newline(
-    node: Any, root: dict[str, Any], schemas: dict[str, dict]
+    node: Any,
+    doc_name: str,
+    root: dict[str, Any],
+    schemas: dict[str, dict],
+    visited: set[tuple[str, str]] | None = None,
 ) -> bool:
-    """True iff schema object `node` (or its `$ref` target) carries `not: {pattern: "\\n"}`."""
+    """True iff schema object `node` (or its `$ref` target) unambiguously forbids `\\n`.
+
+    Only a pure-pattern `not` clause (keys subset of `pattern`, `description`,
+    `$comment`) whose regex matches `\\n` counts — rejecting vacuous
+    multi-keyword `not` clauses like `{"pattern": "\\n", "minLength": 100}`
+    while accepting both `{"pattern": "\\n"}` and wider character-class bans
+    like `{"pattern": "[\\u0000-\\u001f\\u007f\\ufffe\\uffff]"}` (issue #55 R1).
+    """
     if not isinstance(node, dict):
         return False
     not_clause = node.get("not")
-    if isinstance(not_clause, dict) and not_clause.get("pattern") == r"\n":
-        return True
+    if isinstance(not_clause, dict) and set(not_clause.keys()) <= {
+        "pattern",
+        "description",
+        "$comment",
+    }:
+        not_pat = not_clause.get("pattern")
+        if isinstance(not_pat, str):
+            try:
+                if re.search(not_pat, "\n") is not None:
+                    return True
+            except re.error:
+                pass
     ref = node.get("$ref")
     if isinstance(ref, str) and "#/$defs/" in ref:
         doc_part, def_name = ref.split("#/$defs/", 1)
-        target_root = root if not doc_part else schemas.get(doc_part.split("/")[-1])
+        target_doc = doc_name if not doc_part else doc_part.split("/")[-1]
+        target_root = root if not doc_part else schemas.get(target_doc)
+        seen = set() if visited is None else visited
+        key = (target_doc, def_name)
+        if key in seen:
+            return False
+        seen.add(key)
         if isinstance(target_root, dict):
             target = (target_root.get("$defs") or {}).get(def_name)
-            return _node_forbids_newline(target, target_root, schemas)
+            return _node_forbids_newline(target, target_doc, target_root, schemas, seen)
     return False
 
 
 def check_schema_dollar_newline_guards(schemas: dict[str, dict]) -> None:
-    """Every `$`-anchored `pattern` (and `patternProperties` key) must forbid `\\n`.
+    """Every `$`-anchored `pattern`, `patternProperties` key, and `format: date-time` must forbid `\\n`.
 
     Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`,
-    where `$` matches before a trailing `\\n` (unlike ECMA-262 `$`). Requiring
-    `"not": { "pattern": "\\n" }` beside every `$`-anchored `pattern` — and on
-    the sibling `propertyNames` of any `$`-anchored `patternProperties` key —
-    makes the invariant machine-checked so no future PR can reintroduce the
-    trailing-newline bypass (issue #55).
+    where `$` matches before a trailing `\\n` (unlike ECMA-262 `$`), and
+    certain `format: "date-time"` validators also tolerate trailing newlines.
+    Requiring a pure-pattern newline-excluding `not` clause beside every
+    `$`-anchored `pattern` (and on the sibling `propertyNames` of any
+    `$`-anchored `patternProperties` key, and on every `format: "date-time"`),
+    and forbidding `$`-anchored patterns nested inside an enclosing `not`
+    (De Morgan inversion), makes the invariant machine-checked so no future PR
+    can reintroduce the trailing-newline bypass (issue #55).
     """
     for name, schema in sorted(schemas.items()):
 
-        def walk(node: Any, pointer: str) -> None:
+        def walk(node: Any, pointer: str, in_not: bool = False) -> None:
             if isinstance(node, dict):
                 pat = node.get("pattern")
                 if isinstance(pat, str) and _has_unescaped_dollar_anchor(pat):
-                    if not _node_forbids_newline(node, schema, schemas):
+                    if in_not:
+                        fail(
+                            f"schema/{name}:{pointer or '<root>'}: `$`-anchored "
+                            f"pattern {pat!r} is nested inside `not` — Python `re` "
+                            "`$` matches before a trailing newline, inverting `not` "
+                            "(issue #55)",
+                            rule=RULE_SCHEMA_META,
+                        )
+                    elif not _node_forbids_newline(node, name, schema, schemas):
                         fail(
                             f"schema/{name}:{pointer or '<root>'}: `$`-anchored "
                             f"pattern {pat!r} lacks sibling "
                             '`"not": { "pattern": "\\\\n" }` guard — Python `re` '
                             "`$` matches before a trailing newline (issue #55)",
+                            rule=RULE_SCHEMA_META,
+                        )
+                if node.get("format") == "date-time":
+                    if in_not or not _node_forbids_newline(node, name, schema, schemas):
+                        fail(
+                            f"schema/{name}:{pointer or '<root>'}: "
+                            '`format: "date-time"` lacks sibling '
+                            '`"not": { "pattern": "\\\\n" }` guard (or is nested '
+                            "inside `not`) (issue #55)",
                             rule=RULE_SCHEMA_META,
                         )
                 pat_props = node.get("patternProperties")
@@ -2670,8 +2826,15 @@ def check_schema_dollar_newline_guards(schemas: dict[str, dict]) -> None:
                         if isinstance(key_pat, str) and _has_unescaped_dollar_anchor(
                             key_pat
                         ):
-                            if not _node_forbids_newline(
-                                node.get("propertyNames"), schema, schemas
+                            if in_not:
+                                fail(
+                                    f"schema/{name}:{sub_ptr}: `$`-anchored "
+                                    f"patternProperties key {key_pat!r} is nested "
+                                    "inside `not` (issue #55)",
+                                    rule=RULE_SCHEMA_META,
+                                )
+                            elif not _node_forbids_newline(
+                                node.get("propertyNames"), name, schema, schemas
                             ):
                                 fail(
                                     f"schema/{name}:{sub_ptr}: `$`-anchored "
@@ -2680,14 +2843,14 @@ def check_schema_dollar_newline_guards(schemas: dict[str, dict]) -> None:
                                     '{ "pattern": "\\\\n" }` (issue #55)',
                                     rule=RULE_SCHEMA_META,
                                 )
-                        walk(sub, sub_ptr)
+                        walk(sub, sub_ptr, in_not=in_not)
                 for key, value in node.items():
                     if key == "patternProperties":
                         continue
-                    walk(value, f"{pointer}/{key}")
+                    walk(value, f"{pointer}/{key}", in_not=(in_not or key == "not"))
             elif isinstance(node, list):
                 for i, value in enumerate(node):
-                    walk(value, f"{pointer}[{i}]")
+                    walk(value, f"{pointer}[{i}]", in_not=in_not)
 
         walk(schema, "")
 
@@ -2707,6 +2870,17 @@ def check_dollar_newline_selftest() -> None:
                     "type": "string",
                     "pattern": "^[a-z]+$",
                     "not": {"pattern": r"\n"},
+                }
+            },
+            False,
+        ),
+        (
+            "guarded $ pattern via control-char class accepted",
+            {
+                "x.schema.json": {
+                    "type": "string",
+                    "pattern": "^[a-z]+$",
+                    "not": {"pattern": r"[\u0000-\u001f\u007f\ufffe\uffff]"},
                 }
             },
             False,
@@ -2743,6 +2917,104 @@ def check_dollar_newline_selftest() -> None:
                     "type": "object",
                     "propertyNames": {"pattern": r"^[a-z]+\*$", "not": {"pattern": r"\n"}},
                     "patternProperties": {r"\*$": {"type": "object"}},
+                }
+            },
+            False,
+        ),
+        (
+            "nested $defs/x/items unguarded $ refused",
+            {
+                "x.schema.json": {
+                    "$defs": {
+                        "x": {
+                            "type": "array",
+                            "items": {"type": "string", "pattern": "^[a-z]+$"},
+                        }
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            "nested allOf[0]/then/properties/y unguarded $ refused",
+            {
+                "x.schema.json": {
+                    "allOf": [
+                        {
+                            "then": {
+                                "properties": {
+                                    "y": {"type": "string", "pattern": "^[a-z]+$"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            True,
+        ),
+        (
+            "guard via $ref accepted",
+            {
+                "x.schema.json": {
+                    "type": "object",
+                    "propertyNames": {"$ref": "#/$defs/key"},
+                    "patternProperties": {r"\*$": {"type": "object"}},
+                    "$defs": {
+                        "key": {
+                            "type": "string",
+                            "pattern": r"^[a-z]+\*$",
+                            "not": {"pattern": r"\n"},
+                        }
+                    },
+                }
+            },
+            False,
+        ),
+        (
+            "cyclic $ref refused without RecursionError",
+            {
+                "x.schema.json": {
+                    "$defs": {
+                        "a": {"pattern": "^[a-z]+$", "$ref": "#/$defs/b"},
+                        "b": {"$ref": "#/$defs/a"},
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            "vacuous multi-keyword not refused",
+            {
+                "x.schema.json": {
+                    "type": "string",
+                    "pattern": "^[a-z]+$",
+                    "not": {"pattern": r"\n", "minLength": 100},
+                }
+            },
+            True,
+        ),
+        (
+            "$ pattern nested inside enclosing not refused",
+            {
+                "x.schema.json": {
+                    "type": "string",
+                    "not": {"pattern": "^foo$"},
+                }
+            },
+            True,
+        ),
+        (
+            "format date-time without newline guard refused",
+            {"x.schema.json": {"type": "string", "format": "date-time"}},
+            True,
+        ),
+        (
+            "format date-time with newline guard accepted",
+            {
+                "x.schema.json": {
+                    "type": "string",
+                    "format": "date-time",
+                    "not": {"pattern": r"\n"},
                 }
             },
             False,

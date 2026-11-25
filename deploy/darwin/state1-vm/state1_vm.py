@@ -84,9 +84,9 @@ CANARY_ARG = "86400"
 CANARY_DRIFT_ARG = "99999"
 EXECD_PROG = "/opt/tendcf/bin/cf-execd"
 GH_REPO = "frdminc/tendcf"
-RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
-SHA256_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64})[ \t]+\*?([^\s]+)$")
-GUEST_STAGE_RE = re.compile(r"^/var/tmp/tendcf-stage\.[A-Za-z0-9._-]+$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}\Z")
+SHA256_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64})[ \t]+\*?([^\s]+)\Z")
+GUEST_STAGE_RE = re.compile(r"^/var/tmp/tendcf-stage\.[A-Za-z0-9._-]+\Z")
 STAGE_UPLOAD_SH = (
     "set -eu; umask 077; d=$(mktemp -d /var/tmp/tendcf-stage.XXXXXX); "
     'tar -xzf - -C "$d"; printf "%s\\n" "$d"'
@@ -116,11 +116,11 @@ FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
-TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
-DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+REPO_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*\Z")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\Z")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 CONSOLE_PW_LINE_RE = re.compile(r"^PREP-CONSOLE-PW rotated\s*$", re.MULTILINE)
 # prep.sh logs the Secure Token status after the password rotation (issue 78); the driver
 # carries that one line into g6's evidence, which is cut short for a long prep output.
@@ -177,7 +177,7 @@ TREE_CHECK_SH = (
 TREE_CHECK_NO_LINKS_SH = (
     TREE_CHECK_SH + '; find "$1" ! -type f ! -type d -print | head -n 5'
 )
-WORKDIR_RE = re.compile(r"^/opt/tendcf/[A-Za-z0-9._/-]+$")
+WORKDIR_RE = re.compile(r"^/opt/tendcf/[A-Za-z0-9._/-]+\Z")
 
 
 class Refusal(Exception):
@@ -488,14 +488,14 @@ def read_image_json(path: Path) -> dict:
             ("golden_name + -build", NAME_RE, image["golden_name"] + "-build"),
             (
                 "python.version",
-                re.compile(r"^\d+\.\d+\.\d+$"),
+                re.compile(r"^\d+\.\d+\.\d+\Z"),
                 image["python"]["version"],
             ),
-            ("python.sha256", re.compile(r"^[0-9a-f]{64}$"), image["python"]["sha256"]),
-            ("python.url", re.compile(r"^https://\S+$"), image["python"]["url"]),
+            ("python.sha256", re.compile(r"^[0-9a-f]{64}\Z"), image["python"]["sha256"]),
+            ("python.url", re.compile(r"^https://\S+\Z"), image["python"]["url"]),
             (
                 "python.signer",
-                re.compile(r"^[^\n]+ \([A-Z0-9]{10}\)$"),
+                re.compile(r"^[^\n]+ \([A-Z0-9]{10}\)\Z"),
                 image["python"]["signer"],
             ),
         ]

@@ -389,9 +389,13 @@
         },
         "run_as": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*$", "not": { "pattern": "\\n" }, "maxLength": 32 },
         "command": {
-          "description": "argv. An array because order is meaning — with pre_action.command, the only arrays in the file whose order is semantic.",
+          "description": "argv. An array because order is meaning — with pre_action.command, the only arrays in the file whose order is semantic. ASCII control characters and XML 1.0 noncharacters U+FFFE/U+FFFF are forbidden uniformly across schema and projector (issue #54 Q2, Ref: ANTIGRAVITY-120).",
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "not": { "pattern": "[\\u0000-\\u001f\\u007f\\ufffe\\uffff]" }
+          },
           "minItems": 1
         },
         "env": {
@@ -409,7 +413,7 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "description": "A systemd unit is a text file the adapter writes line by line, and systemd re-reads quotes, backslashes, '$' and '%' in an ExecStart argument, and a newline in any value starts a new directive. So a systemd entry's argv and working_dir are held to a safe alphabet instead of being escaped: a value outside it is refused structurally, fail-closed, and nothing is rewritten into a second spelling. Widening the alphabet is a schema_version bump, like any shape change.",
+          "description": "A systemd unit is a text file the adapter writes line by line, and systemd re-reads quotes, backslashes, '$' and '%' in an ExecStart argument, and a newline in any value starts a new directive. Moreover, systemd's config_parse_exec() unquotes firstword (command[0]) BEFORE checking ';' and executable prefixes ('@', '-', ':', '+', '!', '|'), so command[0] must be an absolute non-directory path ('^/...[^/]$') to neutralize root-escalation ('+'/'!') and pipe ('|') prefixes even inside double quotes (issue #54 R1). So a systemd entry's argv and working_dir are held to a safe alphabet instead of being escaped: a value outside it is refused structurally, fail-closed, and nothing is rewritten into a second spelling. Widening the alphabet is a schema_version bump, like any shape change.",
           "if": {
             "properties": { "unit": { "required": ["systemd"] } },
             "required": ["unit"]
@@ -417,7 +421,16 @@
           "then": {
             "properties": {
               "command": {
-                "items": { "pattern": "^[^\"\\\\$%\\u0000-\\u001f\\u007f]+$", "not": { "pattern": "\\n" } }
+                "prefixItems": [
+                  {
+                    "pattern": "^/[^\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]*[^/\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]$",
+                    "not": { "pattern": "\\n" }
+                  }
+                ],
+                "items": {
+                  "pattern": "^[^\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]+$",
+                  "not": { "pattern": "\\n" }
+                }
               },
               "working_dir": { "pattern": "^/$|^(/[A-Za-z0-9._+@:-]+)+$", "not": { "pattern": "\\n" } }
             }
@@ -719,10 +732,10 @@
     },
 
     "abs_path": {
-      "description": "Canonical absolute path: no '//', no trailing slash, no '.' or '..' segments — every path has one spelling. Bare '/' is admitted explicitly (the Fable sketch's pattern could not spell the filesystem root, which the required working_dir needs — reconciliation §15, F-1). Symlink aliasing cannot be excluded textually and is named residue R20; non-ASCII and control characters in segments are a §14.2 review target.",
+      "description": "Canonical absolute path: no '//', no trailing slash, no '.' or '..' segments — every path has one spelling. Bare '/' is admitted explicitly (the Fable sketch's pattern could not spell the filesystem root, which the required working_dir needs — reconciliation §15, F-1). Symlink aliasing cannot be excluded textually and is named residue R20; ASCII control characters and XML 1.0 noncharacters U+FFFE/U+FFFF are forbidden uniformly across schema and projector (issue #54 Q2, Ref: ANTIGRAVITY-120).",
       "type": "string",
       "pattern": "^/$|^(?!.*/\\.\\.?(/|$))(/[^/]+)+$",
-      "not": { "pattern": "\\n" },
+      "not": { "pattern": "[\\u0000-\\u001f\\u007f\\ufffe\\uffff]" },
       "maxLength": 1024
     },
 

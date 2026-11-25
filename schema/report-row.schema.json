@@ -15,7 +15,7 @@
       "type": "object",
       "properties": {
         "device": { "$ref": "common.schema.json#/$defs/host_name" },
-        "recorded_at": { "type": "string", "format": "date-time" },
+        "recorded_at": { "type": "string", "format": "date-time", "not": { "pattern": "\\n" } },
         "release": {
           "description": "The release that produced this row. Required on every row kind — this is what makes 'what was the desired state of device X at time T' reconstructible and 'did this break after the last release' a query rather than an argument.",
           "$ref": "common.schema.json#/$defs/release_stamp"
@@ -136,7 +136,7 @@
         "recorded_at": true,
         "release": true,
         "converged_release": { "$ref": "common.schema.json#/$defs/release_stamp" },
-        "converged_at": { "type": "string", "format": "date-time" },
+        "converged_at": { "type": "string", "format": "date-time", "not": { "pattern": "\\n" } },
         "complete": {
           "description": "False when convergence stopped early — an interlock blocked a bundle, or the run was interrupted. A device that is partially converged must not read as converged.",
           "type": "boolean"

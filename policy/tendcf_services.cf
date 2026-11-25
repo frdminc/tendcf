@@ -51,10 +51,14 @@
 #     templates/systemd.service.mustache (Type=simple; Restart= and
 #     WantedBy= from the entry);
 #   - every command argv element is double-quoted into ExecStart and
-#     nothing is escaped: the goal-file schema holds a systemd entry's argv
-#     and working_dir to an alphabet with no `"`, `\`, `$`, `%` or control
-#     character, so a value systemd would re-read never reaches the
-#     template (goal-file.schema.json, service_present allOf);
+#     nothing is escaped: the goal-file schema and projector hold a systemd
+#     entry's argv and working_dir to an alphabet with no `"`, `\`, `$`, `%`,
+#     ASCII control characters or U+FFFE/U+FFFF, AND require command[0] to be
+#     an absolute non-directory path (`^/...[^/]$`, re-checked on-device by
+#     `tendcf_svc_systemd_cmd0_valid__*`) because systemd's
+#     `config_parse_exec()` unquotes `firstword` before checking `;` and
+#     executable prefixes (`@`, `-`, `:`, `+`, `!`, `|`) (goal-file.schema.json
+#     service_present allOf, issue #54);
 #   - run order per pass is files (render, or delete after teardown) then
 #     commands: daemon-reload, enable/disable, start, restart, teardown,
 #     reload after removal. State probes are snapshots (see the classes
@@ -620,13 +624,14 @@ bundle agent tendcf_interlocks
       # examples/broken/156-159, 161-174 and 176 (the services
       # contract_version by 160 and 175) and by tests/policy/run.sh check 8,
       # which records the argv a program receives. Remaining limit: nothing on
-      # the device re-checks the schema. A projection that skipped it (the
-      # projector only refuses `$(`, `${`, `@(`, `@{`; `tendcf-install.sh
-      # data` installs without it) can carry a space or leading quote,
-      # which shifts argv, or a relative command[0], which the guard on the
-      # commands promise below refuses. Removing the join altogether (an
-      # slist per interlock from getvalues(), passed as arglist) is
-      # deliberately not done until proven against a real build.
+      # the device re-checks the schema (the projector now also enforces
+      # interlock_argv and forbids control characters/noncharacters, though
+      # `tendcf-install.sh data` installs without running the projector), so a
+      # hand-installed file can still carry a space or leading quote, which
+      # shifts argv, or a relative command[0], which the guard on the commands
+      # promise below refuses. Removing the join altogether (an slist per
+      # interlock from getvalues(), passed as arglist) is deliberately not done
+      # until proven against a real build.
       "pre_action_cmd[$(interlock_ids)]"
         string => join(" ",
           "data:variables.tendcf_interlock[$(interlock_ids)][pre_action][command]");
@@ -959,6 +964,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         string => "<missing>",
         ifvarclass => not(isvariable("data:variables.tendcf_service[$(service_ids)][run_as]"));
 
+      "service_cmd0[$(service_ids)]"
+        string => "$(data:variables.tendcf_service[$(service_ids)][command][0])",
+        ifvarclass => isvariable("data:variables.tendcf_service[$(service_ids)][command][0]");
+
       # Collision detection across service_ids (H1 / Adversary #1): the schema
       # admits '.', '-', '_' and '@', all of which canonify() maps to '_'.
       # Two colliding ids would share every sticky per-service class; on darwin
@@ -1251,11 +1260,22 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "tendcf_svc_systemd__$(service_canon[$(service_ids)])"
         expression => strcmp("$(unit_flavour[$(service_ids)])", "systemd");
 
+      # Defense-in-depth on-device guard for systemd ExecStart command[0]
+      # (issue #54 R1, same fail-closed pattern as interlocks 8d): systemd's
+      # `config_parse_exec()` unquotes `firstword` via `EXTRACT_UNQUOTE` BEFORE
+      # checking `;` and executable prefixes (`@`, `-`, `:`, `+`, `!`, `|`), so
+      # a leading `/` and non-trailing `/` (without `"`, `\`, `$`, `%`, or
+      # ASCII control chars) is required even inside double quotes.
+      "tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)])"
+        expression => and(isvariable("service_cmd0[$(service_ids)]"),
+                          regcmp("/[^\"\\\\$%\\x00-\\x1f\\x7f]*[^/\"\\\\$%\\x00-\\x1f\\x7f]", "$(service_cmd0[$(service_ids)])")),
+        ifvarclass => isvariable("service_cmd0[$(service_ids)]");
+
       "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)])"
         expression => "tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)]).!tendcf_svc_reserved__$(service_canon[$(service_ids)])";
 
       "tendcf_svc_systemd_supported__$(service_canon[$(service_ids)])"
-        expression => "tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).tendcf_systemd_host.!tendcf_svc_reserved__$(service_canon[$(service_ids)])";
+        expression => "tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)]).tendcf_systemd_host.!tendcf_svc_reserved__$(service_canon[$(service_ids)])";
 
       "tendcf_svc_supported__$(service_canon[$(service_ids)])"
         expression => "tendcf_svc_launchd_supported__$(service_canon[$(service_ids)])|tendcf_svc_systemd_supported__$(service_canon[$(service_ids)])";
@@ -1820,10 +1840,13 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)])"::
         "tendcf: systemd service refused: id is not a valid systemd service unit name ([A-Za-z0-9][A-Za-z0-9@._-]*.service, <=128 chars)";
 
-      "tendcf_svc_refused__$(service_canon[$(service_ids)]).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere)"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)])"::
+        "tendcf: service '$(service_ids)' refused: systemd command[0] is missing or not a safe absolute non-directory path (must start with '/' and not end with '/')";
+
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere)"::
         "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 
-      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere"::
+      "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere"::
         "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
 
       "tendcf_svc_launchd_present_nonregular__$(service_canon[$(service_ids)])"::
