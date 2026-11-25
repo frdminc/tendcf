@@ -50,7 +50,11 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
 - **`pull`** runs `tart pull <repo>@<digest>`. A no-op when that digest is already in the OCI
   cache. Tart's pull resumes, so re-run it after an interruption.
 - **`golden`** refuses (exit 2) when the pinned image is not already in the OCI cache; it
-  never pulls. It builds into `state1-golden-build` and renames to `state1-golden` last, so a
+  never runs `tart pull`. `clone_vm()` sets `TART_NO_AUTO_PRUNE=1` so Tart itself will not
+  evict the ~35 GB OCI cache entry during a clone, while upstream `cirruslabs/tart` 2.42.0
+  (`Sources/tart/Commands/Clone.swift`) has no `--no-pull` or `--offline` flag (so an external
+  deletion of the OCI cache entry between preflight and `tart clone` would still trigger Tart's
+  built-in pull). It builds into `state1-golden-build` and renames to `state1-golden` last, so a
   half-built image is never the golden one. With `state1-golden` present it does nothing
   unless `--rebuild`, and then the old golden is deleted only at the commit, right before the
   rename (a failed build costs nothing). The commit runs with SIGINT/SIGTERM/SIGHUP ignored and has six steps in
@@ -223,9 +227,17 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
 ## Guards
 
 - **Two-VM cap.** Before every `tart run` (including the restart after a reboot) the driver
-  reads `tart list --source local --format json` and refuses when two VMs are running (Apple's
-  licence allows two macOS VMs per host). It counts every running local VM, macOS or not.
-  `golden` is stricter: it needs the host to itself and refuses when any VM is running.
+  reads `tart list --source local --format json` **and** counts running macOS
+  `Virtualization.framework` VM XPC processes (exact `com.apple.Virtualization.VirtualMachine`
+  line via `/bin/ps -axww -o comm=` with `raw_newlines=True`), refusing when
+  `max(tart_running, vz_running) >= 2` (Apple's licence allows two macOS VMs per host). This
+  conservatively counts all `Virtualization.framework` guests (macOS or Linux), catching both
+  local Tart VMs and other `Virtualization.framework` guests (UTM-VZ, OrbStack, Lima-VZ,
+  Parallels-VZ, or another user's or `TART_HOME`'s Tart VM). Because `comm=` reads `argv[0]`,
+  local process-name spoofing can only trigger a fail-closed refusal, never a cap bypass.
+  Non-`Virtualization.framework` hypervisors (e.g. QEMU or VMware Fusion) remain outside `ps`
+  VZ visibility. `golden` is stricter: it needs the host to itself and refuses when any Tart
+  or `Virtualization.framework` VM is running (checked at preflight, `boot()`, and `pin()`).
 - **One driver at a time per account** (`flock` on one fixed file,
   `<passwd home>/.local/state/tendcf-state1-vm/driver.lock`, opened without following a
   symlink, whatever `--state-dir` and the tart home say; the path follows the passwd home, not
@@ -233,8 +245,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   an older driver and this one exclude each other when `$HOME` is the passwd home), because
   the VM names (`state1-golden-build`,
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
-  so the sweeps above cannot delete a VM another run is using. The cap check is
-  best-effort for VMs that other tools start.
+  so the sweeps above cannot delete a VM another run is using. Both `tart list` and `/bin/ps`
+  `Virtualization.framework` enumeration are point-in-time snapshots, so concurrent VM launches
+  by independent tools after the final pre-start check remain a residual best-effort race
+  (alongside non-`Virtualization.framework` hypervisors such as QEMU or VMware Fusion).
 - No `sudo`, no host launchd change, never the operator's real SSH keys (the driver is not
   handed any and reads none; it mints its own, see Credentials). It writes under `--state-dir` and the lock directory;
   `--summary FILE` may write anywhere you point it, and tart itself writes `~/.tart`.
@@ -334,10 +348,11 @@ Recovery.
 | 2i | Python 3.14.10 present, the whole framework `root:wheel` and not group/world writable, ancestors root-owned and not group/world writable | live |
 | 2j-2k | Screen Sharing disabled (`print-disabled`), nothing listening on tcp 5900 | live |
 | 2l | the vanilla console password `admin` no longer authenticates: `dscl . -authonly admin admin` (no sudo) must exit non-zero with exactly the wrong-password code `-14090 eDSAuthFailed`; any other code (account disabled, password expired), several codes, no code, or ssh's 255 fails the step (`prep.sh` applies the same rule; a missing user also prints `-14090 eDSAuthFailed` on macOS 27.2, observed, so this step does not prove the account exists, the key login as `admin` does) | live |
+| 2m | unused launchd hygiene jobs disabled: every one of the 3 SIP-persistent labels in `prep.sh` `DISABLE_LIST` (`system/com.apple.findmymac` via `sudo -n launchctl print-disabled system`, plus `user/<uid>/com.apple.cloudpaird` and `user/<uid>/com.apple.Siri.agent` via `id -u admin` + `sudo -n launchctl print-disabled user/<uid>`) reports `disabled` or `true` under strict block parsing (`raw_newlines=True`, rejecting control chars, malformed lines, or duplicate entries). `check` queries `user/<uid>` rather than `gui/<uid>` because `prep.sh` rotates `admin`'s console password and invalidates `/etc/kcpassword`, so headless `check` clones have no Aqua `gui/<uid>` session (`gui/<uid>` exits 125) while `user/<uid>` reads the same `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` database over SSH | live |
 | 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
 | 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
 | 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2l (including live password-login refusal 2f) hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2m (including live password-login refusal 2f and all 3 persistent hygiene jobs 2m) hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
 | 10b | post-reboot `launchctl print` for `com.tendcf.canary.main` and `org.tendcf.execd` (loaded from disk at boot; `org.tendcf.execd` running as `root`) | live (with `--tarball` or `--artifact-run`) |
 | 11 | stop and delete the clone, always | live |
 | 11a | canary tombstone teardown (`data` + `run-once`, plist removed, `launchctl print` fails) and `org.tendcf.execd` `disable` (plist removed, `launchctl print` fails) before step 11 | live (with `--tarball` or `--artifact-run`) |
@@ -395,9 +410,17 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
 
 ## Things not yet verified, and what the real runs observed (2026-11-21)
 
-- The launchd disable list in `prep.sh` is a candidate list for a headless VM, applied only to
-  labels whose plist ships on the image. The first real run's `before` snapshot is the
-  evidence to prune it against.
+- **Observed (2026-11-25, macOS 27.2 build 26B123, SIP enabled; `golden --rebuild` on `79a620a5`
+  and live `check` run `20261125T180305Z-c9d4`):** all 25 original candidate labels existed and
+  read back disabled in-session during `golden` (`PREP-RESULT disabled=25 absent=0 failed=0`),
+  but live `check` proved 22 of the 25 overrides are dropped across shutdown/clone boot under
+  SIP (identical in `2m` and post-reboot `10a`). On headless post-rotation `check` clones (no
+  Aqua `gui/<uid>` session after `prep.sh` rotates `admin`'s console password), `launchctl
+  print-disabled gui/<uid>` exits 125 while `launchctl print-disabled user/<uid>` reads the
+  same persistent `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` database. `prep.sh`
+  `DISABLE_LIST` and `check` steps `2m`/`10a` are therefore pruned to the 3 empirically
+  persistent labels: `system/com.apple.findmymac`, `user/<uid>/com.apple.cloudpaird`, and
+  `user/<uid>/com.apple.Siri.agent`.
 - **Observed on the first real run (2026-11-21, macOS 27.2 build 26B123, OpenSSH_10.5p1,
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,

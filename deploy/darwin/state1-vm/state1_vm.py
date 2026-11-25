@@ -117,6 +117,31 @@ LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
+# Exact binary path reported by `/bin/ps -axww -o comm=` for every running macOS
+# Virtualization.framework VM (Tart, UTM-VZ, OrbStack, Lima-VZ, Parallels-VZ, another user's or
+# TART_HOME's Tart VM; observed on macOS 27.2).
+VZ_VM_COMM = (
+    "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/"
+    "com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/"
+    "com.apple.Virtualization.VirtualMachine"
+)
+ADMIN_UID_OUT_RE = re.compile(r"^[1-9][0-9]{0,9}\n?\Z")
+LAUNCHCTL_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+LAUNCHCTL_BLANK_RE = re.compile(r"^[ \t]*\Z")
+LAUNCHCTL_OPEN_RE = re.compile(r"^[ \t]*(?:disabled services = )?\{[ \t]*\Z")
+LAUNCHCTL_CLOSE_RE = re.compile(r"^[ \t]*\}[ \t]*\Z")
+LAUNCHCTL_ENTRY_RE = re.compile(
+    r'^[ \t]*"([^"]+)"[ \t]*=>[ \t]*(disabled|enabled|true|false)[ \t]*\Z'
+)
+# All 3 unused launchd hygiene jobs disabled by guest/prep.sh (1 system + 2 user);
+# empirically pruned 2026-11-25 on live macOS 27.2 (26B123, SIP enabled; issue #78 F20):
+# all 25 original candidates existed and read back disabled in-session, but 22 did not persist
+# across shutdown/clone boot under SIP, leaving these 3 persistent labels.
+HYGIENE_DISABLE_LIST: tuple[tuple[str, str], ...] = (
+    ("system", "com.apple.findmymac"),
+    ("user", "com.apple.cloudpaird"),
+    ("user", "com.apple.Siri.agent"),
+)
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -813,35 +838,63 @@ def oci_names(ctx: Ctx) -> set[str]:
     return {v["Name"] for v in tart_list(ctx, "oci")}
 
 
+def vz_vm_count(ctx: Ctx) -> int:
+    """Count running macOS Virtualization.framework VM XPC processes (other VZ guests included)."""
+    r = ctx.run(["/bin/ps", "-axww", "-o", "comm="], timeout=15, raw_newlines=True)
+    if r.rc != 0:
+        raise ToolError(
+            f"/bin/ps -axww -o comm= failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+        )
+    return sum(1 for ln in r.stdout.split("\n") if ln == VZ_VM_COMM)
+
+
 def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
-    """Refuse when `limit` VMs are already running. Counts every running local VM (conservative).
+    """Refuse when `limit` VMs are already running. Counts both running local tart VMs
+    and macOS Virtualization.framework VM processes (`com.apple.Virtualization.VirtualMachine`),
+    catching other VZ hypervisors and other users'/TART_HOME Tart VMs too (F23).
 
     The default is Apple's licence cap. golden passes limit=1: it needs the vmnet to itself
     (no other guest on it while the host key is pinned), so any running VM refuses it.
     """
     running = sorted(n for n, v in local_vms(ctx).items() if v.get("Running"))
-    if len(running) >= limit:
+    vz = vz_vm_count(ctx)
+    total = max(len(running), vz)
+    if total >= limit:
         why = (
             f"Apple's licence allows {VM_CAP} macOS VMs at once. Not starting another."
             if limit >= VM_CAP
             else "golden needs the host network to itself (no other guest may share the vmnet "
             "while the host key is pinned). Stop them first."
         )
-        raise Refusal(
-            f"{len(running)} VMs already running ({', '.join(running)}); {why}"
-        )
+        parts = list(running)
+        extra_vz = max(0, vz - len(running))
+        if extra_vz:
+            parts.append(
+                f"{extra_vz} other Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+            )
+        raise Refusal(f"{total} VMs already running ({', '.join(parts)}); {why}")
     return running
 
 
 def assert_no_other_vm(ctx: Ctx, allowed: str | None = None) -> None:
-    """Fail the current step if any local VM other than `allowed` is running (issue 78:
+    """Fail the current step if any local tart VM other than `allowed` is running, or if
+    extra Virtualization.framework VM processes beyond `allowed` are running (issue 78 / F23:
     re-checked in golden's boot() and at the start of pin() so a VM started mid-build fails it)."""
-    others = sorted(
-        n for n, v in local_vms(ctx).items() if v.get("Running") and n != allowed
+    vms = local_vms(ctx)
+    others = sorted(n for n, v in vms.items() if v.get("Running") and n != allowed)
+    allowed_running = (
+        1 if (allowed is not None and vms.get(allowed, {}).get("Running")) else 0
     )
-    if others:
+    vz = vz_vm_count(ctx)
+    if others or vz > allowed_running:
+        parts = list(others)
+        extra_vz = max(0, vz - (len(others) + allowed_running))
+        if extra_vz:
+            parts.append(
+                f"{extra_vz} other Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+            )
         raise StepFail(
-            f"another VM is running ({', '.join(others)}); golden needs the host network "
+            f"another VM is running ({', '.join(parts)}); golden needs the host network "
             "to itself while the host key is pinned"
         )
 
@@ -897,8 +950,8 @@ class Vm:
     def __init__(self, ctx: Ctx, name: str):
         self.ctx, self.name, self.proc = ctx, name, None
 
-    def start(self) -> None:
-        assert_vm_cap(self.ctx)
+    def start(self, *, limit: int = VM_CAP) -> None:
+        assert_vm_cap(self.ctx, limit=limit)
         log = self.ctx.logs() / f"{self.name}-run.log"
         argv = ["tart", "run", "--no-graphics", self.name]
         self.ctx.err("$ " + shlex.join(argv) + f"   (log {log})")
@@ -1992,6 +2045,130 @@ def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
     return ok, " ".join(ev)
 
 
+def parse_launchctl_disabled(text: str) -> dict[str, str]:
+    """Strictly parse `launchctl print-disabled` output into `{label: state}` (fail-closed).
+
+    Rejects NUL, CR, or any ASCII control byte other than tab/newline, splits on `\\n` only,
+    requires a single `{ ... }` block with exact `"label" => disabled|enabled|true|false` entries,
+    and rejects duplicate entries for any label.
+    """
+    if LAUNCHCTL_CTRL_RE.search(text):
+        raise StepFail(
+            f"launchctl print-disabled output contains control character: {clip(repr(text), 200)}"
+        )
+    state = "before"
+    entries: dict[str, str] = {}
+    for lineno, line in enumerate(text.split("\n"), 1):
+        if state == "before":
+            if LAUNCHCTL_BLANK_RE.match(line):
+                continue
+            if LAUNCHCTL_OPEN_RE.match(line):
+                state = "in"
+                continue
+            raise StepFail(
+                f"unexpected line {lineno} before launchctl print-disabled block: {clip(line, 120)!r}"
+            )
+        if state == "in":
+            if LAUNCHCTL_BLANK_RE.match(line):
+                continue
+            if LAUNCHCTL_CLOSE_RE.match(line):
+                state = "after"
+                continue
+            m = LAUNCHCTL_ENTRY_RE.match(line)
+            if m is None:
+                raise StepFail(
+                    f"malformed line {lineno} inside launchctl print-disabled block: {clip(line, 120)!r}"
+                )
+            label, val = m.group(1), m.group(2)
+            if label in entries:
+                raise StepFail(
+                    f"duplicate launchctl print-disabled entry for {label!r} on line {lineno}"
+                )
+            entries[label] = val
+            continue
+        if LAUNCHCTL_BLANK_RE.match(line):
+            continue
+        raise StepFail(
+            f"unexpected line {lineno} after launchctl print-disabled block: {clip(line, 120)!r}"
+        )
+    if state == "before":
+        raise StepFail("launchctl print-disabled output missing opening '{'")
+    if state == "in":
+        raise StepFail("launchctl print-disabled output missing closing '}'")
+    return entries
+
+
+def check_hygiene_disabled(ctx: Ctx, target: vmssh.Target) -> str:
+    """Assert every unused launchd hygiene job in HYGIENE_DISABLE_LIST is disabled (F20).
+
+    Queries `sudo -n launchctl print-disabled system`, `id -u admin`, and
+    `sudo -n launchctl print-disabled user/<uid>` (reading `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`,
+    shared with `gui/<uid>`, because headless post-rotation check clones have no Aqua `gui/<uid>`
+    session), failing closed with StepFail on any non-zero exit, invalid UID, malformed output,
+    or label not reported as disabled/true.
+    """
+    r_sys = rssh(
+        ctx,
+        target,
+        ["sudo", "-n", "launchctl", "print-disabled", "system"],
+        raw_newlines=True,
+    )
+    if r_sys.rc != 0:
+        raise StepFail(
+            f"launchctl print-disabled system failed (rc {r_sys.rc}): "
+            f"{clip((r_sys.stderr or r_sys.stdout).strip(), 200)}"
+        )
+    sys_map = parse_launchctl_disabled(r_sys.stdout)
+    r_uid = rssh(ctx, target, ["id", "-u", "admin"], raw_newlines=True)
+    if (
+        r_uid.rc != 0
+        or LAUNCHCTL_CTRL_RE.search(r_uid.stdout)
+        or not ADMIN_UID_OUT_RE.fullmatch(r_uid.stdout)
+    ):
+        raise StepFail(
+            f"id -u admin failed or returned invalid UID (rc {r_uid.rc}): "
+            f"{clip((r_uid.stdout + ' ' + r_uid.stderr).strip(), 200)!r}"
+        )
+    uid = r_uid.stdout.rstrip("\n")
+    if int(uid) >= 2**32:
+        raise StepFail(f"id -u admin returned out-of-range UID: {uid!r}")
+    r_user = rssh(
+        ctx,
+        target,
+        ["sudo", "-n", "launchctl", "print-disabled", f"user/{uid}"],
+        raw_newlines=True,
+    )
+    if r_user.rc != 0:
+        raise StepFail(
+            f"launchctl print-disabled user/{uid} failed (rc {r_user.rc}): "
+            f"{clip((r_user.stderr or r_user.stdout).strip(), 200)}"
+        )
+    user_map = parse_launchctl_disabled(r_user.stdout)
+    missing: list[str] = []
+    n_sys = 0
+    n_user = 0
+    for domain, label in HYGIENE_DISABLE_LIST:
+        if domain == "system":
+            n_sys += 1
+            if sys_map.get(label) not in ("disabled", "true"):
+                missing.append(f"system/{label}")
+        elif domain == "user":
+            n_user += 1
+            if user_map.get(label) not in ("disabled", "true"):
+                missing.append(f"user/{uid}/{label}")
+        else:
+            raise StepFail(f"unknown hygiene domain {domain!r} for {label!r}")
+    if missing:
+        raise StepFail(
+            f"{len(missing)}/{len(HYGIENE_DISABLE_LIST)} hygiene jobs not disabled: "
+            + ", ".join(missing)
+        )
+    return (
+        f"{len(HYGIENE_DISABLE_LIST)}/{len(HYGIENE_DISABLE_LIST)} hygiene jobs disabled "
+        f"({n_sys} system, {n_user} user/{uid})"
+    )
+
+
 def persistent_assertions(
     ctx: Ctx, image: dict, t: vmssh.Target, facts: dict | None = None
 ) -> list[tuple[str, str, bool, str]]:
@@ -2066,25 +2243,32 @@ def persistent_assertions(
     # Screen Sharing: the vanilla image has it on with the published admin password, a
     # network login that bypasses the pinned ssh key. Off in the launchd database, and
     # nothing listening on 5900.
-    r = rssh(ctx, t, ["sudo", "-n", "launchctl", "print-disabled", "system"])
-    out.append(
-        (
-            "2j",
-            "Screen Sharing (com.apple.screensharing) disabled",
-            r.rc == 0
-            and re.search(
-                r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)\b', r.stdout
+    r = rssh(
+        ctx,
+        t,
+        ["sudo", "-n", "launchctl", "print-disabled", "system"],
+        raw_newlines=True,
+    )
+    if r.rc != 0:
+        ok_2j = False
+        ev_2j = f"rc {r.rc}; {clip((r.stderr or r.stdout).strip(), 200) or 'launchctl print-disabled system failed'}"
+    else:
+        try:
+            sys_disabled = parse_launchctl_disabled(r.stdout)
+        except StepFail as e:
+            ok_2j = False
+            ev_2j = f"rc {r.rc}; {e}"
+        else:
+            ss_val = sys_disabled.get("com.apple.screensharing")
+            ok_2j = ss_val in ("disabled", "true")
+            ev_2j = (
+                f"rc {r.rc}; disabled entry present ({ss_val})"
+                if ok_2j
+                else f"rc {r.rc}; no disabled entry for com.apple.screensharing"
+                + (f" (got {ss_val!r})" if ss_val is not None else "")
             )
-            is not None,
-            f"rc {r.rc}; "
-            + (
-                "disabled entry present"
-                if re.search(
-                    r'"com\.apple\.screensharing"\s*=>\s*(disabled|true)', r.stdout
-                )
-                else "no disabled entry for com.apple.screensharing"
-            ),
-        )
+    out.append(
+        ("2j", "Screen Sharing (com.apple.screensharing) disabled", ok_2j, ev_2j)
     )
     r = rssh(ctx, t, ["netstat", "-an", "-p", "tcp"])
     listening = [
@@ -2120,6 +2304,12 @@ def persistent_assertions(
             ),
         )
     )
+    try:
+        ev_2m = check_hygiene_disabled(ctx, t)
+        ok_2m = True
+    except StepFail as e:
+        ok_2m, ev_2m = False, str(e)
+    out.append(("2m", "unused launchd hygiene jobs disabled", ok_2m, ev_2m))
     return out
 
 
@@ -3486,7 +3676,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
 
                 def boot() -> str:
                     assert_no_other_vm(ctx)
-                    vm.start()
+                    vm.start(limit=1)
                     state["ip"] = vm.ip()
                     return f"ip {state['ip']}"
 
@@ -4851,7 +5041,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
                         "; ".join(bad)
-                        or "2a-2l re-checked (2g after the reboot: "
+                        or "2a-2m re-checked (2g after the reboot: "
                         f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s; "
                         f"listing: {facts['mdutil'].listing!r})",
                     )
