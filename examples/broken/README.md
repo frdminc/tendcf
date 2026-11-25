@@ -691,6 +691,9 @@ below are that document's negatives.
 | 91 | `91-container-is-an-array.json` | a kind container is an array | projection |
 | 92 | `92-entry-body-is-an-array.json` | an entry body is an array | projection |
 | 145 | `145-unit-package-under-vars.json` | a `unit-package` container under `vars` (schema v5: detector data, never projected; the existing closed-container rule, not a new one) | projection |
+| 275 | `275-control-char-in-projection.json` | `working_dir` carrying `\nExecStartPre=/bin/evil` (ASCII control character; directive injection / XML 1.0 hazard, issue #54) | projection |
+| 276 | `276-interlock-command-leading-backtick.json` | interlock `pre_action.command[1]` starting with a backtick (`ArgSplitCommand` quote delimiter; `interlock_argv` enforcement, issue #54) | projection |
+| 277 | `277-systemd-command-quote-breakout.json` | systemd `command[1]` carrying `"` (`ExecStart="{{{.}}}"` quote breakout, issue #54) | projection |
 
 Three of the twelve negatives have no row, and deliberately — all three are
 checked by `check_projector_properties()` instead, over bytes it synthesises.

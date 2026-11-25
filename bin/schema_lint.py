@@ -90,7 +90,7 @@ GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
 EXPECTED_BROKEN = 244
 EXPECTED_BYTE_CLASS = 6
-EXPECTED_PROJECTION = 28
+EXPECTED_PROJECTION = 31
 
 # example file -> schema file. report-rows.yml is a sequence of rows, each
 # validated individually against the row schema. The goal-file family is
@@ -1033,6 +1033,69 @@ def check_projector_properties(projector: Any, loaded: dict[str, Any]) -> None:
             "which is R21's tripwire (N-1)",
             rule=RULE_PROJECTION,
         )
+
+    # Issue #54: shell metacharacters proven inert in launchd ProgramArguments/
+    # WorkingDirectory (XML-escaped by RenderHTMLContent, no shell) and systemd
+    # ExecStart (double-quoted, no shell) must remain accepted and preserved
+    # verbatim by project(), while control characters, bad interlock_argv
+    # (leading backtick), and systemd quote breakout are refused.
+    inert_args = ["/bin/echo", ";", "|", "&&", "`echo hi`", "<", ">", "&", "'s'"]
+    launchd_meta = copy.deepcopy(goal)
+    svc_meta = launchd_meta["domains"]["supervision"]["entries"]["service"][target]
+    svc_meta["command"] = [*inert_args, '"q"']
+    svc_meta["working_dir"] = "/tmp/dir;a|b&&c`d`<e>f"
+    try:
+        projected_launchd = json.loads(projector.project(launchd_meta))
+    except Exception as exc:  # noqa: BLE001
+        fail(
+            f"project() refused inert metacharacters in launchd service: {exc}",
+            rule=RULE_PROJECTION,
+        )
+    else:
+        got_svc = projected_launchd["vars"][container][target]
+        if got_svc["command"] != [*inert_args, '"q"'] or got_svc["working_dir"] != "/tmp/dir;a|b&&c`d`<e>f":
+            fail(
+                "project() altered inert metacharacters in launchd service",
+                rule=RULE_PROJECTION,
+            )
+
+    systemd_meta = {
+        "domains": {
+            "supervision": {
+                "entries": {
+                    "service": {
+                        "tendcf.meta.service": {
+                            "bundle": "meta",
+                            "command": inert_args,
+                            "run_as": "nobody",
+                            "state": "present",
+                            "unit": {
+                                "systemd": {
+                                    "enabled": False,
+                                    "restart": "no",
+                                    "wanted_by": "multi-user.target",
+                                }
+                            },
+                            "working_dir": "/",
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try:
+        projected_systemd = json.loads(projector.project(systemd_meta))
+    except Exception as exc:  # noqa: BLE001
+        fail(
+            f"project() refused inert metacharacters in systemd service: {exc}",
+            rule=RULE_PROJECTION,
+        )
+    else:
+        if projected_systemd["vars"][container]["tendcf.meta.service"]["command"] != inert_args:
+            fail(
+                "project() altered inert metacharacters in systemd service",
+                rule=RULE_PROJECTION,
+            )
 
 
 def _differing_pointers(before: Any, after: Any, path: str = "") -> list[str]:
