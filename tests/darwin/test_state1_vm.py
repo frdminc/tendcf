@@ -7740,6 +7740,7 @@ class CheckRenderer(Base):
         with tarfile.open(fileobj=io.BytesIO(self.world.stage_bundles[0]), mode="r:gz") as tf:
             names = set(tf.getnames())
         self.assertIn("tendcf-install.sh", names)
+        self.assertIn("bin/projector.py", names)
         self.assertIn(f"artifact/{self.tarball.name}", names)
         self.assertIn(f"artifact/{self.sha_file.name}", names)
         self.assertIn("policy/tendcf_services.cf", names)

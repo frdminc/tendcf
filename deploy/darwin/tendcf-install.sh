@@ -19,17 +19,20 @@
 # under `writer: "tendcf-install"` (`deploy/darwin/canary/goal-file*.json`,
 # `examples/launchd-writers.yml`, issue #99).
 #
-#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--enable]
+#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--projector-src FILE] [--enable]
 #                    verify and extract the PR 95 macOS fork tarball (clearing
 #                    com.apple.quarantine, ACLs, flags, SUID/SGID), enforce
 #                    root:wheel and go-w on /opt/tendcf and verify ancestors up
 #                    to /, verify Mach-O dependencies and code signatures, lay
-#                    out the work directory, place the policy and promises.cf,
-#                    optionally install CMDB data (validated by cf-promises
-#                    first) and optionally enable org.tendcf.execd. Re-running
-#                    when converged is a no-op that reports `no change`.
-#   data FILE        replace the CMDB data (validated first; the old file is
-#                    restored if cf-promises rejects the new one)
+#                    out the work directory, place the policy, promises.cf and
+#                    projector.py, optionally install CMDB data (validated by
+#                    projector.py and cf-promises --show-classes before
+#                    publication) and optionally enable org.tendcf.execd.
+#                    Re-running when converged is a no-op that reports `no change`.
+#   data FILE        replace the CMDB data (serialized via lockf, validated by
+#                    projector.py and cf-promises --show-classes before
+#                    publication, verified post-publish with atomic rollback on
+#                    failure)
 #   run-once         one `cf-agent -K -I` pass over the installed policy
 #   enable           write /Library/LaunchDaemons/org.tendcf.execd.plist
 #                    (root:wheel 0644, plutil -lint) and bootstrap it
@@ -75,6 +78,8 @@ plist_path="$launchd_dir/$label.plist"
 installed_sha_file="$prefix/share/tendcf/INSTALLED_TARBALL.sha256"
 here="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 policy_src="$here/../../policy"
+projector_src=""
+installed_projector="$prefix/share/tendcf/bin/projector.py"
 
 cf_agent="$prefix/bin/cf-agent"
 cf_promises="$prefix/bin/cf-promises"
@@ -84,6 +89,10 @@ entry=""     # set by init_paths
 data=""      # set by init_paths
 
 stage_dir=""
+place_projector_tmp=""
+put_data_stage_wd=""
+put_data_tmp=""
+put_data_backup=""
 changed=0
 upgrade_needs_execd_restart=0
 upgrade_rollback_armed=0
@@ -171,6 +180,22 @@ cleanup_stage() {
     fi
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
         /bin/rm -rf "$stage_dir" || true
+    fi
+    if [ -n "${put_data_tmp:-}" ]; then
+        /bin/rm -f "$put_data_tmp" || true
+        put_data_tmp=""
+    fi
+    if [ -n "${put_data_backup:-}" ]; then
+        /bin/rm -f "$put_data_backup" || true
+        put_data_backup=""
+    fi
+    if [ -n "${put_data_stage_wd:-}" ] && [ -d "$put_data_stage_wd" ]; then
+        /bin/rm -rf "$put_data_stage_wd" || true
+        put_data_stage_wd=""
+    fi
+    if [ -n "${place_projector_tmp:-}" ]; then
+        /bin/rm -f "$place_projector_tmp" || true
+        place_projector_tmp=""
     fi
 }
 trap cleanup_stage EXIT
@@ -1255,44 +1280,293 @@ EOF
     fi
 }
 
-put_data() {  # put_data FILE
-    local src="$1" backup=""
-    [ -f "$src" ] || die "no such data file: $src"
-    [ -f "$entry" ] || die "not installed: run install first"
-    if [ -L "$data" ] || [ -d "$data" ]; then
-        die "$data is not a regular file; refusing"
+resolve_projector_src() {
+    if [ -z "$projector_src" ]; then
+        if [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
+            projector_src="$here/../../bin/projector.py"
+        elif [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
+            projector_src="$here/bin/projector.py"
+        else
+            die "projector.py not found (use --projector-src FILE)"
+        fi
+    fi
+    [ ! -L "$projector_src" ] && [ -f "$projector_src" ] \
+        || die "projector-src must be a regular non-symlink file: $projector_src"
+}
+
+verify_installed_projector() {
+    check_ancestors "$installed_projector"
+    local d meta owner group mode mode_oct
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        check_dir_root_unwritable "$d"
+    done
+    [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
+        || die "installed projector missing or symlink: $installed_projector (run install first)"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$installed_projector")" || die "cannot stat $installed_projector"
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] || die "$installed_projector owned by $owner, expected root"
+    [ "$group" = wheel ] || die "$installed_projector group is $group, expected wheel"
+    mode_oct=$((8#$mode))
+    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
+        die "$installed_projector mode $mode is group/world-writable or SUID/SGID"
+    fi
+    if has_acl_path "$installed_projector"; then
+        die "$installed_projector has an extended ACL; refusing"
+    fi
+    if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+        die "$installed_projector has com.apple.quarantine; refusing"
+    fi
+}
+
+place_projector() {
+    resolve_projector_src
+    ensure_dir 755 "$prefix/share"
+    ensure_dir 755 "$prefix/share/tendcf"
+    ensure_dir 755 "$prefix/share/tendcf/bin"
+
+    if [ -L "$installed_projector" ] || [ -d "$installed_projector" ]; then
+        die "$installed_projector is not a regular file; refusing"
     fi
 
-    # Idempotent fast path: identical bytes, root:wheel 600, no ACLs.
-    if [ -f "$data" ] \
-        && /usr/bin/cmp -s "$src" "$data" \
-        && [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$data")" = "root:wheel 600" ] \
-        && ! has_acl_path "$data"; then
-        if ! "$cf_promises" -f "$entry" >/dev/null; then
-            die "cf-promises rejected existing $data"
+    local src_real dst_dir_real dst_real
+    src_real="$(resolve_realpath_ok "$projector_src")" || die "cannot resolve $projector_src"
+    dst_dir_real="$(cd "$prefix/share/tendcf/bin" && pwd -P)"
+    dst_real="$dst_dir_real/projector.py"
+
+    if [ "$src_real" = "$dst_real" ]; then
+        [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
+            || die "$installed_projector is not a regular non-symlink file"
+        if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+            /usr/bin/xattr -d com.apple.quarantine "$installed_projector"
+            changed=1
         fi
+        if [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
+            || has_acl_path "$installed_projector"; then
+            /usr/bin/chflags 0 "$installed_projector"
+            /bin/chmod -N "$installed_projector" 2>/dev/null || true
+            /usr/sbin/chown root:wheel "$installed_projector"
+            /bin/chmod 0644 "$installed_projector"
+            changed=1
+        fi
+        verify_installed_projector
         return 0
     fi
 
+    make_stage
+    local staged_proj="$stage_dir/projector.py"
+    /bin/cat "$projector_src" > "$staged_proj"
+    /usr/sbin/chown root:wheel "$staged_proj"
+    /bin/chmod 0644 "$staged_proj"
+
+    local proj_differs=0
+    if [ ! -f "$installed_projector" ]; then
+        proj_differs=1
+    elif ! /usr/bin/cmp -s "$staged_proj" "$installed_projector"; then
+        proj_differs=1
+    elif [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
+        || has_acl_path "$installed_projector" \
+        || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+        proj_differs=1
+    fi
+
+    if [ "$proj_differs" -eq 1 ]; then
+        local old_umask tmp_proj
+        old_umask="$(umask)"
+        umask 022
+        tmp_proj="$(/usr/bin/mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
+        umask "$old_umask"
+        place_projector_tmp="$tmp_proj"
+        /bin/cat "$staged_proj" > "$tmp_proj"
+        if /usr/bin/xattr -p com.apple.quarantine "$tmp_proj" >/dev/null 2>&1; then
+            /usr/bin/xattr -d com.apple.quarantine "$tmp_proj"
+        fi
+        /usr/bin/chflags 0 "$tmp_proj"
+        /bin/chmod -N "$tmp_proj" 2>/dev/null || true
+        /usr/sbin/chown root:wheel "$tmp_proj"
+        /bin/chmod 0644 "$tmp_proj"
+        /bin/mv -f "$tmp_proj" "$installed_projector"
+        place_projector_tmp=""
+        changed=1
+    fi
+    /bin/rm -f "$staged_proj"
+    verify_installed_projector
+}
+
+# Validate CMDB data in WD using cf-promises --show-classes (issue #57).
+# Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly)
+# and fails closed on non-zero exit, empty output, tendcf_cmdb_refused, or any
+# tendcf_cmdb_problem_* class.
+validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
+    local wd="$1" entry_file="$2" tmp_dir="$3"
+    local old_umask classes_file err_file refused refused_line
+    old_umask="$(umask)"
+    umask 077
+    classes_file="$(/usr/bin/mktemp "$tmp_dir/.cf-classes.XXXXXX")"
+    err_file="$(/usr/bin/mktemp "$tmp_dir/.cf-err.XXXXXX")"
+    umask "$old_umask"
+    /bin/chmod 0600 "$classes_file" "$err_file"
+
+    if ! "$cf_promises" --workdir "$wd" -f "$entry_file" --show-classes >"$classes_file" 2>"$err_file"; then
+        if [ -s "$err_file" ]; then
+            /bin/cat "$err_file" >&2
+        fi
+        /bin/rm -f "$classes_file" "$err_file"
+        echo "tendcf-install: cf-promises failed validating $wd" >&2
+        return 1
+    fi
+    if [ ! -s "$classes_file" ] || ! /usr/bin/awk 'NF > 0 { n++ } END { exit (n == 0) }' "$classes_file"; then
+        /bin/rm -f "$classes_file" "$err_file"
+        echo "tendcf-install: cf-promises --show-classes produced empty output for $wd" >&2
+        return 1
+    fi
+    refused="$(/usr/bin/awk '$1 == "tendcf_cmdb_refused" || $1 ~ /^tendcf_cmdb_problem_/ { seen[$1]=1 } END { for (c in seen) print c }' "$classes_file" | /usr/bin/sort)"
+    /bin/rm -f "$classes_file" "$err_file"
+    if [ -n "$refused" ]; then
+        refused_line="$(printf '%s\n' "$refused" | /usr/bin/tr '\n' ' ')"
+        echo "tendcf-install: CMDB policy refused data in $wd (classes: ${refused_line% })" >&2
+        return 1
+    fi
+    return 0
+}
+
+put_data() {  # put_data FILE
+    local src="$1"
+    [ ! -L "$src" ] && [ -f "$src" ] || die "data file must be a regular non-symlink file: $src"
+    [ -f "$entry" ] && [ ! -L "$entry" ] || die "not installed: run install first"
+    [ -d "$workdir/inputs" ] && [ ! -L "$workdir/inputs" ] || die "$workdir/inputs missing or symlink"
+    check_dir_root_unwritable "$workdir/data"
+
+    # Create stage_dir in the main shell BEFORE command-substitution subshells
+    # (find_real_python) so no subshell leaks a /var/tmp directory.
+    make_stage
+    verify_installed_projector
+
+    local py
+    py="$(find_real_python)" || die "cannot validate projection: no verified root-owned Python 3 found"
+
+    # Serialize concurrent publishers on an exclusive lock via lockf(1) FD 9 (#58).
+    local lockfile="$workdir/data/.publish.lock"
+    if [ -L "$lockfile" ] || [ -d "$lockfile" ]; then
+        die "$lockfile is not a regular file; refusing"
+    fi
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
+    exec 9>>"$lockfile"
+    umask "$old_umask"
+    if ! /usr/bin/lockf 9; then
+        exec 9>&-
+        die "failed to acquire publish lock $lockfile"
+    fi
+    if [ -L "$lockfile" ] || [ ! -f "$lockfile" ]; then
+        exec 9>&-
+        die "$lockfile is not a regular file; refusing"
+    fi
+    /usr/sbin/chown root:wheel "$lockfile"
+    /bin/chmod 0600 "$lockfile"
+    /bin/chmod -N "$lockfile" 2>/dev/null || true
+
+    if [ -L "$data" ] || [ -d "$data" ]; then
+        exec 9>&-
+        die "$data is not a regular file; refusing"
+    fi
+
+    # Stage candidate bytes ONCE into a private 0700 workdir (zero TOCTOU, zero
+    # pre-validation exposure to cf-execd; issues #53, #57).
+    local stage_wd staged_data
+    old_umask="$(umask)"
+    umask 077
+    stage_wd="$(/usr/bin/mktemp -d "$stage_dir/putdata.XXXXXX")"
+    umask "$old_umask"
+    put_data_stage_wd="$stage_wd"
+    /usr/sbin/chown root:wheel "$stage_wd"
+    /bin/chmod 0700 "$stage_wd"
+
+    /usr/bin/install -d -m 0755 -o root -g wheel \
+        "$stage_wd/bin" "$stage_wd/outputs" "$stage_wd/modules" "$stage_wd/state"
+    /usr/bin/install -d -m 0700 -o root -g wheel "$stage_wd/ppkeys" "$stage_wd/data"
+    /bin/cp -pRP "$workdir/inputs" "$stage_wd/inputs"
+
+    staged_data="$stage_wd/data/host_specific.json"
+    old_umask="$(umask)"
+    umask 077
+    /bin/cat "$src" > "$staged_data"
+    umask "$old_umask"
+    /usr/sbin/chown root:wheel "$staged_data"
+    /bin/chmod 0600 "$staged_data"
+    /bin/chmod -N "$staged_data" 2>/dev/null || true
+
+    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I).
+    if ! "$py" -I "$installed_projector" --check "$staged_data"; then
+        die "projector rejected $src; live $data untouched"
+    fi
+
+    # Gate 2 (#57): pre-publish cf-promises --show-classes check on staged workdir.
+    if ! validate_cmdb_workdir "$stage_wd" "$stage_wd/inputs/promises.cf" "$stage_wd"; then
+        die "pre-publish CMDB validation rejected $src; live $data untouched"
+    fi
+
+    # Idempotent fast path (under lock, after Gates 1 & 2): identical bytes,
+    # root:wheel 600, no ACLs.
+    if [ -f "$data" ] && [ ! -L "$data" ] \
+        && /usr/bin/cmp -s "$staged_data" "$data" \
+        && [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$data")" = "root:wheel 600" ] \
+        && ! has_acl_path "$data"; then
+        if ! validate_cmdb_workdir "$workdir" "$entry" "$stage_wd"; then
+            die "existing live $data failed CMDB validation"
+        fi
+        /bin/rm -rf "$stage_wd"
+        put_data_stage_wd=""
+        exec 9>&-
+        return 0
+    fi
+
+    # Atomic publish using unique same-directory mktemp staging/backup paths (#58).
+    local tmp backup=""
+    old_umask="$(umask)"
+    umask 077
+    tmp="$(/usr/bin/mktemp "$workdir/data/.host_specific.new.XXXXXX")"
+    umask "$old_umask"
+    put_data_tmp="$tmp"
+    /bin/cat "$staged_data" > "$tmp"
+    /usr/sbin/chown root:wheel "$tmp"
+    /bin/chmod 0600 "$tmp"
+    /bin/chmod -N "$tmp" 2>/dev/null || true
+
     if [ -f "$data" ] && [ ! -L "$data" ]; then
-        backup="$data.previous"
-        /bin/cp -p "$data" "$backup"
+        old_umask="$(umask)"
+        umask 077
+        backup="$(/usr/bin/mktemp "$workdir/data/.host_specific.prev.XXXXXX")"
+        umask "$old_umask"
+        put_data_backup="$backup"
+        /bin/cat "$data" > "$backup"
+        /usr/sbin/chown root:wheel "$backup"
+        /bin/chmod 0600 "$backup"
+        /bin/chmod -N "$backup" 2>/dev/null || true
     fi
-    local tmp="$data.new.$$"
-    if ! /usr/bin/install -m 0600 -o root -g wheel "$src" "$tmp"; then
-        /bin/rm -f "$tmp" "$backup"
-        die "could not write $tmp"
-    fi
+
     /bin/mv -f "$tmp" "$data"
-    if ! "$cf_promises" -f "$entry" >/dev/null; then
+    put_data_tmp=""
+
+    # Gate 3 (#57): post-publish verification on live workdir with atomic rollback.
+    if ! validate_cmdb_workdir "$workdir" "$entry" "$stage_wd"; then
         if [ -n "$backup" ]; then
             /bin/mv -f "$backup" "$data"
+            put_data_backup=""
+            die "post-publish CMDB validation rejected $src; previous data restored"
         else
             /bin/rm -f "$data"
+            die "post-publish CMDB validation rejected $src; new data removed"
         fi
-        die "cf-promises rejected $src; previous data restored"
     fi
-    /bin/rm -f "$backup"
+
+    if [ -n "$backup" ]; then
+        /bin/rm -f "$backup"
+        put_data_backup=""
+    fi
+    /bin/rm -rf "$stage_wd"
+    put_data_stage_wd=""
+    exec 9>&-
     changed=1
     say "data installed: $data ($(/usr/bin/wc -c < "$data" | /usr/bin/tr -d ' ') bytes)"
 }
@@ -1438,6 +1712,7 @@ prevalidate_install_inputs() {
     local bad_src
     bad_src="$(/usr/bin/find "$policy_src" ! -type f ! -type d -print -quit)"
     [ -z "$bad_src" ] || die "refusing non-regular/non-directory entry in policy-src: $bad_src"
+    resolve_projector_src
     if [ -n "$datafile" ]; then
         [ ! -L "$datafile" ] && [ -f "$datafile" ] \
             || die "data file must be a regular non-symlink file: $datafile"
@@ -1452,6 +1727,7 @@ cmd_install() {
             --sha256) [ $# -ge 2 ] || die "install: --sha256 needs a path"; sha256_file="$2"; shift 2 ;;
             --data) [ $# -ge 2 ] || die "install: --data needs a path"; datafile="$2"; shift 2 ;;
             --policy-src) [ $# -ge 2 ] || die "install: --policy-src needs a path"; policy_src="$2"; shift 2 ;;
+            --projector-src) [ $# -ge 2 ] || die "install: --projector-src needs a path"; projector_src="$2"; shift 2 ;;
             --enable) do_enable=1; shift ;;
             *) die "install: unknown argument $1" ;;
         esac
@@ -1459,8 +1735,8 @@ cmd_install() {
     if [ -n "$sha256_file" ] && [ -z "$tarball" ]; then
         die "install: --sha256 requires --tarball"
     fi
-    # Fail fast on bad --policy-src or --data, or stale interrupted-upgrade dirs,
-    # before booting out org.tendcf.execd.
+    # Fail fast on bad --policy-src, --projector-src or --data, or stale
+    # interrupted-upgrade dirs, before booting out org.tendcf.execd.
     prevalidate_install_inputs "$datafile"
     check_no_stale_upgrade_dirs
     if [ -n "$tarball" ]; then
@@ -1491,6 +1767,7 @@ cmd_install() {
     fi
     lay_out
     place_policy
+    place_projector
     if [ -n "$datafile" ]; then
         put_data "$datafile"
     fi

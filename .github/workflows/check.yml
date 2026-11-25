@@ -58,6 +58,18 @@ jobs:
       - name: State 1 VM harness tests
         run: python3 -I -m unittest discover -s tests/darwin -v
 
+      # Pure-stdlib RFC 8785 JCS fallback (bin/projector.py, issue #53): run both
+      # with rfc8785 installed (byte-for-byte parity) and under isolated stdlib-only
+      # python3 -I (bare target host execution).
+      - name: Projector JCS stdlib fallback tests
+        run: |
+          uv run --with rfc8785 python -m unittest discover -s tests/projector -v
+          python3 -I -m unittest discover -s tests/projector -v
+
+      # Linux installer hardening contract & hermetic tests (#53, #57, #58).
+      - name: Linux installer contract tests
+        run: python3 -I -m unittest discover -s tests/deploy -v
+
       # The patch overlay on libntech/cfengine (overlay/, issue #3): the
       # manifest agrees with the patch files, and the mechanism itself is
       # proven on a synthetic repository — a sample series applies, a
