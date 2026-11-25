@@ -31,8 +31,8 @@ directory (or by path); the lead runs real passes through `bgrun`.
 ```sh
 python3 state1_vm.py resolve                         # registry digest of the tag; no tart, no pull
 python3 state1_vm.py pull                            # ~30 GB: its own job, so load-watch admits it alone
-python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo)
-python3 state1_vm.py check                           # image-only check (skips steps 3-9/9a/10b/11a)
+python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo; --adopt to promote a matching committing marker)
+python3 state1_vm.py check                           # image-only check (skips steps 3-9/9a/10b/11a; add --adopt to write a missing owner marker on pass)
 python3 state1_vm.py check --tarball FILE            # full check with a local PR 95 tarball + .sha256
 python3 state1_vm.py check --artifact-run RUN_ID     # full check downloading the PR 95 artifact via gh
 ```
@@ -171,13 +171,23 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   `golden --rebuild` sweeps the kept build and builds afresh, and the run exits 1. The remaining unattended deletion is the case where the owner file already
   names this state dir (a final file that agrees with the record) but the usability test
   fails: that golden is ours and is replaced.
-  **Upgrade note:** run `golden --rebuild` once after upgrading: an older driver's
-  `golden --rebuild` from another state dir can leave the new marker agreeing with this state
-  dir's record. A golden built before owner files existed (or whose owner file is the
-  older unkeyed one) has none, so the first plain
-  `golden` after upgrading exits 2 until one `golden --rebuild` writes it; `check` does not need
-  the marker and still passes. (Letting a passing `check` write the missing marker is tracked as
-  [issue 81](https://github.com/frdminc/tendcf/issues/81).) `check` reads the marker too: a
+  **Upgrade note and explicit adoption (`--adopt`, issue 81 / `Ref: ANTIGRAVITY-12j`):** plain
+  `golden` and plain `check` stay strictly fail-closed and never silently write or promote an
+  owner marker. A golden built before owner files existed (or whose owner file is the older
+  unkeyed one) has none, so plain `golden` exits 2 while plain `check` still passes. To adopt
+  explicitly without a full `--rebuild`:
+  - **`check --adopt`**: after passing the full strict key-login check against a clone of the
+    golden, re-checks the marker inside the driver lock and writes the `final` owner marker ONLY
+    if no marker exists for this golden in this canonical `TART_HOME`, or an existing `final`
+    marker already matches this exact state dir (idempotent). Refuses fail-closed (exit 2) if a
+    `final` marker exists for a different state dir (or tart home/key), or if a `committing`
+    marker exists (directing you to `golden --adopt` or `golden --rebuild`).
+  - **`golden --adopt`**: under the driver lock, promotes an existing `committing` marker to
+    `final` ONLY if the golden exists in `tart list`, the `committing` marker belongs to this
+    exact state dir and canonical `TART_HOME`, and its `key_id` and `host_key` match this state
+    dir's `golden.json` and `known_hosts` pin (same verification as `golden_usable`), with no
+    conflicting `final` marker. Otherwise refuses fail-closed (exit 2).
+  `check` reads the marker too: a
   **final** file naming another state dir, another tart home or another key exits 2 early,
   naming it; a `committing` file of another state dir (its commit did not finish: the golden is
   the old or the new build) does not refuse, the login decides and the evidence says so; a

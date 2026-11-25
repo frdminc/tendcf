@@ -2088,6 +2088,155 @@ class Golden(Base):
             json.loads(self.owner_file().read_text())["key_id"], ctx2.run_id
         )
 
+    def test_issue81_check_adopt_and_golden_adopt_explicit_flags(self):
+        # Build a golden, then remove its owner marker to simulate a pre-marker golden
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        marker = self.owner_file()
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        marker.unlink()
+
+        # Plain check passes and NEVER writes the missing marker
+        rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx("20261125T000001Z-c"))
+        self.assertEqual(rc, 0, s)
+        self.assertFalse(marker.exists())
+        # Plain golden stays strictly fail-closed
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000002Z-g"))
+        self.assertEqual(rc, 2, ev)
+
+        # check --adopt on a FAILING check does NOT write the marker
+        self.world.fail_remote.add("spctl")
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000003Z-cf"))
+        self.world.fail_remote.discard("spctl")
+        self.assertEqual(rc, 1)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.steps(s)["adopt"]["status"], "skip")
+
+        # check --adopt on a PASSING check writes the final owner marker
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000004Z-ca"))
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["adopt"]["status"], "pass")
+        self.assertTrue(marker.exists())
+        written = json.loads(marker.read_text())
+        self.assertEqual(written["state"], "final")
+        self.assertEqual(written["golden"], GOLDEN)
+        self.assertEqual(written["state_dir"], os.path.realpath(self.ctx.state_dir))
+        self.assertEqual(written["tart_home"], self.ctx.tart_home)
+        self.assertEqual(written["key_id"], rec["key_id"])
+        self.assertEqual(written["host_key"], rec["host_key"])
+
+        # Subsequent plain golden now accepts it as ours ("nothing to do")
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000005Z-g2"))
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
+        # check --adopt is idempotent when final marker already matches this state dir
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000006Z-ca2"))
+        self.assertEqual(rc, 0, s)
+        self.assertIn("already owned", self.steps(s)["adopt"]["evidence"])
+
+        # check --adopt refuses fail-closed if a final marker belongs to a DIFFERENT state dir
+        other_dir = self.tmp / "other-state"
+        other_dir.mkdir(mode=0o700)
+        write_marker(self.ctx, state_dir=os.path.realpath(other_dir), state="final", key_id=rec["key_id"], host_key=rec["host_key"])
+        clones_before = len(self.world.tart_calls("clone"))
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000007Z-ca3"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(self.world.tart_calls("clone")), clones_before)
+
+        # check --adopt refuses fail-closed if a committing marker exists (even for this state dir)
+        write_marker(self.ctx, state="committing", key_id=rec["key_id"], host_key=rec["host_key"])
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000008Z-ca4"))
+        self.assertEqual(rc, 2)
+        self.assertIn("committing", s["steps"][-1]["evidence"])
+        self.assertIn("golden --adopt", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones_before)
+
+        # Race check: if a committing marker appears mid-check before adoption writes, check --adopt refuses
+        marker.unlink()
+        orig_reboot = self.world._guest
+
+        def plant_committing_on_reboot(r, input_text):
+            if r[:4] == ["sudo", "-n", "shutdown", "-r"]:
+                write_marker(self.ctx, state="committing", key_id=rec["key_id"], host_key=rec["host_key"])
+            return orig_reboot(r, input_text)
+
+        with mock.patch.object(self.world, "_guest", plant_committing_on_reboot):
+            rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000009Z-race"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+    def test_issue81_golden_adopt_promotes_matching_committing_marker_and_refuses_otherwise(self):
+        # Simulate a commit that stopped between golden.json and the final owner marker
+        marker_name = self.owner_file().name
+        patcher, _ = self.failing_writes({marker_name: 2})
+        with patcher:
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        marker = self.owner_file()
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+        # Plain golden stays strictly fail-closed
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000010Z-p"))
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("did not finish", ev)
+
+        # --adopt combined with --rebuild or --keep-on-failure is refused
+        for bad_flag in ("--rebuild", "--keep-on-failure"):
+            rc, s = self.run_cmd("golden", "--adopt", bad_flag, ctx=self.second_run_ctx("20261125T000011Z-bad"))
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot be combined", s["steps"][-1]["evidence"])
+
+        # Mismatched key_id or host_key in committing marker is refused fail-closed
+        good_committing = marker.read_text()
+        for field, bad_val in (("key_id", "wrong-key"), ("host_key", "ssh-ed25519 SHA256:wrong")):
+            m_data = json.loads(good_committing)
+            m_data[field] = bad_val
+            marker.write_text(json.dumps(m_data))
+            rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000012Z-mm"))
+            self.assertEqual(rc, 2, field)
+            self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+        # Committing marker owned by another state dir is refused
+        other_dir = self.tmp / "other-state-2"
+        other_dir.mkdir(mode=0o700)
+        m_data = json.loads(good_committing)
+        m_data["state_dir"] = os.path.realpath(other_dir)
+        marker.write_text(json.dumps(m_data))
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000013Z-ot"))
+        self.assertEqual(rc, 2)
+        self.assertIn("belongs to state dir", s["steps"][-1]["evidence"])
+
+        # Missing marker is refused by golden --adopt (directs to check --adopt)
+        marker.unlink()
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000014Z-no"))
+        self.assertEqual(rc, 2)
+        self.assertIn("check --adopt", s["steps"][-1]["evidence"])
+
+        # Missing golden VM in tart list is refused even with a matching committing marker
+        marker.write_text(good_committing)
+        saved_vm = self.world.vms.pop(GOLDEN)
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000015Z-vm"))
+        self.assertEqual(rc, 2)
+        self.assertIn("does not exist", s["steps"][-1]["evidence"])
+        self.world.vms[GOLDEN] = saved_vm
+
+        # Happy path: golden --adopt promotes the matching committing marker to final
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000016Z-ok"))
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["adopt"]["status"], "pass")
+        self.assertEqual(json.loads(marker.read_text())["state"], "final")
+
+        # Idempotent when already final and matching
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000017Z-id"))
+        self.assertEqual(rc, 0, s)
+        self.assertIn("already final", self.steps(s)["adopt"]["evidence"])
+
+        # Plain golden now says "nothing to do"
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000018Z-p2"))
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
     def test_an_owner_file_that_disagrees_with_the_record_is_refused(self):
         self.run_cmd(*self.golden_args())
         good = self.owner_file().read_text()

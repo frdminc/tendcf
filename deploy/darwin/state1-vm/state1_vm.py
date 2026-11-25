@@ -2803,6 +2803,153 @@ def golden_identity(
     return str(priv)
 
 
+def check_adopt_precondition(ctx: Ctx, golden: str, rec: dict) -> tuple[bool, str]:
+    """Validate whether `check --adopt` may adopt `golden` for this state dir (issue 81,
+    Ref: ANTIGRAVITY-12j). Returns (need_write, status):
+      - (True, "missing") when no owner marker exists yet
+      - (False, "already_final") when a final marker already matches this exact state dir
+    Raises Refusal (exit 2) on any conflicting final marker, any committing marker, or any
+    unreadable/malformed marker."""
+    marker = owner_path(ctx, golden)
+    try:
+        owner = read_owner_file(marker)
+    except Refusal as e:
+        raise Refusal(
+            f"cannot adopt {golden}: unreadable owner file ({e}); run `golden --rebuild`"
+        ) from e
+    if owner is None:
+        return True, "missing"
+    if owner.get("golden") != golden:
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} names golden {owner.get('golden')!r}, not {golden}"
+        )
+    other = owner.get("state_dir")
+    if not isinstance(other, str) or bad_marker_state_dir(other):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} has invalid state_dir {other!r}; "
+            "run `golden --rebuild`"
+        )
+    state = owner.get("state")
+    if state == OWNER_COMMITTING:
+        raise Refusal(
+            f"cannot adopt {golden} via `check --adopt`: {marker} has a committing marker "
+            f"(a commit by {other!r} did not finish); run `golden --adopt` if this state dir's "
+            "commit finished before the final marker, or `golden --rebuild`"
+        )
+    if state != OWNER_FINAL:
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} has unexpected state {state!r}; "
+            "run `golden --rebuild`"
+        )
+    if not same_state_dir(ctx, other):
+        raise Refusal(
+            f"cannot adopt {golden}: owned by state dir {other!r}, not this one "
+            f"({owner_state_dir(ctx)}); use `--state-dir {shlex.quote(other)}` or "
+            "`golden --rebuild`"
+        )
+    if not isinstance(owner.get("tart_home"), str) or owner["tart_home"] != ctx.tart_home:
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} was written for tart home "
+            f"{owner.get('tart_home')!r}, not {ctx.tart_home!r}; run `golden --rebuild`"
+        )
+    if owner.get("key_id") != rec["key_id"] or owner.get("host_key") != rec.get("host_key"):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} names key {owner.get('key_id')!r} and host key "
+            f"{owner.get('host_key')!r}, disagreeing with golden.json ({rec['key_id']!r} / "
+            f"{rec.get('host_key')!r}); run `golden --rebuild`"
+        )
+    return False, "already_final"
+
+
+def adopt_committing_golden(
+    ctx: Ctx, golden: str, names: set[str], summary: Summary
+) -> None:
+    """`golden --adopt` (issue 81, Ref: ANTIGRAVITY-12j): under the driver lock, promote an
+    existing committing owner marker belonging to this exact state dir to final, after
+    verifying the golden exists and its key_id and host_key match golden.json + known_hosts."""
+    if golden not in names:
+        raise Refusal(f"cannot adopt {golden}: {golden} does not exist in tart list")
+    marker = owner_path(ctx, golden)
+    try:
+        owner = read_owner_file(marker)
+    except Refusal as e:
+        raise Refusal(
+            f"cannot adopt {golden}: unreadable owner file ({e}); run `golden --rebuild`"
+        ) from e
+    if owner is None:
+        raise Refusal(
+            f"cannot adopt {golden} via `golden --adopt`: no owner file ({marker}); "
+            "run `check --adopt` to adopt a marker-less golden or `golden --rebuild`"
+        )
+    if owner.get("golden") != golden:
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} names golden {owner.get('golden')!r}, not {golden}"
+        )
+    other = owner.get("state_dir")
+    if not isinstance(other, str) or bad_marker_state_dir(other):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} has invalid state_dir {other!r}; "
+            "run `golden --rebuild`"
+        )
+    if not same_state_dir(ctx, other):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} belongs to state dir {other!r}, not this one "
+            f"({owner_state_dir(ctx)}); use `--state-dir {shlex.quote(other)}` or "
+            "`golden --rebuild`"
+        )
+    if not isinstance(owner.get("tart_home"), str) or owner["tart_home"] != ctx.tart_home:
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} was written for tart home "
+            f"{owner.get('tart_home')!r}, not {ctx.tart_home!r}; run `golden --rebuild`"
+        )
+    state = owner.get("state")
+    if state not in (OWNER_COMMITTING, OWNER_FINAL):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} has unexpected state {state!r}; "
+            "run `golden --rebuild`"
+        )
+    rec = read_golden_record(ctx)
+    golden_usable(ctx, golden, rec, hint="")
+    if (
+        owner.get("key_id") != rec["key_id"]
+        or owner.get("host_key") is None
+        or owner.get("host_key") != rec.get("host_key")
+    ):
+        raise Refusal(
+            f"cannot adopt {golden}: {marker} names key {owner.get('key_id')!r} and host key "
+            f"{owner.get('host_key')!r}, which does not match golden.json ({rec['key_id']!r} / "
+            f"{rec.get('host_key')!r}); run `golden --rebuild`"
+        )
+    if state == OWNER_FINAL:
+        summary.add(
+            "adopt",
+            f"adopt {golden} owner marker",
+            "pass",
+            f"already final and owned by this state dir ({marker}); nothing to do",
+        )
+        return
+    with signals_ignored():
+        try:
+            write_owner(ctx, golden, rec["key_id"], rec["host_key"], OWNER_FINAL)
+            note = (
+                f"promoted committing owner marker {marker} to final "
+                f"(key {rec['key_id']}, host_key {rec['host_key']})"
+            )
+        except LandedNotDurable as e:
+            note = (
+                f"promoted committing owner marker {marker} to final "
+                f"(landed, durability unconfirmed: {e})"
+            )
+        except OSError as e:
+            raise ToolError(f"failed to write final owner marker {marker}: {e}") from e
+    summary.add(
+        "adopt",
+        f"promote committing owner marker for {golden} to final",
+        "pass",
+        note,
+    )
+
+
 def clone_vm(ctx: Ctx, src: str, dst: str, timeout: float) -> Result:
     # TART_NO_AUTO_PRUNE: a clone must not evict the 30 GB pinned image from tart's OCI cache.
     return ctx.run(
@@ -2829,6 +2976,14 @@ def cmd_golden(ctx: Ctx, args) -> int:
     key_made = False
     key_id = ctx.run_id  # one key per golden build: never reused, never shared
     rebuild = args.rebuild
+    adopt = bool(getattr(args, "adopt", False))
+    if adopt and (rebuild or args.keep_on_failure):
+        return refuse(
+            summary,
+            ctx,
+            args,
+            "--adopt cannot be combined with --rebuild or --keep-on-failure",
+        )
 
     def key_dir_made() -> None:
         nonlocal key_made
@@ -2843,6 +2998,10 @@ def cmd_golden(ctx: Ctx, args) -> int:
             try:
                 summary.extra["tart_version"] = tart_version(ctx)
                 names = set(local_vms(ctx))
+                if adopt:
+                    adopt_committing_golden(ctx, golden, names, summary)
+                    emit(summary, ctx, args.summary)
+                    return 0
                 if golden in names and not rebuild:
                     try:
                         rec = read_golden_record(ctx)
@@ -3597,6 +3756,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                 if owner_note:
                     summary.add("owner", "owner file", "pass", owner_note)
                 identity = golden_usable(ctx, golden)
+                adopt = bool(getattr(args, "adopt", False))
+                if adopt:
+                    check_adopt_precondition(ctx, golden, read_golden_record(ctx))
                 assert_vm_cap(ctx)
                 if artifact_run is not None:
                     artifact_tmpdir = Path(
@@ -4493,6 +4655,57 @@ def cmd_check(ctx: Ctx, args) -> int:
                         step11a_teardown,
                         fatal=False,
                     )
+                if adopt:
+                    if not summary.ok:
+                        summary.add(
+                            "adopt",
+                            "adopt golden owner marker",
+                            "skip",
+                            "not adopted: check failed",
+                        )
+                    else:
+                        golden_usable(ctx, golden)
+                        rec_adopt = read_golden_record(ctx)
+                        need_write, _ = check_adopt_precondition(
+                            ctx, golden, rec_adopt
+                        )
+                        marker = owner_path(ctx, golden)
+                        if need_write:
+                            with signals_ignored():
+                                try:
+                                    write_owner(
+                                        ctx,
+                                        golden,
+                                        rec_adopt["key_id"],
+                                        rec_adopt.get("host_key"),
+                                        OWNER_FINAL,
+                                    )
+                                    adopt_note = (
+                                        f"wrote final owner marker {marker} for key "
+                                        f"{rec_adopt['key_id']}"
+                                    )
+                                except LandedNotDurable as e:
+                                    adopt_note = (
+                                        f"wrote final owner marker {marker} "
+                                        f"(landed, durability unconfirmed: {e})"
+                                    )
+                                except OSError as e:
+                                    raise ToolError(
+                                        f"failed to write owner marker {marker}: {e}"
+                                    ) from e
+                            summary.add(
+                                "adopt",
+                                "adopt golden owner marker",
+                                "pass",
+                                adopt_note,
+                            )
+                        else:
+                            summary.add(
+                                "adopt",
+                                "adopt golden owner marker",
+                                "pass",
+                                f"already owned by this state dir ({marker}); nothing to change",
+                            )
                 rc = 0
             except Refusal as e:
                 refusal = str(e)
@@ -4582,8 +4795,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="leave the half-built VM for inspection (swept on the next run)",
     )
+    g.add_argument(
+        "--adopt",
+        action="store_true",
+        help="promote a matching committing owner marker for this state dir to final",
+    )
     c = sub.add_parser(
         "check", help="clone state1-golden, run the checklist, delete the clone"
+    )
+    c.add_argument(
+        "--adopt",
+        action="store_true",
+        help="after passing strict key login, write a final owner marker if none exists",
     )
     c.add_argument(
         "--tarball",
