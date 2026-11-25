@@ -198,6 +198,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertIn('[ -n "$2" ]', cmd_fn)
         idx_preval = cmd_fn.find('prevalidate_install_inputs "$datafile"')
         idx_prep = cmd_fn.find("prepare_projector_source")
+        idx_detach = cmd_fn.find("detach_unsafe_installed_projector")
         idx_tree = cmd_fn.find("check_tree")
         idx_policy = cmd_fn.find("place_policy")
         idx_proj = cmd_fn.find("place_projector")
@@ -205,6 +206,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         for lbl, idx in (
             ("prevalidate", idx_preval),
             ("prepare_projector_source", idx_prep),
+            ("detach_unsafe_installed_projector", idx_detach),
             ("check_tree", idx_tree),
             ("place_policy", idx_policy),
             ("place_projector", idx_proj),
@@ -212,9 +214,17 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         ):
             self.assertNotEqual(idx, -1, f"missing {lbl} in cmd_install")
         self.assertLess(idx_preval, idx_prep)
-        self.assertLess(idx_prep, idx_tree)
+        self.assertLess(idx_prep, idx_detach)
+        self.assertLess(idx_detach, idx_tree)
         self.assertLess(idx_policy, idx_proj)
         self.assertLess(idx_proj, idx_data)
+
+        # Codex R4 #1: place_projector operates exclusively from $prepared_projector_file
+        proj_fn = _extract_func(self.src, "place_projector")
+        proj_code = "\n".join(line for line in proj_fn.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("readlink", proj_code)
+        self.assertNotIn("$projector_src", proj_code)
+        self.assertIn("$prepared_projector_file", proj_code)
 
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(line for line in put_fn.splitlines() if not line.lstrip().startswith("#"))
@@ -667,7 +677,9 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "check_dir_chain_strict_under_prefix",
                 "resolve_projector_src",
                 "verify_installed_projector",
+                "installed_projector_clean_ok",
                 "prepare_projector_source",
+                "detach_unsafe_installed_projector",
                 "place_projector",
             )
         )
@@ -704,7 +716,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     'prepared_projector_stage=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
                     'put_data_stage_wd=""\n'
                     'put_data_tmp=""\n'
                     'put_data_backup=""\n'
@@ -856,8 +868,10 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "check_dir_chain_strict_under_prefix",
                 "resolve_projector_src",
                 "verify_installed_projector",
+                "installed_projector_clean_ok",
                 "check_tree",
                 "prepare_projector_source",
+                "detach_unsafe_installed_projector",
                 "place_projector",
                 "prevalidate_install_inputs",
                 "cmd_install",
@@ -885,7 +899,8 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             policy_dir.mkdir()
             (policy_dir / "tendcf_services.cf").write_text("# dummy\n", encoding="utf-8")
 
-            def run_cmd_install(extra_args: str) -> subprocess.CompletedProcess[str]:
+            def run_cmd_install(extra_args: str, *, fail_place_policy: bool = False) -> subprocess.CompletedProcess[str]:
+                place_pol_body = 'die "injected place_policy failure"' if fail_place_policy else "return 0"
                 script = (
                     "set -euo pipefail\n"
                     f'export PATH="{shim_dir}:$PATH"\n'
@@ -895,7 +910,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "verify_tree_binaries() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
-                    "place_policy() { return 0; }\n"
+                    f"place_policy() {{ {place_pol_body}; }}\n"
                     f'prefix="{prefix}"\n'
                     f'cf_lib_path="{prefix}/lib"\n'
                     f'cf_agent="{prefix}/bin/cf-agent"\n'
@@ -913,7 +928,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     'prepared_projector_stage=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
                     'put_data_stage_wd=""\n'
                     'put_data_tmp=""\n'
                     'put_data_backup=""\n'
@@ -921,12 +936,12 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "put_data_had_prev=0\n"
                     f"{funcs}\n"
                     "trap cleanup_temp EXIT\n"
-                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{dst}" {extra_args}\n'
+                    f'cmd_install --policy-src "{policy_dir}" {extra_args}\n'
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
 
             # 1. Unpinned on writable packaged projector -> REFUSED BEFORE check_tree runs!
-            r_unpinned = run_cmd_install("")
+            r_unpinned = run_cmd_install(f'--projector-src "{dst}"')
             self.assertNotEqual(r_unpinned.returncode, 0)
             self.assertIn("--projector-sha256", r_unpinned.stderr)
             self.assertEqual(
@@ -935,9 +950,52 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "check_tree must NOT have run to launder writable projector before refusal",
             )
 
-            # 2. Pinned with valid --projector-sha256 -> SUCCEEDS and replaces with a FRESH INODE!
+            # 2. R4 Fix #2 (Codex R4 #2): failure between check_tree and place_projector leaves unsafe dst DETACHED (absent)!
+            ext_proj = root / "ext-projector.py"
+            shutil.copy2(PROJECTOR, ext_proj)
+            os.chmod(ext_proj, 0o644)
+            for label, args in (
+                ("external_src", f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}'),
+                ("pinned_dst", f'--projector-src "{dst}" --projector-sha256 {proj_sha}'),
+            ):
+                with self.subTest(mid_fail=label):
+                    shutil.copy2(PROJECTOR, dst)
+                    os.chmod(dst, 0o666)
+                    r_fail = run_cmd_install(args, fail_place_policy=True)
+                    self.assertNotEqual(r_fail.returncode, 0)
+                    self.assertIn("injected place_policy failure", r_fail.stderr)
+                    self.assertFalse(
+                        dst.exists() or dst.is_symlink(),
+                        "unsafe installed_projector must be detached before check_tree, never laundered",
+                    )
+                    # Subsequent verify_installed_projector fails closed
+                    r_ver = subprocess.run(
+                        [
+                            "/bin/bash",
+                            "-c",
+                            "set -euo pipefail\n"
+                            f'export PATH="{shim_dir}:$PATH"\n'
+                            'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                            "check_ancestors_ok() { return 0; }\n"
+                            f'prefix="{prefix}"\n'
+                            f'installed_projector="{dst}"\n'
+                            f"{funcs}\n"
+                            "verify_installed_projector\n",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(r_ver.returncode, 0)
+                    # Subsequent unpinned cmd_install pointing at missing $dst fails closed
+                    r_retry = run_cmd_install(f'--projector-src "{dst}"')
+                    self.assertNotEqual(r_retry.returncode, 0)
+
+            # 3. Pinned with valid --projector-sha256 over writable dst -> SUCCEEDS and replaces with FRESH INODE!
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o666)
             old_ino = dst.stat().st_ino
-            r_pinned = run_cmd_install(f"--projector-sha256 {proj_sha}")
+            r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
             self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
             self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
@@ -964,7 +1022,9 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "check_dir_chain_strict_under_prefix",
                 "resolve_projector_src",
                 "verify_installed_projector",
+                "installed_projector_clean_ok",
                 "prepare_projector_source",
+                "detach_unsafe_installed_projector",
                 "place_projector",
             )
         )
@@ -1040,7 +1100,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     'prepared_projector_stage=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
                     'put_data_stage_wd=""\n'
                     'put_data_tmp=""\n'
                     'put_data_backup=""\n'
@@ -1050,6 +1110,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "trap cleanup_temp EXIT\n"
                     f'cd "{cwd}"\n'
                     "prepare_projector_source\n"
+                    "detach_unsafe_installed_projector\n"
                     "place_projector\n"
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)

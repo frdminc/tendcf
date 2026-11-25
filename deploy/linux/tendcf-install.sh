@@ -78,7 +78,7 @@ place_projector_tmp=""
 prepared_projector_stage=""
 prepared_projector_file=""
 projector_prepared=0
-projector_src_originally_trusted=0
+installed_projector_originally_clean=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -497,6 +497,26 @@ EOF
     mv -f "$entry.new" "$entry"
 }
 
+# Non-fatal check: $installed_projector is already a completely clean, trusted
+# regular non-symlink file (root:root 0644) under real non-symlink root:root
+# non-writable directories up to /.
+installed_projector_clean_ok() {
+    check_ancestors_ok "$prefix" || return 1
+    local d meta uid gid mode
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        [ ! -L "$d" ] && [ -d "$d" ] || return 1
+        meta="$(stat -c '%u %g %a' "$d" 2>/dev/null)" || return 1
+        read -r uid gid mode <<< "$meta"
+        [ "$uid" = 0 ] && [ "$gid" = 0 ] || return 1
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    done
+    [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] || return 1
+    meta="$(stat -c '%u %g %a' "$installed_projector" 2>/dev/null)" || return 1
+    read -r uid gid mode <<< "$meta"
+    [ "$uid" = 0 ] && [ "$gid" = 0 ] && [ $((8#$mode)) -eq $((8#644)) ] || return 1
+    return 0
+}
+
 # Establish projector source trust and stage bytes into a private root-only
 # 0700 temp file BEFORE check_tree() repairs permissions under $prefix (so a
 # formerly writable/non-root source can never be laundered to root-owned, and
@@ -506,11 +526,11 @@ prepare_projector_source() {
     if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
         die "install: --projector-sha256 must be 64 lowercase hex characters"
     fi
-    projector_src_originally_trusted=0
+    local src_trusted=0
     if source_file_root_trusted_ok "$projector_src"; then
-        projector_src_originally_trusted=1
+        src_trusted=1
     fi
-    if [ -z "$projector_sha256" ] && [ "$projector_src_originally_trusted" -ne 1 ]; then
+    if [ -z "$projector_sha256" ] && [ "$src_trusted" -ne 1 ]; then
         die "$projector_src is not a root-owned non-writable regular file with trusted ancestors (or pass --projector-sha256)"
     fi
 
@@ -546,9 +566,37 @@ prepare_projector_source() {
     projector_prepared=1
 }
 
+# Detach any unsafe existing $installed_projector BEFORE check_tree() repairs
+# permissions under $prefix, so check_tree() can never launder a mutable or
+# untrusted inode into trusted-looking root:root 0644 metadata if an
+# intervening step fails before place_projector().
+detach_unsafe_installed_projector() {
+    local d
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        if [ -L "$d" ]; then
+            die "$d is a symlink; refusing"
+        fi
+    done
+    installed_projector_originally_clean=0
+    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+        if installed_projector_clean_ok; then
+            installed_projector_originally_clean=1
+        else
+            if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+                die "$installed_projector is a directory; refusing"
+            fi
+            rm -f "$installed_projector"
+            if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+                die "could not detach unsafe existing $installed_projector before repair"
+            fi
+        fi
+    fi
+}
+
 place_projector() {
     if [ "${projector_prepared:-0}" -ne 1 ] || [ ! -f "${prepared_projector_file:-}" ]; then
         prepare_projector_source
+        detach_unsafe_installed_projector
     fi
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     local d
@@ -564,23 +612,15 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real same_realpath=0
-    src_real="$(readlink -f "$projector_src")" || die "cannot resolve $projector_src"
-    dst_dir_real="$(readlink -f "$prefix/share/tendcf/bin")" || die "cannot resolve $prefix/share/tendcf/bin"
-    dst_real="$dst_dir_real/projector.py"
-    if [ "$src_real" = "$dst_real" ]; then
-        same_realpath=1
-    fi
-
-    # In-place idempotence (keeping the existing inode) is allowed ONLY when
-    # the source is the same path AND was already proven root-owned/unwritable
-    # BEFORE check_tree(). Otherwise always install a fresh inode via mktemp+mv
-    # so any previously opened writable file descriptor is detached.
-    if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then
-        [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
-            || die "$installed_projector is not a regular non-symlink file"
-        chown root:root "$installed_projector"
-        chmod 0644 "$installed_projector"
+    # Operate exclusively from $prepared_projector_file (never re-resolve or
+    # re-read $projector_src). Keep the existing inode ONLY when it was already
+    # proven clean before check_tree(), matches $prepared_projector_file byte
+    # for byte, and still passes installed_projector_clean_ok.
+    if [ "${installed_projector_originally_clean:-0}" -eq 1 ] \
+        && [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
+        && cmp -s "$prepared_projector_file" "$installed_projector" \
+        && installed_projector_clean_ok; then
+        :
     else
         local old_umask tmp
         old_umask="$(umask)"
@@ -860,6 +900,7 @@ cmd_install() {
     done
     prevalidate_install_inputs "$datafile"
     prepare_projector_source
+    detach_unsafe_installed_projector
     check_tree
     init_paths
     lay_out

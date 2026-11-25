@@ -98,8 +98,8 @@ stage_dir=""
 place_projector_tmp=""
 prepared_projector_file=""
 projector_prepared=0
-projector_src_originally_trusted=0
 installed_projector_originally_clean=0
+upgrade_prefix_swapped=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -1039,6 +1039,7 @@ install_tarball() {
 
     if [ ! -e "$prefix" ]; then
         /bin/mv "$staged_tree" "$prefix"
+        upgrade_prefix_swapped=1
     else
         # Upgrade in place: fail fast if $prefix/var is a symlink BEFORE touching
         # any running cf-execd, then arm the EXIT-trap rollback across the swap
@@ -1079,6 +1080,7 @@ install_tarball() {
         fi
         /bin/mv "$staged_tree" "$prefix" \
             || die "failed to install new tree at $prefix"
+        upgrade_prefix_swapped=1
         if [ "$was_loaded" -eq 1 ]; then
             upgrade_needs_execd_restart=1
         fi
@@ -1448,6 +1450,36 @@ verify_installed_projector() {
     fi
 }
 
+# Non-fatal check: $installed_projector is already a completely clean, trusted
+# regular non-symlink file (root:wheel 0644, flags=0, no ACLs, no quarantine)
+# under real non-symlink root:wheel non-writable ACL-free dirs up to /.
+installed_projector_clean_ok() {
+    check_ancestors_ok "$prefix" || return 1
+    local d meta owner group mode
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        [ ! -L "$d" ] && [ -d "$d" ] || return 1
+        meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$d" 2>/dev/null)" || return 1
+        read -r owner group mode <<< "$meta"
+        [ "$owner" = root ] && [ "$group" = wheel ] || return 1
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+        if has_acl_path "$d"; then
+            return 1
+        fi
+    done
+    [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] || return 1
+    [ "$(/usr/bin/stat -f '%f' "$installed_projector" 2>/dev/null)" = "0" ] || return 1
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$installed_projector" 2>/dev/null)" || return 1
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] && [ "$group" = wheel ] && [ $((8#$mode)) -eq $((8#644)) ] || return 1
+    if has_acl_path "$installed_projector"; then
+        return 1
+    fi
+    if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
 # Establish projector source trust and stage bytes ONCE into a private
 # root-only 0700 file BEFORE install_tarball() and check_tree() mutate or
 # repair permissions under $prefix (prevents laundering a writable/non-root
@@ -1457,16 +1489,11 @@ prepare_projector_source() {
     if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
         die "install: --projector-sha256 must be 64 lowercase hex characters"
     fi
-    projector_src_originally_trusted=0
+    local src_trusted=0
     if source_file_root_trusted_ok "$projector_src"; then
-        projector_src_originally_trusted=1
+        src_trusted=1
     fi
-    installed_projector_originally_clean=0
-    if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
-        && source_file_root_trusted_ok "$installed_projector"; then
-        installed_projector_originally_clean=1
-    fi
-    if [ -z "$projector_sha256" ] && [ "$projector_src_originally_trusted" -ne 1 ]; then
+    if [ -z "$projector_sha256" ] && [ "$src_trusted" -ne 1 ]; then
         die "$projector_src is not a root:wheel non-writable ACL-free regular file with trusted ancestors (or pass --projector-sha256)"
     fi
 
@@ -1492,9 +1519,40 @@ prepare_projector_source() {
     projector_prepared=1
 }
 
+# Detach any unsafe existing $installed_projector BEFORE check_tree() repairs
+# permissions under $prefix, so check_tree() can never launder a mutable or
+# untrusted inode into trusted-looking root:wheel 0644 metadata if an
+# intervening step fails before place_projector().
+detach_unsafe_installed_projector() {
+    local d
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        if [ -L "$d" ]; then
+            die "$d is a symlink; refusing"
+        fi
+    done
+    installed_projector_originally_clean=0
+    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+        if installed_projector_clean_ok; then
+            installed_projector_originally_clean=1
+        else
+            if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+                die "$installed_projector is a directory; refusing"
+            fi
+            if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+                /usr/bin/chflags 0 "$installed_projector"
+            fi
+            /bin/rm -f "$installed_projector"
+            if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+                die "could not detach unsafe existing $installed_projector before repair"
+            fi
+        fi
+    fi
+}
+
 place_projector() {
     if [ "${projector_prepared:-0}" -ne 1 ] || [ ! -f "${prepared_projector_file:-}" ]; then
         prepare_projector_source
+        detach_unsafe_installed_projector
     fi
     ensure_dir 755 "$prefix/share"
     ensure_dir 755 "$prefix/share/tendcf"
@@ -1504,60 +1562,20 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real same_realpath=0
-    src_real="$(resolve_realpath_ok "$projector_src")" || die "cannot resolve $projector_src"
-    dst_dir_real="$(cd "$prefix/share/tendcf/bin" && pwd -P)"
-    dst_real="$dst_dir_real/projector.py"
-    if [ "$src_real" = "$dst_real" ]; then
-        same_realpath=1
-    fi
-
-    # In-place idempotence (keeping the existing inode) is allowed ONLY when
-    # the source is the same path AND was already proven root:wheel/unwritable
-    # BEFORE check_tree(). Otherwise replace via a fresh mktemp sibling + mv -f
-    # so any previously opened writable file descriptor is detached.
-    if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then
-        [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
-            || die "$installed_projector is not a regular non-symlink file"
-        local need_fix=0
-        if [ "$(/usr/bin/stat -f '%f' "$installed_projector")" != "0" ] \
-            || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1 \
-            || [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
-            || has_acl_path "$installed_projector"; then
-            need_fix=1
-        fi
-        if [ "$need_fix" -eq 1 ]; then
-            /usr/bin/chflags 0 "$installed_projector"
-            if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
-                /usr/bin/xattr -d com.apple.quarantine "$installed_projector"
-            fi
-            /bin/chmod -N "$installed_projector" 2>/dev/null || true
-            /usr/sbin/chown root:wheel "$installed_projector"
-            /bin/chmod 0644 "$installed_projector"
-            changed=1
-        fi
-        /bin/rm -f "$prepared_projector_file"
-        prepared_projector_file=""
-        projector_prepared=0
-        verify_installed_projector
-        return 0
-    fi
-
-    local proj_differs=0 dst_flags=0
-    if [ "$same_realpath" -eq 1 ] || [ "${installed_projector_originally_clean:-0}" -ne 1 ] || [ ! -f "$installed_projector" ]; then
-        proj_differs=1
-        if [ -e "$installed_projector" ]; then
-            dst_flags="$(/usr/bin/stat -f '%f' "$installed_projector")"
-        fi
-    else
+    # Operate exclusively from $prepared_projector_file (never re-resolve or
+    # re-read $projector_src). Preserve the existing inode (no change) ONLY when
+    # no tarball prefix swap occurred, $installed_projector was already clean
+    # before check_tree(), bytes match $prepared_projector_file, and current
+    # metadata is clean.
+    local proj_differs=1 dst_flags=0
+    if [ "${upgrade_prefix_swapped:-0}" -eq 0 ] \
+        && [ "${installed_projector_originally_clean:-0}" -eq 1 ] \
+        && [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
+        && /usr/bin/cmp -s "$prepared_projector_file" "$installed_projector" \
+        && installed_projector_clean_ok; then
+        proj_differs=0
+    elif [ -e "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
         dst_flags="$(/usr/bin/stat -f '%f' "$installed_projector")"
-        if [ "$dst_flags" != "0" ] \
-            || ! /usr/bin/cmp -s "$prepared_projector_file" "$installed_projector" \
-            || [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
-            || has_acl_path "$installed_projector" \
-            || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
-            proj_differs=1
-        fi
     fi
 
     if [ "$proj_differs" -eq 1 ]; then
@@ -1989,6 +2007,7 @@ cmd_install() {
         fi
         install_tarball "$tarball" "$sha256_file"
     fi
+    detach_unsafe_installed_projector
     check_tree
     init_paths
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
@@ -2036,6 +2055,7 @@ cmd_install() {
     upgrade_saved_workdir=""
     upgrade_saved_inputs=0
     upgrade_saved_data=0
+    upgrade_prefix_swapped=0
     release_publish_lock
     if [ "$changed" -eq 0 ]; then
         say "no change ($("$cf_agent" --version | /usr/bin/sed -n 1p))"

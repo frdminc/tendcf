@@ -1044,6 +1044,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         idx_stale = cmd_fn.find("check_no_stale_upgrade_dirs")
         idx_prep = cmd_fn.find("prepare_projector_source")
         idx_tarball = cmd_fn.find('install_tarball "$tarball" "$sha256_file"')
+        idx_detach = cmd_fn.find("detach_unsafe_installed_projector")
+        idx_tree = cmd_fn.find("check_tree")
         idx_policy = cmd_fn.find("place_policy")
         idx_proj = cmd_fn.find("place_projector")
         idx_data = cmd_fn.find('put_data "$datafile"')
@@ -1055,6 +1057,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             ("check_no_stale_upgrade_dirs", idx_stale),
             ("prepare_projector_source", idx_prep),
             ("install_tarball", idx_tarball),
+            ("detach_unsafe_installed_projector", idx_detach),
+            ("check_tree", idx_tree),
             ("place_policy", idx_policy),
             ("place_projector", idx_proj),
             ("put_data", idx_data),
@@ -1066,6 +1070,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertLess(idx_acq, idx_stale)
         self.assertLess(idx_stale, idx_prep)
         self.assertLess(idx_prep, idx_tarball)
+        self.assertLess(idx_tarball, idx_detach)
+        self.assertLess(idx_detach, idx_tree)
         self.assertLess(idx_policy, idx_proj)
         self.assertLess(idx_proj, idx_data)
         self.assertLess(idx_disarm, idx_rel)
@@ -1114,19 +1120,24 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertLess(idx_upg_rb, idx_fd9_close, "upgrade rollback must complete BEFORE closing FD 9")
 
         proj_fn = _extract_func(self.src, "place_projector")
-        idx_same = proj_fn.find('if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then')
-        self.assertNotEqual(idx_same, -1)
-        idx_ext = proj_fn.find("local proj_differs=0 dst_flags=0", idx_same)
-        self.assertNotEqual(idx_ext, -1)
-        same_block = proj_fn[idx_same:idx_ext]
-        idx_chflags = same_block.find("/usr/bin/chflags 0")
-        idx_xattr_d = same_block.find("/usr/bin/xattr -d com.apple.quarantine")
-        self.assertNotEqual(idx_chflags, -1)
-        self.assertNotEqual(idx_xattr_d, -1)
-        self.assertLess(idx_chflags, idx_xattr_d, "chflags 0 must run before xattr -d in same-realpath branch")
-        ext_block = proj_fn[idx_ext:]
-        self.assertIn("stat -f '%f'", ext_block)
-        self.assertIn('/usr/bin/chflags 0 "$installed_projector"', ext_block)
+        proj_code = "\n".join(
+            line for line in proj_fn.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("resolve_realpath_ok", proj_code)
+        self.assertNotIn("$projector_src", proj_code)
+        self.assertIn("upgrade_prefix_swapped", proj_code)
+        self.assertIn("installed_projector_originally_clean", proj_code)
+        self.assertIn('/usr/bin/cmp -s "$prepared_projector_file" "$installed_projector"', proj_code)
+        self.assertIn("installed_projector_clean_ok", proj_code)
+        self.assertIn("stat -f '%f'", proj_code)
+        self.assertIn('/usr/bin/chflags 0 "$installed_projector"', proj_code)
+
+        detach_fn = _extract_func(self.src, "detach_unsafe_installed_projector")
+        idx_d_chflags = detach_fn.find('/usr/bin/chflags 0 "$installed_projector"')
+        idx_d_rm = detach_fn.find('/bin/rm -f "$installed_projector"')
+        self.assertNotEqual(idx_d_chflags, -1)
+        self.assertNotEqual(idx_d_rm, -1)
+        self.assertLess(idx_d_chflags, idx_d_rm, "chflags 0 must run before rm -f in detach_unsafe_installed_projector")
 
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(
@@ -1325,7 +1336,9 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "check_source_file_root_trusted",
                     "check_dir_root_unwritable",
                     "verify_installed_projector",
+                    "installed_projector_clean_ok",
                     "prepare_projector_source",
+                    "detach_unsafe_installed_projector",
                     "place_projector",
                 ),
             )
@@ -1357,8 +1370,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     'place_projector_tmp=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
                     "installed_projector_originally_clean=0\n"
+                    "upgrade_prefix_swapped=0\n"
                     "changed=0\n"
                     f"{place_funcs}\n"
                     "place_projector\n"
@@ -1860,8 +1873,10 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "source_file_root_trusted_ok",
                     "check_source_file_root_trusted",
                     "verify_installed_projector",
+                    "installed_projector_clean_ok",
                     "check_tree",
                     "prepare_projector_source",
+                    "detach_unsafe_installed_projector",
                     "place_projector",
                     "prevalidate_install_inputs",
                     "cmd_install",
@@ -1871,8 +1886,13 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             real_sed = shutil.which("sed") or "/usr/bin/sed"
             funcs = funcs.replace("/usr/bin/find", real_find).replace("/usr/bin/sed", real_sed)
 
-            def run_cmd_install(extra_args: str) -> subprocess.CompletedProcess[str]:
+            dirty_marker = prefix / "share" / "tendcf" / "dirty-marker"
+            dirty_marker.write_text("dirty\n", encoding="utf-8")
+
+            def run_cmd_install(extra_args: str, *, fail_place_policy: bool = False) -> subprocess.CompletedProcess[str]:
                 paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
+                os.chmod(dirty_marker, 0o666)
+                place_pol_body = 'die "injected place_policy failure"' if fail_place_policy else "return 0"
                 script = (
                     "set -euo pipefail\n"
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
@@ -1882,11 +1902,10 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "check_ancestors() { return 0; }\n"
                     "check_ancestors_ok() { return 0; }\n"
                     "make_stage() { return 0; }\n"
-                    "tree_is_clean() { return 1; }\n"
                     "verify_macho_tree() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
-                    "place_policy() { return 0; }\n"
+                    f"place_policy() {{ {place_pol_body}; }}\n"
                     f'prefix="{prefix}"\n'
                     f'stage_dir="{paths["stage_dir"]}"\n'
                     f'cf_agent="{prefix}/bin/cf-agent"\n'
@@ -1901,8 +1920,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     'place_projector_tmp=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
                     "installed_projector_originally_clean=0\n"
+                    "upgrade_prefix_swapped=0\n"
                     "upgrade_rollback_armed=0\n"
                     'upgrade_backup_prefix=""\n'
                     'upgrade_staged_tree=""\n'
@@ -1922,10 +1941,10 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     'put_data_backup=""\n'
                     "changed=0\n"
                     f"{funcs}\n"
-                    # Override check_tree's post-repair tree_is_clean to pass only once mode is repaired
-                    'tree_is_clean() { local m; m="$(' + str(paths["shim_dir"] / "stat") + ' -f \'%Lp\' "$installed_projector")"; [ $((8#$m & 8#022)) -eq 0 ]; }\n'
+                    # Drive check_tree's repair path using dirty_marker so check_tree always runs chmod -R a-s,go-w
+                    f'tree_is_clean() {{ local m; m="$({paths["shim_dir"] / "stat"} -f \'%Lp\' "{dirty_marker}")"; [ $((8#$m & 8#022)) -eq 0 ]; }}\n'
                     "trap cleanup_stage EXIT\n"
-                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{dst}" {extra_args}\n'
+                    f'cmd_install --policy-src "{policy_dir}" {extra_args}\n'
                 )
                 # Ensure xattr shim prints nothing & returns 0 for `xattr -s`, returns 1 for `xattr -p`
                 (paths["shim_dir"] / "xattr").write_text(
@@ -1951,7 +1970,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
 
             # 1. Unpinned on writable packaged projector -> REFUSED BEFORE check_tree runs!
-            r_unpinned = run_cmd_install("")
+            r_unpinned = run_cmd_install(f'--projector-src "{dst}"')
             self.assertNotEqual(r_unpinned.returncode, 0)
             self.assertIn("--projector-sha256", r_unpinned.stderr)
             self.assertEqual(
@@ -1960,9 +1979,52 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                 "check_tree must NOT have run to launder writable projector before refusal",
             )
 
-            # 2. Pinned with valid --projector-sha256 -> SUCCEEDS and replaces with FRESH INODE!
+            # 2. R4 Fix #2 (Codex R4 #2): failure between check_tree and place_projector leaves unsafe dst DETACHED!
+            ext_proj = root / "ext-projector.py"
+            shutil.copy2(PROJECTOR, ext_proj)
+            os.chmod(ext_proj, 0o644)
+            for label, args in (
+                ("external_src", f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}'),
+                ("pinned_dst", f'--projector-src "{dst}" --projector-sha256 {proj_sha}'),
+            ):
+                with self.subTest(mid_fail=label):
+                    shutil.copy2(PROJECTOR, dst)
+                    os.chmod(dst, 0o666)
+                    r_fail = run_cmd_install(args, fail_place_policy=True)
+                    self.assertNotEqual(r_fail.returncode, 0)
+                    self.assertIn("injected place_policy failure", r_fail.stderr)
+                    self.assertFalse(
+                        dst.exists() or dst.is_symlink(),
+                        "unsafe installed_projector must be detached before check_tree, never laundered",
+                    )
+                    # Subsequent verify_installed_projector fails closed
+                    r_ver = subprocess.run(
+                        [
+                            "/bin/bash",
+                            "-c",
+                            "set -euo pipefail\n"
+                            'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                            "has_acl_path() { return 1; }\n"
+                            "check_ancestors() { return 0; }\n"
+                            f'prefix="{prefix}"\n'
+                            f'installed_projector="{dst}"\n'
+                            f"{funcs}\n"
+                            "verify_installed_projector\n",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(r_ver.returncode, 0)
+                    # Subsequent unpinned cmd_install pointing at missing $dst fails closed
+                    r_retry = run_cmd_install(f'--projector-src "{dst}"')
+                    self.assertNotEqual(r_retry.returncode, 0)
+
+            # 3. Pinned with valid --projector-sha256 over writable dst -> SUCCEEDS and replaces with FRESH INODE!
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o666)
             old_ino = dst.stat().st_ino
-            r_pinned = run_cmd_install(f"--projector-sha256 {proj_sha}")
+            r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
             self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
             self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
@@ -1971,6 +2033,131 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                 old_ino,
                 "pinned install over formerly writable projector must replace inode",
             )
+
+    def test_cmd_install_tarball_prefix_swap_installs_pre_swap_staged_projector(self) -> None:
+        """R4 Fix #1 (Codex R4 #1): Darwin tarball prefix swap installs pre-swap staged projector bytes without re-resolving $projector_src."""
+        orig_bytes = PROJECTOR.read_bytes()
+        for scenario in ("different_bytes", "omitted"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                paths = self._build_env(root, DARWIN_OK_CF_SCRIPT, initial_data=None)
+                prefix = paths["prefix"]
+                (prefix / "bin").mkdir(parents=True)
+                for b in ("cf-agent", "cf-promises", "cf-key", "cf-execd"):
+                    bp = prefix / "bin" / b
+                    bp.write_text("#!/bin/sh\necho 'CFEngine Core 3.21.0'\n", encoding="utf-8")
+                    bp.chmod(0o755)
+                dst = paths["installed_projector"]
+                dst.write_bytes(orig_bytes)
+                os.chmod(dst, 0o644)
+
+                # Build replacement tree that install_tarball will swap into $prefix
+                new_tree = root / "new-prefix"
+                (new_tree / "bin").mkdir(parents=True)
+                for b in ("cf-agent", "cf-promises", "cf-key", "cf-execd"):
+                    bp = new_tree / "bin" / b
+                    bp.write_text("#!/bin/sh\necho 'CFEngine Core 3.22.0'\n", encoding="utf-8")
+                    bp.chmod(0o755)
+                if scenario == "different_bytes":
+                    (new_tree / "share" / "tendcf" / "bin").mkdir(parents=True)
+                    rogue = new_tree / "share" / "tendcf" / "bin" / "projector.py"
+                    rogue.write_bytes(b"# rogue replacement tarball projector bytes\n")
+                    os.chmod(rogue, 0o644)
+
+                policy_dir = root / "policy"
+                policy_dir.mkdir()
+                (policy_dir / "tendcf_services.cf").write_text("# dummy\n", encoding="utf-8")
+                fake_tar = root / "fake.tar.gz"
+                fake_tar.write_bytes(b"tar")
+                fake_sha = root / "fake.tar.gz.sha256"
+                fake_sha.write_text("0" * 64 + "  fake.tar.gz\n", encoding="utf-8")
+
+                funcs = self._darwin_funcs(
+                    paths["shim_dir"],
+                    (
+                        "cleanup_stage",
+                        "ensure_dir",
+                        "check_dir_root_unwritable",
+                        "acquire_publish_lock",
+                        "release_publish_lock",
+                        "check_no_stale_upgrade_dirs",
+                        "resolve_projector_src",
+                        "source_file_root_trusted_ok",
+                        "check_source_file_root_trusted",
+                        "verify_installed_projector",
+                        "installed_projector_clean_ok",
+                        "prepare_projector_source",
+                        "detach_unsafe_installed_projector",
+                        "place_projector",
+                        "prevalidate_install_inputs",
+                        "cmd_install",
+                    ),
+                )
+                real_find = shutil.which("find") or "/usr/bin/find"
+                real_sed = shutil.which("sed") or "/usr/bin/sed"
+                funcs = funcs.replace("/usr/bin/find", real_find).replace("/usr/bin/sed", real_sed)
+
+                script = (
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "has_acl_tree() { return 1; }\n"
+                    "check_ancestors() { return 0; }\n"
+                    "check_ancestors_ok() { return 0; }\n"
+                    "make_stage() { return 0; }\n"
+                    f'install_tarball() {{ rm -rf "{prefix}.prev"; mv "{prefix}" "{prefix}.prev"; mv "{new_tree}" "{prefix}"; upgrade_prefix_swapped=1; changed=1; }}\n'
+                    "check_tree() { return 0; }\n"
+                    "init_paths() { return 0; }\n"
+                    "lay_out() { return 0; }\n"
+                    "place_policy() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'stage_dir="{paths["stage_dir"]}"\n'
+                    f'cf_agent="{prefix}/bin/cf-agent"\n'
+                    f'cf_promises="{prefix}/bin/cf-promises"\n'
+                    f'cf_key="{prefix}/bin/cf-key"\n'
+                    f'cf_execd="{prefix}/bin/cf-execd"\n'
+                    f'here="{root}"\n'
+                    f'policy_src="{policy_dir}"\n'
+                    'projector_src=""\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{dst}"\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "installed_projector_originally_clean=0\n"
+                    "upgrade_prefix_swapped=0\n"
+                    "upgrade_rollback_armed=0\n"
+                    'upgrade_backup_prefix=""\n'
+                    'upgrade_staged_tree=""\n'
+                    "upgrade_moved_var=0\n"
+                    "upgrade_was_loaded=0\n"
+                    "upgrade_had_plist=0\n"
+                    "upgrade_snapshot_taken=0\n"
+                    'upgrade_saved_workdir=""\n'
+                    "upgrade_saved_inputs=0\n"
+                    "upgrade_saved_data=0\n"
+                    "upgrade_needs_execd_restart=0\n"
+                    "publish_lock_held=0\n"
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "changed=0\n"
+                    f"{funcs}\n"
+                    "trap cleanup_stage EXIT\n"
+                    f'cmd_install --tarball "{fake_tar}" --sha256 "{fake_sha}" --policy-src "{policy_dir}" --projector-src "{dst}"\n'
+                )
+                r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+                self.assertEqual(r.returncode, 0, f"scenario={scenario} failed:\n{r.stdout}\n{r.stderr}")
+                self.assertTrue(dst.is_file() and not dst.is_symlink())
+                self.assertEqual(
+                    dst.read_bytes(),
+                    orig_bytes,
+                    f"scenario={scenario}: must install pre-swap staged bytes, not replacement tarball bytes",
+                )
+                self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
 
     def test_relative_projector_src_normalized_and_checked_through_ancestors(self) -> None:
         """R3 Fix #1 (Macroscope #4701728688): Darwin relative --projector-src normalized via pwd -L."""
@@ -2032,7 +2219,9 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "source_file_root_trusted_ok",
                     "check_source_file_root_trusted",
                     "verify_installed_projector",
+                    "installed_projector_clean_ok",
                     "prepare_projector_source",
+                    "detach_unsafe_installed_projector",
                     "place_projector",
                 ),
             )
@@ -2052,12 +2241,13 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     'place_projector_tmp=""\n'
                     'prepared_projector_file=""\n'
                     "projector_prepared=0\n"
-                    "projector_src_originally_trusted=0\n"
                     "installed_projector_originally_clean=0\n"
+                    "upgrade_prefix_swapped=0\n"
                     "changed=0\n"
                     f"{funcs}\n"
                     f'cd "{cwd}"\n'
                     "prepare_projector_source\n"
+                    "detach_unsafe_installed_projector\n"
                     "place_projector\n"
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
