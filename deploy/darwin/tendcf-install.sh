@@ -1519,53 +1519,35 @@ prepare_projector_source() {
     projector_prepared=1
 }
 
-# Refuse any unsafe existing $prefix/share/tendcf* parent chain BEFORE mutating
-# permissions/ownership/ACLs (so SIGTERM/SIGKILL can never leave an exposed leaf
-# in a newly trusted parent), detach any unsafe leaf inside an already-trusted
-# parent chain, and on fresh trees lacking $prefix/share/tendcf lock down
-# $prefix and $prefix/share non-recursively top-down before check_tree().
+# Refuse ANY unsafe existing directory in $prefix..$prefix/share/tendcf/bin
+# BEFORE mutating permissions/ACLs or running check_tree() (zero directory
+# mutation, eliminating TOCTOU/SIGKILL parent-laundering windows), and detach
+# any unsafe existing leaf inside an already-trusted parent chain.
 detach_unsafe_installed_projector() {
     check_ancestors "$prefix"
     installed_projector_originally_clean=0
     local d
-    if [ -e "$prefix/share/tendcf" ] || [ -L "$prefix/share/tendcf" ]; then
-        for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
-            if [ "$d" = "$prefix/share/tendcf/bin" ] && [ ! -e "$d" ] && [ ! -L "$d" ]; then
-                break
-            fi
-            check_dir_root_unwritable "$d"
-        done
-        if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-            if installed_projector_clean_ok; then
-                installed_projector_originally_clean=1
-                return 0
-            fi
-            if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
-                die "$installed_projector is a directory; refusing"
-            fi
-            if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
-                /usr/bin/chflags 0 "$installed_projector"
-            fi
-            /bin/rm -f "$installed_projector"
-            if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-                die "could not remove untrusted $installed_projector"
-            fi
-        fi
-        return 0
-    fi
-    for d in "$prefix" "$prefix/share"; do
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
         if [ ! -e "$d" ] && [ ! -L "$d" ]; then
             break
         fi
-        [ ! -L "$d" ] && [ -d "$d" ] || die "$d is not a real directory; refusing"
-        /usr/bin/chflags 0 "$d"
-        /bin/chmod -N "$d" 2>/dev/null || true
-        /usr/sbin/chown root:wheel "$d"
-        /bin/chmod a-s,go-w "$d"
         check_dir_root_unwritable "$d"
     done
-    if [ -e "$prefix/share/tendcf" ] || [ -L "$prefix/share/tendcf" ]; then
-        die "$prefix/share/tendcf appeared unexpectedly during prefix lockdown; refusing"
+    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+        if installed_projector_clean_ok; then
+            installed_projector_originally_clean=1
+            return 0
+        fi
+        if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+            die "$installed_projector is a directory; refusing"
+        fi
+        if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+            /usr/bin/chflags 0 "$installed_projector"
+        fi
+        /bin/rm -f "$installed_projector"
+        if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+            die "could not remove untrusted $installed_projector"
+        fi
     fi
 }
 

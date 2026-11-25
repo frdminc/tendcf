@@ -1134,19 +1134,20 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertIn('/usr/bin/chflags 0 "$installed_projector"', proj_code)
 
         detach_fn = _extract_func(self.src, "detach_unsafe_installed_projector")
-        idx_d_check = detach_fn.find('check_dir_root_unwritable "$d"')
-        idx_d_chflags = detach_fn.find('/usr/bin/chflags 0 "$installed_projector"')
-        idx_d_rm = detach_fn.find('/bin/rm -f "$installed_projector"')
-        idx_d_fresh_lock = detach_fn.find('/bin/chmod a-s,go-w "$d"')
-        idx_d_fresh_guard = detach_fn.find("appeared unexpectedly during prefix lockdown")
+        detach_code = "\n".join(
+            line for line in detach_fn.splitlines() if not line.lstrip().startswith("#")
+        )
+        # Codex R7 #1: detach_unsafe_installed_projector NEVER mutates directory ownership/permissions/ACLs
+        self.assertNotIn("chown", detach_code)
+        self.assertNotIn("chmod", detach_code)
+        idx_d_check = detach_code.find('check_dir_root_unwritable "$d"')
+        idx_d_chflags = detach_code.find('/usr/bin/chflags 0 "$installed_projector"')
+        idx_d_rm = detach_code.find('/bin/rm -f "$installed_projector"')
         self.assertNotEqual(idx_d_check, -1)
         self.assertNotEqual(idx_d_chflags, -1)
         self.assertNotEqual(idx_d_rm, -1)
-        self.assertNotEqual(idx_d_fresh_lock, -1)
-        self.assertNotEqual(idx_d_fresh_guard, -1)
         self.assertLess(idx_d_check, idx_d_rm, "existing parent chain must be verified BEFORE unlinking $installed_projector")
         self.assertLess(idx_d_chflags, idx_d_rm, "chflags 0 must run before rm -f in detach_unsafe_installed_projector")
-        self.assertLess(idx_d_fresh_lock, idx_d_fresh_guard, "fresh-build lockdown must verify share/tendcf did not appear")
 
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(
@@ -2119,77 +2120,114 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             )
             os.chmod(proj_bin_dir, 0o755)
 
-            # (c) Fresh tree lacking $prefix/share/tendcf with initially writable $prefix/share -> locks down & succeeds!
-            # Move dirty_marker to $prefix/dirty-marker while $prefix/share/tendcf is removed
+            # (c) Codex R7 #1: writable $prefix/share (0777) MUST fail closed with ZERO mutations whether
+            #     $prefix/share/tendcf is absent OR contains a 0644 projector subtree!
             shutil.rmtree(prefix / "share" / "tendcf")
             dirty_marker_orig = dirty_marker
-            os.chmod(prefix / "share", 0o777)
-            # Re-create dirty_marker outside share/tendcf (temporarily recreate dir only via cmd_install)
             alt_dirty = prefix / "share" / "dirty-marker"
             alt_dirty.write_text("dirty\n", encoding="utf-8")
             os.chmod(alt_dirty, 0o666)
-            paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
-            r_fresh = subprocess.run(
+            os.chmod(prefix / "share", 0o777)
+
+            def run_cmd_install_alt_dirty(extra_args: str) -> subprocess.CompletedProcess[str]:
+                paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
+                return subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        "set -euo pipefail\n"
+                        'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                        'say() { echo "tendcf-install: $*"; }\n'
+                        "has_acl_path() { return 1; }\n"
+                        "has_acl_tree() { return 1; }\n"
+                        "check_ancestors() { return 0; }\n"
+                        "check_ancestors_ok() { return 0; }\n"
+                        "make_stage() { return 0; }\n"
+                        "verify_macho_tree() { return 0; }\n"
+                        "init_paths() { return 0; }\n"
+                        "lay_out() { return 0; }\n"
+                        "place_policy() { return 0; }\n"
+                        f'prefix="{prefix}"\n'
+                        f'stage_dir="{paths["stage_dir"]}"\n'
+                        f'cf_agent="{prefix}/bin/cf-agent"\n'
+                        f'cf_promises="{prefix}/bin/cf-promises"\n'
+                        f'cf_key="{prefix}/bin/cf-key"\n'
+                        f'cf_execd="{prefix}/bin/cf-execd"\n'
+                        f'here="{root}"\n'
+                        f'policy_src="{policy_dir}"\n'
+                        'projector_src=""\n'
+                        'projector_sha256=""\n'
+                        f'installed_projector="{dst}"\n'
+                        'place_projector_tmp=""\n'
+                        'prepared_projector_file=""\n'
+                        "projector_prepared=0\n"
+                        "installed_projector_originally_clean=0\n"
+                        "upgrade_prefix_swapped=0\n"
+                        "upgrade_rollback_armed=0\n"
+                        'upgrade_backup_prefix=""\n'
+                        'upgrade_staged_tree=""\n'
+                        "upgrade_moved_var=0\n"
+                        "upgrade_was_loaded=0\n"
+                        "upgrade_had_plist=0\n"
+                        "upgrade_snapshot_taken=0\n"
+                        'upgrade_saved_workdir=""\n'
+                        "upgrade_saved_inputs=0\n"
+                        "upgrade_saved_data=0\n"
+                        "upgrade_needs_execd_restart=0\n"
+                        "publish_lock_held=0\n"
+                        "put_data_rollback_armed=0\n"
+                        "put_data_had_prev=0\n"
+                        'put_data_stage_wd=""\n'
+                        'put_data_tmp=""\n'
+                        'put_data_backup=""\n'
+                        "changed=0\n"
+                        f"{funcs}\n"
+                        f'tree_is_clean() {{ local m; m="$({paths["shim_dir"] / "stat"} -f \'%Lp\' "{alt_dirty}")"; [ $((8#$m & 8#022)) -eq 0 ]; }}\n'
+                        "trap cleanup_stage EXIT\n"
+                        f'cmd_install --policy-src "{policy_dir}" {extra_args}\n',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            r_wshare_absent = run_cmd_install_alt_dirty(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
+            self.assertNotEqual(r_wshare_absent.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE((prefix / "share").stat().st_mode),
+                0o777,
+                "writable $prefix/share must NOT be mutated before failing closed",
+            )
+            (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o644)
+            r_wshare_leaf = run_cmd_install_alt_dirty(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
+            self.assertNotEqual(r_wshare_leaf.returncode, 0)
+            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode), 0o777)
+            r_ver_ws = subprocess.run(
                 [
                     "/bin/bash",
                     "-c",
                     "set -euo pipefail\n"
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
-                    'say() { echo "tendcf-install: $*"; }\n'
                     "has_acl_path() { return 1; }\n"
-                    "has_acl_tree() { return 1; }\n"
                     "check_ancestors() { return 0; }\n"
-                    "check_ancestors_ok() { return 0; }\n"
-                    "make_stage() { return 0; }\n"
-                    "verify_macho_tree() { return 0; }\n"
-                    "init_paths() { return 0; }\n"
-                    "lay_out() { return 0; }\n"
-                    "place_policy() { return 0; }\n"
                     f'prefix="{prefix}"\n'
-                    f'stage_dir="{paths["stage_dir"]}"\n'
-                    f'cf_agent="{prefix}/bin/cf-agent"\n'
-                    f'cf_promises="{prefix}/bin/cf-promises"\n'
-                    f'cf_key="{prefix}/bin/cf-key"\n'
-                    f'cf_execd="{prefix}/bin/cf-execd"\n'
-                    f'here="{root}"\n'
-                    f'policy_src="{policy_dir}"\n'
-                    'projector_src=""\n'
-                    'projector_sha256=""\n'
                     f'installed_projector="{dst}"\n'
-                    'place_projector_tmp=""\n'
-                    'prepared_projector_file=""\n'
-                    "projector_prepared=0\n"
-                    "installed_projector_originally_clean=0\n"
-                    "upgrade_prefix_swapped=0\n"
-                    "upgrade_rollback_armed=0\n"
-                    'upgrade_backup_prefix=""\n'
-                    'upgrade_staged_tree=""\n'
-                    "upgrade_moved_var=0\n"
-                    "upgrade_was_loaded=0\n"
-                    "upgrade_had_plist=0\n"
-                    "upgrade_snapshot_taken=0\n"
-                    'upgrade_saved_workdir=""\n'
-                    "upgrade_saved_inputs=0\n"
-                    "upgrade_saved_data=0\n"
-                    "upgrade_needs_execd_restart=0\n"
-                    "publish_lock_held=0\n"
-                    "put_data_rollback_armed=0\n"
-                    "put_data_had_prev=0\n"
-                    'put_data_stage_wd=""\n'
-                    'put_data_tmp=""\n'
-                    'put_data_backup=""\n'
-                    "changed=0\n"
                     f"{funcs}\n"
-                    f'tree_is_clean() {{ local m; m="$({paths["shim_dir"] / "stat"} -f \'%Lp\' "{alt_dirty}")"; [ $((8#$m & 8#022)) -eq 0 ]; }}\n'
-                    "trap cleanup_stage EXIT\n"
-                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{ext_proj}" --projector-sha256 {proj_sha}\n',
+                    "verify_installed_projector\n",
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
             )
+            self.assertNotEqual(r_ver_ws.returncode, 0)
+
+            # (d) Fresh tree with ALREADY-trusted $prefix/$prefix/share (0755) and absent $prefix/share/tendcf -> succeeds!
+            shutil.rmtree(prefix / "share" / "tendcf")
+            os.chmod(prefix / "share", 0o755)
+            r_fresh = run_cmd_install_alt_dirty(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
             self.assertEqual(r_fresh.returncode, 0, r_fresh.stderr)
-            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode) & 0o022, 0)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
             self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
             dirty_marker_orig.write_text("dirty\n", encoding="utf-8")

@@ -227,6 +227,13 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertNotIn("prepare_projector_source", proj_code)
         self.assertIn("$prepared_projector_file", proj_code)
 
+        # Codex R7 #1: detach_unsafe_installed_projector NEVER mutates directory ownership/permissions
+        detach_fn = _extract_func(self.src, "detach_unsafe_installed_projector")
+        detach_code = "\n".join(line for line in detach_fn.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("chown", detach_code)
+        self.assertNotIn("chmod", detach_code)
+        self.assertLess(detach_code.find('check_dir_root_unwritable "$d"'), detach_code.find('rm -f "$installed_projector"'))
+
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(line for line in put_fn.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotIn("$data.new", put_code)
@@ -1080,13 +1087,49 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             )
             os.chmod(proj_bin_dir, 0o755)
 
-            # (c) Fresh build case (matching .github/workflows/linux.yml): $prefix/share is initially writable
-            #     with $prefix/share/tendcf ABSENT -> cmd_install locks down $prefix/$prefix/share and succeeds!
+            # (c) Codex R7 #1: writable $prefix/share (0777) MUST fail closed with ZERO mutations whether
+            #     $prefix/share/tendcf is absent OR contains a 0644 projector subtree!
             shutil.rmtree(prefix / "share" / "tendcf")
             os.chmod(prefix / "share", 0o777)
+            r_wshare_absent = run_cmd_install(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
+            self.assertNotEqual(r_wshare_absent.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE((prefix / "share").stat().st_mode),
+                0o777,
+                "writable $prefix/share must NOT be mutated before failing closed",
+            )
+            # With a 0644 projector subtree placed under writable $prefix/share, cmd_install still refuses
+            # without hardening $prefix/share, and verify_installed_projector still refuses the projector!
+            (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o644)
+            r_wshare_leaf = run_cmd_install(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
+            self.assertNotEqual(r_wshare_leaf.returncode, 0)
+            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode), 0o777)
+            r_ver_ws = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    f'export PATH="{shim_dir}:$PATH"\n'
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "check_ancestors_ok() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'installed_projector="{dst}"\n'
+                    f"{funcs}\n"
+                    "verify_installed_projector\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_ver_ws.returncode, 0)
+
+            # (d) Fresh build with ALREADY-trusted $prefix/$prefix/share (0755) and absent $prefix/share/tendcf -> succeeds!
+            shutil.rmtree(prefix / "share" / "tendcf")
+            os.chmod(prefix / "share", 0o755)
             r_fresh = run_cmd_install(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
             self.assertEqual(r_fresh.returncode, 0, r_fresh.stderr)
-            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode) & 0o022, 0)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
             self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
 

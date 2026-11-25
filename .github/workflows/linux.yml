@@ -72,9 +72,11 @@ jobs:
       - name: Root-owned install, cf-execd and canary (step 7)
         run: |
           # GitHub Actions Ubuntu runner images ship /opt writable (for hostedtoolcache),
-          # which tendcf-install.sh's ancestor trust check rightly refuses. Harden /opt
-          # on this throwaway VM right before the final root-install step.
+          # and step 2 built /opt/tendcf as `runner` so `make install` ran unprivileged
+          # (whereas real hosts extract the root-owned tree as root before invoking
+          # tendcf-install.sh install). Harden both on this throwaway VM before step 7.
           sudo chown root:root /opt && sudo chmod 0755 /opt
+          sudo chown -R root:root /opt/tendcf && sudo chmod -R a-s,go-w /opt/tendcf
           tests/deploy/linux-install.sh
 
   # Upstream cfengine/core and libntech at the overlay bases plus the overlay
