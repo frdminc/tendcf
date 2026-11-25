@@ -2962,12 +2962,164 @@ class Golden(Base):
         self.assertEqual(drv.account_home({"HOME": "/ignored"}), pw)
         with mock.patch.object(drv.pwd, "getpwuid", side_effect=KeyError("uid")):
             self.assertEqual(drv.account_home({"HOME": "/h"}), "/h")
+            self.assertEqual(drv.account_home({"HOME": "relative/home"}), "/")
             self.assertEqual(drv.account_home({}), "/")
             self.assertEqual(
                 drv.resolve_tart_home({"HOME": "/h"}), os.path.realpath("/h/.tart")
             )
             ctx = self.make_ctx(self.tmp / "nopw", "20261121T000000Z-np")
         self.assertTrue(ctx.tart_home)  # no traceback for a uid without a passwd entry
+
+    def test_issue82_state_dir_ancestors_dangling_symlink_wording_and_paths(self):
+        # Item 1: non-sticky group/world-writable ancestor is refused before creating anything
+        parent = self.tmp / "writable-parent"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o777)
+        target = parent / "sub" / "state"
+        rc, s = self.run_cmd(
+            *self.golden_args(), ctx=self.make_ctx(target, "20261125T000000Z-a1")
+        )
+        self.assertEqual(rc, 2, s)
+        self.assertIn("must not be group or world writable unless sticky", s["steps"][-1]["evidence"])
+        self.assertFalse((parent / "sub").exists())
+
+        # Sticky world-writable ancestor owned by us (like /tmp 1777) is allowed
+        os.chmod(parent, 0o1777)
+        rc, s = self.run_cmd(
+            *self.golden_args(), ctx=self.make_ctx(target, "20261125T000000Z-a2")
+        )
+        self.assertEqual(rc, 0, s)
+
+        # Item 5: dangling symlink in an ancestor (--state-dir /tmp/link/sub) creates nothing
+        dangling_target = self.tmp / "dangling-anc-target"
+        dangling_link = self.tmp / "dangling-anc"
+        dangling_link.symlink_to(dangling_target)
+        rc, s = self.run_cmd(
+            *self.golden_args(),
+            ctx=self.make_ctx(dangling_link / "sub", "20261125T000000Z-a3"),
+        )
+        self.assertEqual(rc, 2, s)
+        self.assertIn("points nowhere", s["steps"][-1]["evidence"])
+        self.assertFalse(dangling_target.exists())
+
+        # Item 6: root-owned leaf symlink wording + PermissionError != "points nowhere"
+        real_dir = self.tmp / "root-target"
+        real_dir.mkdir(mode=0o700)
+        root_link = self.tmp / "root-link"
+        root_link.symlink_to(real_dir)
+        real_lstat = os.lstat
+
+        def root_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) == os.path.abspath(root_link):
+                fields = list(st)
+                fields[stat.ST_UID] = 0
+                return os.stat_result(fields)
+            return st
+
+        if os.geteuid() != 0:
+            with mock.patch.object(drv.os, "lstat", root_lstat):
+                msg = drv.state_dir_link_problem(root_link)
+            self.assertIn("root-owned symlink (uid 0), not owned by you", msg)
+            self.assertNotIn("owned by uid 0, not you", msg)
+
+        real_stat = os.stat
+
+        def eacces_stat(path, *a, **kw):
+            if os.fspath(path) == os.path.abspath(root_link):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_stat(path, *a, **kw)
+
+        with mock.patch.object(drv.os, "stat", eacces_stat):
+            msg = drv.state_dir_link_problem(root_link)
+        self.assertIn("Permission denied", msg)
+        self.assertNotIn("points nowhere", msg)
+
+        # Item 4: resolved paths are consistent (ctx.lock_path.parent resolved like state_dir)
+        ctx_paths = self.make_ctx(self.tmp / "state-consistent", "20261125T000000Z-a4")
+        self.assertEqual(
+            str(ctx_paths.lock_path.parent),
+            os.path.realpath(self.tmp / "lockdir"),
+        )
+
+    def test_issue82_remove_vm_post_delete_local_vms_failure_keeps_committing_marker(self):
+        # Item 2: when local_vms() raises AFTER `tart delete` actually deleted the old golden,
+        # the handler must re-list on a best-effort basis and NEVER restore the old final marker
+        # when the golden is gone or the re-list fails.
+        for case in ("gone_on_relist", "relist_fails_too"):
+            with self.subTest(case=case):
+                self.tearDown_world()
+                rc, s = self.run_cmd(*self.golden_args())
+                self.assertEqual(rc, 0, s)
+                marker = drv.owner_path(self.ctx, GOLDEN)
+                self.assertEqual(json.loads(marker.read_text())["state"], "final")
+                real_run = self.world.run
+                deleted_golden = False
+                post_delete_lists = 0
+
+                def flaky_after_delete(argv, **kw):
+                    nonlocal deleted_golden, post_delete_lists
+                    if argv[:3] == ["tart", "delete", GOLDEN]:
+                        res = real_run(argv, **kw)
+                        deleted_golden = True
+                        return res
+                    if deleted_golden and argv[:3] == ["tart", "list", "--source"]:
+                        post_delete_lists += 1
+                        if post_delete_lists == 1 or case == "relist_fails_too":
+                            return drv.Result(1, "", "tart list: transient error")
+                    return real_run(argv, **kw)
+
+                with mock.patch.object(self.world, "run", flaky_after_delete):
+                    rc, s = self.run_cmd(
+                        *self.golden_args("--rebuild"), ctx=self.second_run_ctx()
+                    )
+                self.assertEqual(rc, 1, s)
+                ev = self.steps(s)["g10"]["evidence"]
+                self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+                self.assertNotIn("restored", ev)
+                if case == "gone_on_relist":
+                    self.assertIn("now gone", ev)
+                else:
+                    self.assertIn("unknown", ev)
+                # If a golden is present while the marker is committing, plain golden refuses (exit 2)
+                self.world.vms[GOLDEN] = {"Running": False}
+                rc2, ev2, _ = self.plain(self.second_run_ctx("20261125T000000Z-plain"))
+                self.assertEqual(rc2, 2, ev2)
+                self.assertIn("did not finish", ev2)
+
+    def test_issue82_canonical_tart_home_folds_case_and_firmlink(self):
+        # Item 3: two spellings of one TART_HOME produce the same canonical tart_home & marker
+        d = self.tmp / "TartHomeCase"
+        d.mkdir(mode=0o700)
+        resolved = drv.canonical_dir_path(str(d))
+        if sys.platform == "darwin":
+            # Firmlink spelling (/System/Volumes/Data/...) and uppercase spelling (on case-insensitive APFS)
+            sv_data = Path("/System/Volumes/Data" + resolved)
+            if sv_data.exists():
+                self.assertEqual(drv.canonical_dir_path(str(sv_data)), resolved)
+                self.assertEqual(
+                    drv.canonical_dir_path(str(sv_data / "nonexistent-sub")),
+                    os.path.join(resolved, "nonexistent-sub"),
+                )
+            upper = str(d.parent / "TARTHOMECASE")
+            if os.path.exists(upper) and os.path.samefile(upper, d):
+                ctx1 = self.make_ctx(self.ctx.state_dir, "20261125T000000Z-c1", tart_home=str(d))
+                ctx2 = self.make_ctx(self.ctx.state_dir, "20261125T000000Z-c2", tart_home=upper)
+                self.assertEqual(ctx1.tart_home, ctx2.tart_home)
+                self.assertEqual(drv.owner_path(ctx1, GOLDEN), drv.owner_path(ctx2, GOLDEN))
+        # Also test F_GETPATH path explicitly on all platforms (including Linux CI) via mock
+        with (
+            mock.patch.object(drv, "F_GETPATH", 50),
+            mock.patch.object(
+                drv.fcntl,
+                "fcntl",
+                return_value=b"/Users/alice/.tart\x00" + b"\x00" * 1005,
+            ),
+        ):
+            self.assertEqual(drv.canonical_dir_path(str(d)), "/Users/alice/.tart")
+            self.assertEqual(
+                drv.canonical_dir_path(str(d / "sub")), "/Users/alice/.tart/sub"
+            )
 
     def test_a_dangling_link_planted_right_after_the_realpath_is_still_refused(self):
         link = self.tmp / "late-link"

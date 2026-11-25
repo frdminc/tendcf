@@ -60,7 +60,9 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   The record files are written only after the rename succeeded, and from the moment the old
   golden is touched the finished build is never deleted by cleanup: if the delete or the rename
   fails the finished build is kept, `known_hosts`/`golden.json` still describe the old golden
-  (a failed delete puts the previous owner file back; a failed rename leaves the intent one),
+  (a failed delete re-lists on a best-effort basis and puts the previous owner file back only if
+  the old golden is confirmed still present; if the old golden is gone or the re-list fails, the
+  intent marker stays and the state is reported as unknown; a failed rename leaves the intent one),
   and the evidence says what to run (the new record is parked as `known_hosts.pending` and
   `golden.json.pending` in the state dir and `golden-owner-<golden>.json.pending` beside the
   lock; a hand finish is `tart rename` then three `mv`, the last one making this state dir the
@@ -119,15 +121,19 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   **Owner marker.** The tart golden is global to a tart home and the records are per
   `--state-dir`, so the commit writes `<passwd home>/.local/state/tendcf-state1-vm/golden-owner-<golden
   name>-<tart key>.json` beside the driver lock (`<tart key>` is the first 8 hex digits of a
-  SHA-256 of the resolved tart home): the golden, the resolved state dir, the tart home,
+  SHA-256 of the canonical tart home, folded via macOS `F_GETPATH` on an `O_DIRECTORY` fd so
+  case variants and `/System/Volumes/Data` firmlinks share one key): the golden, the resolved state dir, the tart home,
   `key_id`, `host_key` and a `state`. The lock directory must be a real directory of yours that is not group or world
   writable, and the file is read without following a symlink (a FIFO or directory is refused,
   never waited on). The state dir (`--state-dir`, which holds the pin and the record) gets the
-  same ownership and mode check (the path is resolved with `realpath` once, at startup, and
-  a symlink to such a directory is the operator's choice; a missing one is made 0700, parents
-  included; a path that is a file is refused, and so is a `--state-dir` that is itself a
-  symlink that points nowhere or is not yours: nothing is created through it; a link
-  planted after the path was resolved is not followed either). A lock directory that cannot be
+  same ownership and mode check, plus every ancestor of the resolved path up to `/` is verified
+  with `O_DIRECTORY|O_NOFOLLOW` to be a real directory owned by root or you and not group/world
+  writable unless sticky before any missing directory is created (the path is resolved with
+  `realpath` once, at startup, and a symlink of yours to such an existing directory is the
+  operator's choice; a missing one is made 0700, parents included; a path that is a file is
+  refused, and so is any dangling or foreign-owned symlink at `--state-dir` or in an ancestor, or
+  a root-owned symlink at `--state-dir` itself: nothing is created through it; a link planted
+  after the path was resolved is not followed either). A lock directory that cannot be
   made is a refusal (exit 2) naming it; the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
   usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
   this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees

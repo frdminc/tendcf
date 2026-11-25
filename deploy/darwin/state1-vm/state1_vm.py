@@ -98,14 +98,17 @@ STAGE_UPLOAD_SH = (
 def account_home(environ: dict[str, str] | None = None) -> str:
     """The account's home from the passwd entry, never $HOME, like Foundation; $HOME (else
     "/") only when this uid has no passwd entry (a container or a sandbox), where Foundation
-    also falls back to it."""
+    also falls back to it. A relative $HOME is rejected (falls back to "/")."""
     try:
         return pwd.getpwuid(os.getuid()).pw_dir
     except KeyError:
-        return (os.environ if environ is None else environ).get("HOME") or "/"
+        home = (os.environ if environ is None else environ).get("HOME") or ""
+        return home if os.path.isabs(home) else "/"
 
 
-DEFAULT_STATE_DIR = Path(account_home()) / ".local" / "state" / "tendcf-state1-vm"
+DEFAULT_STATE_DIR = (
+    Path(os.path.realpath(account_home())) / ".local" / "state" / "tendcf-state1-vm"
+)
 # One lock per account (DEFAULT_STATE_DIR/driver.lock, the name master uses) whatever
 # --state-dir and the tart home say: the VM names (state1-golden-build, state1-check-*) are
 # global to a tart home and the state dirs are shared across tart homes, so one driver at a
@@ -317,20 +320,55 @@ def tail_file(path: Path, limit: int = EVIDENCE_MAX) -> str:
     return data.decode("utf-8", "replace")
 
 
+F_GETPATH = getattr(fcntl, "F_GETPATH", None) if sys.platform == "darwin" else None
+
+
+def canonical_dir_path(path: str) -> str:
+    """Canonical path for a directory (folding symlinks, APFS case, and macOS
+    /System/Volumes/Data firmlinks via F_GETPATH on an O_DIRECTORY fd). When the directory
+    does not yet exist, canonicalizes its nearest existing ancestor directory and appends the
+    remaining components; falls back to os.path.realpath on non-macOS."""
+    rp = os.path.realpath(path)
+    if F_GETPATH is None:
+        return rp
+    cur = Path(rp)
+    tail: list[str] = []
+    while True:
+        try:
+            fd = os.open(cur, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            parent = cur.parent
+            if parent == cur:
+                return rp
+            tail.append(cur.name)
+            cur = parent
+            continue
+        try:
+            buf = fcntl.fcntl(fd, F_GETPATH, b"\0" * 1024)
+            canon = os.fsdecode(buf.split(b"\0", 1)[0])
+        except OSError:
+            return rp
+        finally:
+            os.close(fd)
+        if tail:
+            return os.path.join(canon, *reversed(tail))
+        return canon
+
+
 def resolve_tart_home(environ: dict[str, str] | None = None) -> str:
-    """The tart home `tart` itself uses, resolved (tart's Config.swift): $TART_HOME whenever
-    it is set, even to the empty string (realpath("") is the cwd, as in tart); else the
-    account's home (CFFIXED_USER_HOME if set, even empty, else the passwd entry: never $HOME) plus
-    /.tart. Computed once per run (Ctx) and exported as TART_HOME to every tart call, so tart
-    and this driver cannot disagree."""
+    """The tart home `tart` itself uses, canonicalized (tart's Config.swift): $TART_HOME
+    whenever it is set, even to the empty string (realpath("") is the cwd, as in tart); else
+    the account's home (CFFIXED_USER_HOME if set, even empty, else the passwd entry: never
+    $HOME) plus /.tart. Computed once per run (Ctx) and exported as TART_HOME to every tart
+    call, so tart and this driver cannot disagree."""
     env = os.environ if environ is None else environ
     raw = env.get("TART_HOME")
     if raw is not None:
-        return os.path.realpath(raw)
+        return canonical_dir_path(raw)
     base = env.get("CFFIXED_USER_HOME")  # set but empty is the cwd, as in Foundation
     if base is None:
         base = account_home(env)
-    return os.path.realpath(os.path.join(base, ".tart"))
+    return canonical_dir_path(os.path.join(base, ".tart"))
 
 
 def tart_key(tart_home: str) -> str:
@@ -339,29 +377,58 @@ def tart_key(tart_home: str) -> str:
 
 
 def state_dir_link_problem(given: Path) -> str:
-    """Why a --state-dir that is itself a symlink must not be followed ("" when fine): one
-    that dangles would make the driver create its target (and missing parents) wherever the
-    link points, and one that another user owns lets them choose where the state dir is. A
-    symlink of ours to an existing directory is the operator's choice and stays accepted.
-    Ancestors of the path are not checked (tracked in issue 82)."""
-    try:
-        st = os.lstat(given)
-    except OSError:
-        return ""  # missing (made later) or unreadable (the stat there says so)
-    if not stat.S_ISLNK(st.st_mode):
-        return ""
-    if st.st_uid != os.getuid():
-        return (
-            f"the state dir {str(given)!r} is a symlink owned by uid {st.st_uid}, not you: "
-            "refusing to follow it (pass the real directory)"
-        )
-    try:
-        os.stat(given)
-    except OSError:
-        return (
-            f"the state dir {str(given)!r} is a symlink that points nowhere: refusing to "
-            "create its target (make the directory or pass a real path)"
-        )
+    """Why a --state-dir or any of its symlinked ancestors must not be followed ("" when fine):
+    a dangling symlink (at the leaf or in an ancestor, e.g. /tmp/link/sub) would make the
+    driver create its target and missing parents wherever the link points, and a symlink owned
+    by another user lets them redirect the state dir. Root-owned system ancestor symlinks
+    (such as /var -> private/var and /tmp -> private/tmp on macOS) pointing to existing
+    directories are accepted; a root-owned symlink at the leaf itself is refused clearly."""
+    abs_given = Path(os.path.abspath(given))
+    chain = [p for p in reversed(abs_given.parents) if p != Path("/")] + [abs_given]
+    euid = os.geteuid()
+    for p in chain:
+        is_final = p == abs_given
+        try:
+            st = os.lstat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            break  # missing tail (made later after resolved ancestor checks)
+        except OSError as e:
+            return (
+                f"cannot inspect {'the state dir' if is_final else 'ancestor'} {str(p)!r}: "
+                f"{e.strerror or e}"
+            )
+        if not stat.S_ISLNK(st.st_mode):
+            continue
+        if is_final:
+            if st.st_uid != euid:
+                if st.st_uid == 0:
+                    return (
+                        f"the state dir {str(p)!r} is a root-owned symlink (uid 0), not "
+                        "owned by you: refusing to follow it (pass the real directory)"
+                    )
+                return (
+                    f"the state dir {str(p)!r} is a symlink owned by uid {st.st_uid}, not you: "
+                    "refusing to follow it (pass the real directory)"
+                )
+        elif st.st_uid not in (0, euid):
+            return (
+                f"ancestor {str(p)!r} of the state dir is a symlink owned by uid "
+                f"{st.st_uid}, not you or root: refusing to follow it (pass the real directory)"
+            )
+        try:
+            os.stat(p)
+        except FileNotFoundError:
+            which = "the state dir" if is_final else "ancestor"
+            extra = "" if is_final else " of the state dir"
+            return (
+                f"{which} {str(p)!r}{extra} is a symlink that points nowhere: refusing to "
+                "create its target (make the directory or pass a real path)"
+            )
+        except OSError as e:
+            return (
+                f"cannot resolve symlink {str(p)!r} for the state dir: "
+                f"{e.strerror or e} (make the directory or pass a real path)"
+            )
     return ""
 
 
@@ -392,8 +459,13 @@ class Ctx:
         self.state_dir_refusal = state_dir_link_problem(given)
         if not self.tart_home:
             self.tart_home = resolve_tart_home()
+        else:
+            self.tart_home = canonical_dir_path(self.tart_home)
         if self.lock_path is None:
             self.lock_path = DEFAULT_STATE_DIR / LOCK_NAME
+        else:
+            lp = Path(self.lock_path)
+            self.lock_path = Path(os.path.realpath(lp.parent)) / lp.name
         if not self.run_id:
             self.run_id = (
                 self.now().strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(2)
@@ -1211,31 +1283,94 @@ def driver_lock(ctx: Ctx):
         os.close(fd)
 
 
+def _check_state_ancestor(anc: Path, state_dir: Path, euid: int) -> None:
+    """Verify one ancestor of the resolved state dir via O_DIRECTORY|O_NOFOLLOW + fstat:
+    must be a real directory owned by root or us, and not group/world writable unless sticky."""
+    try:
+        fd = os.open(anc, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise Refusal(
+                f"ancestor {anc} of the state dir {state_dir} is a symlink "
+                "(planted after resolution): refusing to follow it"
+            ) from e
+        if e.errno == errno.ENOTDIR:
+            raise Refusal(
+                f"ancestor {anc} of the state dir {state_dir} is not a directory"
+            ) from e
+        raise Refusal(
+            f"cannot inspect ancestor {anc} of the state dir {state_dir}: {e}"
+        ) from e
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refusal(
+            f"ancestor {anc} of the state dir {state_dir} is not a directory"
+        )
+    if st.st_uid not in (0, euid):
+        raise Refusal(
+            f"ancestor {anc} of the state dir {state_dir} must be owned by root or you "
+            f"(is uid {st.st_uid})"
+        )
+    if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+        raise Refusal(
+            f"ancestor {anc} of the state dir {state_dir} must not be group or world "
+            f"writable unless sticky (is uid {st.st_uid}, mode {st.st_mode & 0o777:o})"
+        )
+
+
 def check_state_dir(ctx: Ctx) -> None:
     """The state dir holds the pin (known_hosts) and the record (golden.json) that `check`
-    trusts: it must be a directory of ours that is not group or world writable (the same rule
-    as the lock directory). Ctx resolved it once at startup (symlinks and relative paths
-    included, so a later retarget or chdir does not move it); a missing one is made 0700 with
-    its missing parents (umask 077 around the mkdir). Mode bits only: macOS ACLs are not
-    considered, and ancestors of an existing path are not checked."""
+    trusts: it must be a real directory of ours that is not group or world writable, and every
+    ancestor of the resolved path up to `/` must be a real directory owned by root or us with
+    no group/world write unless sticky (issue 82). Ctx resolved it once at startup (symlinks
+    and relative paths included, so a later retarget or chdir does not move it); missing
+    directories are created one component at a time as 0700 (umask 077) only after all
+    existing ancestors are verified with O_DIRECTORY|O_NOFOLLOW."""
     if ctx.state_dir_refusal:
         raise Refusal(ctx.state_dir_refusal)
+    if not ctx.state_dir.is_absolute():
+        raise Refusal(f"the state dir {ctx.state_dir} must be an absolute path")
+    euid = os.geteuid()
     old = os.umask(0o077)
     try:
-        ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except FileExistsError:
-        pass  # a file: the check below says so
-    except OSError as e:
-        raise Refusal(f"cannot create the state dir {ctx.state_dir}: {e}") from e
+        for anc in reversed(ctx.state_dir.parents):
+            if not os.path.lexists(anc):
+                try:
+                    os.mkdir(anc, 0o700)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    raise Refusal(
+                        f"cannot create the state dir {ctx.state_dir}: {e}"
+                    ) from e
+            _check_state_ancestor(anc, ctx.state_dir, euid)
+        if not os.path.lexists(ctx.state_dir):
+            try:
+                os.mkdir(ctx.state_dir, 0o700)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                raise Refusal(
+                    f"cannot create the state dir {ctx.state_dir}: {e}"
+                ) from e
     finally:
         os.umask(old)
     try:
-        st = ctx.state_dir.lstat()  # resolved already: a link here was planted since
+        fd = os.open(ctx.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise Refusal(f"the state dir {ctx.state_dir} is not a directory") from e
         raise Refusal(f"cannot inspect the state dir {ctx.state_dir}: {e}") from e
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
     if not stat.S_ISDIR(st.st_mode):
         raise Refusal(f"the state dir {ctx.state_dir} is not a directory")
-    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+    if st.st_uid != euid or st.st_mode & 0o022:
         raise Refusal(
             f"the state dir {ctx.state_dir} (the pinned known_hosts and golden.json) must be "
             f"a directory owned by you and not group or world writable (is uid "
@@ -3146,13 +3281,38 @@ def cmd_golden(ctx: Ctx, args) -> int:
                             try:
                                 done = remove_vm(ctx, golden)
                             except ToolError as e:
-                                # the old golden and its records are unchanged: so is the
-                                # owner file, again
-                                back = restore_marker(prev_marker, prev_readable)
+                                # Re-list on a best-effort basis before restoring the old
+                                # final marker: local_vms() can raise after `tart delete`
+                                # succeeded (issue 82). Only restore the previous marker
+                                # when we positively see the old golden still present.
+                                try:
+                                    still_present: bool | None = golden in local_vms(ctx)
+                                    relist_err = ""
+                                except ToolError as e2:
+                                    still_present = None
+                                    relist_err = str(e2)
+                                if still_present is True:
+                                    back = restore_marker(prev_marker, prev_readable)
+                                    raise ToolError(
+                                        f"removing the old {golden} failed: {e}; it and the finished "
+                                        f"build {build} are both kept; known_hosts and golden.json "
+                                        f"are unchanged; {back}{finish_note(False)}"
+                                    ) from e
+                                if still_present is False:
+                                    raise ToolError(
+                                        f"removing the old {golden} reported an error ({e}), and a "
+                                        f"re-list shows {golden} is now gone (not kept); the owner "
+                                        "file remains committing (the old golden is gone, so plain "
+                                        "`golden` builds again; rename first to keep this build); "
+                                        f"the finished build is kept as {build}{finish_note(False)}"
+                                    ) from e
                                 raise ToolError(
-                                    f"removing the old {golden} failed: {e}; it and the finished "
-                                    f"build {build} are both kept; known_hosts and golden.json "
-                                    f"are unchanged; {back}{finish_note(False)}"
+                                    f"removing the old {golden} failed ({e}) and re-listing "
+                                    f"{golden} also failed ({relist_err}), so whether the old "
+                                    f"{golden} still exists is unknown; the owner file remains "
+                                    "committing (if it still exists, plain `golden` refuses "
+                                    "(exit 2) until `--rebuild`); the finished build is kept as "
+                                    f"{build}{finish_note(False)}"
                                 ) from e
                             removed = True
                             summary.add(
