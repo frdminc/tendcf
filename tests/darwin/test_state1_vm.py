@@ -791,17 +791,21 @@ class FakeWorld:
                 else:
                     lines.append(f"drwxr-xr-x   2 root  wheel  64 Nov 25 00:00 {p}\n")
             return drv.Result(0, "".join(lines))
-        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"] or r[:5] == [
+        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp %Sp"] or r[:5] == [
             "sudo",
             "-n",
             "stat",
             "-f",
-            "%Su:%Sg %Lp",
+            "%Su:%Sg %Lp %Sp",
         ]:
             target_p = r[5] if r[0] == "sudo" else r[3]
             if target_p in (drv.TENDCF_PREFIX, f"{self.workdir}/inputs"):
-                return drv.Result(0, FW_PYTHON_FIXED + "\n")
-            return drv.Result(0, self.fw_owner + "\n")
+                val = FW_PYTHON_FIXED
+            else:
+                val = self.fw_owner
+            if len(val.split()) == 2:
+                val = val + " drwxr-xr-x"
+            return drv.Result(0, val + "\n")
         if r[:3] == ["sysctl", "-n", "kern.bootsessionuuid"]:
             n = self.boot if self.reboot_changes_uuid else 1
             return drv.Result(0, f"3F2A-uuid-{n}\n")
@@ -2180,6 +2184,30 @@ class Golden(Base):
         self.assertEqual(rc, 2)
         self.assertEqual(json.loads(marker.read_text())["state"], "committing")
 
+        # PR 112 R1 Group 5 (Adversary B2): swapping golden.json/key mid-check before adoption
+        # writes is refused (even if the new record still passes golden_usable, it does not match
+        # the initial SSH-verified credentials).
+        marker.unlink()
+        new_key_id = "20261125T000099Z-swap"
+        swap_pub, _ = drv.mint_keypair(self.ctx, new_key_id)
+        swap_rec = {
+            **rec,
+            "key_id": new_key_id,
+            "authorized_key": drv.fingerprint(swap_pub),
+        }
+
+        def swap_record_after_reboot_checks(r, input_text):
+            res = orig_reboot(r, input_text)
+            if r[0] == "dscl" and self.world.rebooted:
+                (self.ctx.state_dir / "golden.json").write_text(json.dumps(swap_rec))
+            return res
+
+        with mock.patch.object(self.world, "_guest", swap_record_after_reboot_checks):
+            rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000009Z-swap"))
+        self.assertEqual(rc, 2, s)
+        self.assertIn("changed during check", s["steps"][-1]["evidence"])
+        self.assertFalse(marker.exists())
+
     def test_issue81_golden_adopt_promotes_matching_committing_marker_and_refuses_otherwise(self):
         # Simulate a commit that stopped between golden.json and the final owner marker
         marker_name = self.owner_file().name
@@ -2235,10 +2263,22 @@ class Golden(Base):
         self.assertIn("does not exist", s["steps"][-1]["evidence"])
         self.world.vms[GOLDEN] = saved_vm
 
-        # Happy path: golden --adopt promotes the matching committing marker to final
+        # PR 112 R1 Group 6 (Adversary B3): leftover <golden>-build VM refuses golden --adopt
+        self.world.vms[f"{GOLDEN}-build"] = {"Running": False}
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000015Z-bld"))
+        self.assertEqual(rc, 2)
+        self.assertIn("leftover build VM", s["steps"][-1]["evidence"])
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+        self.world.vms.pop(f"{GOLDEN}-build")
+
+        # Happy path: golden --adopt promotes the matching committing marker to final AND
+        # cleans up parked .pending files left by the earlier interrupted commit (Group 6).
+        self.assertTrue(self.pending_files(), "expected parked .pending files before adopt")
         rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000016Z-ok"))
         self.assertEqual(rc, 0, s)
         self.assertEqual(self.steps(s)["adopt"]["status"], "pass")
+        self.assertEqual(self.steps(s)["pending"]["status"], "pass")
+        self.assertEqual(self.pending_files(), [])
         self.assertEqual(json.loads(marker.read_text())["state"], "final")
 
         # Idempotent when already final and matching
@@ -3251,17 +3291,78 @@ class Golden(Base):
             self.assertIn("root-owned symlink (uid 0), not owned by you", msg)
             self.assertNotIn("owned by uid 0, not you", msg)
 
-        real_stat = os.stat
+        real_dir_rp = os.path.realpath(real_dir)
+        real_dir_str = str(real_dir)
 
-        def eacces_stat(path, *a, **kw):
-            if os.fspath(path) == os.path.abspath(root_link):
-                raise PermissionError(errno.EACCES, "Permission denied", str(path))
-            return real_stat(path, *a, **kw)
+        def eacces_lstat(path, *a, **kw):
+            p_str = os.fspath(path)
+            if p_str in (real_dir_rp, real_dir_str):
+                raise PermissionError(errno.EACCES, "Permission denied", p_str)
+            return real_lstat(path, *a, **kw)
 
-        with mock.patch.object(drv.os, "stat", eacces_stat):
+        with mock.patch.object(drv.os, "lstat", eacces_lstat):
             msg = drv.state_dir_link_problem(root_link)
         self.assertIn("Permission denied", msg)
         self.assertNotIn("points nowhere", msg)
+
+        # PR 112 R1 Group 4 (Adversary B1 + Neon #5):
+        # 1) Lexical `..` must NOT bypass a foreign symlink ancestor (/tmp/foreign_link/../sub)
+        tmp_rp = os.path.realpath(self.tmp)
+        foreign_target = self.tmp / "foreign-dotdot-target"
+        foreign_target.mkdir(mode=0o700)
+        foreign_anc = self.tmp / "foreign-anc-link"
+        foreign_anc.symlink_to(foreign_target)
+        dotdot_path = foreign_anc / ".." / "sub"
+
+        def foreign_anc_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) in (str(foreign_anc), tmp_rp + "/foreign-anc-link"):
+                fields = list(st)
+                fields[stat.ST_UID] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return st
+
+        with mock.patch.object(drv.os, "lstat", foreign_anc_lstat):
+            msg = drv.state_dir_link_problem(dotdot_path)
+        self.assertIn("not you or root", msg)
+
+        # 2) Multi-hop symlink chain (my_link -> hop2_foreign -> real_dir) checks every hop
+        hop2 = self.tmp / "hop2-foreign"
+        hop2.symlink_to(real_dir)
+        hop1 = self.tmp / "hop1-mine"
+        hop1.symlink_to(hop2)
+
+        def hop2_foreign_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) in (str(hop2), tmp_rp + "/hop2-foreign"):
+                fields = list(st)
+                fields[stat.ST_UID] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return st
+
+        with mock.patch.object(drv.os, "lstat", hop2_foreign_lstat):
+            msg = drv.state_dir_link_problem(hop1)
+        self.assertIn("not you", msg)
+
+        # 3) Symlink loop fails cleanly with Too many levels of symbolic links
+        loop_a = self.tmp / "loop-a"
+        loop_b = self.tmp / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        msg = drv.state_dir_link_problem(loop_a)
+        self.assertIn("Too many levels of symbolic links", msg)
+        self.assertNotIn("points nowhere", msg)
+
+        # PR 112 R1 Group 8c: driver_lock refuses a non-sticky world-writable lock ancestor
+        bad_lock_parent = self.tmp / "bad-lock-anc"
+        bad_lock_parent.mkdir(mode=0o700)
+        os.chmod(bad_lock_parent, 0o777)
+        ctx_bad_lock = self.make_ctx(self.tmp / "state-lk", "20261125T000000Z-lka")
+        ctx_bad_lock.lock_path = bad_lock_parent / "sub" / "driver.lock"
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_bad_lock)
+        self.assertEqual(rc, 2, s)
+        self.assertIn("must not be group or world writable unless sticky", s["steps"][-1]["evidence"])
+        os.chmod(bad_lock_parent, 0o700)
 
         # Item 4: resolved paths are consistent (ctx.lock_path.parent resolved like state_dir)
         ctx_paths = self.make_ctx(self.tmp / "state-consistent", "20261125T000000Z-a4")
@@ -3928,6 +4029,11 @@ class Check(Base):
                 SSHD_CAMEL + "Banner /x\x00y\n",
                 "NUL byte",
             ),
+            (
+                "non-ASCII duplicate PasswordAuthentication (PR 112 R1 Group 3)",
+                SSHD_CAMEL + "PasswordAuthentication \ufffdno\n",
+                "duplicate keys",
+            ),
         ):
             with self.subTest(name):
                 ok, ev = drv.sshd_key_only(drv.Result(0, out))
@@ -3990,6 +4096,67 @@ class Check(Base):
         r = run_check()
         self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
         self.assertIn("Match Address", r.stdout)
+
+        # PR 112 R1 Group 1: all 5 bypasses + NUL + mid-line # + quoted keywords
+        (base / "crypto" / "apple.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        # 1) Drop-in filename with space via glob
+        spaced = base / "sshd_config.d" / "99 custom.conf"
+        spaced.write_text("Match User root\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match User", r.stdout)
+        spaced.unlink()
+
+        # 2) Quoted Include with spaces in path ("dir with space/a.conf") + mid-line #
+        (base / "dir with space").mkdir()
+        (base / "dir with space" / "a.conf").write_text('"Match" all\n')
+        (base / "sshd_config").write_text(
+            'Include #nonexistent.conf "dir with space/a.conf"\n'
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match", r.stdout)
+
+        # 3) Relative Include *.conf with a colliding file in cwd must expand under $base, not cwd
+        colliding_cwd = Path(tempfile.mkdtemp(prefix="tendcf-sshd-cwd-"))
+        self.addCleanup(shutil.rmtree, colliding_cwd, True)
+        (colliding_cwd / "clean.conf").write_text("# clean in cwd\n")
+        (base / "evil.conf").write_text("Match all\n")
+        (base / "sshd_config").write_text("Include *.conf\n")
+        r = subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(base / "sshd_config"), str(base)],
+            cwd=str(colliding_cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match all", r.stdout)
+        (base / "evil.conf").unlink()
+
+        # 4) Filename containing glob metacharacters (* and ?) cannot fool visited dedup
+        (base / "sshd_config.d" / "a?b.conf").write_text("# harmless\n")
+        (base / "sshd_config.d" / "a1b.conf").write_text("Match all\n")
+        (base / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match all", r.stdout)
+        (base / "sshd_config.d" / "a?b.conf").unlink()
+        (base / "sshd_config.d" / "a1b.conf").unlink()
+
+        # 5) CRLF Include and Match\rall
+        (base / "crlf_evil.conf").write_bytes(b"Match\rall\r\n")
+        (base / "sshd_config").write_bytes(b"Include crlf_evil.conf\r\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match", r.stdout)
+        (base / "crlf_evil.conf").unlink()
+
+        # 6) NUL byte in config fails closed
+        (base / "sshd_config").write_bytes(b"PasswordAuthentication no\x00\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
 
     # -- 2g / 10a: Spotlight off, with a bounded settle (issue 70 run 2)
     def test_2g_waits_out_transitioning_and_records_polls_and_seconds(self):
@@ -4585,10 +4752,56 @@ class Check(Base):
             ("root:admin 755", True, False),  # group is not wheel
             ("root:wheel 775", True, False),  # group writable
             ("admin:wheel 755", True, False),
+            ("root:wheel 755 lrwxr-xr-x", True, False),  # PR 112 R1 Group 2: target symlink refused
         ):
             self.world.fw_owner = owner
             ok, ev = drv.check_root_owned(self.ctx, t, "/fw")
             self.assertEqual(ok, want, (owner, ev))
+        # tree=True also rejects symlink target or non-directory regular file target
+        for bad_target in ("root:wheel 755 lrwxr-xr-x", "root:wheel 644 -rw-r--r--"):
+            self.world.fw_owner = bad_target
+            ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
+            self.assertFalse(ok, (bad_target, ev))
+            self.assertIn("symlink or non-directory refused", ev)
+        # Verify TREE_CHECK_SH itself rejects symlinks and checks dotfiles via `find -exec /bin/ls -lde`
+        self.assertIn('test ! -L "$1" && test -d "$1"', drv.TREE_CHECK_SH)
+        self.assertIn('find "$1" -exec /bin/ls -lde {} +', drv.TREE_CHECK_SH)
+        td = Path(tempfile.mkdtemp(prefix="tendcf-tree-acl-"))
+        self.addCleanup(shutil.rmtree, td, True)
+        (td / ".hidden_dir").mkdir()
+        hidden_f = td / ".hidden_dir" / ".secret"
+        hidden_f.write_text("x")
+        sym = td / "sym"
+        sym.symlink_to(td / ".hidden_dir")
+        # Symlink target to TREE_CHECK_SH fails non-zero
+        r_sym = subprocess.run(
+            ["/bin/sh", "-c", drv.TREE_CHECK_SH, "sh", str(sym)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(r_sym.returncode, 0)
+        # Stub /bin/ls-like check: prove TREE_CHECK_SH's find -exec reaches hidden dotfiles
+        fake_bin = Path(tempfile.mkdtemp(prefix="tendcf-tree-ls-"))
+        self.addCleanup(shutil.rmtree, fake_bin, True)
+        fake_ls = fake_bin / "ls"
+        fake_ls.write_text(
+            '#!/bin/sh\n'
+            'for p in "$@"; do\n'
+            '  case "$p" in\n'
+            '    */.secret) echo "-rw-r--r--+ 1 root wheel 1 Nov 25 00:00 $p"; echo " 0: user:admin allow write" ;;\n'
+            '  esac\n'
+            'done\n'
+        )
+        fake_ls.chmod(0o755)
+        tree_sh_test = drv.TREE_CHECK_SH.replace("/bin/ls", str(fake_ls))
+        r_acl = subprocess.run(
+            ["/bin/sh", "-c", tree_sh_test, "sh", str(td)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn("ACL:", r_acl.stdout)
         self.world.fw_owner = FW_PYTHON_FIXED
         ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
         self.assertTrue(ok, ev)
@@ -5781,6 +5994,83 @@ class GuestScripts(unittest.TestCase):
         self.assertIn("Match block", r.stderr)
         self.assertNotIn("REACHED", r.stdout)
 
+        # PR 112 R1 Group 1 & 8a in prep.sh: space in globbed drop-in, quoted Include with space,
+        # relative Include *.conf with colliding cwd, glob metachars (*, ?), CRLF Include/Match,
+        # mid-line #, NUL byte in config, and sshd_specs dedup + invalid IP filtering.
+        (ssh_dir / "crypto.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        # 1) Space in globbed drop-in
+        spaced = ssh_dir / "sshd_config.d" / "99 custom.conf"
+        spaced.write_text("Match User root\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        spaced.unlink()
+        # 2) Quoted Include with space + mid-line #
+        (ssh_dir / "dir with space").mkdir()
+        (ssh_dir / "dir with space" / "a.conf").write_text('"Match" all\n')
+        (ssh_dir / "sshd_config").write_text('Include #ignored.conf "dir with space/a.conf"\n')
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        # 3) Relative Include *.conf with colliding file in cwd
+        cwd_dir = Path(tempfile.mkdtemp(prefix="tendcf-prep7-cwd-"))
+        self.addCleanup(shutil.rmtree, cwd_dir, True)
+        (cwd_dir / "clean.conf").write_text("# clean\n")
+        (ssh_dir / "bad.conf").write_text("Match all\n")
+        (ssh_dir / "sshd_config").write_text("Include *.conf\n")
+        r = subprocess.run(
+            ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
+            cwd=str(cwd_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**base_env, "SSHD_OUT": SSHD_CAMEL, "SSHD_RC": "0"},
+        )
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "bad.conf").unlink()
+        # 4) Filename containing ? does not swallow another filename via case wildcard
+        (ssh_dir / "sshd_config.d" / "x?y.conf").write_text("# ok\n")
+        (ssh_dir / "sshd_config.d" / "x1y.conf").write_text("Match all\n")
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "sshd_config.d" / "x?y.conf").unlink()
+        (ssh_dir / "sshd_config.d" / "x1y.conf").unlink()
+        # 5) CRLF Include + Match\rall
+        (ssh_dir / "crlf.conf").write_bytes(b"Match\rall\r\n")
+        (ssh_dir / "sshd_config").write_bytes(b"Include crlf.conf\r\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "crlf.conf").unlink()
+        # 6) NUL byte in config file
+        (ssh_dir / "sshd_config").write_bytes(b"PasswordAuthentication no\x00\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
+        # 7) Group 8a: dedup 127.0.0.1 (via ,addr=) and skip non-IP tokens like link#4
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        if specs_log.exists():
+            specs_log.unlink()
+        r = subprocess.run(
+            ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **base_env,
+                "SSHD_CLIENT_ADDRS": "127.0.0.1 link#4 192.168.64.1 192.168.64.1",
+                "SSHD_OUT": SSHD_CAMEL,
+                "SSHD_RC": "0",
+            },
+        )
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        seen_dedup = specs_log.read_text().splitlines()
+        self.assertEqual(len(seen_dedup), 4, seen_dedup)
+        self.assertFalse(any("link#4" in s for s in seen_dedup))
+
     def fake_bin(self, name, body):
         d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
         self.addCleanup(shutil.rmtree, d, True)
@@ -6466,7 +6756,10 @@ class GuestScripts(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="tendcf-pkgutil-"))
         self.addCleanup(shutil.rmtree, d, True)
         stub = d / "pkgutil"
-        (d / "out.txt").write_text(output)
+        if isinstance(output, bytes):
+            (d / "out.txt").write_bytes(output)
+        else:
+            (d / "out.txt").write_text(output)
         stub.write_text(f'#!/bin/sh\ncat "{d}/out.txt"\nexit {rc}\n')
         stub.chmod(0o755)
         driver = d / "run.sh"
@@ -6530,6 +6823,49 @@ class GuestScripts(unittest.TestCase):
             "trusted by the Apple notary service", "not notarized"
         )
         self.assertNotEqual(self.pkgutil_check(bad_notary).returncode, 0)
+        # PR 112 R1 Group 7 (Adversary B4): section anchoring, uniqueness, and CR/NUL rejection
+        # Status inside Certificate Chain fails
+        status_in_chain = self.GOOD_SIG.replace(
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+            "",
+        ) + "    Status: signed by a developer certificate issued by Apple for distribution\n"
+        self.assertNotEqual(self.pkgutil_check(status_in_chain).returncode, 0)
+        # Notarization inside Certificate Chain fails
+        notary_in_chain = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n", ""
+        ) + "    Notarization: trusted by the Apple notary service\n"
+        self.assertNotEqual(self.pkgutil_check(notary_in_chain).returncode, 0)
+        # Leaf 1. line outside (before) Certificate Chain fails
+        leaf_before_chain = (
+            "   1. Developer ID Installer: Python Software Foundation (BMM5U3QVKW)\n"
+            + self.GOOD_SIG.replace(
+                "    1. Developer ID Installer: Python Software Foundation (BMM5U3QVKW)\n",
+                "",
+            )
+        )
+        self.assertNotEqual(self.pkgutil_check(leaf_before_chain).returncode, 0)
+        # Duplicate Status / Notarization / 1. lines fail even when one matches
+        dup_status = self.GOOD_SIG.replace(
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+            "   Status: untrusted\n"
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+        )
+        self.assertNotEqual(self.pkgutil_check(dup_status).returncode, 0)
+        dup_notary = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n",
+            "   Notarization: revoked\n"
+            "   Notarization: trusted by the Apple notary service\n",
+        )
+        self.assertNotEqual(self.pkgutil_check(dup_notary).returncode, 0)
+        dup_leaf = self.GOOD_SIG + "    1. Developer ID Installer: Evil (XXXXXXXXXX)\n"
+        self.assertNotEqual(self.pkgutil_check(dup_leaf).returncode, 0)
+        # CR and NUL bytes fail closed
+        self.assertNotEqual(
+            self.pkgutil_check(self.GOOD_SIG.replace("\n", "\r\n").encode()).returncode, 0
+        )
+        self.assertNotEqual(
+            self.pkgutil_check(self.GOOD_SIG.encode() + b"\x00").returncode, 0
+        )
 
 
 class CheckRenderer(Base):

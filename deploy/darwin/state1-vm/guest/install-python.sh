@@ -21,25 +21,58 @@ installed() {
     [ "$("$py" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' </dev/null)" = "$version" ]
 }
 
-# pkgutil --check-signature must exit 0, report Apple's distribution-certificate status,
-# notarization trust, and name the leaf certificate exactly "Developer ID Installer: <signer>".
-# The sha256 pin is the real control; this is the second one. Lines are compared whole, after trimming.
+# pkgutil --check-signature must exit 0, report Apple's distribution-certificate status and
+# notarization trust strictly before `Certificate Chain:`, and name the leaf certificate
+# uniquely as `1. Developer ID Installer: <signer>` strictly inside `Certificate Chain:`.
+# Output goes through a temp file + `LC_ALL=C tr` so NUL and CR bytes fail closed.
 check_signature() {
-    sig=$(pkgutil --check-signature "$1" </dev/null) || die "pkgutil --check-signature failed for $1"
-    got_status=0 got_notarized=0 got_signer=0
-    while IFS= read -r line; do
-        line=${line#"${line%%[![:space:]]*}"}
-        case $line in
-            "Status: signed by a developer certificate issued by Apple for distribution") got_status=1 ;;
-            "Notarization: trusted by the Apple notary service") got_notarized=1 ;;
-            "1. Developer ID Installer: $signer") got_signer=1 ;;
-        esac
-    done <<EOF
-$sig
-EOF
-    [ "$got_status" -eq 1 ] || die "package status is not 'signed by a developer certificate issued by Apple for distribution'"
-    [ "$got_notarized" -eq 1 ] || die "package notarization is not 'trusted by the Apple notary service'"
-    [ "$got_signer" -eq 1 ] || die "package leaf certificate is not 'Developer ID Installer: $signer'"
+    sig_tmp=$(mktemp "${work:-/var/tmp}/tendcf-pkgutil.XXXXXX")
+    sig_rc=0
+    pkgutil --check-signature "$1" </dev/null >"$sig_tmp" || sig_rc=$?
+    if [ "$sig_rc" -ne 0 ]; then
+        rm -f -- "$sig_tmp"
+        die "pkgutil --check-signature failed for $1 (rc $sig_rc)"
+    fi
+    sig_err=$(LC_ALL=C tr '\000' '\001' <"$sig_tmp" | LC_ALL=C awk -v signer="$signer" '
+        function fail(msg) { if (!bad) print msg; bad = 1; exit }
+        index($0, "\001") > 0 { fail("pkgutil output contains NUL byte") }
+        index($0, "\r") > 0 { fail("pkgutil output contains carriage return") }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line == "Certificate Chain:") {
+                chain_hdr++
+                in_chain = 1
+                next
+            }
+            if (line ~ /^Status:/) {
+                status_n++
+                if (in_chain) fail("Status line appeared inside Certificate Chain")
+                if (line == "Status: signed by a developer certificate issued by Apple for distribution") status_ok++
+                next
+            }
+            if (line ~ /^Notarization:/) {
+                notary_n++
+                if (in_chain) fail("Notarization line appeared inside Certificate Chain")
+                if (line == "Notarization: trusted by the Apple notary service") notary_ok++
+                next
+            }
+            if (line ~ /^1\. /) {
+                leaf_n++
+                if (!in_chain) fail("leaf certificate line appeared outside Certificate Chain")
+                if (line == "1. Developer ID Installer: " signer) leaf_ok++
+                next
+            }
+        }
+        END {
+            if (bad) exit
+            if (chain_hdr + 0 != 1) { print "expected exactly 1 Certificate Chain section, saw " (chain_hdr + 0); exit }
+            if (status_n + 0 != 1 || status_ok + 0 != 1) { print "package status is not uniquely '\''signed by a developer certificate issued by Apple for distribution'\''"; exit }
+            if (notary_n + 0 != 1 || notary_ok + 0 != 1) { print "package notarization is not uniquely '\''trusted by the Apple notary service'\''"; exit }
+            if (leaf_n + 0 != 1 || leaf_ok + 0 != 1) { print "package leaf certificate is not uniquely '\''Developer ID Installer: " signer "'\''"; exit }
+        }')
+    rm -f -- "$sig_tmp"
+    [ -z "$sig_err" ] || die "$sig_err"
 }
 
 if installed; then

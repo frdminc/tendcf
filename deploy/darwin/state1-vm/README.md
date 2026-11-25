@@ -463,8 +463,9 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
   changes nothing about the token; run 2 saw it still ENABLED after the rotation (issue 78, in
   part: see the run 2 bullet above).
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
-  Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
-  lines the script compares, that python.org's installer leaves `Python.framework/Versions`
+  Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status, `Notarization:
+  trusted by the Apple notary service`, and `1.` leaf lines (anchored around `Certificate Chain:`)
+  the script compares, that python.org's installer leaves `Python.framework/Versions`
   and the tree `root:admin 775` (read from CPython's `build-installer.py` "Fix file modes" and
   `postflight.framework`; the installed modes are unverified, which is why the fix-up and the
   assertion cover the whole framework and every ancestor), that `stat -f '%N %Su:%Sg %Lp'` and

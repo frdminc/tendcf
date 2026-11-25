@@ -169,12 +169,14 @@ RUN_SCRIPT_SH = (
     "trap 'rm -f \"$f\"' EXIT; trap 'exit 129' HUP INT TERM; "
     'cat > "$f" || exit 1; sudo -n /bin/sh "$f" "$@"'
 )
-# Is the root-owned tree root:wheel and free of group/world write, SUID/SGID, and ACLs? Prints offenders only.
+# Is the root-owned tree a real directory (not a symlink), root:wheel, and free of group/world
+# write, SUID/SGID, and ACLs (including dotfiles and hidden subdirectories)? Prints offenders only.
 TREE_CHECK_SH = (
-    'test -d "$1" || exit 1; '
+    'test ! -L "$1" && test -d "$1" || exit 1; '
     'find "$1" \\( ! -user root -o ! -group wheel \\) -print | head -n 5; '
     'find "$1" ! -type l \\( -perm -020 -o -perm -002 -o -perm -4000 -o -perm -2000 \\) -print | head -n 5; '
-    'ls -lRe "$1" | awk \'/^ [0-9]+: / { print "ACL:" $0; exit }\''
+    'out=$(find "$1" -exec /bin/ls -lde {} +) || exit 1; '
+    'printf "%s\\n" "$out" | awk \'/^ [0-9]+: / || /^[^[:space:]]+\\+[[:space:]]/ { print "ACL:" $0; exit }\''
 )
 # Same as TREE_CHECK_SH plus rejects any non-regular/non-directory entry (e.g. symlinks under inputs/).
 TREE_CHECK_NO_LINKS_SH = (
@@ -376,60 +378,167 @@ def tart_key(tart_home: str) -> str:
     return hashlib.sha256(os.fsencode(tart_home)).hexdigest()[:8]
 
 
-def state_dir_link_problem(given: Path) -> str:
-    """Why a --state-dir or any of its symlinked ancestors must not be followed ("" when fine):
-    a dangling symlink (at the leaf or in an ancestor, e.g. /tmp/link/sub) would make the
-    driver create its target and missing parents wherever the link points, and a symlink owned
-    by another user lets them redirect the state dir. Root-owned system ancestor symlinks
-    (such as /var -> private/var and /tmp -> private/tmp on macOS) pointing to existing
-    directories are accepted; a root-owned symlink at the leaf itself is refused clearly."""
-    abs_given = Path(os.path.abspath(given))
-    chain = [p for p in reversed(abs_given.parents) if p != Path("/")] + [abs_given]
-    euid = os.geteuid()
-    for p in chain:
-        is_final = p == abs_given
-        try:
-            st = os.lstat(p)
-        except (FileNotFoundError, NotADirectoryError):
-            break  # missing tail (made later after resolved ancestor checks)
-        except OSError as e:
+def _symlink_owner_refusal(path: Path, uid: int, euid: int, *, is_final: bool) -> str:
+    if is_final:
+        if uid != euid:
+            if uid == 0:
+                return (
+                    f"the state dir {str(path)!r} is a root-owned symlink (uid 0), not "
+                    "owned by you: refusing to follow it (pass the real directory)"
+                )
             return (
-                f"cannot inspect {'the state dir' if is_final else 'ancestor'} {str(p)!r}: "
-                f"{e.strerror or e}"
+                f"the state dir {str(path)!r} is a symlink owned by uid {uid}, not you: "
+                "refusing to follow it (pass the real directory)"
+            )
+    elif uid not in (0, euid):
+        return (
+            f"ancestor {str(path)!r} of the state dir is a symlink owned by uid "
+            f"{uid}, not you or root: refusing to follow it (pass the real directory)"
+        )
+    return ""
+
+
+def _walk_state_dir_links(
+    base: Path,
+    parts: list[str],
+    *,
+    is_final_leaf: bool,
+    in_symlink: bool,
+    origin_link: Path | None,
+    euid: int,
+    hops: int,
+) -> tuple[Path | None, int, str]:
+    """Walk `parts` from `base` component-by-component without lexical `..` collapse,
+    following symlinks hop-by-hop with `os.readlink` and verifying `lstat` ownership at
+    every hop (up to 40 hops)."""
+    cur = base
+    for i, part in enumerate(parts):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent
+            continue
+        cand = cur / part
+        leaf_here = is_final_leaf and (i == len(parts) - 1)
+        try:
+            st = os.lstat(cand)
+        except FileNotFoundError:
+            if in_symlink:
+                link_ref = origin_link or cand
+                which = "the state dir" if is_final_leaf else "ancestor"
+                extra = "" if is_final_leaf else " of the state dir"
+                return (
+                    None,
+                    hops,
+                    f"{which} {str(link_ref)!r}{extra} is a symlink that points nowhere: "
+                    "refusing to create its target (make the directory or pass a real path)",
+                )
+            return cand, hops, ""  # missing tail of a real path (made later)
+        except NotADirectoryError:
+            if in_symlink:
+                link_ref = origin_link or cand
+                return (
+                    None,
+                    hops,
+                    f"cannot resolve symlink {str(link_ref)!r} for the state dir: "
+                    "Not a directory (make the directory or pass a real path)",
+                )
+            return cand, hops, ""
+        except OSError as e:
+            if in_symlink:
+                link_ref = origin_link or cand
+                return (
+                    None,
+                    hops,
+                    f"cannot resolve symlink {str(link_ref)!r} for the state dir: "
+                    f"{e.strerror or e} (make the directory or pass a real path)",
+                )
+            return (
+                None,
+                hops,
+                f"cannot inspect {'the state dir' if leaf_here else 'ancestor'} {str(cand)!r}: "
+                f"{e.strerror or e}",
             )
         if not stat.S_ISLNK(st.st_mode):
+            cur = cand
             continue
-        if is_final:
-            if st.st_uid != euid:
-                if st.st_uid == 0:
-                    return (
-                        f"the state dir {str(p)!r} is a root-owned symlink (uid 0), not "
-                        "owned by you: refusing to follow it (pass the real directory)"
-                    )
-                return (
-                    f"the state dir {str(p)!r} is a symlink owned by uid {st.st_uid}, not you: "
-                    "refusing to follow it (pass the real directory)"
-                )
-        elif st.st_uid not in (0, euid):
+        err = _symlink_owner_refusal(cand, st.st_uid, euid, is_final=leaf_here)
+        if err:
+            return None, hops, err
+        hops += 1
+        if hops > 40:
+            link_ref = origin_link or cand
             return (
-                f"ancestor {str(p)!r} of the state dir is a symlink owned by uid "
-                f"{st.st_uid}, not you or root: refusing to follow it (pass the real directory)"
+                None,
+                hops,
+                f"cannot resolve symlink {str(link_ref)!r} for the state dir: "
+                "Too many levels of symbolic links (make the directory or pass a real path)",
             )
         try:
-            os.stat(p)
-        except FileNotFoundError:
-            which = "the state dir" if is_final else "ancestor"
-            extra = "" if is_final else " of the state dir"
-            return (
-                f"{which} {str(p)!r}{extra} is a symlink that points nowhere: refusing to "
-                "create its target (make the directory or pass a real path)"
-            )
+            raw_target = os.readlink(cand)
         except OSError as e:
             return (
-                f"cannot resolve symlink {str(p)!r} for the state dir: "
-                f"{e.strerror or e} (make the directory or pass a real path)"
+                None,
+                hops,
+                f"cannot resolve symlink {str(cand)!r} for the state dir: "
+                f"{e.strerror or e} (make the directory or pass a real path)",
             )
-    return ""
+        t_path = Path(raw_target)
+        if t_path.is_absolute():
+            t_base = Path("/")
+            t_parts = list(t_path.parts[1:])
+        else:
+            t_base = cur
+            t_parts = list(t_path.parts)
+        resolved, hops, err = _walk_state_dir_links(
+            t_base,
+            t_parts,
+            is_final_leaf=leaf_here,
+            in_symlink=True,
+            origin_link=origin_link or cand,
+            euid=euid,
+            hops=hops,
+        )
+        if err or resolved is None:
+            return None, hops, err
+        cur = resolved
+    return cur, hops, ""
+
+
+def state_dir_link_problem(given: Path) -> str:
+    """Why a --state-dir or any of its symlinked ancestors must not be followed ("" when fine):
+    walks `given` component-by-component without lexical `..` collapse and follows symlinks
+    hop-by-hop with `lstat` ownership checks at every hop (issue 82 + PR 112 R1). A dangling
+    symlink (at the leaf or in an ancestor, e.g. /tmp/link/sub) or a foreign-owned symlink at
+    any hop is refused; root-owned system ancestor symlinks (such as /var -> private/var and
+    /tmp -> private/tmp on macOS) pointing to existing directories are accepted."""
+    euid = os.geteuid()
+    # Direct check on the given leaf spelling itself (catches foreign/root leaf symlinks
+    # before ancestor symlink canonicalization changes the path spelling).
+    try:
+        st_given = os.lstat(given)
+    except OSError:
+        st_given = None
+    if st_given is not None and stat.S_ISLNK(st_given.st_mode):
+        err = _symlink_owner_refusal(given, st_given.st_uid, euid, is_final=True)
+        if err:
+            return err
+    raw = Path(given)
+    if raw.is_absolute():
+        parts = list(raw.parts[1:])
+    else:
+        cwd_parts = list(Path(os.getcwd()).parts)
+        parts = cwd_parts[1:] + list(raw.parts)
+    _, _, err = _walk_state_dir_links(
+        Path("/"),
+        parts,
+        is_final_leaf=True,
+        in_symlink=False,
+        origin_link=None,
+        euid=euid,
+        hops=0,
+    )
+    return err
 
 
 @dataclass
@@ -835,16 +944,6 @@ SSHD_REQUIRED_EXACT: dict[str, frozenset[str]] = {
         {"authenticationmethods publickey", "authenticationmethods any"}
     ),
 }
-SSHD_WANT = frozenset(
-    {
-        "passwordauthentication no",
-        "kbdinteractiveauthentication no",
-        "pubkeyauthentication yes",
-        "permitrootlogin no",
-        "gssapiauthentication no",
-        "hostbasedauthentication no",
-    }
-)
 # Inspect sshd_config and all recursive Include targets (cycle-safe, max depth 16) for any
 # uncommented Match directive. Arguments: $1 = main sshd_config path, $2 = base dir (/etc/ssh).
 SSHD_MATCH_CHECK_SH = r'''set -eu
@@ -877,50 +976,107 @@ while [ -n "$queue" ]; do
     [ -f "$f" ] || continue
     [ -r "$f" ] || { echo "unreadable config: $f" >&2; exit 1; }
     c=$(canon "$f")
-    case "
-$visited
-" in *"
-$c
-"*) continue ;; esac
-    visited="$visited
+    case $c in *"
+"*) echo "config path contains newline: $c" >&2; exit 1 ;; esac
+    if [ -n "$visited" ] && printf '%s\n' "$visited" | LC_ALL=C grep -qxF -- "$c"; then
+        continue
+    fi
+    if [ -n "$visited" ]; then
+        visited="$visited
 $c"
+    else
+        visited="$c"
+    fi
+    raw_len=$(wc -c <"$f")
+    clean_len=$(LC_ALL=C tr -d '\000' <"$f" | wc -c)
+    [ "$raw_len" -eq "$clean_len" ] || { echo "config contains NUL byte: $f" >&2; exit 1; }
     hit=$(LC_ALL=C awk '
-        /^[ \t]*#/ || /^[ \t]*$/ { next }
+        function unquote(s) {
+            if (length(s) >= 2 && substr(s, 1, 1) == "\"" && substr(s, length(s), 1) == "\"")
+                return substr(s, 2, length(s) - 2)
+            return s
+        }
         {
-            line = $0; sub(/^[ \t]+/, "", line)
-            key = line; sub(/[ \t=].*$/, "", key)
-            if (tolower(key) == "match") {
-                printf "%s:%d: %s\n", FILENAME, FNR, $0
+            line = $0
+            gsub(/\r/, " ", line)
+            sub(/^[ \t]+/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            if (substr(line, 1, 1) == "\"") {
+                q = index(substr(line, 2), "\"")
+                key = (q > 0) ? substr(line, 2, q - 1) : substr(line, 2)
+            } else {
+                key = line
+                sub(/[ \t=].*$/, "", key)
+            }
+            if (tolower(unquote(key)) == "match") {
+                printf "%s:%d: %s\n", FILENAME, FNR, line
                 exit
             }
         }' "$f")
     if [ -n "$hit" ]; then printf '%s\n' "$hit"; exit 2; fi
     incs=$(LC_ALL=C awk '
-        /^[ \t]*#/ || /^[ \t]*$/ { next }
         {
-            line = $0; sub(/^[ \t]+/, "", line)
-            key = line; sub(/[ \t=].*$/, "", key)
-            if (tolower(key) == "include") {
-                rest = substr(line, length(key) + 1)
-                sub(/^[ \t=]+/, "", rest)
-                n = split(rest, parts, /[ \t]+/)
-                for (i = 1; i <= n; i++) {
-                    p = parts[i]
-                    if (p ~ /^#/) break
-                    if (p ~ /^".*"$/) p = substr(p, 2, length(p) - 2)
-                    if (p != "") print p
+            line = $0
+            gsub(/\r/, " ", line)
+            sub(/^[ \t]+/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            if (substr(line, 1, 1) == "\"") {
+                q = index(substr(line, 2), "\"")
+                if (q > 0) {
+                    key = substr(line, 2, q - 1)
+                    rest = substr(line, q + 2)
+                } else {
+                    key = substr(line, 2)
+                    rest = ""
                 }
+            } else {
+                key = line
+                sub(/[ \t=].*$/, "", key)
+                rest = substr(line, length(key) + 1)
+            }
+            if (tolower(key) != "include") next
+            sub(/^[ \t]+/, "", rest)
+            if (substr(rest, 1, 1) == "=") {
+                rest = substr(rest, 2)
+                sub(/^[ \t]+/, "", rest)
+            }
+            while (rest != "") {
+                if (substr(rest, 1, 1) == "\"") {
+                    q = index(substr(rest, 2), "\"")
+                    if (q > 0) {
+                        tok = substr(rest, 2, q - 1)
+                        rest = substr(rest, q + 2)
+                    } else {
+                        tok = substr(rest, 2)
+                        rest = ""
+                    }
+                } else {
+                    tok = rest
+                    sub(/[ \t].*$/, "", tok)
+                    rest = substr(rest, length(tok) + 1)
+                }
+                if (tok != "") print tok
+                sub(/^[ \t]+/, "", rest)
             }
         }' "$f")
     next_depth=$((depth + 1))
-    old_ifs=$IFS
-    IFS='
-'
-    for pat in $incs; do
-        IFS=$old_ifs
+    set -f
+    while [ -n "$incs" ]; do
+        pat=${incs%%"
+"*}
+        case $incs in *"
+"*) incs=${incs#*"
+"} ;; *) incs="" ;; esac
         [ -n "$pat" ] || continue
         case $pat in /*) full=$pat ;; *) full="$base/$pat" ;; esac
+        old_ifs=$IFS
+        IFS=''
+        set +f
         for matched in $full; do
+            set -f
+            IFS=$old_ifs
+            case $matched in *"
+"*) echo "config path contains newline: $matched" >&2; exit 1 ;; esac
             if [ ! -e "$matched" ] && [ ! -L "$matched" ]; then continue; fi
             if [ -d "$matched" ] && [ ! -L "$matched" ]; then continue; fi
             if [ -n "$queue" ]; then
@@ -930,8 +1086,10 @@ $next_depth	$matched"
                 queue="$next_depth	$matched"
             fi
         done
+        set -f
+        IFS=$old_ifs
     done
-    IFS=$old_ifs
+    set +f
 done
 '''
 
@@ -965,23 +1123,23 @@ def sshd_key_only(r: Result) -> tuple[bool, str]:
     whole lines split on "\\n" only (never splitlines(): it also splits on \\x0b, \\x0c,
     \\x1c-\\x1e, U+0085, U+2028 and U+2029, which a quoted sshd value such as Banner can carry,
     so one printed line could fake a wanted one), no stripping, ASCII-only case folding, and
-    require each checked key to appear exactly once (A7). The caller must run ssh with
-    raw_newlines=True: in text mode Python turns a lone CR into a newline before this sees it.
-    A CR or NUL byte anywhere in the output fails closed."""
+    require each checked key to appear exactly once (A7). Duplicate checked keys are counted
+    before filtering non-ASCII values so a non-ASCII duplicate still fails closed (matching
+    prep.sh). The caller must run ssh with raw_newlines=True: in text mode Python turns a lone
+    CR into a newline before this sees it. A CR or NUL byte anywhere in the output fails closed."""
     key_counts: dict[str, int] = {k: 0 for k in SSHD_REQUIRED_EXACT}
     exact_counts: dict[str, int] = {k: 0 for k in SSHD_REQUIRED_EXACT}
     for ln in r.stdout.split("\n"):
-        if not ln.isascii():
+        stripped_raw = ln.lstrip(" \t")
+        if not stripped_raw:
             continue
-        lo = ln.lower()
-        stripped = lo.lstrip(" \t")
-        if not stripped:
-            continue
-        key = re.split(r"[ \t=]", stripped, maxsplit=1)[0]
-        if key in SSHD_REQUIRED_EXACT:
-            key_counts[key] += 1
-            if lo in SSHD_REQUIRED_EXACT[key]:
-                exact_counts[key] += 1
+        raw_key = re.split(r"[ \t=]", stripped_raw, maxsplit=1)[0]
+        if raw_key.isascii():
+            key = raw_key.lower()
+            if key in SSHD_REQUIRED_EXACT:
+                key_counts[key] += 1
+                if ln.isascii() and ln.lower() in SSHD_REQUIRED_EXACT[key]:
+                    exact_counts[key] += 1
     duplicates = sorted(k for k, c in key_counts.items() if c > 1)
     missing = []
     for k, allowed in sorted(SSHD_REQUIRED_EXACT.items()):
@@ -1257,28 +1415,111 @@ def write_landed(dest: Path, text: str, mode: int = 0o600) -> None:
 # ---------------------------------------------------------------- lock, signals
 
 
+def _check_dir_ancestor(
+    anc: Path, target_dir: Path, euid: int, *, label: str = "the state dir"
+) -> None:
+    """Verify one ancestor of a resolved directory via O_DIRECTORY|O_NOFOLLOW + fstat:
+    must be a real directory owned by root or us, and not group/world writable unless sticky."""
+    try:
+        fd = os.open(anc, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise Refusal(
+                f"ancestor {anc} of {label} {target_dir} is a symlink "
+                "(planted after resolution): refusing to follow it"
+            ) from e
+        if e.errno == errno.ENOTDIR:
+            prefix = (
+                f"cannot create the lock directory {target_dir}: "
+                if label == "the lock directory"
+                else ""
+            )
+            raise Refusal(
+                f"{prefix}ancestor {anc} of {label} {target_dir} is not a directory"
+            ) from e
+        raise Refusal(
+            f"cannot inspect ancestor {anc} of {label} {target_dir}: {e}"
+        ) from e
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refusal(f"ancestor {anc} of {label} {target_dir} is not a directory")
+    if st.st_uid not in (0, euid):
+        raise Refusal(
+            f"ancestor {anc} of {label} {target_dir} must be owned by root or you "
+            f"(is uid {st.st_uid})"
+        )
+    if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+        raise Refusal(
+            f"ancestor {anc} of {label} {target_dir} must not be group or world "
+            f"writable unless sticky (is uid {st.st_uid}, mode {st.st_mode & 0o777:o})"
+        )
+
+
+def _check_lock_dir(lock_dir: Path) -> None:
+    """Ensure the lock/owner-marker directory and every ancestor up to `/` pass the same
+    O_DIRECTORY|O_NOFOLLOW ownership/write checks as check_state_dir (using os.geteuid())."""
+    if not lock_dir.is_absolute():
+        raise Refusal(f"the lock directory {lock_dir} must be an absolute path")
+    euid = os.geteuid()
+    old = os.umask(0o077)
+    try:
+        for anc in reversed(lock_dir.parents):
+            if not os.path.lexists(anc):
+                try:
+                    os.mkdir(anc, 0o700)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    raise Refusal(
+                        f"cannot create the lock directory {lock_dir}: {e}"
+                    ) from e
+            _check_dir_ancestor(anc, lock_dir, euid, label="the lock directory")
+        if not os.path.lexists(lock_dir):
+            try:
+                os.mkdir(lock_dir, 0o700)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                raise Refusal(
+                    f"cannot create the lock directory {lock_dir}: {e}"
+                ) from e
+    finally:
+        os.umask(old)
+    try:
+        fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise Refusal(
+                f"{lock_dir} (the driver lock and owner markers) must be a real directory"
+            ) from e
+        raise Refusal(f"cannot inspect {lock_dir}: {e}") from e
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != euid or st.st_mode & 0o022:
+        raise Refusal(
+            f"{lock_dir} (the driver lock and owner markers) must be a real "
+            f"directory owned by you and not group or world writable (is uid {st.st_uid}, "
+            f"mode {st.st_mode & 0o777:o})"
+        )
+
+
 @contextlib.contextmanager
 def driver_lock(ctx: Ctx):
     """One driver per account (one lock file under the account's passwd home, whatever
     --state-dir and the tart home say); never follows a symlink at the path."""
-    try:
-        ctx.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError as e:
-        raise Refusal(
-            f"cannot create the lock directory {ctx.lock_path.parent}: {e}"
-        ) from e
     # the owner marker beside the lock gates an unattended rebuild: nobody else may plant,
-    # replace or delete it, so the directory is ours and not group or world writable
-    try:
-        st = ctx.lock_path.parent.lstat()
-    except OSError as e:
-        raise Refusal(f"cannot inspect {ctx.lock_path.parent}: {e}") from e
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
-        raise Refusal(
-            f"{ctx.lock_path.parent} (the driver lock and owner markers) must be a real "
-            f"directory owned by you and not group or world writable (is uid {st.st_uid}, "
-            f"mode {st.st_mode & 0o777:o})"
-        )
+    # replace or delete it, so the directory (and every ancestor) is checked with O_NOFOLLOW.
+    lock_dir = (
+        ctx.lock_path.parent
+        if ctx.lock_path.parent.is_symlink()
+        else Path(os.path.realpath(ctx.lock_path.parent))
+    )
+    _check_lock_dir(lock_dir)
     check_state_dir(ctx)
     try:
         fd = os.open(ctx.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -1294,44 +1535,6 @@ def driver_lock(ctx: Ctx):
         yield
     finally:
         os.close(fd)
-
-
-def _check_state_ancestor(anc: Path, state_dir: Path, euid: int) -> None:
-    """Verify one ancestor of the resolved state dir via O_DIRECTORY|O_NOFOLLOW + fstat:
-    must be a real directory owned by root or us, and not group/world writable unless sticky."""
-    try:
-        fd = os.open(anc, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as e:
-        if e.errno in (errno.ELOOP, errno.EMLINK):
-            raise Refusal(
-                f"ancestor {anc} of the state dir {state_dir} is a symlink "
-                "(planted after resolution): refusing to follow it"
-            ) from e
-        if e.errno == errno.ENOTDIR:
-            raise Refusal(
-                f"ancestor {anc} of the state dir {state_dir} is not a directory"
-            ) from e
-        raise Refusal(
-            f"cannot inspect ancestor {anc} of the state dir {state_dir}: {e}"
-        ) from e
-    try:
-        st = os.fstat(fd)
-    finally:
-        os.close(fd)
-    if not stat.S_ISDIR(st.st_mode):
-        raise Refusal(
-            f"ancestor {anc} of the state dir {state_dir} is not a directory"
-        )
-    if st.st_uid not in (0, euid):
-        raise Refusal(
-            f"ancestor {anc} of the state dir {state_dir} must be owned by root or you "
-            f"(is uid {st.st_uid})"
-        )
-    if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
-        raise Refusal(
-            f"ancestor {anc} of the state dir {state_dir} must not be group or world "
-            f"writable unless sticky (is uid {st.st_uid}, mode {st.st_mode & 0o777:o})"
-        )
 
 
 def check_state_dir(ctx: Ctx) -> None:
@@ -1359,7 +1562,7 @@ def check_state_dir(ctx: Ctx) -> None:
                     raise Refusal(
                         f"cannot create the state dir {ctx.state_dir}: {e}"
                     ) from e
-            _check_state_ancestor(anc, ctx.state_dir, euid)
+            _check_dir_ancestor(anc, ctx.state_dir, euid, label="the state dir")
         if not os.path.lexists(ctx.state_dir):
             try:
                 os.mkdir(ctx.state_dir, 0o700)
@@ -1454,12 +1657,15 @@ def check_root_owned(
     Permission denied errors on stderr.
     """
     pfx = ["sudo", "-n"] if as_root else []
-    r = rssh(ctx, t, [*pfx, "stat", "-f", "%Su:%Sg %Lp", path])
-    m = re.fullmatch(r"(\S+):(\S+) ([0-7]+)", r.stdout.strip())
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%Su:%Sg %Lp %Sp", path])
+    m = re.fullmatch(r"(\S+):(\S+) ([0-7]+) (\S+)", r.stdout.strip())
     if r.rc != 0 or not m:
         return False, f"stat {path} failed (rc {r.rc}): {clip(r.stderr, 200)}"
-    ok = perm_ok(m[1], m[2], m[3])
-    ev = f"{path} {m[1]}:{m[2]} {m[3]}"
+    type_ok = not m[4].startswith("l") and (not tree or m[4].startswith("d"))
+    ok = perm_ok(m[1], m[2], m[3]) and type_ok
+    ev = f"{path} {m[1]}:{m[2]} {m[3]} {m[4]}"
+    if not type_ok:
+        ev += " (symlink or non-directory refused)"
     parents = ancestors_of(path)
     r = rssh(ctx, t, [*pfx, "stat", "-f", "%N %Su:%Sg %Lp %Sp", *parents])
     rows = [ln.rsplit(" ", 3) for ln in r.stdout.strip().splitlines()]
@@ -2899,6 +3105,13 @@ def adopt_committing_golden(
     verifying the golden exists and its key_id and host_key match golden.json + known_hosts."""
     if golden not in names:
         raise Refusal(f"cannot adopt {golden}: {golden} does not exist in tart list")
+    build = golden + "-build"
+    if build in names:
+        raise Refusal(
+            f"cannot adopt {golden}: leftover build VM {build} exists in tart list "
+            "(an un-renamed build may be newer than the existing golden); "
+            "inspect/rename it or run `golden --rebuild`"
+        )
     marker = owner_path(ctx, golden)
     try:
         owner = read_owner_file(marker)
@@ -2972,6 +3185,35 @@ def adopt_committing_golden(
             )
         except OSError as e:
             raise ToolError(f"failed to write final owner marker {marker}: {e}") from e
+        pending_files = [
+            ctx.state_dir / "known_hosts.pending",
+            ctx.state_dir / "golden.json.pending",
+            marker.with_name(marker.name + ".pending"),
+        ]
+        gone: list[str] = []
+        stuck_pending: list[str] = []
+        for pf in pending_files:
+            try:
+                pf.unlink()
+                gone.append(str(pf))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                stuck_pending.append(f"{pf}: {e}")
+        if gone or stuck_pending:
+            summary.add(
+                "pending",
+                "remove parked files of an earlier unfinished commit",
+                "fail" if stuck_pending else "pass",
+                "; ".join(
+                    (["removed " + ", ".join(gone)] if gone else [])
+                    + (
+                        ["NOT removed: " + "; ".join(stuck_pending)]
+                        if stuck_pending
+                        else []
+                    )
+                ),
+            )
     summary.add(
         "adopt",
         f"promote committing owner marker for {golden} to final",
@@ -3799,8 +4041,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                     summary.add("owner", "owner file", "pass", owner_note)
                 identity = golden_usable(ctx, golden)
                 adopt = bool(getattr(args, "adopt", False))
+                initial_adopt_rec: dict | None = None
                 if adopt:
-                    check_adopt_precondition(ctx, golden, read_golden_record(ctx))
+                    initial_adopt_rec = read_golden_record(ctx)
+                    check_adopt_precondition(ctx, golden, initial_adopt_rec)
                 assert_vm_cap(ctx)
                 if artifact_run is not None:
                     artifact_tmpdir = Path(
@@ -4708,6 +4952,19 @@ def cmd_check(ctx: Ctx, args) -> int:
                     else:
                         golden_usable(ctx, golden)
                         rec_adopt = read_golden_record(ctx)
+                        if (
+                            initial_adopt_rec is None
+                            or rec_adopt["key_id"] != initial_adopt_rec["key_id"]
+                            or rec_adopt.get("host_key")
+                            != initial_adopt_rec.get("host_key")
+                        ):
+                            raise Refusal(
+                                f"cannot adopt {golden}: golden.json changed during check "
+                                f"(was key_id={initial_adopt_rec['key_id'] if initial_adopt_rec else None!r}, "
+                                f"host_key={initial_adopt_rec.get('host_key') if initial_adopt_rec else None!r}; "
+                                f"now key_id={rec_adopt['key_id']!r}, "
+                                f"host_key={rec_adopt.get('host_key')!r})"
+                            )
                         need_write, _ = check_adopt_precondition(
                             ctx, golden, rec_adopt
                         )
