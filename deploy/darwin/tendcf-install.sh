@@ -114,6 +114,7 @@ bootout_execd() {
 }
 
 cleanup_stage() {
+    exec 9>&-
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
         local restored_prefix=0
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
@@ -532,6 +533,16 @@ verify_python_candidate_ok() {
             else
                 return 1
             fi
+            local dev_py="$dev_dir/usr/bin/python3" real_dev_py
+            [ -x "$dev_py" ] || return 1
+            check_ancestor_dir_ok "$dev_dir/usr" || return 1
+            check_ancestor_dir_ok "$dev_dir/usr/bin" || return 1
+            check_ancestors_ok "$dev_py" || return 1
+            real_dev_py="$(resolve_safe_binary_ok "$dev_py")" || return 1
+            case "$real_dev_py" in
+                "$py_root"/*|"$dev_dir/usr/bin"/*) ;;
+                *) return 1 ;;
+            esac
             ;;
         *)
             return 1
@@ -1336,13 +1347,18 @@ place_projector() {
     if [ "$src_real" = "$dst_real" ]; then
         [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
             || die "$installed_projector is not a regular non-symlink file"
-        if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
-            /usr/bin/xattr -d com.apple.quarantine "$installed_projector"
-            changed=1
-        fi
-        if [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
+        local need_fix=0
+        if [ "$(/usr/bin/stat -f '%f' "$installed_projector")" != "0" ] \
+            || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1 \
+            || [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
             || has_acl_path "$installed_projector"; then
+            need_fix=1
+        fi
+        if [ "$need_fix" -eq 1 ]; then
             /usr/bin/chflags 0 "$installed_projector"
+            if /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+                /usr/bin/xattr -d com.apple.quarantine "$installed_projector"
+            fi
             /bin/chmod -N "$installed_projector" 2>/dev/null || true
             /usr/sbin/chown root:wheel "$installed_projector"
             /bin/chmod 0644 "$installed_projector"
@@ -1406,7 +1422,7 @@ validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
     umask "$old_umask"
     /bin/chmod 0600 "$classes_file" "$err_file"
 
-    if ! "$cf_promises" --workdir "$wd" -f "$entry_file" --show-classes >"$classes_file" 2>"$err_file"; then
+    if ! "$cf_promises" --workdir "$wd" -f "$entry_file" --show-classes >"$classes_file" 2>"$err_file" 9>&-; then
         if [ -s "$err_file" ]; then
             /bin/cat "$err_file" >&2
         fi
@@ -1445,9 +1461,11 @@ put_data() {  # put_data FILE
     py="$(find_real_python)" || die "cannot validate projection: no verified root-owned Python 3 found"
 
     # Serialize concurrent publishers on an exclusive lock via lockf(1) FD 9 (#58).
+    # Pre-check against symlinks, directories, FIFOs, sockets, and devices so
+    # opening FD 9 can never block on a FIFO or follow a symlink.
     local lockfile="$workdir/data/.publish.lock"
-    if [ -L "$lockfile" ] || [ -d "$lockfile" ]; then
-        die "$lockfile is not a regular file; refusing"
+    if [ -e "$lockfile" ] || [ -L "$lockfile" ]; then
+        [ -f "$lockfile" ] && [ ! -L "$lockfile" ] || die "$lockfile is not a regular file; refusing"
     fi
     local old_umask
     old_umask="$(umask)"
@@ -1466,14 +1484,16 @@ put_data() {  # put_data FILE
     /bin/chmod 0600 "$lockfile"
     /bin/chmod -N "$lockfile" 2>/dev/null || true
 
-    if [ -L "$data" ] || [ -d "$data" ]; then
-        exec 9>&-
-        die "$data is not a regular file; refusing"
+    if [ -e "$data" ] || [ -L "$data" ]; then
+        if [ -L "$data" ] || [ ! -f "$data" ]; then
+            exec 9>&-
+            die "$data is not a regular file; refusing"
+        fi
     fi
 
     # Stage candidate bytes ONCE into a private 0700 workdir (zero TOCTOU, zero
     # pre-validation exposure to cf-execd; issues #53, #57).
-    local stage_wd staged_data
+    local stage_wd staged_data data_bytes
     old_umask="$(umask)"
     umask 077
     stage_wd="$(/usr/bin/mktemp -d "$stage_dir/putdata.XXXXXX")"
@@ -1496,8 +1516,9 @@ put_data() {  # put_data FILE
     /bin/chmod 0600 "$staged_data"
     /bin/chmod -N "$staged_data" 2>/dev/null || true
 
-    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I).
-    if ! "$py" -I "$installed_projector" --check "$staged_data"; then
+    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I,
+    # FD 9 closed in child).
+    if ! "$py" -I "$installed_projector" --check "$staged_data" 9>&-; then
         die "projector rejected $src; live $data untouched"
     fi
 
@@ -1505,6 +1526,8 @@ put_data() {  # put_data FILE
     if ! validate_cmdb_workdir "$stage_wd" "$stage_wd/inputs/promises.cf" "$stage_wd"; then
         die "pre-publish CMDB validation rejected $src; live $data untouched"
     fi
+
+    data_bytes="$(/usr/bin/wc -c < "$staged_data" | /usr/bin/tr -d ' ')"
 
     # Idempotent fast path (under lock, after Gates 1 & 2): identical bytes,
     # root:wheel 600, no ACLs.
@@ -1551,7 +1574,10 @@ put_data() {  # put_data FILE
     # Gate 3 (#57): post-publish verification on live workdir with atomic rollback.
     if ! validate_cmdb_workdir "$workdir" "$entry" "$stage_wd"; then
         if [ -n "$backup" ]; then
-            /bin/mv -f "$backup" "$data"
+            if ! /bin/mv -f "$backup" "$data"; then
+                put_data_backup=""
+                die "cf-promises rejected $src and rollback failed; backup preserved at $backup"
+            fi
             put_data_backup=""
             die "post-publish CMDB validation rejected $src; previous data restored"
         else
@@ -1568,7 +1594,7 @@ put_data() {  # put_data FILE
     put_data_stage_wd=""
     exec 9>&-
     changed=1
-    say "data installed: $data ($(/usr/bin/wc -c < "$data" | /usr/bin/tr -d ' ') bytes)"
+    say "data installed: $data ($data_bytes bytes)"
 }
 
 check_launchd_dir() {
@@ -1723,11 +1749,11 @@ cmd_install() {
     local tarball="" sha256_file="" datafile="" do_enable=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --tarball) [ $# -ge 2 ] || die "install: --tarball needs a path"; tarball="$2"; shift 2 ;;
-            --sha256) [ $# -ge 2 ] || die "install: --sha256 needs a path"; sha256_file="$2"; shift 2 ;;
-            --data) [ $# -ge 2 ] || die "install: --data needs a path"; datafile="$2"; shift 2 ;;
-            --policy-src) [ $# -ge 2 ] || die "install: --policy-src needs a path"; policy_src="$2"; shift 2 ;;
-            --projector-src) [ $# -ge 2 ] || die "install: --projector-src needs a path"; projector_src="$2"; shift 2 ;;
+            --tarball) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --tarball needs a non-empty path"; tarball="$2"; shift 2 ;;
+            --sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --sha256 needs a non-empty path"; sha256_file="$2"; shift 2 ;;
+            --data) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --data needs a non-empty path"; datafile="$2"; shift 2 ;;
+            --policy-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --policy-src needs a non-empty path"; policy_src="$2"; shift 2 ;;
+            --projector-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-src needs a non-empty path"; projector_src="$2"; shift 2 ;;
             --enable) do_enable=1; shift ;;
             *) die "install: unknown argument $1" ;;
         esac
@@ -1889,7 +1915,7 @@ case "$sub" in
     workdir) init_paths; echo "$workdir" ;;
     data)
         init_paths
-        [ $# -eq 1 ] || die "usage: $0 data FILE"
+        [ $# -eq 1 ] && [ -n "$1" ] || die "usage: $0 data FILE"
         put_data "$1"
         if [ "$changed" -eq 0 ]; then say "no change ($data)"; fi
         ;;

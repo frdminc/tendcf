@@ -132,6 +132,10 @@ except ModuleNotFoundError:
 # directly to `rfc8785.dumps`. Both paths enforce identical RFC 8785 §3.2.2–
 # §3.2.3 rules (IEEE-754 safe integer bounds, ES6 number serialization,
 # lowercase \u00xx control escapes, lone-surrogate rejection, UTF-16BE key sort).
+#
+# Attribution: `_jcs_write_float` and `_JCS_ESCAPE_MAP` are adapted from the
+# `rfc8785` Python package and Andrew Rundgren's `cyberphone/json-canonicalization`
+# reference implementation (Apache License, Version 2.0).
 _JCS_INT_MAX = 2**53 - 1
 _JCS_INT_MIN = -(2**53) + 1
 _JCS_ESCAPE_RE = re.compile(r'[\x00-\x1f\\"]')
@@ -529,7 +533,12 @@ def project(goal_file: dict) -> bytes:
             # P-2/P-6.5: the body verbatim, id not canonified, nothing
             # reordered or renumbered. Deep-copied so the returned bytes can
             # never depend on a later mutation of the caller's document.
-            container[entry_id] = copy.deepcopy(body)
+            try:
+                container[entry_id] = copy.deepcopy(body)
+            except RecursionError as exc:
+                raise ProjectionRefused(
+                    f"the goal file exceeds maximum nesting depth: {exc}"
+                ) from exc
         containers[name] = container
 
     # P-6.3: `vars` is always present, even with no container under it.
@@ -581,7 +590,7 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
     except json.JSONDecodeError as exc:
         flag(RULE_PROJECTION_BYTES, f"not JSON: {exc}")
         return found
-    except ValueError as exc:  # _reject_duplicate_keys
+    except (ValueError, RecursionError) as exc:  # _reject_duplicate_keys / excessive depth
         flag(RULE_PROJECTION_BYTES, f"not canonical JSON: {exc}")
         return found
 
@@ -864,7 +873,12 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                             )
 
     # --- string-shaped hazards, wherever they sit -------------------------
-    for pointer, node in _walk(doc):
+    try:
+        walked = list(_walk(doc))
+    except RecursionError as exc:
+        flag(RULE_PROJECTION_BYTES, f"excessive nesting depth: {exc}")
+        return found
+    for pointer, node in walked:
         if isinstance(node, bool):
             continue
         if isinstance(node, float):

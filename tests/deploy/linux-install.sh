@@ -87,7 +87,7 @@ check "manager forgot the unit (not-found)" bash -c "[ \"\$(systemctl show -p Lo
 echo "# 5. installer hardening (#53, #57, #58)"
 scratch="$(mktemp -d)"
 cleanup_all() {
-    rm -rf "$scratch" "$wd/data/def.json"
+    rm -rf "$scratch" "$wd/inputs/def.json"
     cleanup
 }
 trap cleanup_all EXIT
@@ -131,14 +131,17 @@ chmod 0600 "$gate2_wd/data/host_specific.json"
 check "#57 real cf-promises flags tendcf_cmdb_refused on cmdb-classes-section" \
     bash -c "out=\"\$(LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --workdir \"$gate2_wd\" -f \"$gate2_wd/inputs/promises.cf\" --show-classes)\" && printf '%s\n' \"\$out\" | awk '\$1 == \"tendcf_cmdb_refused\" { found=1 } END { exit !found }'"
 
-# #57 Gate 3 post-publish rollback: a rogue augments file (def.json) in live $wd/data
-# lets Gate 1 & Gate 2 pass on staged workdir, triggers tendcf_cmdb_refused on live Gate 3,
-# and must atomically roll back live host_specific.json to its previous contents.
-printf '%s' '{"classes":{"rogue_augments_class":["any"]}}' > "$wd/data/def.json"
-chmod 0600 "$wd/data/def.json"
-check "#57 Gate 3 post-publish tendcf_cmdb_refused rolls back to previous live data" \
-    bash -c "! \"$installer\" data \"$canary/host_specific.json\" >/dev/null 2>&1 && cmp -s \"$orig_snap\" \"$live_data\""
-rm -f "$wd/data/def.json"
+# #57 Gate 2 end-to-end pre-publish refusal on a projector-valid projection:
+# plant a rogue augments file at $wd/inputs/def.json (where CFEngine loads
+# augments from). Gate 1 (projector.py --check) passes on the valid canary
+# projection, then Gate 2 copies $wd/inputs into the staged workdir, sees
+# tendcf_cmdb_problem_foreign_class / tendcf_cmdb_refused, and refuses BEFORE
+# live host_specific.json is ever touched (bytes, inode, and mtime unchanged).
+printf '%s' '{"classes":{"rogue_augments_class":["any"]}}' > "$wd/inputs/def.json"
+chmod 0600 "$wd/inputs/def.json"
+check "#57 Gate 2 pre-publish tendcf_cmdb_refused rejects projector-valid data with zero live exposure" \
+    bash -c "! \"$installer\" data \"$canary/host_specific.json\" >/dev/null 2>&1 && cmp -s \"$orig_snap\" \"$live_data\" && [ \"\$(stat -c '%i' \"$live_data\")\" = \"$orig_ino\" ] && [ \"\$(stat -c '%Y.%y' \"$live_data\")\" = \"$orig_mtime\" ]"
+rm -f "$wd/inputs/def.json"
 
 # #58: concurrent publishers serialize cleanly with zero collisions and zero temp leftovers
 pids=()

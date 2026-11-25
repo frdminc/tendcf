@@ -100,6 +100,8 @@ class TendcfInstallUpgradeRollbackContract(unittest.TestCase):
         self.assertIn("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/*", fn)
         self.assertIn('check_ancestors_ok "$dev_dir"', fn)
         self.assertIn('check_ancestor_dir_ok "$dev_dir"', fn)
+        self.assertIn('dev_py="$dev_dir/usr/bin/python3"', fn)
+        self.assertIn('resolve_safe_binary_ok "$dev_py"', fn)
         self.assertIn("else\n                return 1", fn)
 
         find_py = _extract_func(self.src, "find_real_python")
@@ -109,7 +111,7 @@ class TendcfInstallUpgradeRollbackContract(unittest.TestCase):
         self.assertNotEqual(idx_usr, -1)
         self.assertLess(idx_clt, idx_usr)
 
-        # Hermetic behavioral test: when /usr/bin/python3 resolves to /usr/bin/python3
+        # Hermetic behavioral test 1: when /usr/bin/python3 resolves to /usr/bin/python3
         # and xcode-select points at a directory lacking Python3.framework, return 1.
         with tempfile.TemporaryDirectory() as td:
             empty_dev = Path(td) / "Developer"
@@ -140,6 +142,70 @@ class TendcfInstallUpgradeRollbackContract(unittest.TestCase):
                 r.returncode,
                 0,
                 "verify_python_candidate_ok must return 1 when Python3.framework is absent",
+            )
+
+        # Hermetic behavioral test 2: when Python3.framework exists but
+        # $dev_dir/usr/bin/python3 is missing OR resolves outside $py_root / $dev_dir/usr/bin,
+        # return 1 (fail closed).
+        with tempfile.TemporaryDirectory() as td:
+            dev_dir = Path(td) / "Developer"
+            (dev_dir / "Library" / "Frameworks" / "Python3.framework").mkdir(parents=True)
+            fake_xcode_select = Path(td) / "xcode-select"
+            fake_xcode_select.write_text(f"#!/bin/sh\necho '{dev_dir}'\n", encoding="utf-8")
+            fake_xcode_select.chmod(0o755)
+            fake_py = Path(td) / "py-wrapper"
+            fake_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_py.chmod(0o755)
+            patched_fn = fn.replace("/usr/bin/xcode-select", str(fake_xcode_select))
+
+            # Missing $dev_dir/usr/bin/python3
+            r_missing = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    "check_ancestors_ok() { return 0; }\n"
+                    "check_ancestor_dir_ok() { return 0; }\n"
+                    "root_tree_safe_ok() { return 0; }\n"
+                    'resolve_safe_binary_ok() { echo "/usr/bin/python3"; }\n'
+                    f"{patched_fn}\n"
+                    f'verify_python_candidate_ok "{fake_py}"\n',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(
+                r_missing.returncode,
+                0,
+                "verify_python_candidate_ok must fail closed when $dev_dir/usr/bin/python3 is missing",
+            )
+
+            # Present $dev_dir/usr/bin/python3, but resolves to untrusted /tmp/evil-python3
+            (dev_dir / "usr" / "bin").mkdir(parents=True)
+            dev_py = dev_dir / "usr" / "bin" / "python3"
+            dev_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            dev_py.chmod(0o755)
+            r_outside = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    "check_ancestors_ok() { return 0; }\n"
+                    "check_ancestor_dir_ok() { return 0; }\n"
+                    "root_tree_safe_ok() { return 0; }\n"
+                    f'resolve_safe_binary_ok() {{ if [ "$1" = "{fake_py}" ]; then echo "/usr/bin/python3"; else echo "/tmp/evil-python3"; fi; }}\n'
+                    f"{patched_fn}\n"
+                    f'verify_python_candidate_ok "{fake_py}"\n',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(
+                r_outside.returncode,
+                0,
+                "verify_python_candidate_ok must fail closed when $dev_dir/usr/bin/python3 resolves outside dev_dir",
             )
 
     def test_chflags_before_chmod_and_check_tree_rechecks_clean(self) -> None:
@@ -863,6 +929,8 @@ def _make_darwin_shims(shim_dir: Path) -> None:
         "    print(f'root:wheel {mode:o}')\n"
         "elif fmt == '%Su %Sg %Lp':\n"
         "    print(f'root wheel {mode:o}')\n"
+        "elif fmt == '%f':\n"
+        "    print('0')\n"
         "else:\n"
         "    raise SystemExit(f'unexpected stat fmt: {fmt}')\n",
         encoding="utf-8",
@@ -910,6 +978,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
     def test_contract_projector_gates_lockf_and_unique_paths(self) -> None:
         cmd_fn = _extract_func(self.src, "cmd_install")
         self.assertIn("--projector-src)", cmd_fn)
+        self.assertIn('[ -n "$2" ]', cmd_fn)
         idx_policy = cmd_fn.find("place_policy")
         idx_proj = cmd_fn.find("place_projector")
         idx_data = cmd_fn.find('put_data "$datafile"')
@@ -920,30 +989,52 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         preval_fn = _extract_func(self.src, "prevalidate_install_inputs")
         self.assertIn("resolve_projector_src", preval_fn)
 
+        cleanup_fn = _extract_func(self.src, "cleanup_stage")
+        idx_fd9_close = cleanup_fn.find("exec 9>&-")
+        idx_rb = cleanup_fn.find('if [ "$upgrade_rollback_armed" -eq 1 ]; then')
+        self.assertNotEqual(idx_fd9_close, -1)
+        self.assertNotIn("exec 9>&- 2>/dev/null", cleanup_fn)
+        self.assertLess(idx_fd9_close, idx_rb, "cleanup_stage must close FD 9 before upgrade rollback")
+
+        proj_fn = _extract_func(self.src, "place_projector")
+        idx_same = proj_fn.find('if [ "$src_real" = "$dst_real" ]; then')
+        same_block = proj_fn[idx_same : proj_fn.find("make_stage", idx_same)]
+        idx_chflags = same_block.find("/usr/bin/chflags 0")
+        idx_xattr_d = same_block.find("/usr/bin/xattr -d com.apple.quarantine")
+        self.assertNotEqual(idx_chflags, -1)
+        self.assertNotEqual(idx_xattr_d, -1)
+        self.assertLess(idx_chflags, idx_xattr_d, "chflags 0 must run before xattr -d in same-realpath branch")
+
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(
             line for line in put_fn.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertNotIn("$data.new", put_code)
         self.assertNotIn("$data.previous", put_code)
+        self.assertIn('[ -f "$lockfile" ] && [ ! -L "$lockfile" ]', put_code)
         self.assertIn("/usr/bin/lockf 9", put_code)
         self.assertIn(".host_specific.new.XXXXXX", put_code)
         self.assertIn(".host_specific.prev.XXXXXX", put_code)
-        self.assertIn('"$py" -I "$installed_projector" --check "$staged_data"', put_code)
+        self.assertIn('"$py" -I "$installed_projector" --check "$staged_data" 9>&-', put_code)
 
         idx_stage = put_code.find("make_stage")
         idx_py = put_code.find("find_real_python")
-        idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data"')
+        idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data" 9>&-')
         idx_gate2 = put_code.find('validate_cmdb_workdir "$stage_wd"')
+        idx_bytes = put_code.find('data_bytes="$(/usr/bin/wc -c < "$staged_data"')
         idx_mv = put_code.find('/bin/mv -f "$tmp" "$data"')
         idx_gate3 = put_code.find('validate_cmdb_workdir "$workdir" "$entry"', idx_mv)
+        idx_unlock = put_code.rfind("exec 9>&-")
         self.assertLess(idx_stage, idx_py, "make_stage must run before find_real_python")
         self.assertLess(idx_gate1, idx_gate2)
-        self.assertLess(idx_gate2, idx_mv)
+        self.assertLess(idx_gate2, idx_bytes)
+        self.assertLess(idx_bytes, idx_mv)
         self.assertLess(idx_mv, idx_gate3)
+        self.assertLess(idx_gate3, idx_unlock)
 
         val_fn = _extract_func(self.src, "validate_cmdb_workdir")
         self.assertIn("--show-classes", val_fn)
+        self.assertIn("9>&-", val_fn)
         self.assertIn("tendcf_cmdb_refused", val_fn)
         self.assertIn("tendcf_cmdb_problem_", val_fn)
 
@@ -1001,16 +1092,21 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         src_file: Path,
         *,
         extra_env: dict[str, str] | None = None,
+        mv_override: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         funcs = self._darwin_funcs(
             paths["shim_dir"],
             (
+                "cleanup_stage",
                 "check_dir_root_unwritable",
                 "verify_installed_projector",
                 "validate_cmdb_workdir",
                 "put_data",
             ),
         )
+        if mv_override is not None:
+            real_mv = shutil.which("mv") or "/bin/mv"
+            funcs = funcs.replace(real_mv, mv_override)
         script = (
             "set -euo pipefail\n"
             'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
@@ -1026,15 +1122,14 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             f'data="{paths["data"]}"\n'
             f'cf_promises="{paths["cf_promises"]}"\n'
             f'installed_projector="{paths["installed_projector"]}"\n'
+            'upgrade_rollback_armed=0\n'
             'put_data_stage_wd=""\n'
             'put_data_tmp=""\n'
             'put_data_backup=""\n'
+            'place_projector_tmp=""\n'
             "changed=0\n"
             f"{funcs}\n"
-            'cleanup_put() { [ -n "$put_data_tmp" ] && rm -f "$put_data_tmp" || true; '
-            '[ -n "$put_data_backup" ] && rm -f "$put_data_backup" || true; '
-            '[ -n "$put_data_stage_wd" ] && rm -rf "$put_data_stage_wd" || true; }\n'
-            "trap cleanup_put EXIT\n"
+            "trap cleanup_stage EXIT\n"
             f'put_data "{src_file}"\n'
             'echo "CHANGED=$changed"\n'
         )
@@ -1054,7 +1149,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             root = Path(td)
             orig = DARWIN_CANARY_PRESENT.read_bytes()
             paths = self._build_env(root, "#!/bin/sh\necho 'any   hardclass'\n", initial_data=orig)
-            # Test place_projector idempotency too
+            # Test place_projector install, idempotency, same-realpath, and symlink refusal
             paths["installed_projector"].unlink()
             place_funcs = self._darwin_funcs(
                 paths["shim_dir"],
@@ -1086,14 +1181,48 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                 "changed=0\n"
                 "place_projector\n"
                 'echo "SECOND_CHANGED=$changed"\n'
+                "changed=0\n"
+                f'projector_src="{paths["installed_projector"]}"\n'
+                "place_projector\n"
+                'echo "SAME_REALPATH_CHANGED=$changed"\n'
             )
             rp = subprocess.run(["/bin/bash", "-c", place_script], capture_output=True, text=True, check=False)
             self.assertEqual(rp.returncode, 0, rp.stderr)
             self.assertIn("FIRST_CHANGED=1", rp.stdout)
             self.assertIn("SECOND_CHANGED=0", rp.stdout)
+            self.assertIn("SAME_REALPATH_CHANGED=0", rp.stdout)
             self.assertEqual(paths["installed_projector"].read_bytes(), PROJECTOR.read_bytes())
 
-            # Now test Gate 1 rejection leaves live data untouched
+            # Symlink projector source refused
+            link_src = root / "proj-link.py"
+            link_src.symlink_to(PROJECTOR)
+            rp_link = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "check_ancestors() { return 0; }\n"
+                    "make_stage() { return 0; }\n"
+                    f'prefix="{paths["prefix"]}"\n'
+                    f'stage_dir="{paths["stage_dir"]}"\n'
+                    f'here="{root}"\n'
+                    f'projector_src="{link_src}"\n'
+                    f'installed_projector="{paths["installed_projector"]}"\n'
+                    'place_projector_tmp=""\n'
+                    "changed=0\n"
+                    f"{place_funcs}\n"
+                    "place_projector\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rp_link.returncode, 0)
+            self.assertIn("regular non-symlink", rp_link.stderr)
+
+            # Gate 1 rejection leaves live data untouched
             before_ino = paths["data"].stat().st_ino
             bad = root / "bad.json"
             bad.write_bytes(orig + b"\n")
@@ -1104,18 +1233,26 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             self.assertEqual(paths["data"].stat().st_ino, before_ino)
 
             # Idempotent re-run on identical valid data leaves changed=0
+            paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
             r_idem = self._run_put_data(paths, DARWIN_CANARY_PRESENT)
             self.assertEqual(r_idem.returncode, 0, r_idem.stderr)
             self.assertIn("CHANGED=0", r_idem.stdout)
 
     def test_validate_cmdb_refused_prepublish_and_postpublish_rollback(self) -> None:
         # Pre-publish refusal (exit 0 with tendcf_cmdb_refused) -> live data untouched
+        # (including live-data probe during Gate 2 proving zero window of exposure)
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             orig = DARWIN_CANARY_PRESENT.read_bytes()
+            probe_log = root / "live-during-gate2.log"
             paths = self._build_env(
                 root,
-                "#!/bin/sh\necho 'any   hardclass'\necho 'tendcf_cmdb_problem_badkey   source=policy'\necho 'tendcf_cmdb_refused   source=policy'\nexit 0\n",
+                "#!/bin/sh\n"
+                f'cat "{root / "opt/tendcf/var/libntech/data/host_specific.json"}" > "{probe_log}"\n'
+                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_problem_badkey   source=policy'\n"
+                "echo 'tendcf_cmdb_refused   source=policy'\n"
+                "exit 0\n",
                 initial_data=orig,
             )
             before_ino = paths["data"].stat().st_ino
@@ -1125,6 +1262,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             self.assertIn("tendcf_cmdb_problem_badkey", r.stderr)
             self.assertEqual(paths["data"].read_bytes(), orig)
             self.assertEqual(paths["data"].stat().st_ino, before_ino)
+            self.assertEqual(probe_log.read_bytes(), orig)
 
         # Empty --show-classes -> fail closed
         with tempfile.TemporaryDirectory() as td:
@@ -1136,7 +1274,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             self.assertIn("empty output", r.stderr)
             self.assertEqual(paths["data"].read_bytes(), orig)
 
-        # Post-publish Gate 3 refusal -> rolls back to previous backup
+        # Post-publish Gate 3 refusal with prior data -> rolls back to previous backup
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             orig = DARWIN_CANARY_PRESENT.read_bytes()
@@ -1167,6 +1305,64 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             ]
             self.assertEqual(leftovers, [])
 
+        # Post-publish Gate 3 refusal with initial_data=None -> removes newly published file
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                "  echo 'any   hardclass'\n"
+                "  echo 'tendcf_cmdb_refused   source=policy'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'any   hardclass'\n"
+                "exit 0\n"
+            )
+            paths = self._build_env(root, cf_script, initial_data=None)
+            r = self._run_put_data(paths, DARWIN_CANARY_PRESENT)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("new data removed", r.stderr)
+            self.assertFalse(paths["data"].exists())
+
+        # Post-publish Gate 3 rollback mv failure -> backup is preserved (not deleted by cleanup_stage)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            orig = DARWIN_CANARY_PRESENT.read_bytes()
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                "  echo 'any   hardclass'\n"
+                "  echo 'tendcf_cmdb_refused   source=policy'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'any   hardclass'\n"
+                "exit 0\n"
+            )
+            paths = self._build_env(root, cf_script, initial_data=orig)
+            real_mv = shutil.which("mv") or "/bin/mv"
+            mv_fail = paths["shim_dir"] / "mv-fail-rollback"
+            mv_fail.write_text(
+                f"#!/bin/sh\ncase \"$2\" in *.prev.*) exit 1 ;; esac\nexec {real_mv} \"$@\"\n",
+                encoding="utf-8",
+            )
+            mv_fail.chmod(0o755)
+            r = self._run_put_data(paths, DARWIN_CANARY_ABSENT, mv_override=str(mv_fail))
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("rollback failed; backup preserved at", r.stderr)
+            backups = [p for p in (paths["workdir"] / "data").iterdir() if ".host_specific.prev." in p.name]
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), orig)
+
     def test_concurrent_publishers_serialize_with_lockf(self) -> None:
         """Issue #58: concurrent Darwin put_data publishers serialize via /usr/bin/lockf 9."""
         with tempfile.TemporaryDirectory() as td:
@@ -1191,6 +1387,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             funcs = self._darwin_funcs(
                 paths["shim_dir"],
                 (
+                    "cleanup_stage",
                     "check_dir_root_unwritable",
                     "verify_installed_projector",
                     "validate_cmdb_workdir",
@@ -1218,15 +1415,14 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     f'data="{paths["data"]}"\n'
                     f'cf_promises="{paths["cf_promises"]}"\n'
                     f'installed_projector="{paths["installed_projector"]}"\n'
+                    'upgrade_rollback_armed=0\n'
                     'put_data_stage_wd=""\n'
                     'put_data_tmp=""\n'
                     'put_data_backup=""\n'
+                    'place_projector_tmp=""\n'
                     "changed=0\n"
                     f"{funcs}\n"
-                    'cleanup_put() { [ -n "$put_data_tmp" ] && rm -f "$put_data_tmp" || true; '
-                    '[ -n "$put_data_backup" ] && rm -f "$put_data_backup" || true; '
-                    '[ -n "$put_data_stage_wd" ] && rm -rf "$put_data_stage_wd" || true; }\n'
-                    "trap cleanup_put EXIT\n"
+                    "trap cleanup_stage EXIT\n"
                     f'put_data "{src}"\n'
                 )
                 procs.append(

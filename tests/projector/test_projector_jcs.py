@@ -79,11 +79,12 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             with self.subTest(cp=cp):
                 self.assert_matches_reference(chr(cp))
 
-        # RFC 8785 §3.2.2 example string + BMP/astral Unicode emitted as raw UTF-8
+        # RFC 8785 §3.2.2 example string + U+007F (DEL, unescaped) + BMP/astral Unicode
         self.assert_matches_reference(
             "\u20ac$\u000f\nA'B\"\\\\\"/",
             '"€$\\u000f\\nA\'B\\"\\\\\\\\\\"/"'.encode("utf-8"),
         )
+        self.assert_matches_reference("\x7f", b'"\x7f"')
         self.assert_matches_reference("日本語 😀 € café", '"日本語 😀 € café"'.encode("utf-8"))
 
     def test_utf16be_key_sorting_traps(self) -> None:
@@ -120,6 +121,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             (-0.0, b"0"),
             (1.0, b"1"),
             (-1.0, b"-1"),
+            (0.1 + 0.2, b"0.30000000000000004"),
             (4.50, b"4.5"),
             (2e-3, b"0.002"),
             (1e-4, b"0.0001"),
@@ -208,11 +210,12 @@ class StdlibJcsFallbackTests(unittest.TestCase):
                 b'{"vars":{"x":1e999}}',
                 b'{"vars":{"x":9007199254740992}}',
                 b'{"vars":{"x":"\\ud800"}}',
+                b'{"vars":{"tendcf_service":{"a":' + b"[" * 50000 + b"]" * 50000 + b"}}}",
             ):
                 findings = self.proj.check_projection(raw)
                 self.assertTrue(
                     any(f.rule == self.proj.RULE_PROJECTION_BYTES for f in findings),
-                    f"expected RULE_PROJECTION_BYTES for {raw!r}, got {findings!r}",
+                    f"expected RULE_PROJECTION_BYTES for {raw[:60]!r}, got {findings!r}",
                 )
         finally:
             self.proj._rfc8785 = orig
