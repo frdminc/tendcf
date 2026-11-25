@@ -75,6 +75,10 @@ installed_projector="$prefix/share/tendcf/bin/projector.py"
 probe_tmp=""
 place_projector_stage=""
 place_projector_tmp=""
+prepared_projector_stage=""
+prepared_projector_file=""
+projector_prepared=0
+projector_src_originally_trusted=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -97,8 +101,11 @@ cleanup_put_data() {
                 put_data_backup=""
             fi
         elif [ "${put_data_had_prev:-0}" -eq 0 ] && [ -n "${data:-}" ]; then
-            rm -f "$data" || true
-            echo "tendcf-install: interrupted during post-publish validation; unverified new data removed" >&2
+            if rm -f "$data" && [ ! -e "$data" ] && [ ! -L "$data" ]; then
+                echo "tendcf-install: removed unverified first-time data $data after failure" >&2
+            else
+                echo "tendcf-install: ERROR: rollback could not remove unverified data at $data; inspect manually" >&2
+            fi
         fi
         put_data_rollback_armed=0
     fi
@@ -126,6 +133,11 @@ cleanup_temp() {
     if [ -n "${place_projector_stage:-}" ] && [ -d "$place_projector_stage" ]; then
         rm -rf "$place_projector_stage" || true
         place_projector_stage=""
+    fi
+    if [ -n "${prepared_projector_stage:-}" ] && [ -d "$prepared_projector_stage" ]; then
+        rm -rf "$prepared_projector_stage" || true
+        prepared_projector_stage=""
+        prepared_projector_file=""
     fi
     if [ -n "${probe_tmp:-}" ]; then
         rm -f "$probe_tmp" || true
@@ -177,19 +189,26 @@ check_regular_file_root_unwritable() {
     fi
 }
 
+# Non-fatal trust check: regular non-symlink file, uid 0, not group/world-writable
+# or SUID/SGID, and all ancestors + symlink hops up to / are root-owned and not go-w.
+source_file_root_trusted_ok() {
+    local f="$1" meta uid mode mode_oct
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    check_ancestors_ok "$f" || return 1
+    meta="$(stat -c '%u %a' "$f" 2>/dev/null)" || return 1
+    read -r uid mode <<< "$meta"
+    [ "$uid" = 0 ] || return 1
+    mode_oct=$((8#$mode))
+    [ $((mode_oct & 8#6022)) -eq 0 ] || return 1
+    return 0
+}
+
 # Verify a regular non-symlink file is root-owned (uid 0, any root/system group)
 # and not group/world-writable or SUID/SGID, and all ancestors up to / are safe.
 check_source_file_root_trusted() {
-    local f="$1" meta uid mode mode_oct
-    [ -f "$f" ] && [ ! -L "$f" ] || die "$f is missing or not a regular non-symlink file"
-    check_ancestors_ok "$f" || die "unsafe ancestor above $f (pass --projector-sha256 to pin an unprivileged source)"
-    meta="$(stat -c '%u %a' "$f")" || die "cannot stat $f"
-    read -r uid mode <<< "$meta"
-    [ "$uid" = 0 ] || die "$f owned by uid $uid, expected root (or pass --projector-sha256)"
-    mode_oct=$((8#$mode))
-    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
-        die "$f mode $mode is group/world-writable or SUID/SGID (or pass --projector-sha256)"
-    fi
+    local f="$1"
+    source_file_root_trusted_ok "$f" \
+        || die "$f is not a root-owned non-writable regular file with trusted ancestors (or pass --projector-sha256)"
 }
 
 # Verify every directory component from $prefix down to TARGET is a real
@@ -359,6 +378,20 @@ resolve_projector_src() {
     fi
     [ -f "$projector_src" ] && [ ! -L "$projector_src" ] \
         || die "projector-src must be a regular non-symlink file: $projector_src"
+    # Normalize relative paths to a logical absolute path (preserving any symlink
+    # components in cwd/path so check_ancestors_ok inspects every hop from /).
+    case "$projector_src" in
+        /*) ;;
+        *)
+            local cwd_l
+            cwd_l="$(pwd -L)"
+            if [ "$cwd_l" = "/" ]; then
+                projector_src="/${projector_src#./}"
+            else
+                projector_src="${cwd_l}/${projector_src#./}"
+            fi
+            ;;
+    esac
 }
 
 verify_installed_projector() {
@@ -464,8 +497,59 @@ EOF
     mv -f "$entry.new" "$entry"
 }
 
-place_projector() {
+# Establish projector source trust and stage bytes into a private root-only
+# 0700 temp file BEFORE check_tree() repairs permissions under $prefix (so a
+# formerly writable/non-root source can never be laundered to root-owned, and
+# hash verification happens once against the private copy).
+prepare_projector_source() {
     resolve_projector_src
+    if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --projector-sha256 must be 64 lowercase hex characters"
+    fi
+    projector_src_originally_trusted=0
+    if source_file_root_trusted_ok "$projector_src"; then
+        projector_src_originally_trusted=1
+    fi
+    if [ -z "$projector_sha256" ] && [ "$projector_src_originally_trusted" -ne 1 ]; then
+        die "$projector_src is not a root-owned non-writable regular file with trusted ancestors (or pass --projector-sha256)"
+    fi
+
+    if [ -n "${prepared_projector_stage:-}" ] && [ -d "$prepared_projector_stage" ]; then
+        rm -rf "$prepared_projector_stage"
+        prepared_projector_stage=""
+        prepared_projector_file=""
+    fi
+    local old_umask stage_d staged_p actual_sha
+    old_umask="$(umask)"
+    umask 077
+    stage_d="$(mktemp -d /tmp/tendcf-proj-stage.XXXXXX)"
+    umask "$old_umask"
+    prepared_projector_stage="$stage_d"
+    chown root:root "$stage_d"
+    chmod 0700 "$stage_d"
+
+    staged_p="$stage_d/projector.py"
+    old_umask="$(umask)"
+    umask 077
+    cat "$projector_src" > "$staged_p"
+    umask "$old_umask"
+    chown root:root "$staged_p"
+    chmod 0600 "$staged_p"
+    prepared_projector_file="$staged_p"
+
+    if [ -n "$projector_sha256" ]; then
+        actual_sha="$(sha256sum "$staged_p" | awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$projector_sha256" ]; then
+            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
+        fi
+    fi
+    projector_prepared=1
+}
+
+place_projector() {
+    if [ "${projector_prepared:-0}" -ne 1 ] || [ ! -f "${prepared_projector_file:-}" ]; then
+        prepare_projector_source
+    fi
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     local d
     for d in "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
@@ -480,73 +564,43 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real actual_sha
+    local src_real dst_dir_real dst_real same_realpath=0
     src_real="$(readlink -f "$projector_src")" || die "cannot resolve $projector_src"
     dst_dir_real="$(readlink -f "$prefix/share/tendcf/bin")" || die "cannot resolve $prefix/share/tendcf/bin"
     dst_real="$dst_dir_real/projector.py"
-
     if [ "$src_real" = "$dst_real" ]; then
+        same_realpath=1
+    fi
+
+    # In-place idempotence (keeping the existing inode) is allowed ONLY when
+    # the source is the same path AND was already proven root-owned/unwritable
+    # BEFORE check_tree(). Otherwise always install a fresh inode via mktemp+mv
+    # so any previously opened writable file descriptor is detached.
+    if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then
         [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
             || die "$installed_projector is not a regular non-symlink file"
-        if [ -n "$projector_sha256" ]; then
-            actual_sha="$(sha256sum "$installed_projector" | awk '{ print tolower($1) }')"
-            if [ "$actual_sha" != "$projector_sha256" ]; then
-                die "projector sha256 mismatch for $installed_projector: expected $projector_sha256, got $actual_sha"
-            fi
-        else
-            check_source_file_root_trusted "$installed_projector"
-        fi
         chown root:root "$installed_projector"
         chmod 0644 "$installed_projector"
-        verify_installed_projector
-        return 0
+    else
+        local old_umask tmp
+        old_umask="$(umask)"
+        umask 022
+        tmp="$(mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
+        umask "$old_umask"
+        place_projector_tmp="$tmp"
+        cat "$prepared_projector_file" > "$tmp"
+        chown root:root "$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$installed_projector"
+        place_projector_tmp=""
     fi
 
-    # Without an explicit --projector-sha256 pin, require the source file and
-    # every ancestor up to / to be root-owned and not group/world-writable.
-    if [ -z "$projector_sha256" ]; then
-        check_source_file_root_trusted "$projector_src"
+    if [ -n "${prepared_projector_stage:-}" ] && [ -d "$prepared_projector_stage" ]; then
+        rm -rf "$prepared_projector_stage"
+        prepared_projector_stage=""
+        prepared_projector_file=""
     fi
-
-    # Stage bytes ONCE into a private root-only 0700 directory (eliminates TOCTOU
-    # between integrity verification and atomic installation).
-    local old_umask stage_dir_p staged_proj tmp
-    old_umask="$(umask)"
-    umask 077
-    stage_dir_p="$(mktemp -d "$prefix/share/tendcf/bin/.proj-stage.XXXXXX")"
-    umask "$old_umask"
-    place_projector_stage="$stage_dir_p"
-    chown root:root "$stage_dir_p"
-    chmod 0700 "$stage_dir_p"
-
-    staged_proj="$stage_dir_p/projector.py"
-    old_umask="$(umask)"
-    umask 077
-    cat "$projector_src" > "$staged_proj"
-    umask "$old_umask"
-    chown root:root "$staged_proj"
-    chmod 0600 "$staged_proj"
-
-    if [ -n "$projector_sha256" ]; then
-        actual_sha="$(sha256sum "$staged_proj" | awk '{ print tolower($1) }')"
-        if [ "$actual_sha" != "$projector_sha256" ]; then
-            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
-        fi
-    fi
-
-    old_umask="$(umask)"
-    umask 022
-    tmp="$(mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
-    umask "$old_umask"
-    place_projector_tmp="$tmp"
-    cat "$staged_proj" > "$tmp"
-    chown root:root "$tmp"
-    chmod 0644 "$tmp"
-    mv -f "$tmp" "$installed_projector"
-    place_projector_tmp=""
-
-    rm -rf "$stage_dir_p"
-    place_projector_stage=""
+    projector_prepared=0
     verify_installed_projector
 }
 
@@ -758,9 +812,13 @@ put_data() {  # put_data FILE
             put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; previous data restored"
         else
-            rm -f "$data"
-            put_data_rollback_armed=0
-            die "post-publish CMDB validation rejected $src; new data removed"
+            if rm -f "$data" && [ ! -e "$data" ] && [ ! -L "$data" ]; then
+                put_data_rollback_armed=0
+                die "post-publish CMDB validation rejected $src; new data removed"
+            else
+                put_data_rollback_armed=0
+                die "post-publish CMDB validation rejected $src and rollback could not remove unverified data at $data; inspect manually"
+            fi
         fi
     fi
 
@@ -801,6 +859,7 @@ cmd_install() {
         esac
     done
     prevalidate_install_inputs "$datafile"
+    prepare_projector_source
     check_tree
     init_paths
     lay_out

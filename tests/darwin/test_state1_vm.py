@@ -7946,7 +7946,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
         self.assertIn("/bin/chmod -RN", text)
         self.assertIn("/usr/bin/chflags -R 0", text)
         self.assertIn("/bin/chmod -R a-s,go-w", text)
-        self.assertIn('"$py" -I -', text)
+        self.assertIn('"$py" -I -S -', text)
         self.assertIn("LC_DYLD_ENVIRONMENT", text)
         self.assertIn("LC_LOAD_DYLINKER", text)
         self.assertIn("com.apple.quarantine", text)
@@ -7979,7 +7979,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
     def test_embedded_macho_parser_accepts_valid_and_rejects_bad_deps(self):
         text = self.INSTALLER.read_text(encoding="utf-8")
         m = re.search(
-            r'"\$py" -I - "\$prefix" "\$canon_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY',
+            r'"\$py" -I -S - "\$prefix" "\$canon_root" "\$\{machos\[@\]\}" <<\'PY\'\n(.*?)\nPY',
             text,
             re.DOTALL,
         )

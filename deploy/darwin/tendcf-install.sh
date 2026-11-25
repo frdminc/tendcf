@@ -96,6 +96,10 @@ data=""      # set by init_paths
 
 stage_dir=""
 place_projector_tmp=""
+prepared_projector_file=""
+projector_prepared=0
+projector_src_originally_trusted=0
+installed_projector_originally_clean=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -136,8 +140,11 @@ cleanup_stage() {
                 put_data_backup=""
             fi
         elif [ "${put_data_had_prev:-0}" -eq 0 ] && [ -n "${data:-}" ]; then
-            /bin/rm -f "$data" || true
-            echo "tendcf-install: interrupted during post-publish validation; unverified new data removed" >&2
+            if /bin/rm -f "$data" && [ ! -e "$data" ] && [ ! -L "$data" ]; then
+                echo "tendcf-install: removed unverified first-time data $data after failure" >&2
+            else
+                echo "tendcf-install: ERROR: rollback could not remove unverified data at $data; inspect manually" >&2
+            fi
         fi
         put_data_rollback_armed=0
     fi
@@ -619,7 +626,7 @@ check_macho_path_syntax() {
 # Verify Mach-O load paths, LC_RPATH, LC_DYLD_ENVIRONMENT, LC_LOAD_DYLINKER, and
 # code signatures across ALL files under TREE_ROOT. Uses a directly verified
 # root-owned otool when present; otherwise parses Mach-O load commands directly
-# with isolated stdlib Python (`-I`) verified root-owned (so vanilla macOS works).
+# with isolated stdlib Python (`-I -S`) verified root-owned (so vanilla macOS works).
 verify_macho_tree() {
     local tree_root="$1"
     local canon_root
@@ -726,7 +733,7 @@ verify_macho_tree() {
     /bin/rm -f "$macho_set_file"
 
     if [ -z "$otool_bin" ]; then
-        9>&- "$py" -I - "$prefix" "$canon_root" "${machos[@]}" <<'PY'
+        9>&- "$py" -I -S - "$prefix" "$canon_root" "${machos[@]}" <<'PY'
 import pathlib
 import struct
 import sys
@@ -1378,23 +1385,43 @@ resolve_projector_src() {
     fi
     [ ! -L "$projector_src" ] && [ -f "$projector_src" ] \
         || die "projector-src must be a regular non-symlink file: $projector_src"
+    case "$projector_src" in
+        /*) ;;
+        *)
+            local cwd_l
+            cwd_l="$(pwd -L)"
+            if [ "$cwd_l" = "/" ]; then
+                projector_src="/${projector_src#./}"
+            else
+                projector_src="${cwd_l}/${projector_src#./}"
+            fi
+            ;;
+    esac
+}
+
+# Non-fatal trust check: regular non-symlink file, root:wheel, not
+# group/world-writable or SUID/SGID, no extended ACLs, and every ancestor
+# up to / is a root-owned non-symlink non-writable ACL-free directory.
+source_file_root_trusted_ok() {
+    local f="$1" meta owner group mode mode_oct
+    [ ! -L "$f" ] && [ -f "$f" ] || return 1
+    check_ancestors_ok "$f" || return 1
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$f" 2>/dev/null)" || return 1
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] || return 1
+    [ "$group" = wheel ] || return 1
+    mode_oct=$((8#$mode))
+    [ $((mode_oct & 8#6022)) -eq 0 ] || return 1
+    if has_acl_path "$f"; then
+        return 1
+    fi
+    return 0
 }
 
 check_source_file_root_trusted() {
-    local f="$1" meta owner group mode mode_oct
-    [ ! -L "$f" ] && [ -f "$f" ] || die "$f must be a regular non-symlink file"
-    check_ancestors "$f"
-    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$f")" || die "cannot stat $f"
-    read -r owner group mode <<< "$meta"
-    [ "$owner" = root ] || die "$f owned by $owner, expected root (or pass --projector-sha256)"
-    [ "$group" = wheel ] || die "$f group is $group, expected wheel (or pass --projector-sha256)"
-    mode_oct=$((8#$mode))
-    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
-        die "$f mode $mode is group/world-writable or SUID/SGID (or pass --projector-sha256)"
-    fi
-    if has_acl_path "$f"; then
-        die "$f has an extended ACL; refusing (or pass --projector-sha256)"
-    fi
+    local f="$1"
+    source_file_root_trusted_ok "$f" \
+        || die "$f is not a root:wheel non-writable ACL-free regular file with trusted ancestors (or pass --projector-sha256)"
 }
 
 verify_installed_projector() {
@@ -1421,8 +1448,54 @@ verify_installed_projector() {
     fi
 }
 
-place_projector() {
+# Establish projector source trust and stage bytes ONCE into a private
+# root-only 0700 file BEFORE install_tarball() and check_tree() mutate or
+# repair permissions under $prefix (prevents laundering a writable/non-root
+# source into root-owned and verifies --projector-sha256 before any mutation).
+prepare_projector_source() {
     resolve_projector_src
+    if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --projector-sha256 must be 64 lowercase hex characters"
+    fi
+    projector_src_originally_trusted=0
+    if source_file_root_trusted_ok "$projector_src"; then
+        projector_src_originally_trusted=1
+    fi
+    installed_projector_originally_clean=0
+    if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
+        && source_file_root_trusted_ok "$installed_projector"; then
+        installed_projector_originally_clean=1
+    fi
+    if [ -z "$projector_sha256" ] && [ "$projector_src_originally_trusted" -ne 1 ]; then
+        die "$projector_src is not a root:wheel non-writable ACL-free regular file with trusted ancestors (or pass --projector-sha256)"
+    fi
+
+    make_stage
+    local staged_proj="$stage_dir/prepared-projector.py"
+    local old_umask actual_sha
+    old_umask="$(umask)"
+    umask 077
+    /bin/cat "$projector_src" > "$staged_proj"
+    umask "$old_umask"
+    /usr/sbin/chown root:wheel "$staged_proj"
+    /bin/chmod 0600 "$staged_proj"
+    prepared_projector_file="$staged_proj"
+
+    if [ -n "$projector_sha256" ]; then
+        actual_sha="$(/usr/bin/shasum -a 256 "$staged_proj" | /usr/bin/awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$projector_sha256" ]; then
+            /bin/rm -f "$staged_proj"
+            prepared_projector_file=""
+            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
+        fi
+    fi
+    projector_prepared=1
+}
+
+place_projector() {
+    if [ "${projector_prepared:-0}" -ne 1 ] || [ ! -f "${prepared_projector_file:-}" ]; then
+        prepare_projector_source
+    fi
     ensure_dir 755 "$prefix/share"
     ensure_dir 755 "$prefix/share/tendcf"
     ensure_dir 755 "$prefix/share/tendcf/bin"
@@ -1431,22 +1504,21 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real actual_sha
+    local src_real dst_dir_real dst_real same_realpath=0
     src_real="$(resolve_realpath_ok "$projector_src")" || die "cannot resolve $projector_src"
     dst_dir_real="$(cd "$prefix/share/tendcf/bin" && pwd -P)"
     dst_real="$dst_dir_real/projector.py"
-
     if [ "$src_real" = "$dst_real" ]; then
+        same_realpath=1
+    fi
+
+    # In-place idempotence (keeping the existing inode) is allowed ONLY when
+    # the source is the same path AND was already proven root:wheel/unwritable
+    # BEFORE check_tree(). Otherwise replace via a fresh mktemp sibling + mv -f
+    # so any previously opened writable file descriptor is detached.
+    if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then
         [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
             || die "$installed_projector is not a regular non-symlink file"
-        if [ -n "$projector_sha256" ]; then
-            actual_sha="$(/usr/bin/shasum -a 256 "$installed_projector" | /usr/bin/awk '{ print tolower($1) }')"
-            if [ "$actual_sha" != "$projector_sha256" ]; then
-                die "projector sha256 mismatch for $installed_projector: expected $projector_sha256, got $actual_sha"
-            fi
-        else
-            check_source_file_root_trusted "$installed_projector"
-        fi
         local need_fix=0
         if [ "$(/usr/bin/stat -f '%f' "$installed_projector")" != "0" ] \
             || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1 \
@@ -1464,43 +1536,23 @@ place_projector() {
             /bin/chmod 0644 "$installed_projector"
             changed=1
         fi
+        /bin/rm -f "$prepared_projector_file"
+        prepared_projector_file=""
+        projector_prepared=0
         verify_installed_projector
         return 0
     fi
 
-    # Without an explicit --projector-sha256 pin, require the source file and
-    # every ancestor up to / to be root:wheel, non-writable, and ACL-free.
-    if [ -z "$projector_sha256" ]; then
-        check_source_file_root_trusted "$projector_src"
-    fi
-
-    # Stage bytes ONCE inside private 0700 $stage_dir (eliminates TOCTOU
-    # between hash verification and atomic installation).
-    make_stage
-    local staged_proj="$stage_dir/projector.py"
-    local old_umask
-    old_umask="$(umask)"
-    umask 077
-    /bin/cat "$projector_src" > "$staged_proj"
-    umask "$old_umask"
-    /usr/sbin/chown root:wheel "$staged_proj"
-    /bin/chmod 0600 "$staged_proj"
-
-    if [ -n "$projector_sha256" ]; then
-        actual_sha="$(/usr/bin/shasum -a 256 "$staged_proj" | /usr/bin/awk '{ print tolower($1) }')"
-        if [ "$actual_sha" != "$projector_sha256" ]; then
-            /bin/rm -f "$staged_proj"
-            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
-        fi
-    fi
-
     local proj_differs=0 dst_flags=0
-    if [ ! -f "$installed_projector" ]; then
+    if [ "$same_realpath" -eq 1 ] || [ "${installed_projector_originally_clean:-0}" -ne 1 ] || [ ! -f "$installed_projector" ]; then
         proj_differs=1
+        if [ -e "$installed_projector" ]; then
+            dst_flags="$(/usr/bin/stat -f '%f' "$installed_projector")"
+        fi
     else
         dst_flags="$(/usr/bin/stat -f '%f' "$installed_projector")"
         if [ "$dst_flags" != "0" ] \
-            || ! /usr/bin/cmp -s "$staged_proj" "$installed_projector" \
+            || ! /usr/bin/cmp -s "$prepared_projector_file" "$installed_projector" \
             || [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
             || has_acl_path "$installed_projector" \
             || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
@@ -1509,13 +1561,13 @@ place_projector() {
     fi
 
     if [ "$proj_differs" -eq 1 ]; then
-        local tmp_proj
+        local old_umask tmp_proj
         old_umask="$(umask)"
         umask 022
         tmp_proj="$(/usr/bin/mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
         umask "$old_umask"
         place_projector_tmp="$tmp_proj"
-        /bin/cat "$staged_proj" > "$tmp_proj"
+        /bin/cat "$prepared_projector_file" > "$tmp_proj"
         /usr/bin/chflags 0 "$tmp_proj"
         if /usr/bin/xattr -p com.apple.quarantine "$tmp_proj" >/dev/null 2>&1; then
             /usr/bin/xattr -d com.apple.quarantine "$tmp_proj"
@@ -1530,7 +1582,9 @@ place_projector() {
         place_projector_tmp=""
         changed=1
     fi
-    /bin/rm -f "$staged_proj"
+    /bin/rm -f "$prepared_projector_file"
+    prepared_projector_file=""
+    projector_prepared=0
     verify_installed_projector
 }
 
@@ -1600,6 +1654,16 @@ validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
 put_data() {  # put_data FILE
     local src="$1"
     [ ! -L "$src" ] && [ -f "$src" ] || die "data file must be a regular non-symlink file: $src"
+
+    # Acquire the shared publish lock outside $prefix BEFORE inspecting any
+    # live paths under $prefix (including verify_installed_projector) so
+    # direct put_data calls also serialize cleanly with upgrades/rollbacks.
+    local acquired_lock=0
+    if [ "${publish_lock_held:-0}" -eq 0 ]; then
+        acquire_publish_lock
+        acquired_lock=1
+    fi
+
     [ -f "$entry" ] && [ ! -L "$entry" ] || die "not installed: run install first"
     [ -d "$workdir/inputs" ] && [ ! -L "$workdir/inputs" ] || die "$workdir/inputs missing or symlink"
     check_dir_root_unwritable "$workdir/data"
@@ -1611,14 +1675,6 @@ put_data() {  # put_data FILE
 
     local py
     py="$(find_real_python)" || die "cannot validate projection: no verified root-owned Python 3 found"
-
-    # Acquire the shared publish lock outside $prefix if caller (cmd_install)
-    # is not already holding it; never release a caller-owned lock early.
-    local acquired_lock=0
-    if [ "${publish_lock_held:-0}" -eq 0 ]; then
-        acquire_publish_lock
-        acquired_lock=1
-    fi
 
     if [ -e "$data" ] || [ -L "$data" ]; then
         if [ -L "$data" ] || [ ! -f "$data" ]; then
@@ -1728,9 +1784,13 @@ put_data() {  # put_data FILE
             put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; previous data restored"
         else
-            /bin/rm -f "$data"
-            put_data_rollback_armed=0
-            die "post-publish CMDB validation rejected $src; new data removed"
+            if /bin/rm -f "$data" && [ ! -e "$data" ] && [ ! -L "$data" ]; then
+                put_data_rollback_armed=0
+                die "post-publish CMDB validation rejected $src; new data removed"
+            else
+                put_data_rollback_armed=0
+                die "post-publish CMDB validation rejected $src and rollback could not remove unverified data at $data; inspect manually"
+            fi
         fi
     fi
 
@@ -1922,6 +1982,7 @@ cmd_install() {
     prevalidate_install_inputs "$datafile"
     acquire_publish_lock
     check_no_stale_upgrade_dirs
+    prepare_projector_source
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
             sha256_file="${tarball}.sha256"
@@ -2072,9 +2133,11 @@ case "$sub" in
     disable) cmd_disable ;;
     workdir) init_paths; echo "$workdir" ;;
     data)
-        init_paths
         [ $# -eq 1 ] && [ -n "$1" ] || die "usage: $0 data FILE"
+        acquire_publish_lock
+        init_paths
         put_data "$1"
+        release_publish_lock
         if [ "$changed" -eq 0 ]; then say "no change ($data)"; fi
         ;;
     run-once) init_paths; cmd_run_once ;;

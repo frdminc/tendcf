@@ -197,19 +197,22 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertIn("--projector-sha256)", cmd_fn)
         self.assertIn('[ -n "$2" ]', cmd_fn)
         idx_preval = cmd_fn.find('prevalidate_install_inputs "$datafile"')
+        idx_prep = cmd_fn.find("prepare_projector_source")
         idx_tree = cmd_fn.find("check_tree")
         idx_policy = cmd_fn.find("place_policy")
         idx_proj = cmd_fn.find("place_projector")
         idx_data = cmd_fn.find('put_data "$datafile"')
         for lbl, idx in (
             ("prevalidate", idx_preval),
+            ("prepare_projector_source", idx_prep),
             ("check_tree", idx_tree),
             ("place_policy", idx_policy),
             ("place_projector", idx_proj),
             ("put_data", idx_data),
         ):
             self.assertNotEqual(idx, -1, f"missing {lbl} in cmd_install")
-        self.assertLess(idx_preval, idx_tree)
+        self.assertLess(idx_preval, idx_prep)
+        self.assertLess(idx_prep, idx_tree)
         self.assertLess(idx_policy, idx_proj)
         self.assertLess(idx_proj, idx_data)
 
@@ -575,7 +578,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     self.assertIn("previous data restored", err)
                 else:
                     self.assertFalse(paths["data"].exists())
-                    self.assertIn("unverified new data removed", err)
+                    self.assertIn("removed unverified first-time data", err)
                 leftovers = [
                     p.name
                     for p in (paths["workdir"] / "data").iterdir()
@@ -655,12 +658,16 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         funcs = "\n".join(
             _extract_func(self.src, name)
             for name in (
+                "cleanup_put_data",
+                "cleanup_temp",
                 "check_dir_root_unwritable",
                 "check_regular_file_root_unwritable",
+                "source_file_root_trusted_ok",
                 "check_source_file_root_trusted",
                 "check_dir_chain_strict_under_prefix",
                 "resolve_projector_src",
                 "verify_installed_projector",
+                "prepare_projector_source",
                 "place_projector",
             )
         )
@@ -691,9 +698,20 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     f'projector_src="{proj_src}"\n'
                     f'projector_sha256="{sha}"\n'
                     f'installed_projector="{dst}"\n'
+                    'probe_tmp=""\n'
                     'place_projector_stage=""\n'
                     'place_projector_tmp=""\n'
+                    'prepared_projector_stage=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
                     f"{funcs}\n"
+                    "trap cleanup_temp EXIT\n"
                     "place_projector\n"
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
@@ -823,6 +841,318 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             )
             self.assertNotEqual(r_pol.returncode, 0)
             self.assertIn("unsafe entry", r_pol.stderr)
+
+    def test_cmd_install_checks_projector_trust_before_check_tree_and_replaces_inode(self) -> None:
+        """R3 Fix #1 (Codex #3): check_tree must NOT launder a writable projector; pinned install replaces inode."""
+        funcs = "\n".join(
+            _extract_func(self.src, name)
+            for name in (
+                "cleanup_put_data",
+                "cleanup_temp",
+                "check_dir_root_unwritable",
+                "check_regular_file_root_unwritable",
+                "source_file_root_trusted_ok",
+                "check_source_file_root_trusted",
+                "check_dir_chain_strict_under_prefix",
+                "resolve_projector_src",
+                "verify_installed_projector",
+                "check_tree",
+                "prepare_projector_source",
+                "place_projector",
+                "prevalidate_install_inputs",
+                "cmd_install",
+            )
+        )
+        proj_sha = hashlib.sha256(PROJECTOR.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_linux_shims(shim_dir)
+
+            prefix = root / "opt" / "tendcf"
+            (prefix / "bin").mkdir(parents=True)
+            for b in ("cf-agent", "cf-promises", "cf-key", "cf-execd"):
+                bp = prefix / "bin" / b
+                bp.write_text("#!/bin/sh\necho 'CFEngine Core 3.21.0'\n", encoding="utf-8")
+                bp.chmod(0o755)
+            (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
+            dst = prefix / "share" / "tendcf" / "bin" / "projector.py"
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o666)  # group/world-writable BEFORE cmd_install!
+
+            policy_dir = root / "policy"
+            policy_dir.mkdir()
+            (policy_dir / "tendcf_services.cf").write_text("# dummy\n", encoding="utf-8")
+
+            def run_cmd_install(extra_args: str) -> subprocess.CompletedProcess[str]:
+                script = (
+                    "set -euo pipefail\n"
+                    f'export PATH="{shim_dir}:$PATH"\n'
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    "check_ancestors_ok() { return 0; }\n"
+                    "verify_tree_binaries() { return 0; }\n"
+                    "init_paths() { return 0; }\n"
+                    "lay_out() { return 0; }\n"
+                    "place_policy() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'cf_lib_path="{prefix}/lib"\n'
+                    f'cf_agent="{prefix}/bin/cf-agent"\n'
+                    f'cf_promises="{prefix}/bin/cf-promises"\n'
+                    f'cf_key="{prefix}/bin/cf-key"\n'
+                    f'cf_execd="{prefix}/bin/cf-execd"\n'
+                    f'here="{root}"\n'
+                    f'policy_src="{policy_dir}"\n'
+                    'projector_src=""\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{dst}"\n'
+                    'probe_tmp=""\n'
+                    'place_projector_stage=""\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_stage=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
+                    f"{funcs}\n"
+                    "trap cleanup_temp EXIT\n"
+                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{dst}" {extra_args}\n'
+                )
+                return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+            # 1. Unpinned on writable packaged projector -> REFUSED BEFORE check_tree runs!
+            r_unpinned = run_cmd_install("")
+            self.assertNotEqual(r_unpinned.returncode, 0)
+            self.assertIn("--projector-sha256", r_unpinned.stderr)
+            self.assertEqual(
+                stat.S_IMODE(dst.stat().st_mode),
+                0o666,
+                "check_tree must NOT have run to launder writable projector before refusal",
+            )
+
+            # 2. Pinned with valid --projector-sha256 -> SUCCEEDS and replaces with a FRESH INODE!
+            old_ino = dst.stat().st_ino
+            r_pinned = run_cmd_install(f"--projector-sha256 {proj_sha}")
+            self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
+            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
+            self.assertNotEqual(
+                dst.stat().st_ino,
+                old_ino,
+                "pinned install over formerly writable projector must replace inode",
+            )
+
+    def test_relative_projector_src_normalized_and_checked_through_ancestors(self) -> None:
+        """R3 Fix #1 (Macroscope #4701728688): relative --projector-src normalized via pwd -L and ancestor-checked."""
+        funcs = "\n".join(
+            _extract_func(self.src, name)
+            for name in (
+                "cleanup_put_data",
+                "cleanup_temp",
+                "check_dir_chain_ok",
+                "check_ancestor_dir_ok",
+                "check_ancestors_ok",
+                "check_dir_root_unwritable",
+                "check_regular_file_root_unwritable",
+                "source_file_root_trusted_ok",
+                "check_source_file_root_trusted",
+                "check_dir_chain_strict_under_prefix",
+                "resolve_projector_src",
+                "verify_installed_projector",
+                "prepare_projector_source",
+                "place_projector",
+            )
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_linux_shims(shim_dir)
+
+            # Override stat shim so ancestors ABOVE root look like trusted 0:0 755
+            # (portable across macOS /var/folders and Linux /tmp 1777), while root
+            # and everything underneath report their real filesystem modes.
+            (shim_dir / "stat").write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                f"root_s = {str(root)!r}\n"
+                "fmt = sys.argv[2]\n"
+                "p = sys.argv[3]\n"
+                "rp = os.path.realpath(p) if not os.path.islink(p) else p\n"
+                "if rp != root_s and not rp.startswith(root_s + '/'):\n"
+                "    mode = 0o755\n"
+                "else:\n"
+                "    mode = stat.S_IMODE(os.lstat(p).st_mode)\n"
+                "if fmt == '%U:%G %a':\n"
+                "    print(f'root:root {mode:o}')\n"
+                "elif fmt == '%u %g %a':\n"
+                "    print(f'0 0 {mode:o}')\n"
+                "elif fmt == '%u %a':\n"
+                "    print(f'0 {mode:o}')\n"
+                "elif fmt == '%u':\n"
+                "    print('0')\n",
+                encoding="utf-8",
+            )
+            (shim_dir / "stat").chmod(0o755)
+
+            prefix = root / "opt" / "tendcf"
+            prefix.mkdir(parents=True)
+            os.chmod(root, 0o755)
+            os.chmod(root / "opt", 0o755)
+            os.chmod(prefix, 0o755)
+            dst = prefix / "share" / "tendcf" / "bin" / "projector.py"
+
+            trusted_pkg = root / "trusted_pkg"
+            (trusted_pkg / "bin").mkdir(parents=True)
+            os.chmod(trusted_pkg, 0o755)
+            os.chmod(trusted_pkg / "bin", 0o755)
+            shutil.copy2(PROJECTOR, trusted_pkg / "bin" / "projector.py")
+            os.chmod(trusted_pkg / "bin" / "projector.py", 0o644)
+
+            writable_pkg = root / "writable_pkg"
+            (writable_pkg / "bin").mkdir(parents=True)
+            os.chmod(writable_pkg, 0o777)
+            os.chmod(writable_pkg / "bin", 0o755)
+            shutil.copy2(PROJECTOR, writable_pkg / "bin" / "projector.py")
+            os.chmod(writable_pkg / "bin" / "projector.py", 0o644)
+
+            sym_proj = trusted_pkg / "bin" / "link.py"
+            sym_proj.symlink_to(trusted_pkg / "bin" / "projector.py")
+
+            def run_rel(cwd: Path, rel_src: str) -> subprocess.CompletedProcess[str]:
+                script = (
+                    "set -euo pipefail\n"
+                    f'export PATH="{shim_dir}:$PATH"\n'
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    f'prefix="{prefix}"\n'
+                    f'here="{root}"\n'
+                    f'projector_src="{rel_src}"\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{dst}"\n'
+                    'probe_tmp=""\n'
+                    'place_projector_stage=""\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_stage=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
+                    f"{funcs}\n"
+                    "trap cleanup_temp EXIT\n"
+                    f'cd "{cwd}"\n'
+                    "prepare_projector_source\n"
+                    "place_projector\n"
+                )
+                return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+            # 1. Trusted relative path -> ACCEPTED
+            r_ok = run_rel(trusted_pkg, "bin/projector.py")
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+
+            # 2. Relative symlink -> REFUSED
+            r_sym = run_rel(trusted_pkg, "bin/link.py")
+            self.assertNotEqual(r_sym.returncode, 0)
+            self.assertIn("regular non-symlink", r_sym.stderr)
+
+            # 3. Relative path inside world-writable dir -> REFUSED
+            r_ww = run_rel(writable_pkg, "bin/projector.py")
+            self.assertNotEqual(r_ww.returncode, 0)
+            self.assertIn("--projector-sha256", r_ww.stderr)
+
+    def test_first_publication_rollback_rm_failure_reports_error_and_live_path(self) -> None:
+        """R3 Fix #3 (Codex #4): failed first-pub rm must report error naming $data, never claim removal."""
+        real_rm = shutil.which("rm") or "/bin/rm"
+
+        # Case A: Synchronous Gate 3 refusal with failing rm on $data
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                "  echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "  echo 'tendcf_cmdb_refused   source=policy'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "exit 0\n"
+            )
+            paths = self._build_harness(root, cf_script, initial_data=None)
+            rm_shim = paths["shim_dir"] / "rm"
+            rm_shim.write_text(
+                f"#!/bin/sh\n"
+                'for a in "$@"; do case "$a" in */host_specific.json) exit 1 ;; esac; done\n'
+                f'exec {real_rm} "$@"\n',
+                encoding="utf-8",
+            )
+            rm_shim.chmod(0o755)
+            r = self._run_put_data(paths, CANARY_PRESENT)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("rollback could not remove unverified data at", r.stderr)
+            self.assertIn(str(paths["data"]), r.stderr)
+            self.assertNotIn("new data removed", r.stderr)
+            self.assertTrue(paths["data"].exists())
+
+        # Case B: EXIT-trap SIGTERM during Gate 3 with failing rm on $data
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            gate3_ready = root / "gate3.ready"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                f'  echo ready > "{gate3_ready}"\n'
+                "  sleep 10\n"
+                "fi\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "exit 0\n"
+            )
+            paths = self._build_harness(root, cf_script, initial_data=None)
+            rm_shim = paths["shim_dir"] / "rm"
+            rm_shim.write_text(
+                f"#!/bin/sh\n"
+                'for a in "$@"; do case "$a" in */host_specific.json) exit 1 ;; esac; done\n'
+                f'exec {real_rm} "$@"\n',
+                encoding="utf-8",
+            )
+            rm_shim.chmod(0o755)
+            script = self._put_data_script(paths, CANARY_PRESENT)
+            proc = subprocess.Popen(
+                ["/bin/bash", "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 10.0
+            while not gate3_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(gate3_ready.exists(), "Gate 3 cf-promises never started")
+            os.killpg(proc.pid, signal.SIGTERM)
+            _out, err = proc.communicate(timeout=10)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("ERROR: rollback could not remove unverified data at", err)
+            self.assertIn(str(paths["data"]), err)
+            self.assertNotIn("removed unverified first-time data", err)
+            self.assertTrue(paths["data"].exists())
 
 
 if __name__ == "__main__":

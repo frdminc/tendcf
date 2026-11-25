@@ -463,27 +463,38 @@ def _walk(node: Any, path: str = "") -> Any:
     expansion sequences, NFC, trust-shaped keys — are about strings wherever
     they sit, and a key is where two of the three actually appear.
 
-    Iterative pre-order traversal (explicit LIFO stack) so deeply nested
-    documents never hit Python's recursion limit and callers stream without
-    materializing every `(pointer, value)` pair in memory.
+    True lazy iterator-stack pre-order traversal: each stack frame holds a
+    single active iterator (`iter(dict.items())` or `enumerate(list)`), so
+    child pointer strings are constructed one item at a time on demand and
+    peak memory is O(depth), never O(width * prefix_len).
     """
-    stack: list[tuple[bool, str, Any]] = [(False, path, node)]
+    yield path or "<root>", node
+    stack: list[tuple[str, bool, Any]] = []
+    if isinstance(node, dict):
+        stack.append((path, True, iter(node.items())))
+    elif isinstance(node, list):
+        stack.append((path, False, enumerate(node)))
+
     while stack:
-        is_key, cur_path, cur = stack.pop()
-        if is_key:
-            yield cur_path, cur
+        cur_path, is_dict, it = stack[-1]
+        try:
+            item = next(it)
+        except StopIteration:
+            stack.pop()
             continue
-        yield cur_path or "<root>", cur
-        if isinstance(cur, dict):
-            items = list(cur.items())
-            for key, value in reversed(items):
-                here = f"{cur_path}/{key}" if cur_path else str(key)
-                stack.append((False, here, value))
-                stack.append((True, f"{here} (key)", key))
-        elif isinstance(cur, list):
-            for i in range(len(cur) - 1, -1, -1):
-                here = f"{cur_path}/{i}" if cur_path else str(i)
-                stack.append((False, here, cur[i]))
+        if is_dict:
+            key, value = item
+            here = f"{cur_path}/{key}" if cur_path else str(key)
+            yield f"{here} (key)", key
+            yield here, value
+        else:
+            idx, value = item
+            here = f"{cur_path}/{idx}" if cur_path else str(idx)
+            yield here, value
+        if isinstance(value, dict):
+            stack.append((here, True, iter(value.items())))
+        elif isinstance(value, list):
+            stack.append((here, False, enumerate(value)))
 
 
 def project(goal_file: dict) -> bytes:

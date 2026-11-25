@@ -15,6 +15,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -221,13 +222,65 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             self.proj._rfc8785 = orig
 
     def test_iterative_walk_and_oversized_early_return(self) -> None:
-        # Wide array under a long key streams iteratively without RecursionError
-        long_key = "k" * 2048
-        wide = {"vars": {long_key: list(range(2000))}}
-        walked_count = sum(1 for _ in self.proj._walk(wide))
-        self.assertGreater(walked_count, 2000)
+        # 1. Exact pre-order traversal parity with a reference recursive walk
+        def _ref_walk(node: object, path: str = ""):
+            yield path or "<root>", node
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    here = f"{path}/{key}" if path else str(key)
+                    yield f"{here} (key)", key
+                    yield from _ref_walk(value, here)
+            elif isinstance(node, list):
+                for idx, value in enumerate(node):
+                    here = f"{path}/{idx}" if path else str(idx)
+                    yield from _ref_walk(value, here)
 
-        # Oversized payload (> MAX_PROJECTION_BYTES) returns immediately with RULE_PROJECTION_BYTES
+        nested = {
+            "vars": {
+                "a": [1, {"b": [2, 3], "c": {}}, []],
+                "d": {"e": "x", "f": None},
+            },
+            "empty": {},
+        }
+        self.assertEqual(list(self.proj._walk(nested)), list(_ref_walk(nested)))
+        self.assertEqual(list(self.proj._walk(nested, "top")), list(_ref_walk(nested, "top")))
+
+        # 2. Lazy first-child visit + O(depth) bounded memory on a wide array under a long key
+        long_key = "k" * 2048
+        width = 10000
+        wide = {"vars": {long_key: list(range(width))}}
+        # Eager materialization of all child pointers would require > width * len(long_key) (~20 MB).
+        tracemalloc.start()
+        try:
+            it = self.proj._walk(wide)
+            first_ten = [next(it) for _ in range(10)]
+            _cur_10, peak_10 = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(first_ten), 10)
+        self.assertEqual(first_ten[0], ("<root>", wide))
+        self.assertEqual(first_ten[5], (f"vars/{long_key}/0", 0))
+        self.assertEqual(first_ten[9], (f"vars/{long_key}/4", 4))
+        self.assertLess(
+            peak_10,
+            512 * 1024,
+            f"lazy first-10 _walk allocated {peak_10} bytes (expected O(1), not O(width * key_len))",
+        )
+
+        tracemalloc.start()
+        try:
+            walked_count = sum(1 for _ in self.proj._walk(wide))
+            _cur_full, peak_full = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(walked_count, width + 5)
+        self.assertLess(
+            peak_full,
+            2 * 1024 * 1024,
+            f"full _walk peak memory {peak_full} bytes exceeded O(depth) bound",
+        )
+
+        # 3. Oversized payload (> MAX_PROJECTION_BYTES) returns immediately with RULE_PROJECTION_BYTES
         oversized = b'{"vars":{"a":"' + b"x" * (self.proj.MAX_PROJECTION_BYTES + 16) + b'"}}'
         findings = self.proj.check_projection(oversized)
         self.assertEqual(len(findings), 1)

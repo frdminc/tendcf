@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -29,10 +30,32 @@ DARWIN_OK_CF_SCRIPT = (
 
 
 def _extract_func(src: str, name: str) -> str:
-    m = re.search(rf"^{re.escape(name)}\(\) \{{[^\n]*\n(.*?)^\}}", src, re.MULTILINE | re.DOTALL)
-    if m is None:
+    lines = src.splitlines(keepends=True)
+    header_re = re.compile(rf"^{re.escape(name)}\(\) \{{")
+    heredoc_re = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+    start = None
+    for idx, line in enumerate(lines):
+        if header_re.match(line):
+            start = idx
+            break
+    if start is None:
         raise AssertionError(f"function {name}() not found in {INSTALLER}")
-    return m.group(0)
+    out: list[str] = []
+    heredoc_end: str | None = None
+    for line in lines[start:]:
+        out.append(line)
+        if heredoc_end is not None:
+            if line.rstrip("\r\n") == heredoc_end:
+                heredoc_end = None
+            continue
+        if not line.lstrip().startswith("#"):
+            hm = heredoc_re.search(line)
+            if hm is not None:
+                heredoc_end = hm.group(1)
+                continue
+        if line.rstrip("\r\n") == "}":
+            return "".join(out)
+    raise AssertionError(f"unterminated function {name}() in {INSTALLER}")
 
 
 class TendcfInstallUpgradeRollbackContract(unittest.TestCase):
@@ -1018,6 +1041,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertIn('[ -n "$2" ]', cmd_fn)
         idx_preval = cmd_fn.find('prevalidate_install_inputs "$datafile"')
         idx_acq = cmd_fn.find("acquire_publish_lock")
+        idx_stale = cmd_fn.find("check_no_stale_upgrade_dirs")
+        idx_prep = cmd_fn.find("prepare_projector_source")
         idx_tarball = cmd_fn.find('install_tarball "$tarball" "$sha256_file"')
         idx_policy = cmd_fn.find("place_policy")
         idx_proj = cmd_fn.find("place_projector")
@@ -1027,6 +1052,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         for lbl, idx in (
             ("prevalidate", idx_preval),
             ("acquire_publish_lock", idx_acq),
+            ("check_no_stale_upgrade_dirs", idx_stale),
+            ("prepare_projector_source", idx_prep),
             ("install_tarball", idx_tarball),
             ("place_policy", idx_policy),
             ("place_projector", idx_proj),
@@ -1036,10 +1063,29 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         ):
             self.assertNotEqual(idx, -1, f"missing {lbl} in cmd_install")
         self.assertLess(idx_preval, idx_acq)
-        self.assertLess(idx_acq, idx_tarball)
+        self.assertLess(idx_acq, idx_stale)
+        self.assertLess(idx_stale, idx_prep)
+        self.assertLess(idx_prep, idx_tarball)
         self.assertLess(idx_policy, idx_proj)
         self.assertLess(idx_proj, idx_data)
         self.assertLess(idx_disarm, idx_rel)
+
+        # Codex #1: standalone `data)` dispatch acquires lock BEFORE init_paths.
+        m_data_case = re.search(r"^\s+data\)\n(.*?)^\s+;;", self.src, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m_data_case, "missing data) case in main dispatch")
+        data_case = m_data_case.group(1)
+        idx_d_acq = data_case.find("acquire_publish_lock")
+        idx_d_init = data_case.find("init_paths")
+        idx_d_put = data_case.find('put_data "$1"')
+        idx_d_rel = data_case.find("release_publish_lock")
+        self.assertNotEqual(idx_d_acq, -1)
+        self.assertLess(idx_d_acq, idx_d_init)
+        self.assertLess(idx_d_init, idx_d_put)
+        self.assertLess(idx_d_put, idx_d_rel)
+
+        # Codex #7: Darwin Mach-O verification Python fallback uses `-I -S -`.
+        vm_fn = _extract_func(self.src, "verify_macho_tree")
+        self.assertIn('9>&- "$py" -I -S - "$prefix" "$canon_root" "${machos[@]}"', vm_fn)
 
         preval_fn = _extract_func(self.src, "prevalidate_install_inputs")
         self.assertIn("resolve_projector_src", preval_fn)
@@ -1068,14 +1114,17 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertLess(idx_upg_rb, idx_fd9_close, "upgrade rollback must complete BEFORE closing FD 9")
 
         proj_fn = _extract_func(self.src, "place_projector")
-        idx_same = proj_fn.find('if [ "$src_real" = "$dst_real" ]; then')
-        same_block = proj_fn[idx_same : proj_fn.find("make_stage", idx_same)]
+        idx_same = proj_fn.find('if [ "$same_realpath" -eq 1 ] && [ "${projector_src_originally_trusted:-0}" -eq 1 ]; then')
+        self.assertNotEqual(idx_same, -1)
+        idx_ext = proj_fn.find("local proj_differs=0 dst_flags=0", idx_same)
+        self.assertNotEqual(idx_ext, -1)
+        same_block = proj_fn[idx_same:idx_ext]
         idx_chflags = same_block.find("/usr/bin/chflags 0")
         idx_xattr_d = same_block.find("/usr/bin/xattr -d com.apple.quarantine")
         self.assertNotEqual(idx_chflags, -1)
         self.assertNotEqual(idx_xattr_d, -1)
         self.assertLess(idx_chflags, idx_xattr_d, "chflags 0 must run before xattr -d in same-realpath branch")
-        ext_block = proj_fn[proj_fn.find("make_stage", idx_same) :]
+        ext_block = proj_fn[idx_ext:]
         self.assertIn("stat -f '%f'", ext_block)
         self.assertIn('/usr/bin/chflags 0 "$installed_projector"', ext_block)
 
@@ -1091,6 +1140,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertIn(".host_specific.prev.XXXXXX", put_code)
         self.assertIn('"$py" -I -S "$installed_projector" --check "$staged_data" 9>&-', put_code)
 
+        idx_acq_p = put_code.find("acquire_publish_lock")
+        idx_ver_p = put_code.find("verify_installed_projector")
         idx_stage = put_code.find("make_stage")
         idx_py = put_code.find("find_real_python")
         idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data" 9>&-')
@@ -1100,6 +1151,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         idx_mv = put_code.find('/bin/mv -f "$tmp" "$data"')
         idx_gate3 = put_code.find('validate_cmdb_workdir "$workdir" "$entry"', idx_mv)
         idx_unlock = put_code.rfind("release_publish_lock")
+        self.assertLess(idx_acq_p, idx_ver_p, "acquire_publish_lock must run before verify_installed_projector")
         self.assertLess(idx_stage, idx_py, "make_stage must run before find_real_python")
         self.assertLess(idx_gate1, idx_gate2)
         self.assertLess(idx_gate2, idx_bytes)
@@ -1172,6 +1224,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         src_file: Path,
         *,
         mv_override: str | None = None,
+        rm_override: str | None = None,
         awk_override: str | None = None,
         stage_override: Path | None = None,
         extra_preamble: str = "",
@@ -1191,6 +1244,9 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         if mv_override is not None:
             real_mv = shutil.which("mv") or "/bin/mv"
             funcs = funcs.replace(real_mv, mv_override)
+        if rm_override is not None:
+            real_rm = shutil.which("rm") or "/bin/rm"
+            funcs = funcs.replace(real_rm, rm_override)
         if awk_override is not None:
             real_awk = shutil.which("awk") or "/usr/bin/awk"
             funcs = funcs.replace(real_awk, awk_override)
@@ -1235,10 +1291,11 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         *,
         extra_env: dict[str, str] | None = None,
         mv_override: str | None = None,
+        rm_override: str | None = None,
         awk_override: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         script = self._put_data_script(
-            paths, src_file, mv_override=mv_override, awk_override=awk_override
+            paths, src_file, mv_override=mv_override, rm_override=rm_override, awk_override=awk_override
         )
         env = dict(os.environ)
         if extra_env:
@@ -1264,9 +1321,11 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "ensure_dir",
                     "resolve_realpath_ok",
                     "resolve_projector_src",
+                    "source_file_root_trusted_ok",
                     "check_source_file_root_trusted",
                     "check_dir_root_unwritable",
                     "verify_installed_projector",
+                    "prepare_projector_source",
                     "place_projector",
                 ),
             )
@@ -1287,6 +1346,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
                     "has_acl_path() { return 1; }\n"
                     "check_ancestors() { return 0; }\n"
+                    "check_ancestors_ok() { return 0; }\n"
                     "make_stage() { return 0; }\n"
                     f'prefix="{paths["prefix"]}"\n'
                     f'stage_dir="{paths["stage_dir"]}"\n'
@@ -1295,6 +1355,10 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     f'projector_sha256="{sha}"\n'
                     f'installed_projector="{paths["installed_projector"]}"\n'
                     'place_projector_tmp=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
                     "changed=0\n"
                     f"{place_funcs}\n"
                     "place_projector\n"
@@ -1595,7 +1659,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     self.assertIn("previous data restored", err)
                 else:
                     self.assertFalse(paths["data"].exists())
-                    self.assertIn("unverified new data removed", err)
+                    self.assertIn("removed unverified first-time data", err)
                 leftovers = [
                     p.name
                     for p in (paths["workdir"] / "data").iterdir()
@@ -1762,6 +1826,552 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             ]
             self.assertEqual(leftovers, [])
             self.assertTrue((root / "opt" / ".tendcf-publish.lock").is_file())
+
+    def test_cmd_install_checks_projector_trust_before_check_tree_and_replaces_inode(self) -> None:
+        """R3 Fix #1 (Codex #3): Darwin check_tree must NOT launder writable projector; pinned replaces inode."""
+        proj_sha = hashlib.sha256(PROJECTOR.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths = self._build_env(root, DARWIN_OK_CF_SCRIPT, initial_data=None)
+            prefix = paths["prefix"]
+            (prefix / "bin").mkdir(parents=True)
+            for b in ("cf-agent", "cf-promises", "cf-key", "cf-execd"):
+                bp = prefix / "bin" / b
+                bp.write_text("#!/bin/sh\necho 'CFEngine Core 3.21.0'\n", encoding="utf-8")
+                bp.chmod(0o755)
+            dst = paths["installed_projector"]
+            os.chmod(dst, 0o666)  # group/world-writable BEFORE cmd_install!
+
+            policy_dir = root / "policy"
+            policy_dir.mkdir()
+            (policy_dir / "tendcf_services.cf").write_text("# dummy\n", encoding="utf-8")
+
+            funcs = self._darwin_funcs(
+                paths["shim_dir"],
+                (
+                    "cleanup_stage",
+                    "ensure_dir",
+                    "check_dir_root_unwritable",
+                    "acquire_publish_lock",
+                    "release_publish_lock",
+                    "check_no_stale_upgrade_dirs",
+                    "resolve_realpath_ok",
+                    "resolve_projector_src",
+                    "source_file_root_trusted_ok",
+                    "check_source_file_root_trusted",
+                    "verify_installed_projector",
+                    "check_tree",
+                    "prepare_projector_source",
+                    "place_projector",
+                    "prevalidate_install_inputs",
+                    "cmd_install",
+                ),
+            )
+            real_find = shutil.which("find") or "/usr/bin/find"
+            real_sed = shutil.which("sed") or "/usr/bin/sed"
+            funcs = funcs.replace("/usr/bin/find", real_find).replace("/usr/bin/sed", real_sed)
+
+            def run_cmd_install(extra_args: str) -> subprocess.CompletedProcess[str]:
+                paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
+                script = (
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "has_acl_tree() { return 1; }\n"
+                    "check_ancestors() { return 0; }\n"
+                    "check_ancestors_ok() { return 0; }\n"
+                    "make_stage() { return 0; }\n"
+                    "tree_is_clean() { return 1; }\n"
+                    "verify_macho_tree() { return 0; }\n"
+                    "init_paths() { return 0; }\n"
+                    "lay_out() { return 0; }\n"
+                    "place_policy() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'stage_dir="{paths["stage_dir"]}"\n'
+                    f'cf_agent="{prefix}/bin/cf-agent"\n'
+                    f'cf_promises="{prefix}/bin/cf-promises"\n'
+                    f'cf_key="{prefix}/bin/cf-key"\n'
+                    f'cf_execd="{prefix}/bin/cf-execd"\n'
+                    f'here="{root}"\n'
+                    f'policy_src="{policy_dir}"\n'
+                    'projector_src=""\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{dst}"\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
+                    "upgrade_rollback_armed=0\n"
+                    'upgrade_backup_prefix=""\n'
+                    'upgrade_staged_tree=""\n'
+                    "upgrade_moved_var=0\n"
+                    "upgrade_was_loaded=0\n"
+                    "upgrade_had_plist=0\n"
+                    "upgrade_snapshot_taken=0\n"
+                    'upgrade_saved_workdir=""\n'
+                    "upgrade_saved_inputs=0\n"
+                    "upgrade_saved_data=0\n"
+                    "upgrade_needs_execd_restart=0\n"
+                    "publish_lock_held=0\n"
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "changed=0\n"
+                    f"{funcs}\n"
+                    # Override check_tree's post-repair tree_is_clean to pass only once mode is repaired
+                    'tree_is_clean() { local m; m="$(' + str(paths["shim_dir"] / "stat") + ' -f \'%Lp\' "$installed_projector")"; [ $((8#$m & 8#022)) -eq 0 ]; }\n'
+                    "trap cleanup_stage EXIT\n"
+                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{dst}" {extra_args}\n'
+                )
+                # Ensure xattr shim prints nothing & returns 0 for `xattr -s`, returns 1 for `xattr -p`
+                (paths["shim_dir"] / "xattr").write_text(
+                    '#!/bin/sh\nif [ "$1" = "-p" ]; then exit 1; fi\nexit 0\n',
+                    encoding="utf-8",
+                )
+                (paths["shim_dir"] / "xattr").chmod(0o755)
+                # Allow stat -f '%Lp' in tree_is_clean helper
+                (paths["shim_dir"] / "stat").write_text(
+                    f"#!{sys.executable}\n"
+                    "import os, stat, sys\n"
+                    "fmt = sys.argv[2]\n"
+                    "p = sys.argv[3]\n"
+                    "st = os.lstat(p)\n"
+                    "mode = stat.S_IMODE(st.st_mode)\n"
+                    "if fmt == '%Su:%Sg %Lp': print(f'root:wheel {mode:o}')\n"
+                    "elif fmt == '%Su %Sg %Lp': print(f'root wheel {mode:o}')\n"
+                    "elif fmt == '%Lp': print(f'{mode:o}')\n"
+                    "elif fmt == '%f': print('0')\n",
+                    encoding="utf-8",
+                )
+                (paths["shim_dir"] / "stat").chmod(0o755)
+                return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+            # 1. Unpinned on writable packaged projector -> REFUSED BEFORE check_tree runs!
+            r_unpinned = run_cmd_install("")
+            self.assertNotEqual(r_unpinned.returncode, 0)
+            self.assertIn("--projector-sha256", r_unpinned.stderr)
+            self.assertEqual(
+                stat.S_IMODE(dst.stat().st_mode),
+                0o666,
+                "check_tree must NOT have run to launder writable projector before refusal",
+            )
+
+            # 2. Pinned with valid --projector-sha256 -> SUCCEEDS and replaces with FRESH INODE!
+            old_ino = dst.stat().st_ino
+            r_pinned = run_cmd_install(f"--projector-sha256 {proj_sha}")
+            self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
+            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
+            self.assertNotEqual(
+                dst.stat().st_ino,
+                old_ino,
+                "pinned install over formerly writable projector must replace inode",
+            )
+
+    def test_relative_projector_src_normalized_and_checked_through_ancestors(self) -> None:
+        """R3 Fix #1 (Macroscope #4701728688): Darwin relative --projector-src normalized via pwd -L."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            paths = self._build_env(root, DARWIN_OK_CF_SCRIPT, initial_data=None)
+            paths["installed_projector"].unlink()
+
+            # Override stat shim: ancestors ABOVE root look like root wheel 755; inside root use real modes.
+            (paths["shim_dir"] / "stat").write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                f"root_s = {str(root)!r}\n"
+                "fmt = sys.argv[2]\n"
+                "p = sys.argv[3]\n"
+                "rp = os.path.realpath(p) if not os.path.islink(p) else p\n"
+                "if rp != root_s and not rp.startswith(root_s + '/'):\n"
+                "    mode = 0o755\n"
+                "else:\n"
+                "    mode = stat.S_IMODE(os.lstat(p).st_mode)\n"
+                "if fmt == '%Su:%Sg %Lp': print(f'root:wheel {mode:o}')\n"
+                "elif fmt == '%Su %Sg %Lp': print(f'root wheel {mode:o}')\n"
+                "elif fmt == '%Su %Lp': print(f'root {mode:o}')\n"
+                "elif fmt == '%f': print('0')\n",
+                encoding="utf-8",
+            )
+            (paths["shim_dir"] / "stat").chmod(0o755)
+            os.chmod(root, 0o755)
+            os.chmod(root / "opt", 0o755)
+            os.chmod(paths["prefix"], 0o755)
+
+            trusted_pkg = root / "trusted_pkg"
+            (trusted_pkg / "bin").mkdir(parents=True)
+            os.chmod(trusted_pkg, 0o755)
+            os.chmod(trusted_pkg / "bin", 0o755)
+            shutil.copy2(PROJECTOR, trusted_pkg / "bin" / "projector.py")
+            os.chmod(trusted_pkg / "bin" / "projector.py", 0o644)
+
+            writable_pkg = root / "writable_pkg"
+            (writable_pkg / "bin").mkdir(parents=True)
+            os.chmod(writable_pkg, 0o777)
+            os.chmod(writable_pkg / "bin", 0o755)
+            shutil.copy2(PROJECTOR, writable_pkg / "bin" / "projector.py")
+            os.chmod(writable_pkg / "bin" / "projector.py", 0o644)
+
+            sym_proj = trusted_pkg / "bin" / "link.py"
+            sym_proj.symlink_to(trusted_pkg / "bin" / "projector.py")
+
+            funcs = self._darwin_funcs(
+                paths["shim_dir"],
+                (
+                    "ensure_dir",
+                    "check_ancestor_dir_ok",
+                    "check_ancestors_ok",
+                    "check_ancestors",
+                    "check_dir_root_unwritable",
+                    "resolve_realpath_ok",
+                    "resolve_projector_src",
+                    "source_file_root_trusted_ok",
+                    "check_source_file_root_trusted",
+                    "verify_installed_projector",
+                    "prepare_projector_source",
+                    "place_projector",
+                ),
+            )
+
+            def run_rel(cwd: Path, rel_src: str) -> subprocess.CompletedProcess[str]:
+                script = (
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "make_stage() { return 0; }\n"
+                    f'prefix="{paths["prefix"]}"\n'
+                    f'stage_dir="{paths["stage_dir"]}"\n'
+                    f'here="{root}"\n'
+                    f'projector_src="{rel_src}"\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{paths["installed_projector"]}"\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "projector_src_originally_trusted=0\n"
+                    "installed_projector_originally_clean=0\n"
+                    "changed=0\n"
+                    f"{funcs}\n"
+                    f'cd "{cwd}"\n'
+                    "prepare_projector_source\n"
+                    "place_projector\n"
+                )
+                return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+            r_ok = run_rel(trusted_pkg, "bin/projector.py")
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+            self.assertEqual(paths["installed_projector"].read_bytes(), PROJECTOR.read_bytes())
+
+            r_sym = run_rel(trusted_pkg, "bin/link.py")
+            self.assertNotEqual(r_sym.returncode, 0)
+            self.assertIn("regular non-symlink", r_sym.stderr)
+
+            r_ww = run_rel(writable_pkg, "bin/projector.py")
+            self.assertNotEqual(r_ww.returncode, 0)
+            self.assertIn("--projector-sha256", r_ww.stderr)
+
+    def test_standalone_data_dispatch_locks_before_init_paths_during_prefix_swap(self) -> None:
+        """R3 Fix #2 (Codex #1): standalone `data)` dispatch acquires lock BEFORE init_paths so transient prefix swap never fails it."""
+        m_data_case = re.search(r"^\s+data\)\n(.*?)^\s+;;", self.src, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m_data_case)
+        data_dispatch_body = m_data_case.group(1)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            orig = DARWIN_CANARY_PRESENT.read_bytes()
+            new_bytes = DARWIN_CANARY_ABSENT.read_bytes()
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            # Fake cf-promises supports BOTH --show-vars (for init_paths) and --show-classes (for put_data)
+            cf_script = (
+                "#!/bin/sh\n"
+                'for a in "$@"; do\n'
+                '  if [ "$a" = "--show-vars" ]; then\n'
+                f'    echo "default:sys.workdir  {live_wd}"\n'
+                "    exit 0\n"
+                "  fi\n"
+                "done\n"
+                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "exit 0\n"
+            )
+            paths = self._build_env(root, cf_script, initial_data=orig)
+            prefix = paths["prefix"]
+            (prefix / "bin").mkdir(parents=True)
+            shutil.copy2(paths["cf_promises"], prefix / "bin" / "cf-promises")
+            (prefix / "bin" / "cf-promises").chmod(0o755)
+
+            swapped_ready = root / "prefix.swapped"
+            order_log = root / "order.log"
+
+            upg_funcs = self._darwin_funcs(
+                paths["shim_dir"],
+                ("check_dir_root_unwritable", "acquire_publish_lock", "release_publish_lock"),
+            )
+            upg_script = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                "has_acl_path() { return 1; }\n"
+                "check_ancestors() { return 0; }\n"
+                f'prefix="{prefix}"\n'
+                "publish_lock_held=0\n"
+                "changed=0\n"
+                f"{upg_funcs}\n"
+                "acquire_publish_lock\n"
+                f'mv "{prefix}" "{prefix}.swap.tmp"\n'
+                f'echo swapped > "{swapped_ready}"\n'
+                "sleep 0.35\n"
+                f'mv "{prefix}.swap.tmp" "{prefix}"\n'
+                f'echo "SWAP_RESTORED" >> "{order_log}"\n'
+                "release_publish_lock\n"
+            )
+            p_upg = subprocess.Popen(
+                ["/bin/bash", "-c", upg_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while not swapped_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(swapped_ready.exists(), "upgrade never moved $prefix aside")
+            self.assertFalse(prefix.exists(), "$prefix must be transiently absent when standalone data starts")
+
+            # Run actual extracted `data)` dispatch body (with init_paths regex scoped to temp $prefix)
+            data_stage = root / "stage-data"
+            data_stage.mkdir(mode=0o700)
+            data_funcs = self._darwin_funcs(
+                paths["shim_dir"],
+                (
+                    "cleanup_stage",
+                    "check_dir_root_unwritable",
+                    "check_no_symlink_components_under_prefix",
+                    "acquire_publish_lock",
+                    "release_publish_lock",
+                    "init_paths",
+                    "verify_installed_projector",
+                    "validate_cmdb_workdir",
+                    "put_data",
+                ),
+            ).replace("^/opt/tendcf/", f"^{prefix}/")
+            data_script = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                'say() { echo "tendcf-install: $*"; }\n'
+                "has_acl_path() { return 1; }\n"
+                "tree_is_clean() { [ -d \"$1\" ]; }\n"
+                "check_ancestors() { return 0; }\n"
+                "make_stage() { return 0; }\n"
+                f'find_real_python() {{ echo "{sys.executable}"; }}\n'
+                f'prefix="{prefix}"\n'
+                f'cf_promises="{prefix}/bin/cf-promises"\n'
+                'workdir=""\n'
+                'entry=""\n'
+                'data=""\n'
+                f'stage_dir="{data_stage}"\n'
+                f'installed_projector="{paths["installed_projector"]}"\n'
+                "upgrade_rollback_armed=0\n"
+                "publish_lock_held=0\n"
+                "put_data_rollback_armed=0\n"
+                "put_data_had_prev=0\n"
+                'put_data_stage_wd=""\n'
+                'put_data_tmp=""\n'
+                'put_data_backup=""\n'
+                'place_projector_tmp=""\n'
+                "changed=0\n"
+                f"{data_funcs}\n"
+                "trap cleanup_stage EXIT\n"
+                f'set -- "{DARWIN_CANARY_ABSENT}"\n'
+                f"{data_dispatch_body}\n"
+                f'echo "DATA_DISPATCH_DONE" >> "{order_log}"\n'
+            )
+            p_data = subprocess.Popen(
+                ["/bin/bash", "-c", data_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            uo, ue = p_upg.communicate(timeout=15)
+            do, de = p_data.communicate(timeout=15)
+            self.assertEqual(p_upg.returncode, 0, f"swap sim failed: {uo}\n{ue}")
+            self.assertEqual(p_data.returncode, 0, f"standalone data dispatch failed: {do}\n{de}")
+            self.assertEqual(paths["data"].read_bytes(), new_bytes)
+            self.assertEqual(
+                order_log.read_text(encoding="utf-8").splitlines(),
+                ["SWAP_RESTORED", "DATA_DISPATCH_DONE"],
+            )
+
+    def test_first_publication_rollback_rm_failure_reports_error_and_live_path(self) -> None:
+        """R3 Fix #3 (Codex #4): Darwin first-pub rollback rm failure must report error naming $data."""
+        real_rm = shutil.which("rm") or "/bin/rm"
+
+        # Case A: Synchronous Gate 3 refusal with failing rm on $data
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                "  echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "  echo 'tendcf_cmdb_refused   source=policy'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "exit 0\n"
+            )
+            paths = self._build_env(root, cf_script, initial_data=None)
+            rm_fail = paths["shim_dir"] / "rm-fail-data"
+            rm_fail.write_text(
+                f"#!/bin/sh\n"
+                'for a in "$@"; do case "$a" in */host_specific.json) exit 1 ;; esac; done\n'
+                f'exec {real_rm} "$@"\n',
+                encoding="utf-8",
+            )
+            rm_fail.chmod(0o755)
+            r = self._run_put_data(paths, DARWIN_CANARY_PRESENT, rm_override=str(rm_fail))
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("rollback could not remove unverified data at", r.stderr)
+            self.assertIn(str(paths["data"]), r.stderr)
+            self.assertNotIn("new data removed", r.stderr)
+            self.assertTrue(paths["data"].exists())
+
+        # Case B: EXIT-trap SIGTERM during Gate 3 with failing rm on $data
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+            gate3_ready = root / "gate3.ready"
+            cf_script = (
+                "#!/bin/sh\n"
+                'wd=""\n'
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                'done\n'
+                f'if [ "$wd" = "{live_wd}" ]; then\n'
+                f'  echo ready > "{gate3_ready}"\n'
+                "  sleep 10\n"
+                "fi\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                "exit 0\n"
+            )
+            paths = self._build_env(root, cf_script, initial_data=None)
+            rm_fail = paths["shim_dir"] / "rm-fail-data"
+            rm_fail.write_text(
+                f"#!/bin/sh\n"
+                'for a in "$@"; do case "$a" in */host_specific.json) exit 1 ;; esac; done\n'
+                f'exec {real_rm} "$@"\n',
+                encoding="utf-8",
+            )
+            rm_fail.chmod(0o755)
+            script = self._put_data_script(paths, DARWIN_CANARY_PRESENT, rm_override=str(rm_fail))
+            proc = subprocess.Popen(
+                ["/bin/bash", "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 10.0
+            while not gate3_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(gate3_ready.exists(), "Gate 3 cf-promises never started")
+            os.killpg(proc.pid, signal.SIGTERM)
+            _out, err = proc.communicate(timeout=10)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("ERROR: rollback could not remove unverified data at", err)
+            self.assertIn(str(paths["data"]), err)
+            self.assertNotIn("removed unverified first-time data", err)
+            self.assertTrue(paths["data"].exists())
+
+    def test_verify_macho_tree_python_fallback_uses_isolated_no_site_hermetically(self) -> None:
+        """R3 Fix #5 (Codex #7): exercise verify_macho_tree's no-otool python3 -I -S - path hermetically."""
+        def _build_macho64(dylinker: str, dylibs: list[str]) -> bytes:
+            cmds = bytearray()
+            # LC_LOAD_DYLINKER (0x0E): cmd, cmdsize, name_offset(12), NUL-padded string (8-byte aligned)
+            dl_raw = dylinker.encode("utf-8") + b"\x00"
+            dl_sz = (12 + len(dl_raw) + 7) & ~7
+            cmds += struct.pack("<III", 0x0E, dl_sz, 12) + dl_raw.ljust(dl_sz - 12, b"\x00")
+            # LC_LOAD_DYLIB (0x0C): cmd, cmdsize, name_offset(24), timestamp, cur_ver, compat_ver, NUL-padded string
+            for dep in dylibs:
+                dep_raw = dep.encode("utf-8") + b"\x00"
+                dep_sz = (24 + len(dep_raw) + 7) & ~7
+                cmds += struct.pack("<IIIIII", 0x0C, dep_sz, 24, 2, 0x10000, 0x10000) + dep_raw.ljust(dep_sz - 24, b"\x00")
+            header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 1 + len(dylibs), len(cmds), 0, 0)
+            return header + bytes(cmds)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_darwin_shims(shim_dir)
+            stage_dir = root / "stage"
+            stage_dir.mkdir(mode=0o700)
+
+            file_shim = shim_dir / "file"
+            file_shim.write_text("#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", encoding="utf-8")
+            file_shim.chmod(0o755)
+            codesign_shim = shim_dir / "codesign"
+            codesign_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            codesign_shim.chmod(0o755)
+
+            py_log = root / "py-args.log"
+            py_wrap = shim_dir / "py-wrap"
+            py_wrap.write_text(
+                f"#!/bin/sh\necho \"$*\" > \"{py_log}\"\nexec \"{sys.executable}\" \"$@\"\n",
+                encoding="utf-8",
+            )
+            py_wrap.chmod(0o755)
+
+            vm_fn = self._darwin_funcs(shim_dir, ("verify_macho_tree",))
+            real_find = shutil.which("find") or "/usr/bin/find"
+            real_grep = shutil.which("grep") or "/usr/bin/grep"
+            vm_fn = (
+                vm_fn.replace("/usr/bin/file", str(file_shim))
+                .replace("/usr/bin/codesign", str(codesign_shim))
+                .replace("/usr/bin/find", real_find)
+                .replace("/usr/bin/grep", real_grep)
+            )
+
+            tree = root / "tree"
+            (tree / "bin").mkdir(parents=True)
+            valid_macho = _build_macho64("/usr/lib/dyld", ["/usr/lib/libSystem.B.dylib"])
+            for req in ("cf-agent", "cf-promises", "cf-key", "cf-execd"):
+                p = tree / "bin" / req
+                p.write_bytes(valid_macho)
+                p.chmod(0o755)
+
+            def run_vm() -> subprocess.CompletedProcess[str]:
+                script = (
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "make_stage() { return 0; }\n"
+                    "find_safe_otool() { return 1; }\n"
+                    f'find_real_python() {{ echo "{py_wrap}"; }}\n'
+                    'prefix="/opt/tendcf"\n'
+                    f'stage_dir="{stage_dir}"\n'
+                    f"{vm_fn}\n"
+                    f'verify_macho_tree "{tree}"\n'
+                )
+                return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+
+            # 1. Valid synthetic Mach-O tree passes via python3 -I -S -
+            r_ok = run_vm()
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+            self.assertTrue(py_log.read_text(encoding="utf-8").startswith("-I -S - "), py_log.read_text(encoding="utf-8"))
+
+            # 2. Forbidden external dylib is rejected by the python3 -I -S - parser
+            (tree / "bin" / "cf-agent").write_bytes(
+                _build_macho64("/usr/lib/dyld", ["/tmp/evil.dylib"])
+            )
+            r_bad = run_vm()
+            self.assertNotEqual(r_bad.returncode, 0)
+            self.assertIn("outside /opt/tendcf", r_bad.stderr)
 
 
 if __name__ == "__main__":
