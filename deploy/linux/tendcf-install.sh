@@ -566,19 +566,38 @@ prepare_projector_source() {
     projector_prepared=1
 }
 
-# Lock down the parent directory chain under $prefix top-down (non-recursively)
-# and detach any unsafe existing $installed_projector BEFORE check_tree() runs
-# recursive repair, eliminating both the writable-parent race window and any
-# post-check_tree laundering of a mutable/untrusted inode.
+# Refuse any unsafe existing $prefix/share/tendcf* parent chain BEFORE mutating
+# permissions/ownership (so SIGTERM/SIGKILL can never leave an exposed leaf in a
+# newly trusted parent), detach any unsafe leaf inside an already-trusted parent
+# chain, and on fresh builds lacking $prefix/share/tendcf lock down $prefix and
+# $prefix/share non-recursively top-down before check_tree().
 detach_unsafe_installed_projector() {
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     installed_projector_originally_clean=0
-    if { [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; } && installed_projector_clean_ok; then
-        installed_projector_originally_clean=1
+    local d
+    if [ -e "$prefix/share/tendcf" ] || [ -L "$prefix/share/tendcf" ]; then
+        for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+            if [ "$d" = "$prefix/share/tendcf/bin" ] && [ ! -e "$d" ] && [ ! -L "$d" ]; then
+                break
+            fi
+            check_dir_root_unwritable "$d"
+        done
+        if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+            if installed_projector_clean_ok; then
+                installed_projector_originally_clean=1
+                return 0
+            fi
+            if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+                die "$installed_projector is a directory; refusing"
+            fi
+            rm -f "$installed_projector"
+            if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+                die "could not remove untrusted $installed_projector"
+            fi
+        fi
         return 0
     fi
-    local d
-    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+    for d in "$prefix" "$prefix/share"; do
         if [ ! -e "$d" ] && [ ! -L "$d" ]; then
             break
         fi
@@ -587,14 +606,8 @@ detach_unsafe_installed_projector() {
         chmod a-s,go-w "$d"
         check_dir_root_unwritable "$d"
     done
-    if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
-        die "$installed_projector is a directory; refusing"
-    fi
-    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-        rm -f "$installed_projector"
-    fi
-    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-        die "could not remove untrusted $installed_projector"
+    if [ -e "$prefix/share/tendcf" ] || [ -L "$prefix/share/tendcf" ]; then
+        die "$prefix/share/tendcf appeared unexpectedly during prefix lockdown; refusing"
     fi
 }
 

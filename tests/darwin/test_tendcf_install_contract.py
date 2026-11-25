@@ -1134,14 +1134,19 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertIn('/usr/bin/chflags 0 "$installed_projector"', proj_code)
 
         detach_fn = _extract_func(self.src, "detach_unsafe_installed_projector")
-        idx_d_lockdown = detach_fn.find('/bin/chmod a-s,go-w "$d"')
+        idx_d_check = detach_fn.find('check_dir_root_unwritable "$d"')
         idx_d_chflags = detach_fn.find('/usr/bin/chflags 0 "$installed_projector"')
         idx_d_rm = detach_fn.find('/bin/rm -f "$installed_projector"')
-        self.assertNotEqual(idx_d_lockdown, -1)
+        idx_d_fresh_lock = detach_fn.find('/bin/chmod a-s,go-w "$d"')
+        idx_d_fresh_guard = detach_fn.find("appeared unexpectedly during prefix lockdown")
+        self.assertNotEqual(idx_d_check, -1)
         self.assertNotEqual(idx_d_chflags, -1)
         self.assertNotEqual(idx_d_rm, -1)
-        self.assertLess(idx_d_lockdown, idx_d_rm, "parent lockdown must run BEFORE unlinking $installed_projector")
+        self.assertNotEqual(idx_d_fresh_lock, -1)
+        self.assertNotEqual(idx_d_fresh_guard, -1)
+        self.assertLess(idx_d_check, idx_d_rm, "existing parent chain must be verified BEFORE unlinking $installed_projector")
         self.assertLess(idx_d_chflags, idx_d_rm, "chflags 0 must run before rm -f in detach_unsafe_installed_projector")
+        self.assertLess(idx_d_fresh_lock, idx_d_fresh_guard, "fresh-build lockdown must verify share/tendcf did not appear")
 
         put_fn = _extract_func(self.src, "put_data")
         put_code = "\n".join(
@@ -2065,42 +2070,129 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     r_retry = run_cmd_install(f'--projector-src "{dst}"')
                     self.assertNotEqual(r_retry.returncode, 0)
 
-            # 3. R5 Fix #1 (Codex R5 #1): unsafe writable parent (0777) with (a) existing 0644 leaf and (b) absent leaf
+            # 3. R6 Fix #1 (Codex R6 #1): unsafe writable parent ($prefix/share/tendcf/bin mode 0777) MUST fail closed
+            #    BEFORE mutating any directory mode/owner/ACL, for BOTH existing 0644 leaf and absent leaf!
             proj_bin_dir = prefix / "share" / "tendcf" / "bin"
-            # (a) Writable parent + existing 0644 leaf + mid-install failure -> parent locked down (0755), leaf detached/absent
+            # (a) Writable parent + existing 0644 leaf -> fails closed, parent stays 0777, verify_installed_projector still refuses!
             shutil.copy2(PROJECTOR, dst)
             os.chmod(dst, 0o644)
             os.chmod(proj_bin_dir, 0o777)
             r_wparent_leaf = run_cmd_install(
                 f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
-                fail_place_policy=True,
             )
             self.assertNotEqual(r_wparent_leaf.returncode, 0)
             self.assertEqual(
-                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
-                0,
-                "unsafe writable parent must be locked down non-writable before check_tree",
+                stat.S_IMODE(proj_bin_dir.stat().st_mode),
+                0o777,
+                "unsafe existing projector parent chain must NOT be mutated before refusing",
             )
-            self.assertFalse(
-                dst.exists() or dst.is_symlink(),
-                "leaf inside unsafe writable parent must be detached before check_tree",
+            r_ver_wp = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "check_ancestors() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'installed_projector="{dst}"\n'
+                    f"{funcs}\n"
+                    "verify_installed_projector\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            r_retry_wp = run_cmd_install(f'--projector-src "{dst}"')
-            self.assertNotEqual(r_retry_wp.returncode, 0)
+            self.assertNotEqual(r_ver_wp.returncode, 0, "verify_installed_projector must still refuse exposed leaf")
 
-            # (b) Writable parent + absent leaf -> parent locked down top-down before check_tree, leaf stays absent
+            # (b) Writable parent + absent leaf -> fails closed, parent stays 0777
+            dst.unlink()
             os.chmod(proj_bin_dir, 0o777)
             r_wparent_absent = run_cmd_install(
                 f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
-                fail_place_policy=True,
             )
             self.assertNotEqual(r_wparent_absent.returncode, 0)
             self.assertEqual(
-                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
-                0,
-                "unsafe writable parent with absent leaf must be locked down non-writable before check_tree",
+                stat.S_IMODE(proj_bin_dir.stat().st_mode),
+                0o777,
+                "unsafe existing projector parent chain with absent leaf must NOT be mutated",
             )
-            self.assertFalse(dst.exists() or dst.is_symlink())
+            os.chmod(proj_bin_dir, 0o755)
+
+            # (c) Fresh tree lacking $prefix/share/tendcf with initially writable $prefix/share -> locks down & succeeds!
+            # Move dirty_marker to $prefix/dirty-marker while $prefix/share/tendcf is removed
+            shutil.rmtree(prefix / "share" / "tendcf")
+            dirty_marker_orig = dirty_marker
+            os.chmod(prefix / "share", 0o777)
+            # Re-create dirty_marker outside share/tendcf (temporarily recreate dir only via cmd_install)
+            alt_dirty = prefix / "share" / "dirty-marker"
+            alt_dirty.write_text("dirty\n", encoding="utf-8")
+            os.chmod(alt_dirty, 0o666)
+            paths["stage_dir"].mkdir(exist_ok=True, mode=0o700)
+            r_fresh = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    "has_acl_path() { return 1; }\n"
+                    "has_acl_tree() { return 1; }\n"
+                    "check_ancestors() { return 0; }\n"
+                    "check_ancestors_ok() { return 0; }\n"
+                    "make_stage() { return 0; }\n"
+                    "verify_macho_tree() { return 0; }\n"
+                    "init_paths() { return 0; }\n"
+                    "lay_out() { return 0; }\n"
+                    "place_policy() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'stage_dir="{paths["stage_dir"]}"\n'
+                    f'cf_agent="{prefix}/bin/cf-agent"\n'
+                    f'cf_promises="{prefix}/bin/cf-promises"\n'
+                    f'cf_key="{prefix}/bin/cf-key"\n'
+                    f'cf_execd="{prefix}/bin/cf-execd"\n'
+                    f'here="{root}"\n'
+                    f'policy_src="{policy_dir}"\n'
+                    'projector_src=""\n'
+                    'projector_sha256=""\n'
+                    f'installed_projector="{dst}"\n'
+                    'place_projector_tmp=""\n'
+                    'prepared_projector_file=""\n'
+                    "projector_prepared=0\n"
+                    "installed_projector_originally_clean=0\n"
+                    "upgrade_prefix_swapped=0\n"
+                    "upgrade_rollback_armed=0\n"
+                    'upgrade_backup_prefix=""\n'
+                    'upgrade_staged_tree=""\n'
+                    "upgrade_moved_var=0\n"
+                    "upgrade_was_loaded=0\n"
+                    "upgrade_had_plist=0\n"
+                    "upgrade_snapshot_taken=0\n"
+                    'upgrade_saved_workdir=""\n'
+                    "upgrade_saved_inputs=0\n"
+                    "upgrade_saved_data=0\n"
+                    "upgrade_needs_execd_restart=0\n"
+                    "publish_lock_held=0\n"
+                    "put_data_rollback_armed=0\n"
+                    "put_data_had_prev=0\n"
+                    'put_data_stage_wd=""\n'
+                    'put_data_tmp=""\n'
+                    'put_data_backup=""\n'
+                    "changed=0\n"
+                    f"{funcs}\n"
+                    f'tree_is_clean() {{ local m; m="$({paths["shim_dir"] / "stat"} -f \'%Lp\' "{alt_dirty}")"; [ $((8#$m & 8#022)) -eq 0 ]; }}\n'
+                    "trap cleanup_stage EXIT\n"
+                    f'cmd_install --policy-src "{policy_dir}" --projector-src "{ext_proj}" --projector-sha256 {proj_sha}\n',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_fresh.returncode, 0, r_fresh.stderr)
+            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode) & 0o022, 0)
+            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
+            dirty_marker_orig.write_text("dirty\n", encoding="utf-8")
 
             # 4. R5 Fix #3 (Codex R5 #3): hold open writable FD on dst across cmd_install (prevents ext4 inode reuse
             #    and proves the old writable descriptor cannot tamper with the newly installed projector)

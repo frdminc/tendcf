@@ -1031,42 +1031,64 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     r_retry = run_cmd_install(f'--projector-src "{dst}"')
                     self.assertNotEqual(r_retry.returncode, 0)
 
-            # 3. R5 Fix #1 (Codex R5 #1): unsafe writable parent (0777) with (a) existing 0644 leaf and (b) absent leaf
+            # 3. R6 Fix #1 (Codex R6 #1): unsafe writable parent ($prefix/share/tendcf/bin mode 0777) MUST fail closed
+            #    BEFORE mutating any directory mode/owner/ACL, for BOTH existing 0644 leaf and absent leaf!
             proj_bin_dir = prefix / "share" / "tendcf" / "bin"
-            # (a) Writable parent + existing 0644 leaf + mid-install failure -> parent locked down (0755), leaf detached/absent
+            # (a) Writable parent + existing 0644 leaf -> fails closed, parent stays 0777, verify_installed_projector still refuses!
             shutil.copy2(PROJECTOR, dst)
             os.chmod(dst, 0o644)
             os.chmod(proj_bin_dir, 0o777)
             r_wparent_leaf = run_cmd_install(
                 f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
-                fail_place_policy=True,
             )
             self.assertNotEqual(r_wparent_leaf.returncode, 0)
             self.assertEqual(
-                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
-                0,
-                "unsafe writable parent must be locked down non-writable before check_tree",
+                stat.S_IMODE(proj_bin_dir.stat().st_mode),
+                0o777,
+                "unsafe existing projector parent chain must NOT be mutated before refusing",
             )
-            self.assertFalse(
-                dst.exists() or dst.is_symlink(),
-                "leaf inside unsafe writable parent must be detached before check_tree",
+            r_ver_wp = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    f'export PATH="{shim_dir}:$PATH"\n'
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "check_ancestors_ok() { return 0; }\n"
+                    f'prefix="{prefix}"\n'
+                    f'installed_projector="{dst}"\n'
+                    f"{funcs}\n"
+                    "verify_installed_projector\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
             )
-            r_retry_wp = run_cmd_install(f'--projector-src "{dst}"')
-            self.assertNotEqual(r_retry_wp.returncode, 0)
+            self.assertNotEqual(r_ver_wp.returncode, 0, "verify_installed_projector must still refuse exposed leaf")
 
-            # (b) Writable parent + absent leaf -> parent locked down top-down before check_tree, leaf stays absent
+            # (b) Writable parent + absent leaf -> fails closed, parent stays 0777
+            dst.unlink()
             os.chmod(proj_bin_dir, 0o777)
             r_wparent_absent = run_cmd_install(
                 f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
-                fail_place_policy=True,
             )
             self.assertNotEqual(r_wparent_absent.returncode, 0)
             self.assertEqual(
-                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
-                0,
-                "unsafe writable parent with absent leaf must be locked down non-writable before check_tree",
+                stat.S_IMODE(proj_bin_dir.stat().st_mode),
+                0o777,
+                "unsafe existing projector parent chain with absent leaf must NOT be mutated",
             )
-            self.assertFalse(dst.exists() or dst.is_symlink())
+            os.chmod(proj_bin_dir, 0o755)
+
+            # (c) Fresh build case (matching .github/workflows/linux.yml): $prefix/share is initially writable
+            #     with $prefix/share/tendcf ABSENT -> cmd_install locks down $prefix/$prefix/share and succeeds!
+            shutil.rmtree(prefix / "share" / "tendcf")
+            os.chmod(prefix / "share", 0o777)
+            r_fresh = run_cmd_install(f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}')
+            self.assertEqual(r_fresh.returncode, 0, r_fresh.stderr)
+            self.assertEqual(stat.S_IMODE((prefix / "share").stat().st_mode) & 0o022, 0)
+            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
 
             # 4. R5 Fix #3 (Codex R5 #3): hold open writable FD on dst across cmd_install (prevents ext4 inode reuse
             #    and proves the old writable descriptor cannot tamper with the newly installed projector)
