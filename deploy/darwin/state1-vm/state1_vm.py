@@ -133,34 +133,14 @@ LAUNCHCTL_CLOSE_RE = re.compile(r"^[ \t]*\}[ \t]*\Z")
 LAUNCHCTL_ENTRY_RE = re.compile(
     r'^[ \t]*"([^"]+)"[ \t]*=>[ \t]*(disabled|enabled|true|false)[ \t]*\Z'
 )
-# All 25 unused launchd hygiene jobs disabled by guest/prep.sh (6 system + 19 gui);
-# verified 2026-11-25 on macOS 27.2 (26B123): PREP-RESULT disabled=25 absent=0 failed=0.
+# All 3 unused launchd hygiene jobs disabled by guest/prep.sh (1 system + 2 user);
+# empirically pruned 2026-11-25 on live macOS 27.2 (26B123, SIP enabled; issue #78 F20):
+# all 25 original candidates existed and read back disabled in-session, but 22 did not persist
+# across shutdown/clone boot under SIP, leaving these 3 persistent labels.
 HYGIENE_DISABLE_LIST: tuple[tuple[str, str], ...] = (
-    ("system", "com.apple.analyticsd"),
-    ("system", "com.apple.apsd"),
-    ("system", "com.apple.bluetoothd"),
     ("system", "com.apple.findmymac"),
-    ("system", "com.apple.findmymacmessenger"),
-    ("system", "com.apple.icloud.findmydeviced"),
-    ("gui", "com.apple.assistant_service"),
-    ("gui", "com.apple.assistantd"),
-    ("gui", "com.apple.bird"),
-    ("gui", "com.apple.cloudd"),
-    ("gui", "com.apple.cloudpaird"),
-    ("gui", "com.apple.cloudphotod"),
-    ("gui", "com.apple.gamed"),
-    ("gui", "com.apple.homed"),
-    ("gui", "com.apple.icloudmailagent"),
-    ("gui", "com.apple.iCloudNotificationAgent"),
-    ("gui", "com.apple.knowledge-agent"),
-    ("gui", "com.apple.mediaanalysisd"),
-    ("gui", "com.apple.parsecd"),
-    ("gui", "com.apple.photoanalysisd"),
-    ("gui", "com.apple.photolibraryd"),
-    ("gui", "com.apple.Siri.agent"),
-    ("gui", "com.apple.siriknowledged"),
-    ("gui", "com.apple.suggestd"),
-    ("gui", "com.apple.tipsd"),
+    ("user", "com.apple.cloudpaird"),
+    ("user", "com.apple.Siri.agent"),
 )
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
@@ -2172,7 +2152,7 @@ def check_hygiene_disabled(ctx: Ctx, target: vmssh.Target) -> str:
             n_sys += 1
             if sys_map.get(label) not in ("disabled", "true"):
                 missing.append(f"system/{label}")
-        elif domain == "gui":
+        elif domain == "user":
             n_user += 1
             if user_map.get(label) not in ("disabled", "true"):
                 missing.append(f"user/{uid}/{label}")

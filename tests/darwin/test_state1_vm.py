@@ -819,7 +819,7 @@ class FakeWorld:
             elif dom.startswith("user/"):
                 lines = ['\t"com.apple.xpc.user.foo" => enabled']
                 for d, lbl in drv.HYGIENE_DISABLE_LIST:
-                    if d != "gui":
+                    if d != "user":
                         continue
                     if (d, lbl) in self.hygiene_missing:
                         continue
@@ -5686,16 +5686,23 @@ class Check(Base):
             if line.strip()
         )
         self.assertEqual(drv.HYGIENE_DISABLE_LIST, parsed)
-        self.assertEqual(len(drv.HYGIENE_DISABLE_LIST), 25)
         self.assertEqual(
-            sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "system"), 6
+            drv.HYGIENE_DISABLE_LIST,
+            (
+                ("system", "com.apple.findmymac"),
+                ("user", "com.apple.cloudpaird"),
+                ("user", "com.apple.Siri.agent"),
+            ),
         )
-        self.assertEqual(sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "gui"), 19)
+        self.assertEqual(
+            sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "system"), 1
+        )
+        self.assertEqual(sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "user"), 2)
 
     def test_f20_2m_and_10a_fail_on_system_hygiene_enabled_or_missing(self):
         for kind, attr, target_label in (
-            ("system enabled", "hygiene_enabled", "com.apple.apsd"),
-            ("system missing", "hygiene_missing", "com.apple.analyticsd"),
+            ("system enabled", "hygiene_enabled", "com.apple.findmymac"),
+            ("system missing", "hygiene_missing", "com.apple.findmymac"),
         ):
             with self.subTest(kind):
                 self.world.hygiene_enabled = set()
@@ -5711,13 +5718,13 @@ class Check(Base):
 
     def test_f20_2m_and_10a_fail_on_gui_hygiene_enabled_or_missing(self):
         for kind, attr, target_label in (
-            ("user enabled", "hygiene_enabled", "com.apple.bird"),
-            ("user missing", "hygiene_missing", "com.apple.tipsd"),
+            ("user enabled", "hygiene_enabled", "com.apple.cloudpaird"),
+            ("user missing", "hygiene_missing", "com.apple.Siri.agent"),
         ):
             with self.subTest(kind):
                 self.world.hygiene_enabled = set()
                 self.world.hygiene_missing = set()
-                setattr(self.world, attr, {("gui", target_label)})
+                setattr(self.world, attr, {("user", target_label)})
                 rc, s = self.run_cmd(*self.check_args())
                 self.assertEqual(rc, 1, kind)
                 st = self.steps(s)
@@ -5774,7 +5781,7 @@ class Check(Base):
         self.assertEqual(rc, 0, s)
         st = self.steps(s)
         self.assertEqual(st["2m"]["status"], "pass")
-        self.assertIn("25/25 hygiene jobs disabled (6 system, 19 user/501)", st["2m"]["evidence"])
+        self.assertIn("3/3 hygiene jobs disabled (1 system, 2 user/501)", st["2m"]["evidence"])
         self.assertEqual(st["10a"]["status"], "pass")
         self.assertIn("2a-2m re-checked", st["10a"]["evidence"])
         self.assertTrue(
@@ -5841,7 +5848,7 @@ class Check(Base):
             ]
         )
         for label, bad_sys in (
-            ("duplicate enabled after disabled", f'disabled services = {{\n{sys_good}\n\t"com.apple.apsd" => enabled\n}}\n'),
+            ("duplicate enabled after disabled", f'disabled services = {{\n{sys_good}\n\t"com.apple.findmymac" => enabled\n}}\n'),
             ("trailing garbage", f'disabled services = {{\n{sys_good}\n\t"com.apple.foo" => true; enabled\n}}\n'),
             ("bare CR", f'disabled services = {{\r\n{sys_good}\n}}\n'),
         ):
@@ -5856,10 +5863,10 @@ class Check(Base):
 
         # End-to-end check: regex metachar / suffix spoofing in system fails 2m & 10a
         spoof_lines = ['\t"com.apple.screensharing" => disabled'] + [
-            f'\t"{lbl.replace(".", "X") if lbl == "com.apple.apsd" else lbl}" => disabled'
+            f'\t"{lbl.replace(".", "X") if lbl == "com.apple.findmymac" else lbl}" => disabled'
             for d, lbl in drv.HYGIENE_DISABLE_LIST
             if d == "system"
-        ] + ['\t"com.apple.apsd.extra" => disabled']
+        ] + ['\t"com.apple.findmymac.extra" => disabled']
         self.world.print_disabled_override = {
             "system": "disabled services = {\n" + "\n".join(spoof_lines) + "\n}\n"
         }
@@ -5868,7 +5875,7 @@ class Check(Base):
         st = self.steps(s)
         self.assertEqual(st["2j"]["status"], "pass")
         self.assertEqual(st["2m"]["status"], "fail")
-        self.assertIn("system/com.apple.apsd", st["2m"]["evidence"])
+        self.assertIn("system/com.apple.findmymac", st["2m"]["evidence"])
         self.assertEqual(st["10a"]["status"], "fail")
         self.world.print_disabled_override = {}
 

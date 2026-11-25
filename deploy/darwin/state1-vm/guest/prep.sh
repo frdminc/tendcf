@@ -19,38 +19,18 @@ SSH_DROPIN=/etc/ssh/sshd_config.d/050-tendcf-state1.conf
 SU_PLIST=/Library/Preferences/com.apple.SoftwareUpdate
 ADMIN_UID=$(id -u admin)
 
-# Unused launchd jobs to disable: "<domain> <label>" per line. A candidate list for a
-# headless test VM, not a measured one: the first real run's before-* snapshot is the
-# evidence to prune it against. A label is touched only when its plist ships in one of
-# the standard launchd directories, so a name this macOS version lacks is skipped (and
-# printed), not written into the disabled database. Nothing here is needed for SSH, sudo,
-# launchd, installer, softwareupdate or Recovery.
+# Unused launchd jobs to disable: "<domain> <label>" per line. Pruned empirically on 2026-11-25
+# against live macOS 27.2 (26B123, SIP enabled; issue #78 F20): all 25 original candidate plists
+# existed and read back disabled in-session during `golden`, but 22 did not persist across
+# shutdown/clone boot under SIP, leaving these 3 persistent labels (`user/<uid>` shares
+# `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist` with `gui/<uid>` and works headlessly
+# even after password rotation). A label is touched only when its plist ships in one of the
+# standard launchd directories. Nothing here is needed for SSH, sudo, launchd, installer,
+# softwareupdate or Recovery.
 DISABLE_LIST='
-system com.apple.analyticsd
-system com.apple.apsd
-system com.apple.bluetoothd
 system com.apple.findmymac
-system com.apple.findmymacmessenger
-system com.apple.icloud.findmydeviced
-gui    com.apple.assistant_service
-gui    com.apple.assistantd
-gui    com.apple.bird
-gui    com.apple.cloudd
-gui    com.apple.cloudpaird
-gui    com.apple.cloudphotod
-gui    com.apple.gamed
-gui    com.apple.homed
-gui    com.apple.icloudmailagent
-gui    com.apple.iCloudNotificationAgent
-gui    com.apple.knowledge-agent
-gui    com.apple.mediaanalysisd
-gui    com.apple.parsecd
-gui    com.apple.photoanalysisd
-gui    com.apple.photolibraryd
-gui    com.apple.Siri.agent
-gui    com.apple.siriknowledged
-gui    com.apple.suggestd
-gui    com.apple.tipsd
+user   com.apple.cloudpaird
+user   com.apple.Siri.agent
 '
 
 log() { printf 'prep: %s\n' "$*"; }
@@ -66,6 +46,7 @@ snapshot() { # snapshot PREFIX
     launchctl print "gui/$ADMIN_UID" >"$d/launchctl-print-gui.txt" 2>&1 || true
     launchctl print-disabled system >"$d/disabled-system.txt" 2>&1 || true
     launchctl print-disabled "gui/$ADMIN_UID" >"$d/disabled-gui.txt" 2>&1 || true
+    launchctl print-disabled "user/$ADMIN_UID" >"$d/disabled-user.txt" 2>&1 || true
     mdutil -a -s >"$d/mdutil.txt" 2>&1 || true
     sysadminctl -secureTokenStatus admin >"$d/securetoken.txt" 2>&1 || true
     spctl --status >"$d/spctl.txt" 2>&1 || true
@@ -214,7 +195,7 @@ printf '%s\n' "$DISABLE_LIST" | grep -v '^$' >"$STATE_DIR/disable-list.txt"
 while read -r domain label; do
     case $domain in
         system) dom=system dirs="/System/Library/LaunchDaemons /Library/LaunchDaemons" ;;
-        gui) dom=gui/$ADMIN_UID dirs="/System/Library/LaunchAgents /Library/LaunchAgents" ;;
+        user) dom=user/$ADMIN_UID dirs="/System/Library/LaunchAgents /Library/LaunchAgents" ;;
         *) die "bad domain in DISABLE_LIST: $domain" ;;
     esac
     present=0
