@@ -152,6 +152,14 @@ class FakeWorld:
         )
         self.signals_sent = 0
         self.screensharing_on = False
+        self.admin_uid_result = (0, "501\n", "")
+        self.print_disabled_rc = {}  # domain -> non-zero rc override
+        self.hygiene_enabled = set()  # {(domain, label)} reported as => enabled
+        self.hygiene_missing = set()  # {(domain, label)} omitted from print-disabled
+        self.hygiene_use_true = False
+        self.extra_vz_vms = 0  # extra non-tart Virtualization.framework VM processes
+        self.extra_ps_comms = []  # extra non-VZ process paths in `ps -axo comm=`
+        self.ps_fail = False
         self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
         self.sshd_spec_outputs = {}  # spec -> output override for multi-spec tests
         self.sshd_specs_seen = []  # every -C spec passed to `sudo -n sshd -T -C`
@@ -294,6 +302,17 @@ class FakeWorld:
             if self.interrupt_after_tart == argv[1]:
                 raise Interrupt("SIGINT")
             return res
+        if argv == ["ps", "-axo", "comm="]:
+            if self.ps_fail:
+                return drv.Result(1, "", "ps: failed")
+            n_running = sum(1 for v in self.vms.values() if v.get("Running"))
+            lines = [
+                "/sbin/launchd",
+                "/usr/sbin/syslogd",
+                *self.extra_ps_comms,
+                *([drv.VZ_VM_COMM] * (n_running + self.extra_vz_vms)),
+            ]
+            return drv.Result(0, "\n".join(lines) + "\n")
         if argv[0] == "gh":
             return self._gh(argv[1:])
         if argv[0] == "ssh-keygen":  # a real one: the minted key must be a real key
@@ -730,14 +749,42 @@ class FakeWorld:
             return drv.Result(
                 *(self.su_outputs.pop(0) if self.su_outputs else self.su_schedule)
             )
-        if r[:4] == ["sudo", "-n", "launchctl", "print-disabled"]:
-            on = self.screensharing_on
-            return drv.Result(
-                0,
-                '{\n\t"com.apple.xpc.foo" => enabled\n'
-                + ("" if on else '\t"com.apple.screensharing" => disabled\n')
-                + "}\n",
-            )
+        if r == ["id", "-u", "admin"]:
+            return drv.Result(*self.admin_uid_result)
+        if r[:4] == ["sudo", "-n", "launchctl", "print-disabled"] and len(r) == 5:
+            dom = r[4]
+            if dom in self.print_disabled_rc:
+                return drv.Result(
+                    self.print_disabled_rc[dom],
+                    "",
+                    f"launchctl print-disabled {dom}: failed\n",
+                )
+            val = "true" if self.hygiene_use_true else "disabled"
+            if dom == "system":
+                lines = ['\t"com.apple.xpc.foo" => enabled']
+                if not self.screensharing_on:
+                    lines.append('\t"com.apple.screensharing" => disabled')
+                for d, lbl in drv.HYGIENE_DISABLE_LIST:
+                    if d != "system":
+                        continue
+                    if (d, lbl) in self.hygiene_missing:
+                        continue
+                    if (d, lbl) in self.hygiene_enabled:
+                        lines.append(f'\t"{lbl}" => enabled')
+                    else:
+                        lines.append(f'\t"{lbl}" => {val}')
+            else:
+                lines = ['\t"com.apple.xpc.gui.foo" => enabled']
+                for d, lbl in drv.HYGIENE_DISABLE_LIST:
+                    if d != "gui":
+                        continue
+                    if (d, lbl) in self.hygiene_missing:
+                        continue
+                    if (d, lbl) in self.hygiene_enabled:
+                        lines.append(f'\t"{lbl}" => enabled')
+                    else:
+                        lines.append(f'\t"{lbl}" => {val}')
+            return drv.Result(0, "{\n" + "\n".join(lines) + "\n}\n")
         if r[:3] == ["netstat", "-an", "-p"]:
             return drv.Result(
                 0,
@@ -2676,6 +2723,81 @@ class Golden(Base):
         self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
         self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
 
+    def test_f23_non_tart_vz_vm_refuses_golden_and_fails_boot_and_pin(self):
+        # F23: non-tart Virtualization.framework VM processes block golden preflight (limit=1),
+        # assert_no_other_vm, boot() (g2), and pin() (g7), while non-VZ "Virtual" procs do not.
+        # (c1) 1 non-tart VZ VM at preflight -> Refusal (exit 2) and StepFail in assert_no_other_vm
+        self.world.extra_vz_vms = 1
+        with self.assertRaises(drv.StepFail) as cm:
+            drv.assert_no_other_vm(self.ctx)
+        self.assertIn("1 non-tart Virtualization.framework VM", str(cm.exception))
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 2)
+        self.assertEqual(s["steps"][-1]["step"], "refused")
+        self.assertIn("1 non-tart Virtualization.framework VM", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        self.assertEqual(self.world.tart_calls("run"), [])
+
+        # (d1) Direct assert_no_other_vm(allowed=build): 1 VZ matching allowed passes; 2 VZ fails
+        build = f"{GOLDEN}-build"
+        self.world.vms = {build: {"Running": True}}
+        self.world.extra_vz_vms = 0
+        drv.assert_no_other_vm(self.ctx, allowed=build)  # 1 VZ == allowed_running -> ok
+        self.world.extra_vz_vms = 1
+        with self.assertRaises(drv.StepFail) as cm:
+            drv.assert_no_other_vm(self.ctx, allowed=build)
+        self.assertIn("1 non-tart Virtualization.framework VM", str(cm.exception))
+
+        # (c2) Non-tart VZ VM starts right after tart clone -> boot() (g2) fails
+        self.tearDown_world()
+        real_run1 = self.world.run
+
+        def start_vz_after_clone(argv, **kw):
+            res = real_run1(argv, **kw)
+            if argv[:2] == ["tart", "clone"]:
+                self.world.extra_vz_vms = 1
+            return res
+
+        with mock.patch.object(self.world, "run", start_vz_after_clone):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g2"]["status"], "fail")
+        self.assertIn(
+            "1 non-tart Virtualization.framework VM", self.steps(s)["g2"]["evidence"]
+        )
+        self.assertNotIn(build, self.world.vms)
+
+        # (d2) Non-tart VZ VM starts right after prep.sh -> pin() (g7) fails before pinning
+        self.tearDown_world()
+        real_run2 = self.world.run
+
+        def start_vz_after_prep(argv, **kw):
+            res = real_run2(argv, **kw)
+            if argv[:1] == ["ssh"] and "PREP-RESULT" in (kw.get("input_text") or ""):
+                self.world.extra_vz_vms = 1
+            return res
+
+        with mock.patch.object(self.world, "run", start_vz_after_prep):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g7"]["status"], "fail")
+        self.assertIn(
+            "1 non-tart Virtualization.framework VM", self.steps(s)["g7"]["evidence"]
+        )
+        self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
+        self.assertNotIn(build, self.world.vms)
+
+        # (e) Non-VZ processes with "Virtual" in the name are NOT counted and do not block golden
+        self.tearDown_world()
+        self.world.extra_ps_comms = [
+            "/Library/Application Support/org.pqrs/Karabiner-VirtualHIDDevice",
+            "/usr/local/bin/VirtualBoxVM",
+            drv.VZ_VM_COMM + ".helper",
+        ]
+        self.assertEqual(drv.vz_vm_count(self.ctx), 0)
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+
     def test_issue78_tart_list_failing_during_commit_reports_unknown_state_and_keeps_build(
         self,
     ):
@@ -3853,7 +3975,7 @@ class Check(Base):
         self.assertTrue(s["ok"])
         self.assertEqual(s["schema"], drv.SCHEMA)
         for sid in (
-            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l",
+            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l", "2m",
             "10", "10a", "11",
         ):  # fmt: skip
             self.assertEqual(st[sid]["status"], "pass", (sid, st[sid]))
@@ -5502,6 +5624,164 @@ class Check(Base):
             self.assertEqual(
                 shlex.split(a[-1]), ["dscl", ".", "-authonly", "admin", "admin"]
             )
+
+    def test_f20_hygiene_disable_list_matches_prep_sh(self):
+        # F20: HYGIENE_DISABLE_LIST in state1_vm.py must stay in exact parity with prep.sh.
+        prep_text = (VMDIR / "guest" / "prep.sh").read_text(encoding="utf-8")
+        m = re.search(r"^DISABLE_LIST='\n(.*?)\n'$", prep_text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "DISABLE_LIST block not found in prep.sh")
+        parsed = tuple(
+            tuple(line.split())
+            for line in m.group(1).splitlines()
+            if line.strip()
+        )
+        self.assertEqual(drv.HYGIENE_DISABLE_LIST, parsed)
+        self.assertEqual(len(drv.HYGIENE_DISABLE_LIST), 25)
+        self.assertEqual(
+            sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "system"), 6
+        )
+        self.assertEqual(sum(1 for d, _ in drv.HYGIENE_DISABLE_LIST if d == "gui"), 19)
+
+    def test_f20_2m_and_10a_fail_on_system_hygiene_enabled_or_missing(self):
+        for kind, attr, target_label in (
+            ("system enabled", "hygiene_enabled", "com.apple.apsd"),
+            ("system missing", "hygiene_missing", "com.apple.analyticsd"),
+        ):
+            with self.subTest(kind):
+                self.world.hygiene_enabled = set()
+                self.world.hygiene_missing = set()
+                setattr(self.world, attr, {("system", target_label)})
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, kind)
+                st = self.steps(s)
+                self.assertEqual(st["2m"]["status"], "fail", kind)
+                self.assertIn(f"system/{target_label}", st["2m"]["evidence"])
+                self.assertEqual(st["10a"]["status"], "fail", kind)
+                self.assertIn(f"system/{target_label}", st["10a"]["evidence"])
+
+    def test_f20_2m_and_10a_fail_on_gui_hygiene_enabled_or_missing(self):
+        for kind, attr, target_label in (
+            ("gui enabled", "hygiene_enabled", "com.apple.bird"),
+            ("gui missing", "hygiene_missing", "com.apple.tipsd"),
+        ):
+            with self.subTest(kind):
+                self.world.hygiene_enabled = set()
+                self.world.hygiene_missing = set()
+                setattr(self.world, attr, {("gui", target_label)})
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, kind)
+                st = self.steps(s)
+                self.assertEqual(st["2m"]["status"], "fail", kind)
+                self.assertIn(f"gui/501/{target_label}", st["2m"]["evidence"])
+                self.assertEqual(st["10a"]["status"], "fail", kind)
+                self.assertIn(f"gui/501/{target_label}", st["10a"]["evidence"])
+
+    def test_f20_2m_and_10a_fail_closed_on_print_disabled_error_and_bad_uid(self):
+        # launchctl print-disabled non-zero on system or gui/<uid>
+        for dom in ("system", "gui/501"):
+            with self.subTest(print_disabled_fail=dom):
+                self.world.print_disabled_rc = {dom: 1}
+                self.world.admin_uid_result = (0, "501\n", "")
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, dom)
+                st = self.steps(s)
+                self.assertEqual(st["2m"]["status"], "fail", dom)
+                self.assertIn(dom, st["2m"]["evidence"])
+                self.assertEqual(st["10a"]["status"], "fail", dom)
+        self.world.print_disabled_rc = {}
+
+        # id -u admin non-zero, empty, non-numeric, or multi-line
+        for label, res in (
+            ("non-zero rc", (1, "", "id: admin: no such user\n")),
+            ("empty output", (0, "", "")),
+            ("non-numeric", (0, "admin\n", "")),
+            ("negative", (0, "-501\n", "")),
+            ("multi-line", (0, "501\n502\n", "")),
+        ):
+            with self.subTest(bad_uid=label):
+                self.world.admin_uid_result = res
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1, label)
+                st = self.steps(s)
+                self.assertEqual(st["2m"]["status"], "fail", label)
+                self.assertIn("id -u admin", st["2m"]["evidence"])
+                self.assertEqual(st["10a"]["status"], "fail", label)
+
+        # `=> true` variant passes cleanly (same semantics as 2j / prep.sh)
+        self.world.admin_uid_result = (0, "501\n", "")
+        self.world.hygiene_use_true = True
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)
+        self.assertEqual(st["2m"]["status"], "pass")
+        self.assertIn("25/25 hygiene jobs disabled", st["2m"]["evidence"])
+        self.assertEqual(st["10a"]["status"], "pass")
+        self.assertIn("2a-2m re-checked", st["10a"]["evidence"])
+
+    def test_f23_non_tart_vz_vms_enforced_in_check_and_vm_cap(self):
+        # (a) 2 non-tart VZ processes (0 tart VMs) -> Refusal in assert_vm_cap and check
+        self.world.extra_vz_vms = 2
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.assert_vm_cap(self.ctx)
+        self.assertIn("2 non-tart Virtualization.framework VMs", str(cm.exception))
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn(
+            "2 non-tart Virtualization.framework VMs", s["steps"][-1]["evidence"]
+        )
+        self.assertEqual(self.world.tart_calls("clone"), [])
+        self.assertEqual(self.world.tart_calls("run"), [])
+
+        # (b) 1 tart VM + 1 non-tart VZ process (2 total) -> Refusal naming both
+        self.world.vms["x"] = {"Running": True}
+        self.world.extra_vz_vms = 1
+        with self.assertRaises(drv.Refusal) as cm:
+            drv.assert_vm_cap(self.ctx)
+        self.assertIn("x", str(cm.exception))
+        self.assertIn("1 non-tart Virtualization.framework VM", str(cm.exception))
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 2)
+        self.assertIn("x", s["steps"][-1]["evidence"])
+        self.assertIn(
+            "1 non-tart Virtualization.framework VM", s["steps"][-1]["evidence"]
+        )
+        self.assertEqual(self.world.tart_calls("clone"), [])
+
+        # (e) Non-VZ processes with "Virtual" in the name are not counted as VMs
+        del self.world.vms["x"]
+        self.world.extra_vz_vms = 0
+        self.world.extra_ps_comms = [
+            "/Library/Application Support/org.pqrs/Karabiner-VirtualHIDDevice",
+            "/usr/local/bin/VirtualBoxVM",
+            drv.VZ_VM_COMM + ".helper",
+        ]
+        self.assertEqual(drv.vz_vm_count(self.ctx), 0)
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+
+        # (f) ps returning non-zero fails closed with ToolError
+        self.world.ps_fail = True
+        with self.assertRaises(drv.ToolError):
+            drv.vz_vm_count(self.ctx)
+        with self.assertRaises(drv.ToolError):
+            drv.assert_vm_cap(self.ctx)
+        with self.assertRaises(drv.ToolError):
+            drv.assert_no_other_vm(self.ctx)
+
+    def test_f22_clone_vm_passes_tart_no_auto_prune_1(self):
+        # F22: clone_vm() always passes TART_NO_AUTO_PRUNE=1 (overriding os.environ too)
+        self.world.vms["src-vm"] = {"Running": False}
+        self.world.hostkeys["src-vm"] = NEW_BLOB
+        with mock.patch.dict(os.environ, {"TART_NO_AUTO_PRUNE": "0"}, clear=False):
+            r = drv.clone_vm(self.ctx, "src-vm", "dst-vm", 60)
+        self.assertEqual(r.rc, 0)
+        clone_call = next(
+            (a, e)
+            for a, e in reversed(self.world.calls)
+            if a == ["tart", "clone", "src-vm", "dst-vm"]
+        )
+        self.assertEqual(clone_call[1]["TART_NO_AUTO_PRUNE"], "1")
+        self.assertEqual(clone_call[1]["TART_HOME"], self.ctx.tart_home)
 
     def test_a_second_driver_is_refused_while_the_lock_is_held(self):
         with drv.driver_lock(self.ctx):
@@ -7233,7 +7513,7 @@ class CheckRenderer(Base):
         self.assertTrue(s["ok"])
         st = self.steps(s)
         for sid in (
-            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l",
+            "1", "2a", "2b", "2c", "2d", "2e", "2f", "2g", "2h", "2i", "2j", "2k", "2l", "2m",
             "3", "4", "5", "6", "7", "8", "9", "9a", "10", "10a", "10b", "11a", "11",
         ):  # fmt: skip
             self.assertEqual(st[sid]["status"], "pass", (sid, st[sid]))

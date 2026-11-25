@@ -117,6 +117,43 @@ LOCK_NAME = "driver.lock"
 SCHEMA = "tendcf-state1-vm-summary/1"
 FRAMEWORK_ROOT = "/Library/Frameworks/Python.framework"
 VM_CAP = 2  # Apple's licence: two macOS VMs at once per host
+# Exact binary path reported by `ps -axo comm=` for every running macOS Virtualization.framework VM
+# (Tart, UTM-VZ, OrbStack, Lima-VZ, Parallels-VZ, another user's Tart VM; observed on macOS 27.2).
+VZ_VM_COMM = (
+    "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/"
+    "com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/"
+    "com.apple.Virtualization.VirtualMachine"
+)
+ADMIN_UID_RE = re.compile(r"^[0-9]+\Z")
+# All 25 unused launchd hygiene jobs disabled by guest/prep.sh (6 system + 19 gui);
+# verified 2026-11-25 on macOS 27.2 (26B123): PREP-RESULT disabled=25 absent=0 failed=0.
+HYGIENE_DISABLE_LIST: tuple[tuple[str, str], ...] = (
+    ("system", "com.apple.analyticsd"),
+    ("system", "com.apple.apsd"),
+    ("system", "com.apple.bluetoothd"),
+    ("system", "com.apple.findmymac"),
+    ("system", "com.apple.findmymacmessenger"),
+    ("system", "com.apple.icloud.findmydeviced"),
+    ("gui", "com.apple.assistant_service"),
+    ("gui", "com.apple.assistantd"),
+    ("gui", "com.apple.bird"),
+    ("gui", "com.apple.cloudd"),
+    ("gui", "com.apple.cloudpaird"),
+    ("gui", "com.apple.cloudphotod"),
+    ("gui", "com.apple.gamed"),
+    ("gui", "com.apple.homed"),
+    ("gui", "com.apple.icloudmailagent"),
+    ("gui", "com.apple.iCloudNotificationAgent"),
+    ("gui", "com.apple.knowledge-agent"),
+    ("gui", "com.apple.mediaanalysisd"),
+    ("gui", "com.apple.parsecd"),
+    ("gui", "com.apple.photoanalysisd"),
+    ("gui", "com.apple.photolibraryd"),
+    ("gui", "com.apple.Siri.agent"),
+    ("gui", "com.apple.siriknowledged"),
+    ("gui", "com.apple.suggestd"),
+    ("gui", "com.apple.tipsd"),
+)
 EVIDENCE_MAX = 2000
 CHECK_PREFIX = "state1-check-"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -813,35 +850,63 @@ def oci_names(ctx: Ctx) -> set[str]:
     return {v["Name"] for v in tart_list(ctx, "oci")}
 
 
+def vz_vm_count(ctx: Ctx) -> int:
+    """Count running macOS Virtualization.framework VM XPC processes (non-tart included)."""
+    r = ctx.run(["ps", "-axo", "comm="], timeout=15)
+    if r.rc != 0:
+        raise ToolError(
+            f"ps -axo comm= failed (rc {r.rc}): {clip(r.stderr or r.stdout, 300)}"
+        )
+    return sum(1 for ln in r.stdout.splitlines() if ln.strip() == VZ_VM_COMM)
+
+
 def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
-    """Refuse when `limit` VMs are already running. Counts every running local VM (conservative).
+    """Refuse when `limit` VMs are already running. Counts both running local tart VMs
+    and macOS Virtualization.framework VM processes (`com.apple.Virtualization.VirtualMachine`),
+    catching non-tart VZ hypervisors too (F23).
 
     The default is Apple's licence cap. golden passes limit=1: it needs the vmnet to itself
     (no other guest on it while the host key is pinned), so any running VM refuses it.
     """
     running = sorted(n for n, v in local_vms(ctx).items() if v.get("Running"))
-    if len(running) >= limit:
+    vz = vz_vm_count(ctx)
+    total = max(len(running), vz)
+    if total >= limit:
         why = (
             f"Apple's licence allows {VM_CAP} macOS VMs at once. Not starting another."
             if limit >= VM_CAP
             else "golden needs the host network to itself (no other guest may share the vmnet "
             "while the host key is pinned). Stop them first."
         )
-        raise Refusal(
-            f"{len(running)} VMs already running ({', '.join(running)}); {why}"
-        )
+        parts = list(running)
+        extra_vz = max(0, vz - len(running))
+        if extra_vz:
+            parts.append(
+                f"{extra_vz} non-tart Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+            )
+        raise Refusal(f"{total} VMs already running ({', '.join(parts)}); {why}")
     return running
 
 
 def assert_no_other_vm(ctx: Ctx, allowed: str | None = None) -> None:
-    """Fail the current step if any local VM other than `allowed` is running (issue 78:
+    """Fail the current step if any local tart VM other than `allowed` is running, or if
+    extra Virtualization.framework VM processes beyond `allowed` are running (issue 78 / F23:
     re-checked in golden's boot() and at the start of pin() so a VM started mid-build fails it)."""
-    others = sorted(
-        n for n, v in local_vms(ctx).items() if v.get("Running") and n != allowed
+    vms = local_vms(ctx)
+    others = sorted(n for n, v in vms.items() if v.get("Running") and n != allowed)
+    allowed_running = (
+        1 if (allowed is not None and vms.get(allowed, {}).get("Running")) else 0
     )
-    if others:
+    vz = vz_vm_count(ctx)
+    if others or vz > allowed_running:
+        parts = list(others)
+        extra_vz = max(0, vz - (len(others) + allowed_running))
+        if extra_vz:
+            parts.append(
+                f"{extra_vz} non-tart Virtualization.framework VM{'s' if extra_vz != 1 else ''}"
+            )
         raise StepFail(
-            f"another VM is running ({', '.join(others)}); golden needs the host network "
+            f"another VM is running ({', '.join(parts)}); golden needs the host network "
             "to itself while the host key is pinned"
         )
 
@@ -1992,6 +2057,70 @@ def updates_off(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
     return ok, " ".join(ev)
 
 
+def _launchctl_label_disabled(text: str, label: str) -> bool:
+    return (
+        re.search(
+            rf'^[ \t]*"{re.escape(label)}"[ \t]*=>[ \t]*(?:disabled|true)\b',
+            text,
+            re.MULTILINE,
+        )
+        is not None
+    )
+
+
+def check_hygiene_disabled(ctx: Ctx, target: vmssh.Target) -> str:
+    """Assert every unused launchd hygiene job in HYGIENE_DISABLE_LIST is disabled (F20).
+
+    Queries `sudo -n launchctl print-disabled system`, `id -u admin`, and
+    `sudo -n launchctl print-disabled gui/<uid>`, failing closed with StepFail on any
+    non-zero exit, invalid UID, or label not reported as disabled/true.
+    """
+    r_sys = rssh(ctx, target, ["sudo", "-n", "launchctl", "print-disabled", "system"])
+    if r_sys.rc != 0:
+        raise StepFail(
+            f"launchctl print-disabled system failed (rc {r_sys.rc}): "
+            f"{clip((r_sys.stderr or r_sys.stdout).strip(), 200)}"
+        )
+    r_uid = rssh(ctx, target, ["id", "-u", "admin"])
+    uid = r_uid.stdout.strip()
+    if r_uid.rc != 0 or not ADMIN_UID_RE.match(uid):
+        raise StepFail(
+            f"id -u admin failed or returned non-numeric UID (rc {r_uid.rc}): "
+            f"{clip((r_uid.stdout + ' ' + r_uid.stderr).strip(), 200)!r}"
+        )
+    r_gui = rssh(
+        ctx, target, ["sudo", "-n", "launchctl", "print-disabled", f"gui/{uid}"]
+    )
+    if r_gui.rc != 0:
+        raise StepFail(
+            f"launchctl print-disabled gui/{uid} failed (rc {r_gui.rc}): "
+            f"{clip((r_gui.stderr or r_gui.stdout).strip(), 200)}"
+        )
+    missing: list[str] = []
+    n_sys = 0
+    n_gui = 0
+    for domain, label in HYGIENE_DISABLE_LIST:
+        if domain == "system":
+            n_sys += 1
+            if not _launchctl_label_disabled(r_sys.stdout, label):
+                missing.append(f"system/{label}")
+        elif domain == "gui":
+            n_gui += 1
+            if not _launchctl_label_disabled(r_gui.stdout, label):
+                missing.append(f"gui/{uid}/{label}")
+        else:
+            raise StepFail(f"unknown hygiene domain {domain!r} for {label!r}")
+    if missing:
+        raise StepFail(
+            f"{len(missing)}/{len(HYGIENE_DISABLE_LIST)} hygiene jobs not disabled: "
+            + ", ".join(missing)
+        )
+    return (
+        f"{len(HYGIENE_DISABLE_LIST)}/{len(HYGIENE_DISABLE_LIST)} hygiene jobs disabled "
+        f"({n_sys} system, {n_gui} gui; uid={uid})"
+    )
+
+
 def persistent_assertions(
     ctx: Ctx, image: dict, t: vmssh.Target, facts: dict | None = None
 ) -> list[tuple[str, str, bool, str]]:
@@ -2120,6 +2249,12 @@ def persistent_assertions(
             ),
         )
     )
+    try:
+        ev_2m = check_hygiene_disabled(ctx, t)
+        ok_2m = True
+    except StepFail as e:
+        ok_2m, ev_2m = False, str(e)
+    out.append(("2m", "unused launchd hygiene jobs disabled", ok_2m, ev_2m))
     return out
 
 
@@ -4851,7 +4986,7 @@ def cmd_check(ctx: Ctx, args) -> int:
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
                         "; ".join(bad)
-                        or "2a-2l re-checked (2g after the reboot: "
+                        or "2a-2m re-checked (2g after the reboot: "
                         f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s; "
                         f"listing: {facts['mdutil'].listing!r})",
                     )
