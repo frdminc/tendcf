@@ -1519,41 +1519,49 @@ prepare_projector_source() {
     projector_prepared=1
 }
 
-# Detach any unsafe existing $installed_projector BEFORE check_tree() repairs
-# permissions under $prefix, so check_tree() can never launder a mutable or
-# untrusted inode into trusted-looking root:wheel 0644 metadata if an
-# intervening step fails before place_projector().
+# Lock down the parent directory chain under $prefix top-down (non-recursively)
+# and detach any unsafe existing $installed_projector BEFORE check_tree() runs
+# recursive repair, eliminating both the writable-parent race window and any
+# post-check_tree laundering of a mutable/untrusted inode.
 detach_unsafe_installed_projector() {
+    check_ancestors "$prefix"
+    installed_projector_originally_clean=0
+    if { [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; } && installed_projector_clean_ok; then
+        installed_projector_originally_clean=1
+        return 0
+    fi
     local d
     for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
-        if [ -L "$d" ]; then
-            die "$d is a symlink; refusing"
+        if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+            break
         fi
+        [ ! -L "$d" ] && [ -d "$d" ] || die "$d is not a real directory; refusing"
+        /usr/bin/chflags 0 "$d"
+        /bin/chmod -N "$d" 2>/dev/null || true
+        /usr/sbin/chown root:wheel "$d"
+        /bin/chmod a-s,go-w "$d"
+        check_dir_root_unwritable "$d"
     done
-    installed_projector_originally_clean=0
+    if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+        die "$installed_projector is a directory; refusing"
+    fi
     if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-        if installed_projector_clean_ok; then
-            installed_projector_originally_clean=1
-        else
-            if [ -d "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
-                die "$installed_projector is a directory; refusing"
-            fi
-            if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
-                /usr/bin/chflags 0 "$installed_projector"
-            fi
-            /bin/rm -f "$installed_projector"
-            if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
-                die "could not detach unsafe existing $installed_projector before repair"
-            fi
+        if [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ]; then
+            /usr/bin/chflags 0 "$installed_projector"
         fi
+        /bin/rm -f "$installed_projector"
+    fi
+    if [ -e "$installed_projector" ] || [ -L "$installed_projector" ]; then
+        die "could not remove untrusted $installed_projector"
     fi
 }
 
 place_projector() {
-    if [ "${projector_prepared:-0}" -ne 1 ] || [ ! -f "${prepared_projector_file:-}" ]; then
-        prepare_projector_source
-        detach_unsafe_installed_projector
-    fi
+    [ "${projector_prepared:-0}" -eq 1 ] \
+        && [ -n "${prepared_projector_file:-}" ] \
+        && [ -f "$prepared_projector_file" ] \
+        && [ ! -L "$prepared_projector_file" ] \
+        || die "projector source was not prepared or staged copy is missing"
     ensure_dir 755 "$prefix/share"
     ensure_dir 755 "$prefix/share/tendcf"
     ensure_dir 755 "$prefix/share/tendcf/bin"

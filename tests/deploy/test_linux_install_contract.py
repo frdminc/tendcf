@@ -219,11 +219,12 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertLess(idx_policy, idx_proj)
         self.assertLess(idx_proj, idx_data)
 
-        # Codex R4 #1: place_projector operates exclusively from $prepared_projector_file
+        # Codex R4 #1 & R5 #2: place_projector operates exclusively from $prepared_projector_file and never re-calls prepare_projector_source
         proj_fn = _extract_func(self.src, "place_projector")
         proj_code = "\n".join(line for line in proj_fn.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotIn("readlink", proj_code)
         self.assertNotIn("$projector_src", proj_code)
+        self.assertNotIn("prepare_projector_source", proj_code)
         self.assertIn("$prepared_projector_file", proj_code)
 
         put_fn = _extract_func(self.src, "put_data")
@@ -724,6 +725,8 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "put_data_had_prev=0\n"
                     f"{funcs}\n"
                     "trap cleanup_temp EXIT\n"
+                    "prepare_projector_source\n"
+                    "detach_unsafe_installed_projector\n"
                     "place_projector\n"
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
@@ -755,6 +758,43 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             r_link = run_place(link_src, sha=proj_sha, src_trusted=True)
             self.assertNotEqual(r_link.returncode, 0)
             self.assertIn("regular non-symlink", r_link.stderr)
+
+            # 6. R5 Fix #2 (Codex R5 #2): place_projector fails closed if $prepared_projector_file is missing (never reopens $projector_src)
+            dst.unlink()
+            missing_stage_script = (
+                "set -euo pipefail\n"
+                f'export PATH="{shim_dir}:$PATH"\n'
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                f'prefix="{prefix}"\n'
+                "check_ancestors_ok() { return 0; }\n"
+                f'here="{root}"\n'
+                f'projector_src="{PROJECTOR}"\n'
+                f'projector_sha256="{proj_sha}"\n'
+                f'installed_projector="{dst}"\n'
+                'probe_tmp=""\n'
+                'place_projector_stage=""\n'
+                'place_projector_tmp=""\n'
+                'prepared_projector_stage=""\n'
+                'prepared_projector_file=""\n'
+                "projector_prepared=0\n"
+                "installed_projector_originally_clean=0\n"
+                'put_data_stage_wd=""\n'
+                'put_data_tmp=""\n'
+                'put_data_backup=""\n'
+                "put_data_rollback_armed=0\n"
+                "put_data_had_prev=0\n"
+                f"{funcs}\n"
+                "trap cleanup_temp EXIT\n"
+                "prepare_projector_source\n"
+                'rm -f "$prepared_projector_file"\n'
+                "place_projector\n"
+            )
+            r_missing_stage = subprocess.run(
+                ["/bin/bash", "-c", missing_stage_script], capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(r_missing_stage.returncode, 0)
+            self.assertIn("staged copy is missing", r_missing_stage.stderr)
+            self.assertFalse(dst.exists(), "place_projector must NOT reopen $projector_src when staged file disappeared")
 
     def test_trust_helpers_reject_nonroot_writable_symlink_hops_and_untrusted_python(self) -> None:
         funcs = "\n".join(
@@ -991,19 +1031,66 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     r_retry = run_cmd_install(f'--projector-src "{dst}"')
                     self.assertNotEqual(r_retry.returncode, 0)
 
-            # 3. Pinned with valid --projector-sha256 over writable dst -> SUCCEEDS and replaces with FRESH INODE!
+            # 3. R5 Fix #1 (Codex R5 #1): unsafe writable parent (0777) with (a) existing 0644 leaf and (b) absent leaf
+            proj_bin_dir = prefix / "share" / "tendcf" / "bin"
+            # (a) Writable parent + existing 0644 leaf + mid-install failure -> parent locked down (0755), leaf detached/absent
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o644)
+            os.chmod(proj_bin_dir, 0o777)
+            r_wparent_leaf = run_cmd_install(
+                f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
+                fail_place_policy=True,
+            )
+            self.assertNotEqual(r_wparent_leaf.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
+                0,
+                "unsafe writable parent must be locked down non-writable before check_tree",
+            )
+            self.assertFalse(
+                dst.exists() or dst.is_symlink(),
+                "leaf inside unsafe writable parent must be detached before check_tree",
+            )
+            r_retry_wp = run_cmd_install(f'--projector-src "{dst}"')
+            self.assertNotEqual(r_retry_wp.returncode, 0)
+
+            # (b) Writable parent + absent leaf -> parent locked down top-down before check_tree, leaf stays absent
+            os.chmod(proj_bin_dir, 0o777)
+            r_wparent_absent = run_cmd_install(
+                f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
+                fail_place_policy=True,
+            )
+            self.assertNotEqual(r_wparent_absent.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
+                0,
+                "unsafe writable parent with absent leaf must be locked down non-writable before check_tree",
+            )
+            self.assertFalse(dst.exists() or dst.is_symlink())
+
+            # 4. R5 Fix #3 (Codex R5 #3): hold open writable FD on dst across cmd_install (prevents ext4 inode reuse
+            #    and proves the old writable descriptor cannot tamper with the newly installed projector)
             shutil.copy2(PROJECTOR, dst)
             os.chmod(dst, 0o666)
-            old_ino = dst.stat().st_ino
-            r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
-            self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
-            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
-            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
-            self.assertNotEqual(
-                dst.stat().st_ino,
-                old_ino,
-                "pinned install over formerly writable projector must replace inode",
-            )
+            with dst.open("r+b") as held_fd:
+                old_ino = os.fstat(held_fd.fileno()).st_ino
+                r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
+                self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
+                self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+                self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
+                self.assertNotEqual(
+                    dst.stat().st_ino,
+                    old_ino,
+                    "pinned install over formerly writable projector must replace inode",
+                )
+                held_fd.seek(0)
+                held_fd.write(b"# tampered-old-fd\n")
+                held_fd.flush()
+                self.assertEqual(
+                    dst.read_bytes(),
+                    PROJECTOR.read_bytes(),
+                    "writes through previously opened writable FD must NOT affect newly installed projector",
+                )
 
     def test_relative_projector_src_normalized_and_checked_through_ancestors(self) -> None:
         """R3 Fix #1 (Macroscope #4701728688): relative --projector-src normalized via pwd -L and ancestor-checked."""

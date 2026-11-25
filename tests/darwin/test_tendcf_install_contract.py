@@ -1125,6 +1125,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         )
         self.assertNotIn("resolve_realpath_ok", proj_code)
         self.assertNotIn("$projector_src", proj_code)
+        self.assertNotIn("prepare_projector_source", proj_code)
         self.assertIn("upgrade_prefix_swapped", proj_code)
         self.assertIn("installed_projector_originally_clean", proj_code)
         self.assertIn('/usr/bin/cmp -s "$prepared_projector_file" "$installed_projector"', proj_code)
@@ -1133,10 +1134,13 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         self.assertIn('/usr/bin/chflags 0 "$installed_projector"', proj_code)
 
         detach_fn = _extract_func(self.src, "detach_unsafe_installed_projector")
+        idx_d_lockdown = detach_fn.find('/bin/chmod a-s,go-w "$d"')
         idx_d_chflags = detach_fn.find('/usr/bin/chflags 0 "$installed_projector"')
         idx_d_rm = detach_fn.find('/bin/rm -f "$installed_projector"')
+        self.assertNotEqual(idx_d_lockdown, -1)
         self.assertNotEqual(idx_d_chflags, -1)
         self.assertNotEqual(idx_d_rm, -1)
+        self.assertLess(idx_d_lockdown, idx_d_rm, "parent lockdown must run BEFORE unlinking $installed_projector")
         self.assertLess(idx_d_chflags, idx_d_rm, "chflags 0 must run before rm -f in detach_unsafe_installed_projector")
 
         put_fn = _extract_func(self.src, "put_data")
@@ -1374,6 +1378,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "upgrade_prefix_swapped=0\n"
                     "changed=0\n"
                     f"{place_funcs}\n"
+                    "prepare_projector_source\n"
+                    "detach_unsafe_installed_projector\n"
                     "place_projector\n"
                     f"{post_cmds}\n"
                 )
@@ -1473,6 +1479,45 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             r_link = run_place(str(link_src), sha=proj_sha)
             self.assertNotEqual(r_link.returncode, 0)
             self.assertIn("regular non-symlink", r_link.stderr)
+
+            # 7b. R5 Fix #2 (Codex R5 #2): place_projector fails closed if $prepared_projector_file disappeared (never reopens $projector_src)
+            paths["installed_projector"].unlink()
+            missing_stage_script = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                "has_acl_path() { return 1; }\n"
+                "check_ancestors() { return 0; }\n"
+                "check_ancestors_ok() { return 0; }\n"
+                "make_stage() { return 0; }\n"
+                f'prefix="{paths["prefix"]}"\n'
+                f'stage_dir="{paths["stage_dir"]}"\n'
+                f'here="{root}"\n'
+                f'projector_src="{PROJECTOR}"\n'
+                f'projector_sha256="{proj_sha}"\n'
+                f'installed_projector="{paths["installed_projector"]}"\n'
+                'place_projector_tmp=""\n'
+                'prepared_projector_file=""\n'
+                "projector_prepared=0\n"
+                "installed_projector_originally_clean=0\n"
+                "upgrade_prefix_swapped=0\n"
+                "changed=0\n"
+                f"{place_funcs}\n"
+                "prepare_projector_source\n"
+                'rm -f "$prepared_projector_file"\n'
+                "place_projector\n"
+            )
+            r_missing_stage = subprocess.run(
+                ["/bin/bash", "-c", missing_stage_script], capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(r_missing_stage.returncode, 0)
+            self.assertIn("staged copy is missing", r_missing_stage.stderr)
+            self.assertFalse(
+                paths["installed_projector"].exists(),
+                "place_projector must NOT reopen $projector_src when staged file disappeared",
+            )
+            # Re-install projector for Gate 1 test below
+            r_reinstall = run_place(str(PROJECTOR), sha=proj_sha)
+            self.assertEqual(r_reinstall.returncode, 0, r_reinstall.stderr)
 
             # 8. Gate 1 rejection leaves live data untouched
             before_ino = paths["data"].stat().st_ino
@@ -2020,19 +2065,66 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     r_retry = run_cmd_install(f'--projector-src "{dst}"')
                     self.assertNotEqual(r_retry.returncode, 0)
 
-            # 3. Pinned with valid --projector-sha256 over writable dst -> SUCCEEDS and replaces with FRESH INODE!
+            # 3. R5 Fix #1 (Codex R5 #1): unsafe writable parent (0777) with (a) existing 0644 leaf and (b) absent leaf
+            proj_bin_dir = prefix / "share" / "tendcf" / "bin"
+            # (a) Writable parent + existing 0644 leaf + mid-install failure -> parent locked down (0755), leaf detached/absent
+            shutil.copy2(PROJECTOR, dst)
+            os.chmod(dst, 0o644)
+            os.chmod(proj_bin_dir, 0o777)
+            r_wparent_leaf = run_cmd_install(
+                f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
+                fail_place_policy=True,
+            )
+            self.assertNotEqual(r_wparent_leaf.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
+                0,
+                "unsafe writable parent must be locked down non-writable before check_tree",
+            )
+            self.assertFalse(
+                dst.exists() or dst.is_symlink(),
+                "leaf inside unsafe writable parent must be detached before check_tree",
+            )
+            r_retry_wp = run_cmd_install(f'--projector-src "{dst}"')
+            self.assertNotEqual(r_retry_wp.returncode, 0)
+
+            # (b) Writable parent + absent leaf -> parent locked down top-down before check_tree, leaf stays absent
+            os.chmod(proj_bin_dir, 0o777)
+            r_wparent_absent = run_cmd_install(
+                f'--projector-src "{ext_proj}" --projector-sha256 {proj_sha}',
+                fail_place_policy=True,
+            )
+            self.assertNotEqual(r_wparent_absent.returncode, 0)
+            self.assertEqual(
+                stat.S_IMODE(proj_bin_dir.stat().st_mode) & 0o022,
+                0,
+                "unsafe writable parent with absent leaf must be locked down non-writable before check_tree",
+            )
+            self.assertFalse(dst.exists() or dst.is_symlink())
+
+            # 4. R5 Fix #3 (Codex R5 #3): hold open writable FD on dst across cmd_install (prevents ext4 inode reuse
+            #    and proves the old writable descriptor cannot tamper with the newly installed projector)
             shutil.copy2(PROJECTOR, dst)
             os.chmod(dst, 0o666)
-            old_ino = dst.stat().st_ino
-            r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
-            self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
-            self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
-            self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
-            self.assertNotEqual(
-                dst.stat().st_ino,
-                old_ino,
-                "pinned install over formerly writable projector must replace inode",
-            )
+            with dst.open("r+b") as held_fd:
+                old_ino = os.fstat(held_fd.fileno()).st_ino
+                r_pinned = run_cmd_install(f'--projector-src "{dst}" --projector-sha256 {proj_sha}')
+                self.assertEqual(r_pinned.returncode, 0, r_pinned.stderr)
+                self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
+                self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
+                self.assertNotEqual(
+                    dst.stat().st_ino,
+                    old_ino,
+                    "pinned install over formerly writable projector must replace inode",
+                )
+                held_fd.seek(0)
+                held_fd.write(b"# tampered-old-fd\n")
+                held_fd.flush()
+                self.assertEqual(
+                    dst.read_bytes(),
+                    PROJECTOR.read_bytes(),
+                    "writes through previously opened writable FD must NOT affect newly installed projector",
+                )
 
     def test_cmd_install_tarball_prefix_swap_installs_pre_swap_staged_projector(self) -> None:
         """R4 Fix #1 (Codex R4 #1): Darwin tarball prefix swap installs pre-swap staged projector bytes without re-resolving $projector_src."""
