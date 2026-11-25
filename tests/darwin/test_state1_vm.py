@@ -6265,5 +6265,57 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
                     self.assertNotIn("Traceback", r.stderr, (name, r.stderr))
 
 
+class TrailingNewlineRegexTests(unittest.TestCase):
+    """Issue #55 R1: validation regexes in vmssh and state1_vm must use \\Z, not $."""
+
+    def test_vmssh_target_rejects_user_with_trailing_newline(self):
+        with self.assertRaises(ValueError):
+            vmssh.Target(
+                ip="127.0.0.1",
+                known_hosts="/tmp/kh",
+                identity="/tmp/id",
+                user="admin\n",
+            )
+        # Valid user still accepted.
+        t = vmssh.Target(
+            ip="127.0.0.1",
+            known_hosts="/tmp/kh",
+            identity="/tmp/id",
+            user="admin",
+        )
+        self.assertEqual(t.user, "admin")
+
+    def test_state1_vm_regexes_reject_trailing_newline(self):
+        cases = (
+            ("RUN_ID_RE", drv.RUN_ID_RE, "123456789"),
+            ("SHA256_LINE_RE", drv.SHA256_LINE_RE, "a" * 64 + "  file.tar.gz"),
+            ("GUEST_STAGE_RE", drv.GUEST_STAGE_RE, "/var/tmp/tendcf-stage.abc123"),
+            ("NAME_RE", drv.NAME_RE, "state1-golden"),
+            ("REPO_RE", drv.REPO_RE, "ghcr.io/cirruslabs/macos-sequoia-vanilla"),
+            ("TAG_RE", drv.TAG_RE, "latest"),
+            ("DIGEST_RE", drv.DIGEST_RE, "sha256:" + "0" * 64),
+            ("KEY_ID_RE", drv.KEY_ID_RE, "key-1"),
+            ("WORKDIR_RE", drv.WORKDIR_RE, "/opt/tendcf/work"),
+        )
+        for label, rx, good in cases:
+            with self.subTest(label):
+                self.assertIsNotNone(rx.match(good), f"{label} rejected valid {good!r}")
+                self.assertIsNone(
+                    rx.match(good + "\n"),
+                    f"{label} accepted trailing newline on {good!r}",
+                )
+
+    def test_read_image_json_rejects_trailing_newline_in_python_fields(self):
+        for field in ("version", "sha256", "url", "signer"):
+            with self.subTest(field):
+                bad = json.loads(json.dumps(IMAGE))
+                bad["python"][field] = bad["python"][field] + "\n"
+                with tempfile.TemporaryDirectory() as td:
+                    p = Path(td) / "image.json"
+                    p.write_text(json.dumps(bad), encoding="utf-8")
+                    with self.assertRaises(drv.Refusal):
+                        drv.read_image_json(p)
+
+
 if __name__ == "__main__":
     unittest.main()

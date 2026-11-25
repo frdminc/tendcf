@@ -13,7 +13,8 @@
     "host": {
       "description": "Device public key — host identity is the key, not the hostname (map §3). First-line cross-device replay check (TC-11): a validator refuses a goal file whose host is not itself before computing any diff. Immutable: re-keying is re-enrollment, a baseline ceremony (DC-22 residue). One spelling: fixed prefix, lowercase hex.",
       "type": "string",
-      "pattern": "^ed25519:[0-9a-f]{64}$"
+      "pattern": "^ed25519:[0-9a-f]{64}$",
+      "not": { "pattern": "\\n" }
     },
     "domains": {
       "description": "Every domain this file makes claims about, each with its coverage stated. An entry cannot exist without its domain's coverage: 'silent because unchanged' vs 'silent because not described' is decided structurally (E1 §5.7). A domain absent from this map is UNDECLARED — semantically not-yet-migrated without a name; declaring it is the act of naming the backlog item, and its first appearance is a coverage_changes item in the diff. device-trust is always present and always comprehensive.",
@@ -153,7 +154,8 @@
                     "unit-package": false,
                     "unit-writer": {
                       "propertyNames": {
-                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+(\\.\\*)?$"
+                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+(\\.\\*)?$",
+                        "not": { "pattern": "\\n" }
                       },
                       "patternProperties": {
                         "\\*$": {
@@ -226,7 +228,8 @@
                     },
                     "unit-writer": {
                       "propertyNames": {
-                        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)$"
+                        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)$",
+                        "not": { "pattern": "\\n" }
                       },
                       "patternProperties": {
                         "\\*$": { "properties": { "writer": { "const": "cfengine" } } }
@@ -298,7 +301,8 @@
                     "unit-package": false,
                     "unit-writer": {
                       "propertyNames": {
-                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$"
+                        "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$",
+                        "not": { "pattern": "\\n" }
                       },
                       "additionalProperties": {
                         "properties": { "writer": { "not": { "const": "tendcf-install" } } }
@@ -363,6 +367,7 @@
         "description": "The device-natural unit name — the promiser: launchd label, systemd unit, runit service dir. Not the Site Model service name, which is a source-layer concept (reconciliation §3). Modify-vs-remove+add in the diff then matches modify-vs-unload+load in actuation. Lint: on a comprehensive domain the id must be covered by a same-domain unit-writer key (an exact name, a template key for its instances, or a trailing-star prefix) whose writer is cfengine; a tombstone in `supervision` must be covered the same way in any coverage; and an id present in one domain must not be a tombstone in another (schema v5, R5).",
         "type": "string",
         "pattern": "^[A-Za-z0-9][A-Za-z0-9@._-]*$",
+        "not": { "pattern": "\\n" },
         "maxLength": 128
       },
       "additionalProperties": {
@@ -382,11 +387,15 @@
           "description": "Re-verification scope and interlock blast radius (D16(c)). A bundle exists by being referenced; there is no bundle kind (reconciliation §8). Cross-checked by lint: every interlock's bundle is used by at least one entry.",
           "$ref": "common.schema.json#/$defs/identifier"
         },
-        "run_as": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*$", "maxLength": 32 },
+        "run_as": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*$", "not": { "pattern": "\\n" }, "maxLength": 32 },
         "command": {
-          "description": "argv. An array because order is meaning — with pre_action.command, the only arrays in the file whose order is semantic.",
+          "description": "argv. An array because order is meaning — with pre_action.command, the only arrays in the file whose order is semantic. ASCII control characters and XML 1.0 noncharacters U+FFFE/U+FFFF are forbidden uniformly across schema and projector (issue #54 Q2, Ref: ANTIGRAVITY-120).",
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "not": { "pattern": "[\\u0000-\\u001f\\u007f\\ufffe\\uffff]" }
+          },
           "minItems": 1
         },
         "env": {
@@ -404,7 +413,7 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "description": "A systemd unit is a text file the adapter writes line by line, and systemd re-reads quotes, backslashes, '$' and '%' in an ExecStart argument, and a newline in any value starts a new directive. So a systemd entry's argv and working_dir are held to a safe alphabet instead of being escaped: a value outside it is refused structurally, fail-closed, and nothing is rewritten into a second spelling. Widening the alphabet is a schema_version bump, like any shape change.",
+          "description": "A systemd unit is a text file the adapter writes line by line, and systemd re-reads quotes, backslashes, '$' and '%' in an ExecStart argument, and a newline in any value starts a new directive. Moreover, systemd's config_parse_exec() unquotes firstword (command[0]) BEFORE checking ';' and executable prefixes ('@', '-', ':', '+', '!', '|'), so command[0] must be an absolute non-directory path ('^/...[^/]$') to neutralize root-escalation ('+'/'!') and pipe ('|') prefixes even inside double quotes (issue #54 R1). So a systemd entry's argv and working_dir are held to a safe alphabet instead of being escaped: a value outside it is refused structurally, fail-closed, and nothing is rewritten into a second spelling. Widening the alphabet is a schema_version bump, like any shape change.",
           "if": {
             "properties": { "unit": { "required": ["systemd"] } },
             "required": ["unit"]
@@ -412,9 +421,18 @@
           "then": {
             "properties": {
               "command": {
-                "items": { "pattern": "^[^\"\\\\$%\\u0000-\\u001f\\u007f]+$" }
+                "prefixItems": [
+                  {
+                    "pattern": "^/[^\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]*[^/\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]$",
+                    "not": { "pattern": "\\n" }
+                  }
+                ],
+                "items": {
+                  "pattern": "^[^\"\\\\$%\\u0000-\\u001f\\u007f\\ufffe\\uffff]+$",
+                  "not": { "pattern": "\\n" }
+                }
               },
-              "working_dir": { "pattern": "^/$|^(/[A-Za-z0-9._+@:-]+)+$" }
+              "working_dir": { "pattern": "^/$|^(/[A-Za-z0-9._+@:-]+)+$", "not": { "pattern": "\\n" } }
             }
           }
         }
@@ -462,6 +480,7 @@
                   "description": "The target the [Install] section hangs the unit on (WantedBy=). 'multi-user.target' is what a server unit wants; stated, not defaulted.",
                   "type": "string",
                   "pattern": "^[a-z][a-z0-9-]*[.]target$",
+                  "not": { "pattern": "\\n" },
                   "maxLength": 64
                 }
               },
@@ -513,7 +532,7 @@
           "required": ["command", "expect_exit", "timeout_seconds"],
           "additionalProperties": false
         },
-        "defines_class": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "defines_class": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "not": { "pattern": "\\n" } },
         "blocks": { "const": "enclosing-bundle" },
         "report": { "const": true }
       },
@@ -526,7 +545,8 @@
       "type": "object",
       "propertyNames": {
         "type": "string",
-        "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)|[a-z][a-z0-9]*(?:\\.[A-Za-z0-9][A-Za-z0-9_-]*)+)$"
+        "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*@?\\.(?:service|socket|timer|path)|[A-Za-z0-9._-]+[.-]\\*)|[a-z][a-z0-9]*(?:\\.[A-Za-z0-9][A-Za-z0-9_-]*)+)$",
+        "not": { "pattern": "\\n" }
       },
       "additionalProperties": { "$ref": "#/$defs/unit_writer_entry" },
       "minProperties": 1
@@ -548,7 +568,7 @@
     "unit_package_map": {
       "description": "Debian packages whose own units are not extras. Detector data: it says who may write units, not what should be installed, and it does not project (PROJECTING_KINDS is unchanged). Declaring a package covers the units it ships, so a new unit inside a declared package does not surface, and a new package does. A declared package that is not installed is not a finding, like a prefix with no units. `state: present` means the claim is present, not the package. The id is a BINARY package name: the units of one source package are split across binaries and each must be named. The id covers that package on every architecture (`systemd:amd64` is `systemd`). Ownership is read from the dpkg database, with no file-hash verification (accidents only). The name pattern is Debian Policy 5.6.1: lower case, digits, `+`, `-`, `.`, at least two characters, alphanumeric first. Systemd hosts only. A package id is unique across domains (lint).",
       "type": "object",
-      "propertyNames": { "type": "string", "pattern": "^[a-z0-9][a-z0-9+.-]+$" },
+      "propertyNames": { "type": "string", "pattern": "^[a-z0-9][a-z0-9+.-]+$", "not": { "pattern": "\\n" } },
       "additionalProperties": {
         "type": "object",
         "properties": {
@@ -660,7 +680,8 @@
       "type": "object",
       "propertyNames": {
         "type": "string",
-        "pattern": "^ed25519:[0-9a-f]{64}$"
+        "pattern": "^ed25519:[0-9a-f]{64}$",
+        "not": { "pattern": "\\n" }
       },
       "additionalProperties": {
         "type": "object",
@@ -711,15 +732,17 @@
     },
 
     "abs_path": {
-      "description": "Canonical absolute path: no '//', no trailing slash, no '.' or '..' segments — every path has one spelling. Bare '/' is admitted explicitly (the Fable sketch's pattern could not spell the filesystem root, which the required working_dir needs — reconciliation §15, F-1). Symlink aliasing cannot be excluded textually and is named residue R20; non-ASCII and control characters in segments are a §14.2 review target.",
+      "description": "Canonical absolute path: no '//', no trailing slash, no '.' or '..' segments — every path has one spelling. Bare '/' is admitted explicitly (the Fable sketch's pattern could not spell the filesystem root, which the required working_dir needs — reconciliation §15, F-1). Symlink aliasing cannot be excluded textually and is named residue R20; ASCII control characters and XML 1.0 noncharacters U+FFFE/U+FFFF are forbidden uniformly across schema and projector (issue #54 Q2, Ref: ANTIGRAVITY-120).",
       "type": "string",
       "pattern": "^/$|^(?!.*/\\.\\.?(/|$))(/[^/]+)+$",
+      "not": { "pattern": "[\\u0000-\\u001f\\u007f\\ufffe\\uffff]" },
       "maxLength": 1024
     },
 
     "sha256": {
       "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "not": { "pattern": "\\n" }
     }
   }
 }

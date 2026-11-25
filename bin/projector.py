@@ -188,6 +188,68 @@ TRUST_SHAPED_KEY = re.compile(r"^(ed25519|sha256):")
 # goal file it came from — the same discipline as ENTRY_ID_PATTERNS.
 TRUST_SHAPED_VALUE = re.compile(r"^(ed25519|sha256):[0-9a-f]{64}\Z")
 
+# Issue #54 — Metacharacter & Control-Character Audit (verified against
+# cfengine-core source, policy/tendcf_services.cf, and both Mustache templates):
+#
+# Why `;`, `|`, `&&`, backticks (`` ` ``), `<` and `>` are NOT globally blocked:
+#   - `tendcf_interlock.<id>.pre_action.command[]`: `policy/tendcf_services.cf`
+#     joins the argv with spaces and runs it under `useshell => "noshell"`
+#     (`libpromises/exec_tools.c` ArgSplitCommand + execv(), never `/bin/sh`).
+#     Because ArgSplitCommand splits on whitespace (` \f\n\r\t\v`) and treats a
+#     leading `"`, `'` or `` ` `` as a quote delimiter, standalone
+#     `check_projection()` enforces `common.schema.json#/$defs/interlock_argv`
+#     below (rejecting spaces, quotes, backticks, `;`, `|`, `&`, `<`, `>` and
+#     relative `command[0]` even when a projection bypassed the schema).
+#   - `tendcf_service.<id>.command[]` and `working_dir` on `launchd`: rendered
+#     through `policy/templates/launchd.plist.mustache` with double-brace tags
+#     (`{{.}}`, `{{working_dir}}`), which call `RenderHTMLContent()`
+#     (`libntech/libutils/mustache.c`: escapes `&`, `"`, `<`, `>` to XML
+#     entities), and launchd executes `ProgramArguments` directly via
+#     posix_spawn/execve with no shell. `;`, `|`, `&&`, `` ` ``, `<`, `>` are
+#     therefore inert on launchd. XML 1.0 forbids ASCII control characters
+#     (`\x00-\x08`, `\x0b`, `\x0c`, `\x0e-\x1f`) and noncharacters `U+FFFE`/
+#     `U+FFFF`, which `RenderHTMLContent()` does not escape; `CONTROL_CHAR_RE`
+#     below blocks `[\x00-\x1f\x7f\ufffe\uffff]` uniformly across launchd and
+#     systemd, matching `schema/goal-file.schema.json` (operator ruling Q2,
+#     Ref: ANTIGRAVITY-120).
+#   - `tendcf_service.<id>.command[]` on `systemd`: rendered through
+#     `policy/templates/systemd.service.mustache` as
+#     `ExecStart={{#command}}"{{{.}}}" {{/command}}` (unescaped triple-brace
+#     inside double quotes). Per systemd `src/core/load-fragment.c`
+#     (`config_parse_exec()`), systemd unquotes `firstword` (`command[0]`) via
+#     `EXTRACT_UNQUOTE` BEFORE checking `;` and executable prefixes (`-`, `@`,
+#     `:`, `|`, `+`, `!`), so double quotes alone do NOT neutralize a leading
+#     `+`/`!` (root escalation) or `|` on `command[0]`! Requiring a leading `/`
+#     and non-trailing `/` on `command[0]` (`SYSTEMD_CMD0_RE`, also enforced by
+#     `goal-file.schema.json` and on-device in `policy/tendcf_services.cf`) is
+#     what neutralizes executable prefixes and lone `;`. For `command[1:]`,
+#     `config_parse_exec()` checks raw `p[0] == ';'` BEFORE unquoting, so `;`,
+#     `|`, `&&`, `` ` ``, `<`, `>` inside `"..."` are literal argv elements
+#     (and `systemd.service(5)` never invokes `/bin/sh`). However, `"`, `\`,
+#     `$`, `%` or control/non-characters would break quotes, inject unit
+#     directives, or trigger systemd variable/specifier expansion, so
+#     `SYSTEMD_CMD0_RE` and `SYSTEMD_CMD_ARG_RE` enforce `goal-file.schema.json`'s
+#     systemd command alphabet below, alongside standalone checks on systemd's
+#     `working_dir`, `run_as`, `restart`, `wanted_by` and `unit` shape.
+#   - All other projected strings (`id`, `state`, `bundle`, `env`,
+#     `defines_class`, `blocks`, `unit.launchd.domain`; `unit.runit` carries
+#     only boolean `enabled`): either never reach a shell/template, are
+#     `strcmp`/`canonify`-gated, or land in single-line unit/plist fields
+#     protected by `CONTROL_CHAR_RE` against newline directive injection and
+#     XML 1.0 control/noncharacter corruption.
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f\ufffe\uffff]")
+INTERLOCK_CMD0_RE = re.compile(r"^/[A-Za-z0-9._+@:=,/-]+\Z")
+INTERLOCK_ARG_RE = re.compile(r"^[A-Za-z0-9._+@:=,/-]+\Z")
+SYSTEMD_CMD0_RE = re.compile(
+    r'^/[^"\\$%\x00-\x1f\x7f\ufffe\uffff]*[^/"\\$%\x00-\x1f\x7f\ufffe\uffff]\Z'
+)
+SYSTEMD_CMD_ARG_RE = re.compile(r'^[^"\\$%\x00-\x1f\x7f\ufffe\uffff]+\Z')
+SYSTEMD_WORKDIR_RE = re.compile(r"^/$|^(/[A-Za-z0-9._+@:-]+)+\Z")
+RUN_AS_RE = re.compile(r"^[a-z_][a-z0-9_-]*\Z")
+SYSTEMD_RESTART_VALUES = frozenset({"no", "on-failure", "always"})
+SYSTEMD_WANTED_BY_RE = re.compile(r"^[a-z][a-z0-9-]*[.]target\Z")
+UNIT_FLAVOURS = frozenset({"launchd", "systemd", "runit"})
+
 
 class ProjectionRefused(Exception):
     """`project()` will not emit these bytes, and says why.
@@ -515,6 +577,131 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                         "and never a reference: the projector has no resolver "
                         "and no call site for one (N-4, P-4)",
                     )
+            if kind == "interlock":
+                pre_action = body.get("pre_action")
+                cmd = (
+                    pre_action.get("command")
+                    if isinstance(pre_action, dict) and "command" in pre_action
+                    else None
+                )
+                bad_interlock_cmd = (
+                    not isinstance(pre_action, dict)
+                    or not isinstance(cmd, list)
+                    or not cmd
+                    or not isinstance(cmd[0], str)
+                    or not INTERLOCK_CMD0_RE.match(cmd[0])
+                    or any(
+                        not isinstance(arg, str) or not INTERLOCK_ARG_RE.match(arg)
+                        for arg in cmd[1:]
+                    )
+                )
+                if bad_interlock_cmd:
+                    flag(
+                        RULE_PROJECTION,
+                        f"{where}/pre_action/command: missing/malformed pre_action "
+                        "or violates common.schema.json#/$defs/interlock_argv "
+                        "(absolute command[0], [A-Za-z0-9._+@:=,/-]+ only). "
+                        "policy/tendcf_services.cf joins pre_action.command "
+                        "with spaces under useshell => noshell, where "
+                        "CFEngine's ArgSplitCommand splits on whitespace "
+                        "and opens quotes on leading \", ' or ` (issue #54)",
+                    )
+            elif kind == "service":
+                unit = body.get("unit")
+                if body.get("state") != "absent" or "unit" in body:
+                    valid_unit = (
+                        isinstance(unit, dict)
+                        and len(unit) == 1
+                        and set(unit) <= UNIT_FLAVOURS
+                        and isinstance(next(iter(unit.values())), dict)
+                    )
+                    if not valid_unit:
+                        flag(
+                            RULE_PROJECTION,
+                            f"{where}/unit: must be an object with exactly one "
+                            f"flavour key in {sorted(UNIT_FLAVOURS)} mapping to "
+                            "an object; skipping malformed unit shapes would "
+                            "bypass supervisor-specific validation (issue #54)",
+                        )
+                    elif "systemd" in unit:
+                        sd = unit["systemd"]
+                        cmd = body.get("command")
+                        if (
+                            not isinstance(cmd, list)
+                            or not cmd
+                            or not isinstance(cmd[0], str)
+                            or not SYSTEMD_CMD0_RE.match(cmd[0])
+                        ):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/command[0]: systemd ExecStart executable "
+                                "must be an absolute non-directory path "
+                                '(`^/...[^/]$`) without ", \\, $, %, control '
+                                "characters, or U+FFFE/U+FFFF. systemd's "
+                                "config_parse_exec() unquotes firstword before "
+                                "checking ';' and executable prefixes "
+                                "('@', '-', ':', '+', '!', '|') (issue #54)",
+                            )
+                        elif any(
+                            not isinstance(arg, str)
+                            or not SYSTEMD_CMD_ARG_RE.match(arg)
+                            for arg in cmd[1:]
+                        ):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/command: systemd ExecStart argv contains "
+                                '", \\, $, %, a control character, or '
+                                "U+FFFE/U+FFFF. templates/systemd.service.mustache "
+                                'emits ExecStart="{{{.}}}" unescaped, so those '
+                                "characters break quoting, inject unit directives, "
+                                "or trigger systemd variable/specifier expansion "
+                                "(issue #54)",
+                            )
+                        wd = body.get("working_dir")
+                        if not isinstance(wd, str) or not SYSTEMD_WORKDIR_RE.match(wd):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/working_dir: systemd WorkingDirectory "
+                                "must match ^/$|^(/[A-Za-z0-9._+@:-]+)+\\Z "
+                                "(blocks trailing \\, % specifiers, and leading "
+                                "-/~; issue #54)",
+                            )
+                        run_as = body.get("run_as")
+                        if (
+                            not isinstance(run_as, str)
+                            or not RUN_AS_RE.match(run_as)
+                            or len(run_as) > 32
+                        ):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/run_as: systemd User must match "
+                                "^[a-z_][a-z0-9_-]*\\Z (<=32 chars; blocks "
+                                "numeric UIDs like '0', % specifiers, and "
+                                "trailing \\; issue #54)",
+                            )
+                        restart = sd.get("restart")
+                        if (
+                            not isinstance(restart, str)
+                            or restart not in SYSTEMD_RESTART_VALUES
+                        ):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/unit/systemd/restart: must be one of "
+                                f"{sorted(SYSTEMD_RESTART_VALUES)} (issue #54)",
+                            )
+                        wanted_by = sd.get("wanted_by")
+                        if (
+                            not isinstance(wanted_by, str)
+                            or not SYSTEMD_WANTED_BY_RE.match(wanted_by)
+                            or len(wanted_by) > 64
+                        ):
+                            flag(
+                                RULE_PROJECTION,
+                                f"{where}/unit/systemd/wanted_by: must match "
+                                "^[a-z][a-z0-9-]*[.]target\\Z (<=64 chars; "
+                                "blocks whitespace, multi-target lists, and % "
+                                "specifiers; issue #54)",
+                            )
 
     # --- string-shaped hazards, wherever they sit -------------------------
     for pointer, node in _walk(doc):
@@ -546,6 +733,17 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                     "key, every projected variable on the host (N-3, E-5)",
                 )
                 break
+        if CONTROL_CHAR_RE.search(node):
+            flag(
+                RULE_PROJECTION,
+                f"{pointer}: contains a forbidden control character or XML 1.0 "
+                "noncharacter (\\x00-\\x1f, \\x7f, U+FFFE, U+FFFF). Newlines/CR "
+                "inject directives in templates/systemd.service.mustache, "
+                "control/noncharacters corrupt XML 1.0 in "
+                "templates/launchd.plist.mustache (RenderHTMLContent escapes "
+                "only &, \", <, >), and whitespace controls split "
+                "ArgSplitCommand (issue #54 Q2, Ref: ANTIGRAVITY-120)",
+            )
         if pointer.endswith(" (key)"):
             trust_shaped = TRUST_SHAPED_KEY.match(node)
             where = "a device-trust digest or key id"

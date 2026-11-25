@@ -15,6 +15,7 @@
       "description": "Lowercase kebab identifier used for domains, bundles, roles, and service names.",
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "not": { "pattern": "\\n" },
       "maxLength": 64
     },
 
@@ -22,6 +23,7 @@
       "description": "A host as named in the Site Model inventory/.",
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "not": { "pattern": "\\n" },
       "maxLength": 64
     },
 
@@ -29,6 +31,7 @@
       "description": "Identifier of the signed release that produced this row. Every reporting row carries it (guide §6; D19). Not a sibling-repo lockstep tag.",
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "not": { "pattern": "\\n" },
       "maxLength": 64
     },
 
@@ -36,6 +39,7 @@
       "description": "A name a type supplies or needs, stated locally (D16(b)). `kind:name`. A naming catalogue, not a permission: holding a token grants nothing. The kind set is closed so a typo is a schema error rather than a silently-unmatched edge — map §0 rule 6, prefer machine-checkable to conventional. Extending the set is additive.",
       "type": "string",
       "pattern": "^(service|port|path|class|package|device|network|secret):[^\\s]+$",
+      "not": { "pattern": "\\n" },
       "maxLength": 200
     },
 
@@ -104,7 +108,8 @@
         "defines_class": {
           "description": "CFEngine class defined when the pre-action succeeds; guarded promises key off it.",
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_]*$"
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "not": { "pattern": "\\n" }
         },
         "blocks": {
           "description": "Fixed by decision: the enclosing bundle is simultaneously the grouping unit and the re-verify scope.",
@@ -177,11 +182,12 @@
     "env_map": {
       "description": "Environment for a service. Values are secretspec key NAMES, never secret values. The generic layer holds nobody's facts and no secrets.",
       "type": "object",
-      "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]*$" },
+      "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]*$", "not": { "pattern": "\\n" } },
       "additionalProperties": {
         "description": "A secretspec key name, resolved at run time by secretspec.",
         "type": "string",
-        "pattern": "^[A-Z][A-Z0-9_]*$"
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "not": { "pattern": "\\n" }
       }
     }
   }

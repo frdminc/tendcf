@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred thirty-six deliberately broken overlays, plus six byte-class fixtures in
+Two hundred forty-six deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -575,6 +575,30 @@ Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `uni
 | 265 | `265-launchd-user-gui-run-as-root` | launchd goal file with `unit.launchd.domain: "user-gui"` and `run_as: "root"` | goal cross-file |
 | 266 | `266-services-launchd-user-bg-run-as-root` | `services.yml` service with `launchd.domain: user-background` and `runs_as: root` | cross-file |
 
+## Trailing-newline pattern guards (267-274)
+
+Issue #55 (operator ruling R8, no extra `schema_version` bump in the current window): Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`, where `$` matches before a trailing `\n` (unlike JSON Schema ECMA-262 `$`). Every `$`-anchored `pattern` across all 8 schemas now carries a sibling `"not": { "pattern": "\\n" }` guard, enforced mechanically by `check_schema_dollar_newline_guards()` in `bin/schema_lint.py`. Cases 267-274 pin the critical sites named in issue #55 and comment `7046830857` (each is JCS-canonical bytes with one trailing `\n` defect).
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 267 | `267-systemd-working-dir-trailing-newline` | systemd goal file with `working_dir: "/srv\n"` | schema (`not`) |
+| 268 | `268-abs-path-trailing-newline` | launchd goal file with `working_dir: "/srv\n"` (`$defs/abs_path`) | schema (`abs_path` `not`) |
+| 269 | `269-sha256-trailing-newline` | launchd goal file with `policy-tree` `sha256` ending in `\n` (`$defs/sha256`) | schema (`sha256` `not`) |
+| 270 | `270-advisor-key-trailing-newline` | launchd goal file with an `advisor-key` property name ending in `\n` | schema (`propertyNames` `not`) |
+| 271 | `271-goal-file-host-trailing-newline` | launchd goal file with top-level `host` ending in `\n` | schema (`not`) |
+| 272 | `272-goal-diff-host-trailing-newline` | `goal-diff.json` with top-level `host` ending in `\n` | schema (`not`) |
+| 273 | `273-systemd-command-trailing-newline` | systemd goal file with `command[1]` ending in `\n` (`"infinity\n"`) | schema (`not`) |
+| 274 | `274-approval-baseline-sha256-trailing-newline` | `approval-application.json` with `baseline_sha256` ending in `\n` | schema (`not`) |
+
+## Systemd `command[0]` prefix and uniform control/noncharacter guards (278-279)
+
+Issue #54 R1 + operator rulings Q1 & Q2 (`Ref: ANTIGRAVITY-120`, 2026-11-25, extending R8 in-place at `schema_version: 9` / `services.schema.json` `contract_version: 4` with no extra bump): systemd's `config_parse_exec()` unquotes `firstword` before parsing `;` and executable prefixes (`@`, `-`, `:`, `+`, `!`, `|`), so systemd `command[0]` requires a leading `/` and non-trailing `/` (`prefixItems[0]`), and `[\u0000-\u001f\u007f\ufffe\uffff]` is banned uniformly across `abs_path`, service `command[]`, and `bin/projector.py`.
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 278 | `278-systemd-command0-exec-prefix` | systemd goal file with `command[0]: "+/usr/bin/id"` (systemd root-escalation prefix) | schema (`pattern`) |
+| 279 | `279-launchd-command-nonchar` | launchd goal file with `U+FFFE` XML 1.0 noncharacter in `command[1]` | schema (`not`) |
+
 ## Every class has a fixture
 
 `check_class_coverage()` asks the declarations' question from the other
@@ -676,6 +700,16 @@ below are that document's negatives.
 | 91 | `91-container-is-an-array.json` | a kind container is an array | projection |
 | 92 | `92-entry-body-is-an-array.json` | an entry body is an array | projection |
 | 145 | `145-unit-package-under-vars.json` | a `unit-package` container under `vars` (schema v5: detector data, never projected; the existing closed-container rule, not a new one) | projection |
+| 275 | `275-control-char-in-projection.json` | systemd `working_dir` carrying `\nExecStartPre=/bin/evil` (newline directive injection, issue #54) | projection |
+| 276 | `276-interlock-command-leading-backtick.json` | interlock `pre_action.command[1]` starting with a backtick (`ArgSplitCommand` quote delimiter; `interlock_argv` enforcement, issue #54) | projection |
+| 277 | `277-systemd-command-quote-breakout.json` | systemd `command[1]` carrying `"` (`ExecStart="{{{.}}}"` quote breakout, issue #54) | projection |
+| 280 | `280-systemd-command0-exec-prefix.json` | systemd `command[0]` carrying `+/usr/bin/id` (`config_parse_exec()` unquotes `firstword` before parsing `+`/`!`/`|`, issue #54 R1) | projection |
+| 281 | `281-systemd-working-dir-trailing-backslash.json` | systemd `working_dir` carrying trailing `\` (`WorkingDirectory=/srv\`, issue #54 R1) | projection |
+| 282 | `282-systemd-run-as-specifier.json` | systemd `run_as` carrying `%u` (specifier / invalid Linux username, issue #54 R1) | projection |
+| 283 | `283-systemd-restart-invalid.json` | systemd `unit.systemd.restart` carrying `always\` (outside `no`/`on-failure`/`always`, issue #54 R1) | projection |
+| 284 | `284-systemd-wanted-by-multi-target.json` | systemd `unit.systemd.wanted_by` carrying `multi-user.target %n` (whitespace / specifier, issue #54 R1) | projection |
+| 285 | `285-service-unit-invalid-shape.json` | service `unit` as an array `["systemd"]` (malformed unit container bypassing supervisor validation, issue #54 R1) | projection |
+| 286 | `286-launchd-nonchar-in-command.json` | launchd `command[1]` carrying XML 1.0 noncharacter `U+FFFE` (uniform `CONTROL_CHAR_RE` ban, Q2 `Ref: ANTIGRAVITY-120`) | projection |
 
 Three of the twelve negatives have no row, and deliberately — all three are
 checked by `check_projector_properties()` instead, over bytes it synthesises.

@@ -1483,24 +1483,81 @@ EOF
     fi
     rm -f "$launchd_daemons/com.tendcf.Demo.case.plist"
 
-    # 5m.17 XML-escaping round-trip (<, >, &, ") through launchd.plist.mustache + plutil -lint + plistlib.load.
-    cat > "$work/data/host_specific.json" <<'EOF'
-{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{"com.tendcf.demo.xml":{"bundle":"demo","command":["/bin/echo","a&b","<tag>","\"quoted\""],"run_as":"nobody","state":"present","unit":{"launchd":{"domain":"system","keep_alive":false,"run_at_load":true}},"working_dir":"/tmp/dir&<\"x\">"}}}}
-EOF
+    # 5m.17 XML-escaping & shell-metacharacter inertness round-trip
+    # (<, >, &, ", ', ;, |, &&, backticks, redirection) through
+    # launchd.plist.mustache + plutil -lint + plistlib.load (issue #54).
+    meta_sentinel="$work/launchd-meta-should-not-exist"
+    rm -f "$meta_sentinel"
+    python3 - "$work/data/host_specific.json" "$meta_sentinel" <<'PYEOF'
+import json, pathlib, sys
+out_path, sentinel = sys.argv[1], sys.argv[2]
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "demo-check": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "demo_ok",
+                "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {
+            "com.tendcf.demo.xml": {
+                "bundle": "demo",
+                "command": [
+                    "/bin/echo",
+                    "a&b",
+                    "<tag>",
+                    '"quoted"',
+                    "'single'",
+                    ";",
+                    "|",
+                    "&&",
+                    f"`touch {sentinel}`",
+                    f">{sentinel}",
+                    "</dev/null",
+                ],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"launchd": {"domain": "system", "keep_alive": False, "run_at_load": True}},
+                "working_dir": '/tmp/dir&<"x">;a|b&&`c`',
+            }
+        },
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
     : > "$launchctl_log"
     printf 'normal\n' > "$launchctl_mode"
     "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-xml.out" 2>&1 || true
     xml_plist="$launchd_daemons/com.tendcf.demo.xml.plist"
-    check "launchd XML escaping: rendered plist passes plutil -lint" plutil_lint "$xml_plist"
-    check "launchd XML escaping: plistlib decodes exact special characters" \
-        python3 - "$xml_plist" <<'PYEOF'
+    check "launchd XML escaping & metacharacter inertness: rendered plist passes plutil -lint" plutil_lint "$xml_plist"
+    check "launchd XML escaping & metacharacter inertness: plistlib decodes exact characters" \
+        python3 - "$xml_plist" "$meta_sentinel" <<'PYEOF'
 import plistlib, sys
+sentinel = sys.argv[2]
 with open(sys.argv[1], "rb") as f:
     doc = plistlib.load(f)
 assert doc["Label"] == "com.tendcf.demo.xml"
-assert doc["ProgramArguments"] == ["/bin/echo", "a&b", "<tag>", '"quoted"'], doc["ProgramArguments"]
-assert doc["WorkingDirectory"] == '/tmp/dir&<"x">', doc["WorkingDirectory"]
+assert doc["ProgramArguments"] == [
+    "/bin/echo",
+    "a&b",
+    "<tag>",
+    '"quoted"',
+    "'single'",
+    ";",
+    "|",
+    "&&",
+    f"`touch {sentinel}`",
+    f">{sentinel}",
+    "</dev/null",
+], doc["ProgramArguments"]
+assert doc["WorkingDirectory"] == '/tmp/dir&<"x">;a|b&&`c`', doc["WorkingDirectory"]
 PYEOF
+    check "launchd metacharacter inertness: no shell command executed during render" \
+        test ! -e "$meta_sentinel"
     rm -f "$xml_plist" "$launchctl_state/com.tendcf.demo.xml"
 
     # 5m.18 Tombstone on darwin.!tendcf_launchd_host (symlinked launchd_dir, Neon L6) -> refused and reported, zero launchctl calls.
@@ -3130,6 +3187,70 @@ PYEOF
             as_root rm -f "$execd_timer_path"
             execd_timer_created=0
         fi
+
+        # 6c(3). Issue #54 R1: real systemd-analyze verify on a rendered
+        # metacharacter unit (proves systemd parses quoted `;`, `|`, `&&`,
+        # backticks, `<`, `>` in command[1:] cleanly when command[0] starts
+        # with `/`) and root-level refusal of `+/usr/bin/id` and `|/usr/bin/id`.
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            meta_verify_unit="$work/tendcf-meta-verify.service"
+            true_bin="$(command -v true)"
+            python3 - "$work/data/host_specific.json" "$true_bin" <<'PYEOF'
+import json, pathlib, sys
+out_path, true_bin = sys.argv[1], sys.argv[2]
+doc = {
+    "vars": {
+        "tendcf_service": {
+            "tendcf-meta-verify.service": {
+                "bundle": "meta",
+                "command": [
+                    true_bin,
+                    ";",
+                    "|",
+                    "&&",
+                    "`echo hi`",
+                    ">/dev/null",
+                    "</dev/null",
+                    "&",
+                    "'single'",
+                ],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {
+                    "systemd": {
+                        "enabled": False,
+                        "restart": "on-failure",
+                        "wanted_by": "multi-user.target",
+                    }
+                },
+                "working_dir": "/",
+            }
+        }
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+            cat > "$work/inputs/systemd-meta-verify.cf" <<EOF
+body common control
+{
+      bundlesequence => { "tendcf_test_systemd_verify" };
+}
+bundle agent tendcf_test_systemd_verify
+{
+  files:
+      "$meta_verify_unit"
+        create => "true",
+        edit_template => "$repo/policy/templates/systemd.service.mustache",
+        template_method => "mustache",
+        template_data => mergedata("data:variables.tendcf_service[tendcf-meta-verify.service]",
+                                    '{"id": "tendcf-meta-verify.service"}');
+}
+EOF
+            "$cf_agent" -K -I -f "$work/inputs/systemd-meta-verify.cf" >"$work/sysd-meta-verify.out" 2>&1 || true
+            check "systemd-analyze verify: metacharacter unit rendered" test -f "$meta_verify_unit"
+            check "systemd-analyze verify: metacharacter unit passes systemd parser" \
+                systemd-analyze verify "$meta_verify_unit"
+        fi
     fi
 elif [ "${TENDCF_TEST_SYSTEMD:-}" = 1 ]; then
     check "TENDCF_TEST_SYSTEMD=1 needs a host booted by systemd" false
@@ -3151,6 +3272,139 @@ else
         bash -c "! grep -q 'tombstone not actuated' '$out'"
     check "no systemctl invocation for the tombstone" no_systemctl "$out"
 fi
+
+# 6d. Cross-platform systemd.service.mustache render check (issue #54): proves
+#     ExecStart uses unescaped triple-braces `{{{.}}}` inside double quotes so
+#     `;`, `|`, `&&`, backticks, `<`, `>` render verbatim (not HTML-escaped),
+#     on a single ExecStart= line, without executing a shell during Mustache
+#     rendering. Runs on both Darwin and Linux without root.
+sysd_meta_unit="$work/systemd-meta.service"
+sysd_meta_sentinel="$work/systemd-meta-should-not-exist"
+rm -f "$sysd_meta_unit" "$sysd_meta_sentinel"
+python3 - "$work/data/host_specific.json" "$sysd_meta_sentinel" <<'PYEOF'
+import json, pathlib, sys
+out_path, sentinel = sys.argv[1], sys.argv[2]
+doc = {
+    "vars": {
+        "tendcf_service": {
+            "tendcf.meta.service": {
+                "bundle": "meta",
+                "command": [
+                    "/usr/bin/echo",
+                    ";",
+                    "|",
+                    "&&",
+                    f"`touch {sentinel}`",
+                    f">{sentinel}",
+                    "</dev/null",
+                    "&",
+                    "'single'",
+                ],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {
+                    "systemd": {
+                        "enabled": False,
+                        "restart": "on-failure",
+                        "wanted_by": "multi-user.target",
+                    }
+                },
+                "working_dir": "/srv",
+            }
+        }
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+cat > "$work/inputs/systemd-mustache-render.cf" <<EOF
+body common control
+{
+      bundlesequence => { "tendcf_test_systemd_render" };
+}
+bundle agent tendcf_test_systemd_render
+{
+  files:
+      "$sysd_meta_unit"
+        create => "true",
+        edit_template => "$repo/policy/templates/systemd.service.mustache",
+        template_method => "mustache",
+        template_data => mergedata("data:variables.tendcf_service[tendcf.meta.service]",
+                                    '{"id": "tendcf.meta.service"}');
+}
+EOF
+"$cf_agent" -K -I -f "$work/inputs/systemd-mustache-render.cf" >"$work/sysd-meta-render.out" 2>&1 || true
+check "systemd.service.mustache metacharacter render: unit file created" test -f "$sysd_meta_unit"
+check "systemd.service.mustache metacharacter render: ExecStart preserves ;, |, &&, backticks, <, > verbatim inside double quotes" \
+    python3 - "$sysd_meta_unit" "$sysd_meta_sentinel" <<'PYEOF'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+sentinel = sys.argv[2]
+expected_exec = (
+    'ExecStart="/usr/bin/echo" ";" "|" "&&" '
+    f'"`touch {sentinel}`" ">{sentinel}" "</dev/null" "&" "\'single\'" '
+)
+lines = text.splitlines()
+assert "Type=simple" in lines, lines
+assert "User=nobody" in lines, lines
+assert "WorkingDirectory=/srv" in lines, lines
+assert "Restart=on-failure" in lines, lines
+assert "WantedBy=multi-user.target" in lines, lines
+exec_lines = [ln for ln in lines if ln.startswith("ExecStart=")]
+assert exec_lines == [expected_exec], f"got {exec_lines!r}, want {[expected_exec]!r}"
+assert "&amp;" not in text and "&lt;" not in text and "&gt;" not in text, text
+PYEOF
+check "systemd.service.mustache metacharacter render: no shell command executed during render" \
+    test ! -e "$sysd_meta_sentinel"
+
+# 6e. Cross-platform systemd command[0] fail-closed refusal (issue #54 R1):
+#     systemd's config_parse_exec() unquotes firstword BEFORE parsing `;` and
+#     executable prefixes (`+`/`!`/`|`/`@`/`-`/`:`), so the policy itself must
+#     refuse any systemd command[0] that is not a safe absolute non-directory
+#     path (even on a projection that skipped schema & projector), rendering
+#     nothing and invoking zero systemctl commands.
+for bad_cmd0_spec in \
+    "plus:+/usr/bin/id" \
+    "pipe:|/usr/bin/id" \
+    "trailing-slash:/usr/bin/" \
+    "relative:sleep"; do
+    bname="${bad_cmd0_spec%%:*}"
+    bcmd0="${bad_cmd0_spec#*:}"
+    python3 - "$work/data/host_specific.json" "$bcmd0" <<'PYEOF'
+import json, pathlib, sys
+out_path, cmd0 = sys.argv[1], sys.argv[2]
+doc = {
+    "vars": {
+        "tendcf_service": {
+            "tendcf.badcmd0.service": {
+                "bundle": "demo",
+                "command": [cmd0, "arg1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {
+                    "systemd": {
+                        "enabled": False,
+                        "restart": "on-failure",
+                        "wanted_by": "multi-user.target",
+                    }
+                },
+                "working_dir": "/",
+            }
+        }
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True))
+PYEOF
+    bout="$work/sysd-bad-cmd0-$bname.out"
+    "$cf_agent" -K -v -f "$work/inputs/entry.cf" >"$bout" 2>&1 || true
+    check "systemd bad command[0] ($bname): refused with dedicated command[0] report" \
+        grep -qF "tendcf: service 'tendcf.badcmd0.service' refused: systemd command[0] is missing or not a safe absolute non-directory path" "$bout"
+    check "systemd bad command[0] ($bname): not misreported as unsupported flavour" \
+        bash -c "! grep -q \"unit flavour 'systemd' is not implemented\" '$bout'"
+    check "systemd bad command[0] ($bname): nothing rendered" \
+        bash -c "! grep -Eq 'Created file|Updated rendering|Edited file' '$bout'"
+    check "systemd bad command[0] ($bname): no systemctl invocation" \
+        no_systemctl "$bout"
+done
 
 # 7. NixOS shape: booted by systemd but /etc/systemd/system is a symlink into a
 #    read-only tree (nixos-passthrough-plan.md section 1). The adapter must refuse
@@ -3275,7 +3529,8 @@ argv_case() {  # argv_case NAME ELEMENT...  (writes the fixture, runs cf-agent, 
         bash -c "! grep -q 'is not an absolute path' '$out'"
 }
 argv_case alphabet 'a,b=c:d@e+f' '--k=v,w:/p@h+1._-' '-' 'A0z9' '/x/y'
-argv_case meta ';' '/usr/bin/false' '||' '>' '/dev/null' '&' '*' '~' '#'
+bt="$(printf '\140')"
+argv_case meta ';' '/usr/bin/false' '||' '&&' "a${bt}b" '<' '>' '/dev/null' '&' '*' '~' '#'
 
 # 8d. a relative command[0] (a projection that skipped the schema) is refused
 #     by the policy itself. Without the guard cf-agent stats and execv()s the

@@ -33,12 +33,14 @@
         "prefix": {
           "description": "Reverse-DNS label prefix ending in `.*`, e.g. `com.tendcf.example.*`. Mutually exclusive with `label`. bin/schema_lint.py additionally rejects a prefix nested inside another or overlapping an exact `label` — two writers over one namespace is exactly the hazard this file exists to prevent.",
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$"
+          "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+\\.\\*$",
+          "not": { "pattern": "\\n" }
         },
         "label": {
           "description": "Exact reverse-DNS launchd label, e.g. `org.tendcf.execd`. Mutually exclusive with `prefix`. Required for `writer: \"tendcf-install\"` (which bin/schema_lint.py pins to `org.tendcf.execd`).",
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$"
+          "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$",
+          "not": { "pattern": "\\n" }
         },
         "writer": {
           "description": "The single tool permitted to write labels under this prefix or exact label. `tendcf-install` is permitted only on an exact `label` entry (never a `prefix`) and is pinned to `org.tendcf.execd` by lint.",

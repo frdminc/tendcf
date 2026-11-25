@@ -79,7 +79,8 @@
         "runs_as": {
           "description": "Local user the service runs as.",
           "type": "string",
-          "pattern": "^[a-z_][a-z0-9_-]*$"
+          "pattern": "^[a-z_][a-z0-9_-]*$",
+          "not": { "pattern": "\\n" }
         },
         "command": {
           "description": "argv, not a shell string — a shell string would put quoting rules between the model and the renderer.",
@@ -99,7 +100,8 @@
             "label": {
               "description": "Must fall under a prefix or exact label declared in the launchd unit-writers registry — cross-checked by bin/schema_lint.py. One writer per unit prefix/label; launchd is the first adapter of that generic rule.",
               "type": "string",
-              "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$"
+              "pattern": "^[a-z][a-z0-9]*(\\.[A-Za-z0-9][A-Za-z0-9_-]*)+$",
+              "not": { "pattern": "\\n" }
             },
             "domain": {
               "description": "Which launchd domain runs the job (`system`, `user-gui`, or `user-background`). Optional in the Site Model; nix2cf resolves an omitted value to `system` when rendering the goal file.",
@@ -115,7 +117,7 @@
         "systemd": {
           "type": "object",
           "properties": {
-            "unit": { "type": "string", "pattern": "^[A-Za-z0-9@._-]+\\.(service|timer|socket)$" }
+            "unit": { "type": "string", "pattern": "^[A-Za-z0-9@._-]+\\.(service|timer|socket)$", "not": { "pattern": "\\n" } }
           },
           "required": ["unit"],
           "additionalProperties": false
@@ -123,7 +125,7 @@
         "termux": {
           "type": "object",
           "properties": {
-            "service_name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+            "service_name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$", "not": { "pattern": "\\n" } }
           },
           "required": ["service_name"],
           "additionalProperties": false
