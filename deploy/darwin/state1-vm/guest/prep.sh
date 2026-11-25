@@ -417,6 +417,9 @@ $_canon"
                         fail(3, "obfuscated sshd keyword: " line)
                     }
                 }
+                if (norm_key == "") {
+                    fail(3, "empty sshd keyword: " line)
+                }
                 if (norm_key == "match") {
                     fail(2, line)
                 }

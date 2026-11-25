@@ -4284,6 +4284,24 @@ class Check(Base):
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("interior CR or control byte", r.stderr)
 
+        # PR 112 R4 (Codex empty first keyword): leading "=" or "" fails closed;
+        # blank lines and indented "# = Match" / '# "" Include' comments pass cleanly
+        for cfg_line in (
+            "= Match User admin\n  PasswordAuthentication yes\n",
+            f"= Include {base}/d/x.conf\n",
+            '"" Match User admin\n  PasswordAuthentication yes\n',
+            f'"" Include {base}/d/x.conf\n',
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn("empty sshd keyword", r.stderr, (cfg_line, r.stderr))
+        (base / "sshd_config").write_text(
+            '\n   \t\n# = Match User admin\n  # "" Include /etc/ssh/a.conf\nPasswordAuthentication no\n'
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
     def test_sshd_match_check_real_sshd_parity(self):
         # Verify against real /usr/sbin/sshd that every OpenSSH strdelim()/argv_split()
         # syntax variant that honours a Match in sshd -T is refused by BOTH
@@ -4323,9 +4341,11 @@ class Check(Base):
         )
         cfg = base / "sshd_config"
 
-        # Clean baseline with trailing # comment containing a single quote: sshd keeps
+        # Clean baseline with blank lines, indented "# = Match" / '# "" Include' comments,
+        # and trailing # comment containing a single quote: sshd keeps
         # PasswordAuthentication no, and both checkers pass.
         cfg.write_text(
+            f'\n   \n# = Match User admin\n  # "" Include {base}/d/x.conf\n'
             f"PasswordAuthentication no\nInclude {base}/clean.conf # admin's comment\n"
         )
         r_sshd = subprocess.run(
@@ -4352,7 +4372,7 @@ class Check(Base):
         )
         self.assertEqual(r_prep.returncode, 0, (r_prep.stdout, r_prep.stderr))
 
-        # All live OpenSSH bypass variants (R2 Opus H1 + R3 Codex #1/#2)
+        # All 14 live OpenSSH bypass variants (R2 Opus H1 + R3 Codex #1/#2 + R4 Codex empty keyword)
         variants = (
             (b'M"atch" User admin\n  PasswordAuthentication yes\n', "mid-token quoted Match"),
             (f'I"nclude" {base}/d/x.conf\n'.encode(), "mid-token quoted Include"),
@@ -4364,6 +4384,10 @@ class Check(Base):
             (b'M"atch"User admin\n  PasswordAuthentication yes\n', "adjacent mid-quoted Match"),
             (f'I"nclude"{base}/d/x.conf\n'.encode(), "adjacent mid-quoted Include"),
             (f"Include {base}/cr\rx.conf\n".encode(), "interior CR in Include filename"),
+            (b"= Match User admin\n  PasswordAuthentication yes\n", "leading = before Match"),
+            (f"= Include {base}/d/x.conf\n".encode(), "leading = before Include"),
+            (b'"" Match User admin\n  PasswordAuthentication yes\n', "empty quoted keyword before Match"),
+            (f'"" Include {base}/d/x.conf\n'.encode(), "empty quoted keyword before Include"),
         )
         for body, label in variants:
             cfg.write_bytes(b"PasswordAuthentication no\n" + body)
@@ -6347,11 +6371,22 @@ class GuestScripts(unittest.TestCase):
             (f"Include {ssh_dir}/a\rb.conf\n".encode(), "interior CR or control byte"),
             (b"Include\n", "Include directive with no arguments"),
             (b"Include # comment\n", "Include directive with no arguments"),
+            # PR 112 R4 (Codex empty first keyword)
+            (b"= Match User admin\n", "empty sshd keyword"),
+            (f"= Include {ssh_dir}/d/x.conf\n".encode(), "empty sshd keyword"),
+            (b'"" Match User admin\n', "empty sshd keyword"),
+            (f'"" Include {ssh_dir}/d/x.conf\n'.encode(), "empty sshd keyword"),
         ):
             (ssh_dir / "sshd_config").write_bytes(cfg_bytes)
             r = run_step7(SSHD_CAMEL)
             self.assertEqual(r.returncode, 1, (cfg_bytes, r.stdout, r.stderr))
             self.assertIn(want_msg, r.stderr, (cfg_bytes, r.stderr))
+        # Positive control: blank lines and indented "# = Match" / '# "" Include' comments pass
+        (ssh_dir / "sshd_config").write_text(
+            '\n   \t\n# = Match User admin\n  # "" Include /etc/ssh/a.conf\nInclude sshd_config.d/*\n'
+        )
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
         # 7) Group 8a: dedup 127.0.0.1 (via ,addr=) and skip non-IP tokens like link#4
         (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
         if specs_log.exists():
