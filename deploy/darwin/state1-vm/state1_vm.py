@@ -1019,51 +1019,99 @@ $c"
         }
         {
             line = $0
-            gsub(/\r/, " ", line)
+            sub(/\r$/, "", line)
             sub(/^[ \t]+/, "", line)
             if (line == "" || substr(line, 1, 1) == "#") next
-            in_dq = 0
-            i = 1
-            n = length(line)
-            while (i <= n) {
-                ch = substr(line, i, 1)
-                if (ch == "\"") {
-                    in_dq = !in_dq
-                } else if (!in_dq && (ch == " " || ch == "\t" || ch == "=")) {
-                    break
+            # Refuse any remaining CR or ASCII control byte (other than tab) before
+            # parsing so interior CR cannot be rewritten into whitespace and split
+            # an Include filename that OpenSSH argv_split() preserves intact.
+            if (line ~ /[\001-\010\013-\037\177]/) {
+                tmp = line
+                gsub(/\r/, " ", tmp)
+                sub(/^[ \t]+/, "", tmp)
+                tkey = tmp
+                sub(/[ \t=].*$/, "", tkey)
+                gsub(/["\047\\]/, "", tkey)
+                if (tolower(tkey) == "match") {
+                    fail(2, line)
                 }
-                i++
+                fail(3, "interior CR or control byte in sshd config: " line)
             }
-            raw_key = substr(line, 1, i - 1)
-            rest = substr(line, i)
-            norm_key = raw_key
-            gsub(/["\047\\]/, "", norm_key)
-            norm_key = tolower(norm_key)
+            raw_first = line
+            sub(/[ \t=].*$/, "", raw_first)
+            was_quoted_key = 0
+            if (raw_first !~ /["\047\\]/) {
+                norm_key = tolower(raw_first)
+                rest = substr(line, length(raw_first) + 1)
+            } else {
+                # OpenSSH strdelim_internal() ends a quoted keyword at the closing
+                # double quote with no whitespace required after it (e.g.
+                # "Include"/path or "Match"User). Fail closed on unclosed quotes,
+                # ambiguous closing-quote boundaries, or obfuscated keywords.
+                q1 = index(line, "\"")
+                if (q1 > 0 && q1 <= length(raw_first)) {
+                    q2_rel = index(substr(line, q1 + 1), "\"")
+                    if (q2_rel == 0) {
+                        tkey = raw_first
+                        gsub(/["\047\\]/, "", tkey)
+                        if (tolower(tkey) == "match") {
+                            fail(2, line)
+                        }
+                        fail(3, "unclosed quote in sshd keyword: " line)
+                    }
+                    q2 = q1 + q2_rel
+                    tok_q = substr(line, 1, q2)
+                    after_q = substr(line, q2 + 1)
+                    norm_q = tok_q
+                    gsub(/["\047\\]/, "", norm_q)
+                    norm_q = tolower(norm_q)
+                    if (norm_q == "match") {
+                        fail(2, line)
+                    }
+                    if (after_q != "" && substr(after_q, 1, 1) != " " && substr(after_q, 1, 1) != "\t") {
+                        tkey = raw_first
+                        gsub(/["\047\\]/, "", tkey)
+                        if (tolower(tkey) == "match") {
+                            fail(2, line)
+                        }
+                        fail(3, "ambiguous quoted keyword boundary: " line)
+                    }
+                    if (q1 != 1 || index(tok_q, "\047") > 0 || index(tok_q, "\\") > 0) {
+                        if (norm_q == "include") {
+                            fail(3, "obfuscated Include keyword: " line)
+                        }
+                        fail(3, "obfuscated sshd keyword: " line)
+                    }
+                    norm_key = norm_q
+                    rest = after_q
+                    was_quoted_key = 1
+                } else {
+                    tkey = raw_first
+                    gsub(/["\047\\]/, "", tkey)
+                    tkey = tolower(tkey)
+                    if (tkey == "match") {
+                        fail(2, line)
+                    }
+                    if (tkey == "include") {
+                        fail(3, "obfuscated Include keyword: " line)
+                    }
+                    fail(3, "obfuscated sshd keyword: " line)
+                }
+            }
             if (norm_key == "match") {
                 fail(2, line)
             }
             if (norm_key != "include") next
-            if (in_dq || index(raw_key, "\047") > 0 || index(raw_key, "\\") > 0) {
-                fail(3, "obfuscated Include keyword: " line)
-            }
-            if (index(raw_key, "\"") > 0) {
-                if (length(raw_key) < 2 || substr(raw_key, 1, 1) != "\"" || substr(raw_key, length(raw_key), 1) != "\"") {
-                    fail(3, "obfuscated Include keyword: " line)
-                }
-                inner_key = substr(raw_key, 2, length(raw_key) - 2)
-                if (index(inner_key, "\"") > 0) {
-                    fail(3, "obfuscated Include keyword: " line)
-                }
-            }
             sub(/^[ \t]+/, "", rest)
-            if (substr(rest, 1, 1) == "=") {
+            if (!was_quoted_key && substr(rest, 1, 1) == "=") {
                 rest = substr(rest, 2)
                 sub(/^[ \t]+/, "", rest)
             }
             # OpenSSH argv_split() stops at an unquoted word-initial "#", while
             # mid-token or quoted "#" remains part of the filename. Fail closed on
             # single quotes, backslashes, unclosed/mid-token double quotes, leading
-            # "~", or characters outside a conservative path/glob charset.
+            # "~", zero arguments, or characters outside a conservative path/glob charset.
+            line_inc = 0
             while (rest != "") {
                 if (substr(rest, 1, 1) == "#") break
                 if (substr(rest, 1, 1) == "\"") {
@@ -1086,6 +1134,7 @@ $c"
                         fail(3, "unsafe character in quoted Include target: " line)
                     }
                     incs[++n_inc] = tok
+                    line_inc++
                     rest = after
                 } else {
                     tok = rest
@@ -1101,8 +1150,12 @@ $c"
                         fail(3, "unsafe character in Include target: " line)
                     }
                     incs[++n_inc] = tok
+                    line_inc++
                 }
                 sub(/^[ \t]+/, "", rest)
+            }
+            if (line_inc == 0) {
+                fail(3, "Include directive with no arguments: " line)
             }
         }
         END {
@@ -1216,19 +1269,8 @@ def sshd_key_only(r: Result) -> tuple[bool, str]:
 
 
 def check_sshd_key_only(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
-    """Run `sshd -T -C` across all required connection specs and reject uncommented Match blocks."""
-    specs = sshd_connection_specs(t.user, t.ip)
-    failures: list[str] = []
-    for spec in specs:
-        r = rssh(
-            ctx,
-            t,
-            ["sudo", "-n", "/usr/sbin/sshd", "-T", "-C", spec],
-            raw_newlines=True,  # sshd's bytes untranslated: see sshd_key_only
-        )
-        ok_s, ev_s = sshd_key_only(r)
-        if not ok_s:
-            failures.append(f"[{spec}] {ev_s}")
+    """Reject uncommented Match blocks and unsafe Include targets before running `sshd -T -C`
+    across all required connection specs (so a FIFO or malicious Include target cannot hang sshd)."""
     mr = rssh(
         ctx,
         t,
@@ -1246,7 +1288,19 @@ def check_sshd_key_only(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
     )
     if mr.rc != 0 or mr.stdout.strip():
         detail = clip((mr.stdout + " " + mr.stderr).strip(), 300)
-        failures.append(f"Match/Include check failed (rc {mr.rc}): {detail}")
+        return False, f"Match/Include check failed (rc {mr.rc}): {detail}"
+    specs = sshd_connection_specs(t.user, t.ip)
+    failures: list[str] = []
+    for spec in specs:
+        r = rssh(
+            ctx,
+            t,
+            ["sudo", "-n", "/usr/sbin/sshd", "-T", "-C", spec],
+            raw_newlines=True,  # sshd's bytes untranslated: see sshd_key_only
+        )
+        ok_s, ev_s = sshd_key_only(r)
+        if not ok_s:
+            failures.append(f"[{spec}] {ev_s}")
     if failures:
         return False, "; ".join(failures)
     return True, f"{len(specs)} specs ok (missing []); no uncommented Match blocks"

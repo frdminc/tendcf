@@ -155,6 +155,7 @@ class FakeWorld:
         self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
         self.sshd_spec_outputs = {}  # spec -> output override for multi-spec tests
         self.sshd_specs_seen = []  # every -C spec passed to `sudo -n sshd -T -C`
+        self.sshd_call_order = []  # order of "match" vs "sshd-T" calls in 2e/10a
         self.sshd_rc = 0
         self.sshd_raw_newlines = []  # the raw_newlines flag of each sshd -T call
         self.sshd_match_rc = 0
@@ -682,6 +683,7 @@ class FakeWorld:
             self.sshd_raw_newlines.append(self._raw_newlines)
             spec = r[r.index("-C") + 1] if "-C" in r else ""
             self.sshd_specs_seen.append(spec)
+            self.sshd_call_order.append("sshd-T")
             out = self.sshd_spec_outputs.get(spec, self.sshd_output)
             real = drv.RealRunner().run(
                 ["/usr/bin/printf", "%s", out],
@@ -689,6 +691,7 @@ class FakeWorld:
             )
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
         if r[:5] == ["sudo", "-n", "/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH]:
+            self.sshd_call_order.append("match")
             return drv.Result(self.sshd_match_rc, self.sshd_match_output, "")
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             self.mdutil_calls += 1
@@ -4078,13 +4081,29 @@ class Check(Base):
                 self.assertFalse(ok, (name, ev))
                 self.assertIn(want, ev, name)
 
-        # Uncommented Match block fails 2e
+        # PR 112 R3 (Codex M3): SSHD_MATCH_CHECK_SH runs BEFORE sshd -T on passing checks,
+        # and a match/include check failure prevents sshd -T from ever being invoked
+        # (so a FIFO Include target cannot hang sshd).
+        self.world.sshd_call_order.clear()
+        self.world.sshd_specs_seen.clear()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertGreaterEqual(len(self.world.sshd_call_order), 2)
+        self.assertEqual(self.world.sshd_call_order[0], "match")
+        self.assertEqual(self.world.sshd_call_order[1], "sshd-T")
+
+        # Uncommented Match block fails 2e BEFORE sshd -T is invoked
+        self.world.sshd_call_order.clear()
+        self.world.sshd_specs_seen.clear()
         self.world.sshd_match_rc = 2
         self.world.sshd_match_output = "/etc/ssh/crypto.conf:3: Match Address 192.168.64.0/20\n"
         rc, s = self.run_cmd(*self.check_args())
         self.assertEqual(rc, 1)
         self.assertEqual(self.steps(s)["2e"]["status"], "fail")
         self.assertIn("Match", self.steps(s)["2e"]["evidence"])
+        # Both 2e and 10a run match check first and skip sshd -T on failure
+        self.assertEqual(self.world.sshd_call_order, ["match", "match"])
+        self.assertEqual(self.world.sshd_specs_seen, [])
         self.world.sshd_match_rc = 0
         self.world.sshd_match_output = ""
 
@@ -4231,6 +4250,40 @@ class Check(Base):
         self.assertIn("non-regular sshd config target", r.stderr)
         fifo.unlink()
 
+        # PR 112 R3 (Codex #1, #2, #4a, #4b): strdelim_internal closing-quote boundaries,
+        # unclosed keyword quotes, interior CR / control bytes, and zero-argument Include
+        for match_line, want_tok in (
+            ('"Match"User admin\n  PasswordAuthentication yes\n', '"Match"'),
+            ('M"atch"User admin\n  PasswordAuthentication yes\n', 'M"atch"'),
+            ('"Match User admin\n  PasswordAuthentication yes\n', '"Match'),
+        ):
+            (base / "sshd_config").write_text(match_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 2, (match_line, r.stdout, r.stderr))
+            self.assertIn(want_tok, r.stdout)
+
+        for cfg_line, want_err in (
+            (f'"Include"{base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include"={base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include" = {base}/d/x.conf\n', "unsafe character in Include target"),
+            (f'I"nclude"{base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include {base}/d/x.conf\n', "unclosed quote in sshd keyword"),
+            ('"Unknown foo\n', "unclosed quote in sshd keyword"),
+            ("Include\n", "Include directive with no arguments"),
+            ("Include # comment\n", "Include directive with no arguments"),
+            ("Include =\n", "Include directive with no arguments"),
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_err, r.stderr, (cfg_line, r.stderr))
+
+        # Interior CR in Include filename fails closed (not rewritten into spaces)
+        (base / "sshd_config").write_bytes(f"Include {base}/a\rb.conf\n".encode())
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("interior CR or control byte", r.stderr)
+
     def test_sshd_match_check_real_sshd_parity(self):
         # Verify against real /usr/sbin/sshd that every OpenSSH strdelim()/argv_split()
         # syntax variant that honours a Match in sshd -T is refused by BOTH
@@ -4253,6 +4306,9 @@ class Check(Base):
         )
         (base / "d").mkdir()
         (base / "d" / "x.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "cr\rx.conf").write_text(
             "Match User admin\n  PasswordAuthentication yes\n"
         )
         (base / "clean.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
@@ -4296,16 +4352,21 @@ class Check(Base):
         )
         self.assertEqual(r_prep.returncode, 0, (r_prep.stdout, r_prep.stderr))
 
-        # All 5 Opus H1 OpenSSH bypass variants
+        # All live OpenSSH bypass variants (R2 Opus H1 + R3 Codex #1/#2)
         variants = (
-            ('M"atch" User admin\n  PasswordAuthentication yes\n', "mid-token quoted Match"),
-            (f'I"nclude" {base}/d/x.conf\n', "mid-token quoted Include"),
-            (f"Include '{base}/dir with space/a.conf'\n", "single-quoted Include"),
-            (f"Include {base}/dir\\ with\\ space/a.conf\n", "backslash-escaped Include"),
-            (f'Include {base}/d/"x".conf\n', "mid-token quoted Include arg"),
+            (b'M"atch" User admin\n  PasswordAuthentication yes\n', "mid-token quoted Match"),
+            (f'I"nclude" {base}/d/x.conf\n'.encode(), "mid-token quoted Include"),
+            (f"Include '{base}/dir with space/a.conf'\n".encode(), "single-quoted Include"),
+            (f"Include {base}/dir\\ with\\ space/a.conf\n".encode(), "backslash-escaped Include"),
+            (f'Include {base}/d/"x".conf\n'.encode(), "mid-token quoted Include arg"),
+            (f'"Include"{base}/d/x.conf\n'.encode(), "adjacent quoted Include"),
+            (b'"Match"User admin\n  PasswordAuthentication yes\n', "adjacent quoted Match"),
+            (b'M"atch"User admin\n  PasswordAuthentication yes\n', "adjacent mid-quoted Match"),
+            (f'I"nclude"{base}/d/x.conf\n'.encode(), "adjacent mid-quoted Include"),
+            (f"Include {base}/cr\rx.conf\n".encode(), "interior CR in Include filename"),
         )
         for body, label in variants:
-            cfg.write_text("PasswordAuthentication no\n" + body)
+            cfg.write_bytes(b"PasswordAuthentication no\n" + body)
             r_sshd = subprocess.run(
                 [str(sshd_bin), "-T", "-h", str(hk), "-f", str(cfg), "-C", "user=admin,host=x,addr=10.0.0.9"],
                 capture_output=True,
@@ -4318,6 +4379,29 @@ class Check(Base):
                 r_sshd.stdout.lower().splitlines(),
                 f"{label}: expected real sshd to honour Match",
             )
+            r_drv = subprocess.run(
+                ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_drv.returncode, 0, f"{label}: SSHD_MATCH_CHECK_SH failed to refuse")
+            r_prep = subprocess.run(
+                ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+                env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_prep.returncode, 0, f"{label}: prep.sh failed to refuse")
+
+        # Additional R3 fail-closed cases (quoted keyword + "=", unclosed keyword quote, zero-arg Include)
+        for body, label in (
+            (f'"Include"={base}/d/x.conf\n'.encode(), "quoted Include with ="),
+            (f'"Include {base}/d/x.conf\n'.encode(), "unclosed keyword quote"),
+            (b"Include # comment\n", "zero-arg Include with comment"),
+        ):
+            cfg.write_bytes(b"PasswordAuthentication no\n" + body)
             r_drv = subprocess.run(
                 ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
                 capture_output=True,
@@ -6251,6 +6335,23 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("non-regular sshd config target", r.stderr)
         fifo.unlink()
+        # 6c) PR 112 R3 (Codex #1, #2, #4a, #4b) in prep.sh: closing-quote boundaries,
+        # unclosed keyword quote, interior CR in Include filename, and zero-arg Include
+        for cfg_bytes, want_msg in (
+            (b'"Match"User admin\n', "Match block"),
+            (b'M"atch"User admin\n', "Match block"),
+            (b'"Match User admin\n', "Match block"),
+            (f'"Include"{ssh_dir}/d/x.conf\n'.encode(), "ambiguous quoted keyword boundary"),
+            (f'"Include"={ssh_dir}/d/x.conf\n'.encode(), "ambiguous quoted keyword boundary"),
+            (f'"Include {ssh_dir}/d/x.conf\n'.encode(), "unclosed quote in sshd keyword"),
+            (f"Include {ssh_dir}/a\rb.conf\n".encode(), "interior CR or control byte"),
+            (b"Include\n", "Include directive with no arguments"),
+            (b"Include # comment\n", "Include directive with no arguments"),
+        ):
+            (ssh_dir / "sshd_config").write_bytes(cfg_bytes)
+            r = run_step7(SSHD_CAMEL)
+            self.assertEqual(r.returncode, 1, (cfg_bytes, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stderr, (cfg_bytes, r.stderr))
         # 7) Group 8a: dedup 127.0.0.1 (via ,addr=) and skip non-IP tokens like link#4
         (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
         if specs_log.exists():
