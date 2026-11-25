@@ -144,7 +144,9 @@ class FakeWorld:
         # Versions/, Versions/Current and the top-level links: python.org leaves these
         # root:admin 775 too, and a fix-up scoped to Versions/X.Y does not reach them.
         self.fw_versions = FW_PYTHON_ORIGINAL
-        self.stat_overrides = {}  # path -> "owner:group mode" for the ancestor stat
+        self.stat_overrides = {}  # path -> "owner:group mode [perm]" for the ancestor stat
+        self.acl_paths = set()  # paths that report a macOS ACL on /bin/ls -lde
+        self.acl_check_fail = False
         self.signal_on_tart = (
             None  # deliver a real SIGTERM when this tart subcommand runs
         )
@@ -762,21 +764,33 @@ class FakeWorld:
             return drv.Result(0, "0\n")
         if r[0].endswith("python3.14"):
             return drv.Result(0, "3.14.10\n")
-        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"] or r[:5] == [
+        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp %Sp"] or r[:5] == [
             "sudo",
             "-n",
             "stat",
             "-f",
-            "%N %Su:%Sg %Lp",
+            "%N %Su:%Sg %Lp %Sp",
         ]:
             paths = r[5:] if r[0] == "sudo" else r[3:]
-            return drv.Result(
-                0,
-                "".join(
-                    f"{p} {self.stat_overrides.get(p, FW_PYTHON_FIXED)}\n"
-                    for p in paths
-                ),
-            )
+            lines = []
+            for p in paths:
+                val = self.stat_overrides.get(p, FW_PYTHON_FIXED)
+                if len(val.split()) == 2:
+                    val = val + " drwxr-xr-x"
+                lines.append(f"{p} {val}\n")
+            return drv.Result(0, "".join(lines))
+        if r[:2] == ["/bin/ls", "-lde"] or r[:4] == ["sudo", "-n", "/bin/ls", "-lde"]:
+            if self.acl_check_fail:
+                return drv.Result(1, "", "ls: permission denied\n")
+            paths = r[4:] if r[0] == "sudo" else r[2:]
+            lines = []
+            for p in paths:
+                if p in self.acl_paths:
+                    lines.append(f"drwxr-xr-x+  2 root  wheel  64 Nov 25 00:00 {p}\n")
+                    lines.append(" 0: user:admin allow add_file\n")
+                else:
+                    lines.append(f"drwxr-xr-x   2 root  wheel  64 Nov 25 00:00 {p}\n")
+            return drv.Result(0, "".join(lines))
         if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"] or r[:5] == [
             "sudo",
             "-n",
@@ -2562,6 +2576,71 @@ class Golden(Base):
         ):
             drv.read_owner_raw(marker)
         self.assertIn("not owned by you", str(cm.exception))
+
+    def test_issue78_mid_build_intruder_vm_fails_boot_and_pin(self):
+        # Issue #78 (Fable R1 / adversary r3 low 1): an intruder VM started after preflight
+        # fails g2 (boot) and an intruder VM started before pin() fails g7 (pin) without pinning.
+        # Case 1: intruder starts right after tart clone -> g2 fails
+        real_run = self.world.run
+
+        def start_intruder_after_clone(argv, **kw):
+            res = real_run(argv, **kw)
+            if argv[:2] == ["tart", "clone"]:
+                self.world.vms["intruder-boot"] = {"Running": True}
+            return res
+
+        with mock.patch.object(self.world, "run", start_intruder_after_clone):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g2"]["status"], "fail")
+        self.assertIn("intruder-boot", self.steps(s)["g2"]["evidence"])
+        self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
+
+        # Case 2: intruder starts right after prep.sh -> g7 (pin) fails before keyscan/pinning
+        self.tearDown_world()
+        real_run2 = self.world.run
+
+        def start_intruder_after_prep(argv, **kw):
+            res = real_run2(argv, **kw)
+            if argv[:1] == ["ssh"] and "PREP-RESULT" in (kw.get("input_text") or ""):
+                self.world.vms["intruder-pin"] = {"Running": True}
+            return res
+
+        with mock.patch.object(self.world, "run", start_intruder_after_prep):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g7"]["status"], "fail")
+        self.assertIn("intruder-pin", self.steps(s)["g7"]["evidence"])
+        self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
+        self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
+
+    def test_issue78_tart_list_failing_during_commit_reports_unknown_state_and_keeps_build(
+        self,
+    ):
+        # Issue #78 (Fable R5): if tart list fails during commit AFTER the committing marker
+        # was written, g10 raises a ToolError clearly stating the build is kept and golden's
+        # state is unknown.
+        real_write = drv.atomic_write
+        marker_name = self.owner_file().name
+        intent_written = False
+
+        def fail_list_after_intent(dest, text, mode=0o600):
+            nonlocal intent_written
+            res = real_write(dest, text, mode)
+            if Path(dest).name == marker_name and not intent_written:
+                intent_written = True
+                self.world.fail_tart = {"list"}
+            return res
+
+        with mock.patch.object(drv, "atomic_write", fail_list_after_intent):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("during commit failed", ev)
+        self.assertIn("unknown", ev)
+        self.assertIn(f"kept as {GOLDEN}-build", ev)
+        self.assertIn(f"{GOLDEN}-build", self.world.vms)
+        self.assertEqual(json.loads(self.owner_file().read_text())["state"], "committing")
 
     def test_the_lock_directory_must_be_ours_and_not_group_or_world_writable(self):
         self.ctx.lock_path.parent.mkdir(mode=0o700)
@@ -4561,13 +4640,36 @@ class Check(Base):
         orig = self.world._guest
 
         def silent(r, input_text):
-            if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"]:
+            if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp %Sp"]:
                 return drv.Result(1, "", "stat: boom")
             return orig(r, input_text)
 
         self.world._guest = silent
         ok, ev = drv.check_root_owned(self.ctx, t, path)
         self.assertFalse(ok)
+        self.world._guest = orig
+
+        # Issue #78: a symlink ancestor (e.g. /var -> /private/var) fails closed
+        self.world.stat_overrides = {"/Library": "root:wheel 755 lrwxr-xr-x"}
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertFalse(ok, ev)
+        self.assertIn("lrwxr-xr-x", ev)
+        self.world.stat_overrides = {}
+
+        # Issue #78: macOS ACL on the target path or any ancestor fails closed even when tree=False
+        for acl_p in (path, "/Library"):
+            with self.subTest(acl_path=acl_p):
+                self.world.acl_paths = {acl_p}
+                ok, ev = drv.check_root_owned(self.ctx, t, path)
+                self.assertFalse(ok, ev)
+                self.assertIn("ACL check failed", ev)
+        self.world.acl_paths = set()
+
+        self.world.acl_check_fail = True
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertFalse(ok, ev)
+        self.assertIn("ACL check failed", ev)
+        self.world.acl_check_fail = False
 
     def test_a_server_that_still_offers_password_login_fails_2f(self):
         self.world.password_login = (
@@ -5239,6 +5341,39 @@ class Helpers(unittest.TestCase):
             check=False,
         )
         self.assertEqual((r.returncode, r.stdout), (0, "ran arg1\n"), r.stderr)
+        self.assertEqual(set(Path("/var/tmp").glob("tendcf-state1.*")), before)
+        # Issue #78 (Fable R3): actually deliver SIGTERM while the child script sleeps and
+        # assert rc 129 and zero leftover temp files in /var/tmp.
+        p = subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                'sudo() { shift; "$@"; }\n' + drv.RUN_SCRIPT_SH,
+                "sh",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            assert p.stdin is not None and p.stdout is not None
+            p.stdin.write("echo READY; sleep 30\n")
+            p.stdin.close()
+            self.assertEqual(p.stdout.readline(), "READY\n")
+            during = set(Path("/var/tmp").glob("tendcf-state1.*")) - before
+            self.assertEqual(len(during), 1, f"expected temp script while running: {during}")
+            os.killpg(p.pid, signal.SIGTERM)
+            rc = p.wait(timeout=10)
+            self.assertEqual(rc, 129)
+        finally:
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait(timeout=5)
+            for stream in (p.stdout, p.stderr):
+                if stream is not None:
+                    stream.close()
         self.assertEqual(set(Path("/var/tmp").glob("tendcf-state1.*")), before)
 
     def test_python_signer_is_validated_as_one_line_name_and_team_id(self):
@@ -6386,6 +6521,15 @@ class GuestScripts(unittest.TestCase):
         self.assertNotEqual(self.pkgutil_check(not_leaf).returncode, 0)
         # pkgutil itself failing, whatever it printed
         self.assertNotEqual(self.pkgutil_check(self.GOOD_SIG, rc=1).returncode, 0)
+        # Issue #78 A4: missing or untrusted Notarization line fails closed
+        no_notary = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n", ""
+        )
+        self.assertNotEqual(self.pkgutil_check(no_notary).returncode, 0)
+        bad_notary = self.GOOD_SIG.replace(
+            "trusted by the Apple notary service", "not notarized"
+        )
+        self.assertNotEqual(self.pkgutil_check(bad_notary).returncode, 0)
 
 
 class CheckRenderer(Base):

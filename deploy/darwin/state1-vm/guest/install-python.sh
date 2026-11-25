@@ -21,22 +21,24 @@ installed() {
     [ "$("$py" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' </dev/null)" = "$version" ]
 }
 
-# pkgutil --check-signature must exit 0, report Apple's distribution-certificate status and
-# name the leaf certificate exactly "Developer ID Installer: <signer>". The sha256 pin is the
-# real control; this is the second one. Lines are compared whole, after trimming.
+# pkgutil --check-signature must exit 0, report Apple's distribution-certificate status,
+# notarization trust, and name the leaf certificate exactly "Developer ID Installer: <signer>".
+# The sha256 pin is the real control; this is the second one. Lines are compared whole, after trimming.
 check_signature() {
     sig=$(pkgutil --check-signature "$1" </dev/null) || die "pkgutil --check-signature failed for $1"
-    got_status=0 got_signer=0
+    got_status=0 got_notarized=0 got_signer=0
     while IFS= read -r line; do
         line=${line#"${line%%[![:space:]]*}"}
         case $line in
             "Status: signed by a developer certificate issued by Apple for distribution") got_status=1 ;;
+            "Notarization: trusted by the Apple notary service") got_notarized=1 ;;
             "1. Developer ID Installer: $signer") got_signer=1 ;;
         esac
     done <<EOF
 $sig
 EOF
     [ "$got_status" -eq 1 ] || die "package status is not 'signed by a developer certificate issued by Apple for distribution'"
+    [ "$got_notarized" -eq 1 ] || die "package notarization is not 'trusted by the Apple notary service'"
     [ "$got_signer" -eq 1 ] || die "package leaf certificate is not 'Developer ID Installer: $signer'"
 }
 

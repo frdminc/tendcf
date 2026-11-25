@@ -705,6 +705,19 @@ def assert_vm_cap(ctx: Ctx, *, limit: int = VM_CAP) -> list[str]:
     return running
 
 
+def assert_no_other_vm(ctx: Ctx, allowed: str | None = None) -> None:
+    """Fail the current step if any local VM other than `allowed` is running (issue 78:
+    re-checked in golden's boot() and at the start of pin() so a VM started mid-build fails it)."""
+    others = sorted(
+        n for n, v in local_vms(ctx).items() if v.get("Running") and n != allowed
+    )
+    if others:
+        raise StepFail(
+            f"another VM is running ({', '.join(others)}); golden needs the host network "
+            "to itself while the host key is pinned"
+        )
+
+
 def wait_until(
     ctx: Ctx, pred: Callable[[], bool], timeout: float, interval: float = 2.0
 ) -> bool:
@@ -1448,11 +1461,11 @@ def check_root_owned(
     ok = perm_ok(m[1], m[2], m[3])
     ev = f"{path} {m[1]}:{m[2]} {m[3]}"
     parents = ancestors_of(path)
-    r = rssh(ctx, t, [*pfx, "stat", "-f", "%N %Su:%Sg %Lp", *parents])
-    rows = [ln.rsplit(" ", 2) for ln in r.stdout.strip().splitlines()]
+    r = rssh(ctx, t, [*pfx, "stat", "-f", "%N %Su:%Sg %Lp %Sp", *parents])
+    rows = [ln.rsplit(" ", 3) for ln in r.stdout.strip().splitlines()]
     seen = {}
     for row in rows:
-        if len(row) == 3:
+        if len(row) == 4:
             seen[row[0]] = row
     bad_parents = []
     for par in parents:
@@ -1463,17 +1476,34 @@ def check_root_owned(
             or not row
             or not pm
             or not re.fullmatch(r"[0-7]+", row[2])
+            or not row[3].startswith("d")
             or pm[1] != "root"
             or int(row[2], 8) & 0o022
         ):
-            bad_parents.append(f"{par} {row[1] + ' ' + row[2] if row else '?'}")
+            bad_parents.append(
+                f"{par} {row[1] + ' ' + row[2] + ' ' + row[3] if row else '?'}"
+            )
     parents_ok = not bad_parents
     ok = ok and parents_ok
     ev += (
-        f"; {len(parents)} ancestors root-owned, no group/world write"
+        f"; {len(parents)} ancestors root-owned real dirs, no group/world write"
         if parents_ok
-        else f"; ancestors not root-owned or writable (rc {r.rc}): {clip(', '.join(bad_parents) or r.stderr, 300)}"
+        else f"; ancestors not real root-owned dirs or writable (rc {r.rc}): {clip(', '.join(bad_parents) or r.stderr, 300)}"
     )
+    # Check macOS ACLs on the target path and every ancestor (issue 78 adversary r3 low 3).
+    acl_r = rssh(ctx, t, [*pfx, "/bin/ls", "-lde", path, *parents])
+    acl_lines = [
+        ln
+        for ln in acl_r.stdout.splitlines()
+        if re.match(r"^ \d+: ", ln) or re.match(r"^\S+\+\s", ln)
+    ]
+    acl_ok = acl_r.rc == 0 and not acl_lines
+    ok = ok and acl_ok
+    if not acl_ok:
+        ev += (
+            f"; ACL check failed (rc {acl_r.rc}): "
+            f"{clip('; '.join(acl_lines) or acl_r.stderr or acl_r.stdout, 300)}"
+        )
     if tree:
         tree_sh = TREE_CHECK_NO_LINKS_SH if no_symlinks else TREE_CHECK_SH
         r = rssh(ctx, t, [*pfx, "/bin/sh", "-c", tree_sh, "sh", path])
@@ -3102,6 +3132,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     return f"{ref} -> {build}"
 
                 def boot() -> str:
+                    assert_no_other_vm(ctx)
                     vm.start()
                     state["ip"] = vm.ip()
                     return f"ip {state['ip']}"
@@ -3181,6 +3212,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                     )
 
                 def pin() -> str:
+                    assert_no_other_vm(ctx, allowed=build)
                     key = pin_host_key(
                         ctx,
                         str(state["ip"]),
@@ -3422,7 +3454,17 @@ def cmd_golden(ctx: Ctx, args) -> int:
                                 "golden run sweeps it)"
                             ) from e
                         removed = False
-                        if golden in local_vms(ctx):
+                        try:
+                            golden_present = golden in local_vms(ctx)
+                        except ToolError as e:
+                            raise ToolError(
+                                f"checking for an existing {golden} during commit failed: {e}; "
+                                f"whether {golden} exists is unknown, so nothing was deleted or "
+                                f"renamed; the finished build is kept as {build} and the owner "
+                                "file says a commit did not finish, so plain `golden` refuses "
+                                "(exit 2) until `--rebuild`"
+                            ) from e
+                        if golden_present:
                             if not (args.rebuild or present_at_check):
                                 # it appeared after the owner re-check: nobody checked
                                 # it, so no marker may bless it: the intent (committing)
