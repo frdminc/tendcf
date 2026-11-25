@@ -184,8 +184,9 @@ jobs:
       - name: Package the install tree for pastebin (T3)
         run: |
           cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /opt/tendcf/lib/
-          mkdir -p /opt/tendcf/share/tendcf
+          mkdir -p /opt/tendcf/share/tendcf/bin
           cp -R policy deploy /opt/tendcf/share/tendcf/
+          install -m 0644 bin/projector.py /opt/tendcf/share/tendcf/bin/projector.py
           echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
           tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf
       # After packaging, because the test removes the system librsync/libb2

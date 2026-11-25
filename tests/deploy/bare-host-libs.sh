@@ -63,10 +63,21 @@ check "cf-promises starts with the bundled directory on the path" \
     env LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --version
 
 echo "# the installer has to supply the path itself"
+check "bare host python3 -I has no third-party rfc8785 (stdlib JCS fallback active)" \
+    bash -c "! python3 -I -c 'import rfc8785' >/dev/null 2>&1"
 check "install succeeds with the caller's LD_LIBRARY_PATH unset" \
     env -u LD_LIBRARY_PATH "$installer" install --data "$canary/host_specific.json"
 wd="$(env -u LD_LIBRARY_PATH "$installer" workdir)"
+check "projector.py installed root:root 0644 (non-symlink)" \
+    bash -c "[ -f /opt/tendcf/share/tendcf/bin/projector.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/projector.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/projector.py)\" = 'root:root 644' ]"
 check "data validated and placed" test -s "$wd/data/host_specific.json"
+check "packaged installer self-realpath install succeeds" \
+    env -u LD_LIBRARY_PATH /opt/tendcf/share/tendcf/deploy/linux/tendcf-install.sh install --data /opt/tendcf/share/tendcf/deploy/linux/canary/host_specific.json
+bad_bare="$(mktemp)"
+printf '%s\n' "$(cat "$canary/host_specific.json")" > "$bad_bare"
+check "bare host rejects non-canonical projection via stdlib JCS fallback" \
+    bash -c "! env -u LD_LIBRARY_PATH \"$installer\" data \"$bad_bare\" >/dev/null 2>&1 && cmp -s \"$canary/host_specific.json\" \"$wd/data/host_specific.json\""
+rm -f "$bad_bare"
 check "a hostile inherited LD_LIBRARY_PATH is replaced, not used" \
     env LD_LIBRARY_PATH=/nonexistent "$installer" install --data "$canary/host_specific.json"
 check "no binary the root run loads is unresolved" \

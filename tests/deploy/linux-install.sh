@@ -53,6 +53,8 @@ wd="$("$installer" workdir)"
 check "/opt/tendcf is root-owned and not group/other-writable" owned_by_root_unwritable /opt/tendcf
 check "installed policy is root-owned and not group/other-writable" \
     owned_by_root_unwritable "$wd/inputs"
+check "projector.py is installed root:root 0644 (non-symlink)" \
+    bash -c "[ -f /opt/tendcf/share/tendcf/bin/projector.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/projector.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/projector.py)\" = 'root:root 644' ]"
 check "CMDB data is root:root 0600" \
     bash -c "[ \"\$(stat -c '%U:%G %a' $wd/data/host_specific.json)\" = 'root:root 600' ]"
 
@@ -81,6 +83,84 @@ echo "# 4. tombstone"
 check "tombstone removed the unit file" bash -c "[ ! -e /etc/systemd/system/$unit ]"
 check "tombstone stopped the canary" bash -c "! systemctl is-active --quiet $unit"
 check "manager forgot the unit (not-found)" bash -c "[ \"\$(systemctl show -p LoadState --value $unit)\" = not-found ]"
+
+echo "# 5. installer hardening (#53, #57, #58)"
+scratch="$(mktemp -d)"
+cleanup_all() {
+    rm -rf "$scratch" "$wd/data/def.json"
+    cleanup
+}
+trap cleanup_all EXIT
+
+live_data="$wd/data/host_specific.json"
+orig_snap="$scratch/orig.json"
+cp -p "$live_data" "$orig_snap"
+orig_ino="$(stat -c '%i' "$live_data")"
+orig_mtime="$(stat -c '%Y.%y' "$live_data")"
+
+# #53: non-canonical JCS (trailing newline) and forbidden pre_action argv refused without touching live data
+bad_nl="$scratch/noncanonical.json"
+printf '%s\n' "$(cat "$canary/host_specific.json")" > "$bad_nl"
+check "#53 non-canonical projection (trailing newline) refused" \
+    bash -c "! \"$installer\" data \"$bad_nl\" >/dev/null 2>&1"
+check "#53 live data unchanged (bytes, inode, mtime) after non-canonical refusal" \
+    bash -c "cmp -s \"$orig_snap\" \"$live_data\" && [ \"\$(stat -c '%i' \"$live_data\")\" = \"$orig_ino\" ] && [ \"\$(stat -c '%Y.%y' \"$live_data\")\" = \"$orig_mtime\" ]"
+
+bad_argv="$scratch/bad-argv.json"
+printf '%s' '{"vars":{"tendcf_interlock":{"bad-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true","has space"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}}}}' > "$bad_argv"
+check "#53 forbidden pre_action argv refused by projector gate" \
+    bash -c "! \"$installer\" data \"$bad_argv\" >/dev/null 2>&1"
+check "#53 live data unchanged after forbidden argv refusal" \
+    bash -c "cmp -s \"$orig_snap\" \"$live_data\" && [ \"\$(stat -c '%i' \"$live_data\")\" = \"$orig_ino\" ]"
+
+# #57: CMDB refusal fixture rejected before touching live data
+check "#57 cmdb-classes-section fixture refused without touching live data" \
+    bash -c "! \"$installer\" data \"$repo/tests/policy/fixtures/cmdb-classes-section.json\" >/dev/null 2>&1 && cmp -s \"$orig_snap\" \"$live_data\" && [ \"\$(stat -c '%i' \"$live_data\")\" = \"$orig_ino\" ]"
+
+# #57 Gate 2 direct check against real cf-promises --show-classes (valid vs tendcf_cmdb_refused)
+gate2_wd="$scratch/gate2-wd"
+install -d -m 0755 "$gate2_wd/bin" "$gate2_wd/outputs" "$gate2_wd/modules" "$gate2_wd/state"
+install -d -m 0700 "$gate2_wd/ppkeys" "$gate2_wd/data"
+cp -pRP "$wd/inputs" "$gate2_wd/inputs"
+printf '%s' '{"vars":{}}' > "$gate2_wd/data/host_specific.json"
+chmod 0600 "$gate2_wd/data/host_specific.json"
+check "#57 real cf-promises accepts empty vars projection with no tendcf_cmdb_refused" \
+    bash -c "out=\"\$(LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --workdir \"$gate2_wd\" -f \"$gate2_wd/inputs/promises.cf\" --show-classes)\" && [ -n \"\$out\" ] && ! printf '%s\n' \"\$out\" | awk '\$1 == \"tendcf_cmdb_refused\" || \$1 ~ /^tendcf_cmdb_problem_/ { found=1 } END { exit !found }'"
+cp "$repo/tests/policy/fixtures/cmdb-classes-section.json" "$gate2_wd/data/host_specific.json"
+chmod 0600 "$gate2_wd/data/host_specific.json"
+check "#57 real cf-promises flags tendcf_cmdb_refused on cmdb-classes-section" \
+    bash -c "out=\"\$(LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --workdir \"$gate2_wd\" -f \"$gate2_wd/inputs/promises.cf\" --show-classes)\" && printf '%s\n' \"\$out\" | awk '\$1 == \"tendcf_cmdb_refused\" { found=1 } END { exit !found }'"
+
+# #57 Gate 3 post-publish rollback: a rogue augments file (def.json) in live $wd/data
+# lets Gate 1 & Gate 2 pass on staged workdir, triggers tendcf_cmdb_refused on live Gate 3,
+# and must atomically roll back live host_specific.json to its previous contents.
+printf '%s' '{"classes":{"rogue_augments_class":["any"]}}' > "$wd/data/def.json"
+chmod 0600 "$wd/data/def.json"
+check "#57 Gate 3 post-publish tendcf_cmdb_refused rolls back to previous live data" \
+    bash -c "! \"$installer\" data \"$canary/host_specific.json\" >/dev/null 2>&1 && cmp -s \"$orig_snap\" \"$live_data\""
+rm -f "$wd/data/def.json"
+
+# #58: concurrent publishers serialize cleanly with zero collisions and zero temp leftovers
+pids=()
+for i in 1 2 3 4 5 6; do
+    if [ $((i % 2)) -eq 0 ]; then
+        "$installer" data "$canary/host_specific.json" >/dev/null &
+    else
+        "$installer" data "$canary/host_specific-absent.json" >/dev/null &
+    fi
+    pids+=("$!")
+done
+conc_ok=1
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then conc_ok=0; fi
+done
+check "#58 all 6 concurrent publishers exited 0" test "$conc_ok" -eq 1
+check "#58 final live data matches one of the two valid projections byte-for-byte" \
+    bash -c "cmp -s \"$canary/host_specific.json\" \"$live_data\" || cmp -s \"$canary/host_specific-absent.json\" \"$live_data\""
+check "#58 final live data passes cf-promises --show-classes without tendcf_cmdb_refused" \
+    bash -c "out=\"\$(LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --workdir \"$wd\" -f \"$wd/inputs/promises.cf\" --show-classes)\" && [ -n \"\$out\" ] && ! printf '%s\n' \"\$out\" | awk '\$1 == \"tendcf_cmdb_refused\" || \$1 ~ /^tendcf_cmdb_problem_/ { found=1 } END { exit !found }'"
+check "#58 zero leftover staging/backup temp files in workdir/data" \
+    bash -c "[ -z \"\$(find \"$wd/data\" -maxdepth 1 -mindepth 1 ! -name host_specific.json ! -name .publish.lock -print)\" ]"
 
 if [ "$fail" != 0 ]; then exit 1; fi
 echo; echo "all install tests passed"
