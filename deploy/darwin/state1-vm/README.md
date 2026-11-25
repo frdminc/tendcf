@@ -318,7 +318,7 @@ Recovery.
 | 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
 | 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
 | 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2l (including live password-login refusal 2f) hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
 | 10b | post-reboot `launchctl print` for `com.tendcf.canary.main` and `org.tendcf.execd` (loaded from disk at boot; `org.tendcf.execd` running as `root`) | live (with `--tarball` or `--artifact-run`) |
 | 11 | stop and delete the clone, always | live |
 | 11a | canary tombstone teardown (`data` + `run-once`, plist removed, `launchctl print` fails) and `org.tendcf.execd` `disable` (plist removed, `launchctl print` fails) before step 11 | live (with `--tarball` or `--artifact-run`) |
@@ -383,18 +383,24 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
   `PubkeyAuthentication yes`, `PermitRootLogin no`, `UsePAM yes`), not the lowercase of stock
-  OpenSSH. `prep.sh` (`LC_ALL=C grep -qixF`: whole line, ignoring case) and check 2e (and its
-  post-reboot repeat, 10a) accept the same lines: the driver reads sshd's bytes untranslated
-  (`raw_newlines`: no text mode, so Python does not turn a lone CR or CRLF into a newline),
-  splits on `"\n"` only, strips nothing and folds ASCII case only, so padding or a line
-  smuggled in through a quoted value (for example a `Banner` holding a form feed) does not
-  count. Any CR anywhere in the output fails 2e outright, with the reason in the evidence
-  (grep sees a CR as part of its line, so `prep.sh` rejects the same outputs). The
-  `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has `Include
-  /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and sorts
-  after ours), and the effective configuration, as `sshd -T -C user=admin,host=localhost,
-  addr=127.0.0.1` prints it, was key-only; the live refusal of a password login (g9, 2f) has not
-  run. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
+  OpenSSH. `prep.sh` (via a root-only `$STATE_DIR` temp file + `LC_ALL=C tr` + `LC_ALL=C awk` so
+  NUL bytes are preserved and rejected) and check 2e (and its post-reboot repeat, 10a) assert
+  `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`,
+  `PermitRootLogin no`, `GSSAPIAuthentication no`, `HostbasedAuthentication no`, and
+  `AuthenticationMethods` (`publickey` in `prep.sh`; `publickey` or `any` in 2e) with each
+  checked key appearing **exactly once** across loopback and host-facing guest/client `-C` specs
+  for both `admin` and `root`, and fail closed on any uncommented `Match` block across
+  `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/*`, and recursive `Include` targets (such as
+  `/etc/ssh/crypto.conf`). The driver reads sshd's bytes untranslated (`raw_newlines`: no text
+  mode, so Python does not turn a lone CR or CRLF into a newline), splits on `"\n"` only, strips
+  nothing and folds ASCII case only, so padding or a line smuggled in through a quoted value (for
+  example a `Banner` holding a form feed) does not count. Any CR or NUL anywhere in the output
+  fails 2e outright, with the reason in the evidence (prep.sh rejects every output where a CR
+  touches a wanted line; the driver rejects any CR). The `/etc/ssh/sshd_config.d` include is
+  honoured (`sshd_config:19` has `Include /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf`
+  is the only other drop-in and sorts after ours), and the effective configuration, as `sshd -T -C`
+  prints it, was key-only; the live refusal of a password login (g9, 2f, and repeated in 10a) is
+  also checked. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
   cache, `tart ip --wait` answers, and that the vanilla image's Secure Token is enabled for
   `admin`. (Run 2, below, ran the rotation.)
 - **Observed (macOS 27.2 26B123), run 2 on the merged sshd fix (2026-11-21):** `golden` passed

@@ -87,11 +87,15 @@ SECURE_TOKEN_AFTER = (
 )
 SSHD_CAMEL = (
     "UsePAM yes\nPermitRootLogin no\nPubkeyAuthentication yes\n"
-    "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthOptions none\n"
+    "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+    "GSSAPIAuthentication no\nHostbasedAuthentication no\n"
+    "AuthenticationMethods publickey\nPubkeyAuthOptions none\n"
 )
 SSHD_LOWER = (
     "port 22\npasswordauthentication no\nkbdinteractiveauthentication no\n"
     "pubkeyauthentication yes\npermitrootlogin no\n"
+    "gssapiauthentication no\nhostbasedauthentication no\n"
+    "authenticationmethods publickey\n"
 )
 
 
@@ -147,8 +151,13 @@ class FakeWorld:
         self.signals_sent = 0
         self.screensharing_on = False
         self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
+        self.sshd_spec_outputs = {}  # spec -> output override for multi-spec tests
+        self.sshd_specs_seen = []  # every -C spec passed to `sudo -n sshd -T -C`
         self.sshd_rc = 0
         self.sshd_raw_newlines = []  # the raw_newlines flag of each sshd -T call
+        self.sshd_match_rc = 0
+        self.sshd_match_output = ""
+        self.password_login_after_reboot = False
         # `sudo -n mdutil -a -s`: the answers still to give, in order ((rc, stdout)), then
         # mdutil_default for ever; mdutil_calls counts the calls
         self.mdutil_outputs = []
@@ -669,11 +678,16 @@ class FakeWorld:
             # the output goes through the real runner's decode (a real printf), so the
             # production newline handling applies, not the fake's
             self.sshd_raw_newlines.append(self._raw_newlines)
+            spec = r[r.index("-C") + 1] if "-C" in r else ""
+            self.sshd_specs_seen.append(spec)
+            out = self.sshd_spec_outputs.get(spec, self.sshd_output)
             real = drv.RealRunner().run(
-                ["/usr/bin/printf", "%s", self.sshd_output],
+                ["/usr/bin/printf", "%s", out],
                 raw_newlines=self._raw_newlines,
             )
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
+        if r[:5] == ["sudo", "-n", "/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH]:
+            return drv.Result(self.sshd_match_rc, self.sshd_match_output, "")
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             self.mdutil_calls += 1
             self.mdutil_raw_newlines.append(self._raw_newlines)
@@ -787,6 +801,8 @@ class FakeWorld:
             self.ssh_down = 2
             for i in range(self.intruders_on_reboot):
                 self.vms[f"intruder{i}"] = {"Running": True}
+            if self.rebooted and self.password_login_after_reboot:
+                self.password_login = True
             if self.run_exits_on_reboot or self.die_after_reboot:
                 self._stop_current()
             return drv.Result(255, "", "Connection closed")
@@ -3460,6 +3476,141 @@ class Check(Base):
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn("carriage return", st["evidence"], name)
 
+    def test_sshd_hardening_multi_spec_exact_once_extra_keys_match_and_10a_2f(self):
+        # Issue #87: multi-spec -C (admin + root, loopback + guest/gateway IP),
+        # A7 exact-once keys, extra auth settings, Match refusal, and 2f repeated in 10a.
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        expected_specs = {
+            "user=admin,host=localhost,addr=127.0.0.1",
+            "user=root,host=localhost,addr=127.0.0.1",
+            "user=admin,host=192.168.64.10,addr=192.168.64.10",
+            "user=root,host=192.168.64.10,addr=192.168.64.10",
+            "user=admin,host=192.168.64.10,addr=192.168.64.1",
+            "user=root,host=192.168.64.10,addr=192.168.64.1",
+        }
+        self.assertTrue(expected_specs.issubset(set(self.world.sshd_specs_seen)))
+
+        # AuthenticationMethods any (macOS default on existing goldens) is accepted in 2e
+        self.world.sshd_output = SSHD_CAMEL.replace(
+            "AuthenticationMethods publickey", "AuthenticationMethods any"
+        )
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+
+        # Relaxing only the host-facing client spec or root spec fails 2e
+        self.world.sshd_output = SSHD_CAMEL
+        for bad_spec in (
+            "user=admin,host=192.168.64.10,addr=192.168.64.1",
+            "user=root,host=localhost,addr=127.0.0.1",
+        ):
+            with self.subTest(bad_spec=bad_spec):
+                self.world.sshd_spec_outputs = {
+                    bad_spec: SSHD_CAMEL.replace(
+                        "PasswordAuthentication no", "PasswordAuthentication yes"
+                    )
+                }
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1)
+                self.assertEqual(self.steps(s)["2e"]["status"], "fail")
+                self.assertIn(bad_spec, self.steps(s)["2e"]["evidence"])
+        self.world.sshd_spec_outputs = {}
+
+        # A7 exact-once + extra auth keys + NUL rejection
+        for name, out, want in (
+            (
+                "duplicate conflicting PasswordAuthentication",
+                SSHD_CAMEL + "PasswordAuthentication yes\n",
+                "duplicate keys",
+            ),
+            (
+                "duplicate identical PasswordAuthentication",
+                SSHD_CAMEL + "PasswordAuthentication no\n",
+                "duplicate keys",
+            ),
+            (
+                "GSSAPIAuthentication yes",
+                SSHD_CAMEL.replace("GSSAPIAuthentication no", "GSSAPIAuthentication yes"),
+                "gssapiauthentication no",
+            ),
+            (
+                "HostbasedAuthentication yes",
+                SSHD_CAMEL.replace("HostbasedAuthentication no", "HostbasedAuthentication yes"),
+                "hostbasedauthentication no",
+            ),
+            (
+                "AuthenticationMethods password",
+                SSHD_CAMEL.replace("AuthenticationMethods publickey", "AuthenticationMethods password"),
+                "authenticationmethods",
+            ),
+            (
+                "NUL byte in sshd output",
+                SSHD_CAMEL + "Banner /x\x00y\n",
+                "NUL byte",
+            ),
+        ):
+            with self.subTest(name):
+                ok, ev = drv.sshd_key_only(drv.Result(0, out))
+                self.assertFalse(ok, (name, ev))
+                self.assertIn(want, ev, name)
+
+        # Uncommented Match block fails 2e
+        self.world.sshd_match_rc = 2
+        self.world.sshd_match_output = "/etc/ssh/crypto.conf:3: Match Address 192.168.64.0/20\n"
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2e"]["status"], "fail")
+        self.assertIn("Match", self.steps(s)["2e"]["evidence"])
+        self.world.sshd_match_rc = 0
+        self.world.sshd_match_output = ""
+
+        # Live password refusal (2f) is repeated after reboot in 10a
+        self.world.password_login_after_reboot = True
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2f"]["status"], "pass")
+        self.assertEqual(self.steps(s)["10a"]["status"], "fail")
+        self.assertIn("2f", self.steps(s)["10a"]["evidence"])
+        self.assertIn("still offers", self.steps(s)["10a"]["evidence"])
+
+    def test_sshd_match_check_sh_traverses_includes_prevents_cycles_and_catches_match(self):
+        # Run SSHD_MATCH_CHECK_SH directly against real config trees with nested Includes
+        base = Path(tempfile.mkdtemp(prefix="tendcf-sshd-match-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        (base / "sshd_config.d").mkdir()
+        (base / "crypto").mkdir()
+        (base / "crypto" / "apple.conf").write_text("# comment\nCiphers aes256-gcm@openssh.com\n")
+        (base / "crypto.conf").symlink_to(base / "crypto" / "apple.conf")
+        (base / "sshd_config.d" / "100-macos.conf").write_text(
+            "UsePAM yes\nInclude crypto.conf\n"
+        )
+        (base / "sshd_config").write_text(
+            "# Match User foo\nInclude sshd_config.d/*\nPasswordAuthentication no\n"
+        )
+        run_check = lambda: subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(base / "sshd_config"), str(base)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
+        # Include cycle does not infinite-loop
+        (base / "crypto" / "apple.conf").write_text(
+            f"Include {base / 'sshd_config.d' / '100-macos.conf'}\n"
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
+        # Uncommented Match inside a recursively included symlinked file fails closed
+        (base / "crypto" / "apple.conf").write_text(
+            "Match Address 192.168.64.0/20\n    PasswordAuthentication yes\n"
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match Address", r.stdout)
+
     # -- 2g / 10a: Spotlight off, with a bounded settle (issue 70 run 2)
     def test_2g_waits_out_transitioning_and_records_polls_and_seconds(self):
         self.world.mdutil_outputs = [
@@ -4614,31 +4765,57 @@ class RawNewlines(unittest.TestCase):
 
     def test_raw_decodes_utf8_with_replacement_and_passes_input_through(self):
         r = drv.RealRunner().run([self.PRINTF, "\\377x"], timeout=30, raw_newlines=True)
-        self.assertEqual(r.stdout, "�x")
+        self.assertEqual(r.stdout, "\ufffdx")
         r = drv.RealRunner().run(
             ["/bin/cat"], input_text="x\r\ny\r", timeout=30, raw_newlines=True
         )
         self.assertEqual(r.stdout, "x\r\ny\r")
+
+    def test_default_text_mode_decodes_invalid_utf8_with_replacement(self):
+        # Issue #87 Fable r3 nit 4: default text-mode path replaces invalid UTF-8
+        # instead of crashing with an uncaught UnicodeDecodeError.
+        r = drv.RealRunner().run([self.PRINTF, "\\377x"], timeout=30)
+        self.assertEqual((r.rc, r.stdout), (0, "\ufffdx"))
+
+    def test_raw_newlines_combined_with_log_path_is_refused(self):
+        # Issue #87 Fable r3 nit 3: raw_newlines=True + log_path raises ValueError.
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                drv.RealRunner().run(
+                    [self.PRINTF, "ok"],
+                    timeout=30,
+                    raw_newlines=True,
+                    log_path=Path(d) / "out.log",
+                )
 
     def test_2e_matcher_on_real_runner_output(self):
         wrong = SSHD_CAMEL.replace(
             "PasswordAuthentication no", "PasswordAuthentication yes"
         )
         smuggled = wrong + "Banner /x\rPasswordAuthentication no\n"
+        smuggled_missing = (
+            SSHD_CAMEL.replace("PasswordAuthentication no\n", "")
+            + "Banner /x\rPasswordAuthentication no\n"
+        )
         # the real, observed CamelCase output passes, raw or not
         for raw in (True, False):
             ok, ev = drv.sshd_key_only(self.printf(SSHD_CAMEL, raw_newlines=raw))
             self.assertTrue(ok, ev)
         # a CR-smuggled line and a trailing CR fail on the raw bytes ...
         for name, text in (
-            ("smuggled", smuggled),
+            ("smuggled over wrong", smuggled),
+            ("smuggled over missing", smuggled_missing),
             ("trailing CR", SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no\r\n")),
         ):  # fmt: skip
             ok, ev = drv.sshd_key_only(self.printf(text, raw_newlines=True))
             self.assertFalse(ok, (name, ev))
             self.assertIn("carriage return", ev)
-        # ... while the default runner's decode would have shown the matcher a fake line
-        ok, _ = drv.sshd_key_only(self.printf(smuggled))
+        # ... with A7 exact-once, smuggled over wrong fails even in default text mode as a duplicate,
+        # while smuggled over missing still proves why raw_newlines=True is required
+        ok, ev = drv.sshd_key_only(self.printf(smuggled))
+        self.assertFalse(ok, ev)
+        self.assertIn("duplicate keys", ev)
+        ok, _ = drv.sshd_key_only(self.printf(smuggled_missing))
         self.assertTrue(ok, "the default decode turns the CR into a newline")
 
     def test_2g_matcher_on_real_runner_output(self):
@@ -5042,35 +5219,64 @@ class GuestScripts(unittest.TestCase):
                 self.assertIn(form, r.stdout, over)
 
     def test_prep_checks_sshd_effective_config_ignoring_case(self):
-        # the loop that asserts `sshd -T` shows key-only login, run against a fake sshd
+        # Issue #87: prep.sh step 7 checks Match blocks across recursive Includes, multi-spec
+        # sshd -T -C (admin + root, loopback + host-facing), exact-once keys (A7), extra auth
+        # keys, and NUL byte preservation via a temp file (A8).
         text = self.text("prep.sh")
-        a = text.index("effective=$(/usr/sbin/sshd -T")
+        a = text.index("sshd_canon() {")
         b = text.index('log "sshd: key login only"', a)
         snippet = text[a:b]
         tmp = Path(tempfile.mkdtemp(prefix="tendcf-prep7-"))
         self.addCleanup(shutil.rmtree, tmp, True)
+        state_dir = tmp / "state"
+        state_dir.mkdir()
+        ssh_dir = tmp / "ssh"
+        (ssh_dir / "sshd_config.d").mkdir(parents=True)
+        (ssh_dir / "crypto.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        (ssh_dir / "sshd_config.d" / "100-macos.conf").write_text("Include crypto.conf\n")
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        specs_log = tmp / "specs.log"
         fake = tmp / "sshd"
-        fake.write_text('#!/bin/sh\nprintf "%s" "$SSHD_OUT"\nexit "${SSHD_RC:-0}"\n')
+        fake.write_text(
+            '#!/bin/sh\n'
+            'echo "$*" >>"$SPECS_LOG"\n'
+            'if [ -n "${SSHD_FILE:-}" ]; then cat "$SSHD_FILE"; else printf "%s" "$SSHD_OUT"; fi\n'
+            'exit "${SSHD_RC:-0}"\n'
+        )
         fake.chmod(0o755)
         snippet = snippet.replace("/usr/sbin/sshd", str(fake))
-        # A2/A6: the replace must have taken, and the slice must be exactly the expected text
-        # (comments aside), so any widening fails here instead of running on the host: it can
-        # then never run the host's sshd or write anything on the host.
         self.assertNotIn("/usr/sbin/sshd", snippet)
         self.assertIn(str(fake), snippet)
-        code = "".join(
-            ln + "\n" for ln in snippet.split("\n") if ln and not ln.startswith("#")
-        )
-        self.assertEqual(
-            code,
-            f"effective=$({fake} -T -C user=admin,host=localhost,addr=127.0.0.1)\n"
-            "for want in 'passwordauthentication no' 'kbdinteractiveauthentication no'"
-            " 'pubkeyauthentication yes' 'permitrootlogin no'; do\n"
-            """    printf '%s\\n' "$effective" | LC_ALL=C grep -qixF "$want" """
-            """|| die "sshd -T does not show: $want"\n"""
-            "done\n",
-        )
         stub = 'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+        base_env = {
+            "PATH": "/usr/bin:/bin",
+            "STATE_DIR": str(state_dir),
+            "SSHD_CONFIG": str(ssh_dir / "sshd_config"),
+            "SSHD_BASE_DIR": str(ssh_dir),
+            "SSHD_CLIENT_ADDRS": "192.168.64.1",
+            "SPECS_LOG": str(specs_log),
+        }
+
+        def run_step7(out=None, *, raw_bytes=None, rc_env="0"):
+            if specs_log.exists():
+                specs_log.unlink()
+            env = {**base_env, "SSHD_RC": rc_env}
+            if raw_bytes is not None:
+                bf = tmp / "sshd.bin"
+                bf.write_bytes(raw_bytes)
+                env["SSHD_FILE"] = str(bf)
+            else:
+                env["SSHD_OUT"] = out
+            r = subprocess.run(
+                ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(list(state_dir.iterdir()), [], "leaked sshd temp file")
+            return r
+
         cases = (
             (SSHD_CAMEL, 0, ""),  # macOS 27.2, as observed
             (SSHD_LOWER, 0, ""),  # stock OpenSSH
@@ -5080,47 +5286,64 @@ class GuestScripts(unittest.TestCase):
              1, "pubkeyauthentication yes"),
             (SSHD_CAMEL.replace("PermitRootLogin no", "PermitRootLogin no-password"),
              1, "permitrootlogin no"),  # whole line, not a prefix
+            (SSHD_CAMEL.replace("GSSAPIAuthentication no", "GSSAPIAuthentication yes"),
+             1, "gssapiauthentication no"),
+            (SSHD_CAMEL.replace("HostbasedAuthentication no", "HostbasedAuthentication yes"),
+             1, "hostbasedauthentication no"),
+            (SSHD_CAMEL.replace("AuthenticationMethods publickey", "AuthenticationMethods any"),
+             1, "authenticationmethods publickey"),
+            (SSHD_CAMEL + "PasswordAuthentication yes\n", 1, "duplicate key: passwordauthentication"),
             ("", 1, "passwordauthentication no"),
-            # padding, a CR and a leading space are not the wanted line (and the driver agrees)
+            # padding, a CR on a wanted line, and a leading space are rejected
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no  \n"),
              1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no\r\n"),
              1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", " PasswordAuthentication no\n"),
              1, "passwordauthentication no"),
-            # a separator inside a quoted value does not make a second line, in grep either
+            # a CR on an unrelated line passes prep.sh (driver rejects any CR: Fable r3 nit 1)
+            (SSHD_CAMEL.replace("UsePAM yes\n", "UsePAM yes\r\n"), 0, ""),
+            # a separator inside a quoted value does not make a second line
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
              + "Banner /x\x0cPasswordAuthentication no\n", 1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
              + "Banner /x\u2028PasswordAuthentication no\n", 1, "passwordauthentication no"),
         )  # fmt: skip
         for out, want_rc, want_msg in cases:
-            r = subprocess.run(
-                ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
-                capture_output=True,
-                text=True,
-                check=False,
-                env={"PATH": "/usr/bin:/bin", "SSHD_OUT": out},
-            )
+            r = run_step7(out)
             self.assertEqual(r.returncode, want_rc, (out, r.stdout, r.stderr))
             self.assertIn(want_msg, r.stdout + r.stderr)
-        # a lone CR inside a quoted value is part of that line for grep, as for the driver
+        # Verify all 4 specs (admin+root x loopback+host-facing) were evaluated on pass
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        seen_specs = specs_log.read_text().splitlines()
+        for want_spec in (
+            "-T -C user=admin,host=localhost,addr=127.0.0.1",
+            "-T -C user=root,host=localhost,addr=127.0.0.1",
+            "-T -C user=admin,host=192.168.64.1,addr=192.168.64.1",
+            "-T -C user=root,host=192.168.64.1,addr=192.168.64.1",
+        ):
+            self.assertIn(want_spec, seen_specs)
+        # A8: NUL bytes are preserved via the temp file and fail closed
+        r = run_step7(raw_bytes=SSHD_CAMEL.encode() + b"Banner /x\x00y\n")
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
+        # CR-smuggled line and non-zero sshd exit fail closed
         smuggled = (
             SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
             + "Banner /x\rPasswordAuthentication no\n"
         )  # fmt: skip
-        # sshd -T failing: the command substitution dies under set -e with sshd's own status,
-        # even when what it printed looks right, and nothing after it runs
-        for out, rc_env, want_rc in ((smuggled, "0", 1), (SSHD_CAMEL, "3", 3)):
-            r = subprocess.run(
-                ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
-                capture_output=True,
-                text=True,
-                check=False,
-                env={"PATH": "/usr/bin:/bin", "SSHD_OUT": out, "SSHD_RC": rc_env},
-            )
-            self.assertEqual(r.returncode, want_rc, (rc_env, r.stdout, r.stderr))
+        for out, rc_env in ((smuggled, "0"), (SSHD_CAMEL, "3")):
+            r = run_step7(out, rc_env=rc_env)
+            self.assertEqual(r.returncode, 1, (rc_env, r.stdout, r.stderr))
             self.assertNotIn("REACHED", r.stdout)
+        # Uncommented Match in a recursively included file fails closed
+        (ssh_dir / "crypto.conf").write_text("Match Address 192.168.64.0/20\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
 
     def fake_bin(self, name, body):
         d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
@@ -5749,7 +5972,7 @@ class GuestScripts(unittest.TestCase):
         self.assertIn("PREP-HOSTKEY", text)
         self.assertIn("/etc/ssh/ssh_host_ed25519_key.pub", text)
         self.assertLess(text.index("ssh-keygen -A"), text.index('echo "PREP-HOSTKEY'))
-        self.assertIn("'permitrootlogin no'", text)
+        self.assertIn('"permitrootlogin no"', text)
 
     def test_python_install_fixes_and_asserts_ownership_after_the_installer(self):
         text = self.text("install-python.sh")

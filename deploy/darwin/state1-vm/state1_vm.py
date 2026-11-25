@@ -241,9 +241,12 @@ class RealRunner:
     ) -> Result:
         """raw_newlines: no text mode, so no universal-newline translation (it turns a lone
         CR or CRLF into "\\n"): bytes in, stdout/stderr decoded as UTF-8 with errors="replace".
-        Opt-in; the default is unchanged for every other caller."""
+        Opt-in; cannot be combined with log_path. Default text mode also uses UTF-8 with
+        errors="replace" so invalid UTF-8 from a guest command never raises UnicodeDecodeError."""
         if input_text is not None and input_bytes is not None:
             raise ValueError("pass either input_text or input_bytes, not both")
+        if raw_newlines and log_path is not None:
+            raise ValueError("raw_newlines=True cannot be combined with log_path")
         out = open(log_path, "ab") if log_path else None  # noqa: SIM115
         raw = raw_newlines or input_bytes is not None
         payload: bytes | str | None
@@ -253,6 +256,7 @@ class RealRunner:
             payload = input_text.encode("utf-8")
         else:
             payload = input_text
+        use_text = (payload is not None or out is None) and not raw
         try:
             cp = subprocess.run(
                 argv,
@@ -260,7 +264,9 @@ class RealRunner:
                 stdin=None if payload is not None else subprocess.DEVNULL,
                 stdout=out if out else subprocess.PIPE,
                 stderr=subprocess.STDOUT if out else subprocess.PIPE,
-                text=(payload is not None or out is None) and not raw,
+                text=use_text,
+                encoding="utf-8" if use_text else None,
+                errors="replace" if use_text else None,
                 env=env,
                 timeout=timeout,
                 check=False,
@@ -731,33 +737,222 @@ def rssh(
     )
 
 
+SSHD_REQUIRED_EXACT: dict[str, frozenset[str]] = {
+    "passwordauthentication": frozenset({"passwordauthentication no"}),
+    "kbdinteractiveauthentication": frozenset({"kbdinteractiveauthentication no"}),
+    "pubkeyauthentication": frozenset({"pubkeyauthentication yes"}),
+    "permitrootlogin": frozenset({"permitrootlogin no"}),
+    "gssapiauthentication": frozenset({"gssapiauthentication no"}),
+    "hostbasedauthentication": frozenset({"hostbasedauthentication no"}),
+    # macOS OpenSSH prints `AuthenticationMethods any` by default when unset, or
+    # `AuthenticationMethods publickey` when explicitly set by prep.sh; reject any other value.
+    "authenticationmethods": frozenset(
+        {"authenticationmethods publickey", "authenticationmethods any"}
+    ),
+}
 SSHD_WANT = frozenset(
     {
         "passwordauthentication no",
         "kbdinteractiveauthentication no",
         "pubkeyauthentication yes",
         "permitrootlogin no",
+        "gssapiauthentication no",
+        "hostbasedauthentication no",
     }
 )
+# Inspect sshd_config and all recursive Include targets (cycle-safe, max depth 16) for any
+# uncommented Match directive. Arguments: $1 = main sshd_config path, $2 = base dir (/etc/ssh).
+SSHD_MATCH_CHECK_SH = r'''set -eu
+cfg=$1; base=$2
+[ -f "$cfg" ] || { echo "missing sshd config: $cfg" >&2; exit 1; }
+canon() {
+    _p=$1; _hops=0
+    while [ -L "$_p" ]; do
+        _hops=$((_hops + 1))
+        [ "$_hops" -le 16 ] || { echo "symlink loop: $1" >&2; exit 1; }
+        _t=$(readlink "$_p") || { echo "readlink failed: $_p" >&2; exit 1; }
+        case $_t in /*) _p=$_t ;; *) _p=$(dirname "$_p")/$_t ;; esac
+    done
+    _d=$(CDPATH='' cd -P -- "$(dirname "$_p")" 2>/dev/null && pwd -P) || { echo "cannot resolve dir: $_p" >&2; exit 1; }
+    printf '%s/%s\n' "${_d%/}" "$(basename "$_p")"
+}
+visited=""
+queue="0	$cfg"
+while [ -n "$queue" ]; do
+    entry=${queue%%"
+"*}
+    case $queue in *"
+"*) queue=${queue#*"
+"} ;; *) queue="" ;; esac
+    [ -n "$entry" ] || continue
+    depth=${entry%%"	"*}
+    f=${entry#*"	"}
+    [ "$depth" -le 16 ] || { echo "Include nesting exceeds 16 levels at $f" >&2; exit 1; }
+    if [ -L "$f" ] && [ ! -e "$f" ]; then echo "dangling symlink: $f" >&2; exit 1; fi
+    [ -f "$f" ] || continue
+    [ -r "$f" ] || { echo "unreadable config: $f" >&2; exit 1; }
+    c=$(canon "$f")
+    case "
+$visited
+" in *"
+$c
+"*) continue ;; esac
+    visited="$visited
+$c"
+    hit=$(LC_ALL=C awk '
+        /^[ \t]*#/ || /^[ \t]*$/ { next }
+        {
+            line = $0; sub(/^[ \t]+/, "", line)
+            key = line; sub(/[ \t=].*$/, "", key)
+            if (tolower(key) == "match") {
+                printf "%s:%d: %s\n", FILENAME, FNR, $0
+                exit
+            }
+        }' "$f")
+    if [ -n "$hit" ]; then printf '%s\n' "$hit"; exit 2; fi
+    incs=$(LC_ALL=C awk '
+        /^[ \t]*#/ || /^[ \t]*$/ { next }
+        {
+            line = $0; sub(/^[ \t]+/, "", line)
+            key = line; sub(/[ \t=].*$/, "", key)
+            if (tolower(key) == "include") {
+                rest = substr(line, length(key) + 1)
+                sub(/^[ \t=]+/, "", rest)
+                n = split(rest, parts, /[ \t]+/)
+                for (i = 1; i <= n; i++) {
+                    p = parts[i]
+                    if (p ~ /^#/) break
+                    if (p ~ /^".*"$/) p = substr(p, 2, length(p) - 2)
+                    if (p != "") print p
+                }
+            }
+        }' "$f")
+    next_depth=$((depth + 1))
+    old_ifs=$IFS
+    IFS='
+'
+    for pat in $incs; do
+        IFS=$old_ifs
+        [ -n "$pat" ] || continue
+        case $pat in /*) full=$pat ;; *) full="$base/$pat" ;; esac
+        for matched in $full; do
+            if [ ! -e "$matched" ] && [ ! -L "$matched" ]; then continue; fi
+            if [ -d "$matched" ] && [ ! -L "$matched" ]; then continue; fi
+            if [ -n "$queue" ]; then
+                queue="$queue
+$next_depth	$matched"
+            else
+                queue="$next_depth	$matched"
+            fi
+        done
+    done
+    IFS=$old_ifs
+done
+'''
+
+
+def sshd_connection_specs(user: str, ip: str) -> list[str]:
+    """Connection specs for `sshd -T -C`: loopback + host-facing guest/client addresses, for
+    both the login user and root."""
+    users = [user] if user == "root" else [user, "root"]
+    specs: list[str] = [f"user={u},host=localhost,addr=127.0.0.1" for u in users]
+    extra_addrs: list[str] = []
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        addr = None
+    if addr is not None and not addr.is_loopback:
+        extra_addrs.append(ip)
+        if isinstance(addr, ipaddress.IPv4Address):
+            gw = str(ipaddress.IPv4Address((int(addr) & 0xFFFFFF00) | 1))
+            if gw != ip:
+                extra_addrs.append(gw)
+    for client_ip in extra_addrs:
+        for u in users:
+            specs.append(f"user={u},host={ip},addr={client_ip}")
+    return specs
 
 
 def sshd_key_only(r: Result) -> tuple[bool, str]:
     """Check 2e: does `sshd -T` show key-only login? (ok, evidence).
 
     macOS 27.2's sshd prints "PasswordAuthentication no", stock OpenSSH lowercase. Accept
-    exactly what prep.sh's `LC_ALL=C grep -qixF` accepts: whole lines split on "\\n" only
-    (never splitlines(): it also splits on \\x0b, \\x0c, \\x1c-\\x1e, U+0085, U+2028 and U+2029,
-    which a quoted sshd value such as Banner can carry, so one printed line could fake a
-    wanted one), no stripping, ASCII-only case folding. The caller must run ssh with
-    raw_newlines=True: in text mode Python turns a lone CR into a newline before this sees
-    it. A CR anywhere in the output fails closed, as grep would see it as part of a line."""
-    cfg = {ln.lower() for ln in r.stdout.split("\n") if ln.isascii()}
-    missing = sorted(SSHD_WANT - cfg)
+    whole lines split on "\\n" only (never splitlines(): it also splits on \\x0b, \\x0c,
+    \\x1c-\\x1e, U+0085, U+2028 and U+2029, which a quoted sshd value such as Banner can carry,
+    so one printed line could fake a wanted one), no stripping, ASCII-only case folding, and
+    require each checked key to appear exactly once (A7). The caller must run ssh with
+    raw_newlines=True: in text mode Python turns a lone CR into a newline before this sees it.
+    A CR or NUL byte anywhere in the output fails closed."""
+    key_counts: dict[str, int] = {k: 0 for k in SSHD_REQUIRED_EXACT}
+    exact_counts: dict[str, int] = {k: 0 for k in SSHD_REQUIRED_EXACT}
+    for ln in r.stdout.split("\n"):
+        if not ln.isascii():
+            continue
+        lo = ln.lower()
+        stripped = lo.lstrip(" \t")
+        if not stripped:
+            continue
+        key = re.split(r"[ \t=]", stripped, maxsplit=1)[0]
+        if key in SSHD_REQUIRED_EXACT:
+            key_counts[key] += 1
+            if lo in SSHD_REQUIRED_EXACT[key]:
+                exact_counts[key] += 1
+    duplicates = sorted(k for k, c in key_counts.items() if c > 1)
+    missing = []
+    for k, allowed in sorted(SSHD_REQUIRED_EXACT.items()):
+        if exact_counts[k] != 1:
+            if len(allowed) == 1:
+                missing.append(next(iter(allowed)))
+            else:
+                vals = "|".join(sorted(v.split(" ", 1)[1] for v in allowed))
+                missing.append(f"{k} ({vals})")
     cr = "\r" in r.stdout
+    nul = "\x00" in r.stdout
     ev = f"rc {r.rc}; missing {missing}"
+    if duplicates:
+        ev += f"; duplicate keys {duplicates}"
     if cr:
         ev += "; output contains a carriage return (read untranslated; it could fake or hide a line)"
-    return r.rc == 0 and not cr and not missing, ev
+    if nul:
+        ev += "; output contains a NUL byte"
+    return r.rc == 0 and not cr and not nul and not missing and not duplicates, ev
+
+
+def check_sshd_key_only(ctx: Ctx, t: vmssh.Target) -> tuple[bool, str]:
+    """Run `sshd -T -C` across all required connection specs and reject uncommented Match blocks."""
+    specs = sshd_connection_specs(t.user, t.ip)
+    failures: list[str] = []
+    for spec in specs:
+        r = rssh(
+            ctx,
+            t,
+            ["sudo", "-n", "/usr/sbin/sshd", "-T", "-C", spec],
+            raw_newlines=True,  # sshd's bytes untranslated: see sshd_key_only
+        )
+        ok_s, ev_s = sshd_key_only(r)
+        if not ok_s:
+            failures.append(f"[{spec}] {ev_s}")
+    mr = rssh(
+        ctx,
+        t,
+        [
+            "sudo",
+            "-n",
+            "/bin/sh",
+            "-c",
+            SSHD_MATCH_CHECK_SH,
+            "sh",
+            "/etc/ssh/sshd_config",
+            "/etc/ssh",
+        ],
+        raw_newlines=True,
+    )
+    if mr.rc != 0 or mr.stdout.strip():
+        detail = clip((mr.stdout + " " + mr.stderr).strip(), 300)
+        failures.append(f"Match/Include check failed (rc {mr.rc}): {detail}")
+    if failures:
+        return False, "; ".join(failures)
+    return True, f"{len(specs)} specs ok (missing []); no uncommented Match blocks"
 
 
 def wait_for_ssh(ctx: Ctx, vm: Vm, t: vmssh.Target, timeout: float = 300) -> float:
@@ -1362,20 +1557,7 @@ def persistent_assertions(
         )
     )
 
-    r = rssh(
-        ctx,
-        t,
-        [
-            "sudo",
-            "-n",
-            "/usr/sbin/sshd",
-            "-T",
-            "-C",
-            f"user={t.user},host=localhost,addr=127.0.0.1",
-        ],
-        raw_newlines=True,  # sshd's bytes untranslated: see sshd_key_only
-    )
-    ok_2e, ev_2e = sshd_key_only(r)
+    ok_2e, ev_2e = check_sshd_key_only(ctx, t)
     out.append(("2e", "sshd effective config: key login only", ok_2e, ev_2e))
 
     md = mdutil_off(ctx, t)
@@ -3941,12 +4123,16 @@ def cmd_check(ctx: Ctx, args) -> int:
                     bad = [
                         f"{sid} {name}: {ev}" for sid, name, ok, ev in after if not ok
                     ]
+                    try:
+                        refused_password_login(ctx, t.ip, t.known_hosts)
+                    except (StepFail, ToolError) as e:
+                        bad.append(f"2f password login refused from the host: {e}")
                     summary.add(
                         "10a",
                         "image properties still hold after the reboot",
                         "fail" if bad else "pass",
                         "; ".join(bad)
-                        or "2a-2e, 2g-2l re-checked (2g after the reboot: "
+                        or "2a-2l re-checked (2g after the reboot: "
                         f"polls={facts['mdutil'].polls} waited={facts['mdutil'].waited:.0f}s; "
                         f"listing: {facts['mdutil'].listing!r})",
                     )

@@ -248,26 +248,203 @@ fi
 [ -f /etc/ssh/ssh_host_ed25519_key.pub ] || die "no ed25519 host key after regeneration"
 
 # 7. Key-only SSH login. macOS sshd_config includes sshd_config.d; first value wins.
+# Check the effective config tree (sshd_config, sshd_config.d/*, and recursive Includes with
+# cycle prevention) for any uncommented Match block, then assert sshd -T across loopback and
+# host-facing client specs for both admin and root (exact-once keys, NUL bytes preserved via a
+# root-only temp file under $STATE_DIR).
 grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config \
     || die "/etc/ssh/sshd_config does not include sshd_config.d"
 mkdir -p /etc/ssh/sshd_config.d
 tmp=$SSH_DROPIN.new
 cat >"$tmp" <<'CONF'
-# tendcf state 1 VM (issue 70 answer 3): key login only, no password login.
+# tendcf state 1 VM (issue 70 answer 3, issue 87): key login only, no password login.
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+AuthenticationMethods publickey
 CONF
 chown root:wheel "$tmp"
 chmod 644 "$tmp"
 mv -f "$tmp" "$SSH_DROPIN"
-effective=$(/usr/sbin/sshd -T -C user=admin,host=localhost,addr=127.0.0.1)
-# macOS 27.2's sshd (OpenSSH_10.5p1) prints the keys in CamelCase ("PasswordAuthentication no"),
-# stock OpenSSH in lowercase: match the whole line, ignoring case.
-for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no'; do
-    printf '%s\n' "$effective" | LC_ALL=C grep -qixF "$want" || die "sshd -T does not show: $want"
+sshd_canon() {
+    _p=$1 _hops=0
+    while [ -L "$_p" ]; do
+        _hops=$((_hops + 1))
+        [ "$_hops" -le 16 ] || die "sshd config symlink loop: $1"
+        _t=$(readlink "$_p") || die "readlink failed on $_p"
+        case $_t in
+            /*) _p=$_t ;;
+            *) _p=$(dirname "$_p")/$_t ;;
+        esac
+    done
+    _d=$(CDPATH='' cd -P -- "$(dirname "$_p")" 2>/dev/null && pwd -P) || die "cannot resolve sshd config dir for $_p"
+    printf '%s/%s\n' "${_d%/}" "$(basename "$_p")"
+}
+check_sshd_no_match() {
+    _cfg=$1
+    [ -f "$_cfg" ] || die "missing sshd config: $_cfg"
+    _visited=""
+    _queue="0	$_cfg"
+    while [ -n "$_queue" ]; do
+        _entry=${_queue%%"
+"*}
+        case $_queue in
+            *"
+"*) _queue=${_queue#*"
+"} ;;
+            *) _queue="" ;;
+        esac
+        [ -n "$_entry" ] || continue
+        _depth=${_entry%%"	"*}
+        _f=${_entry#*"	"}
+        [ "$_depth" -le 16 ] || die "sshd Include nesting exceeds 16 levels at $_f"
+        if [ -L "$_f" ] && [ ! -e "$_f" ]; then
+            die "dangling symlink in sshd config: $_f"
+        fi
+        [ -f "$_f" ] || continue
+        [ -r "$_f" ] || die "unreadable sshd config file: $_f"
+        _canon=$(sshd_canon "$_f")
+        case "
+$_visited
+" in
+            *"
+$_canon
+"*) continue ;;
+        esac
+        _visited="$_visited
+$_canon"
+        _match_hit=$(LC_ALL=C awk '
+            /^[ \t]*#/ || /^[ \t]*$/ { next }
+            {
+                line = $0; sub(/^[ \t]+/, "", line)
+                key = line; sub(/[ \t=].*$/, "", key)
+                if (tolower(key) == "match") {
+                    printf "%s:%d: %s\n", FILENAME, FNR, $0
+                    exit
+                }
+            }' "$_f")
+        [ -z "$_match_hit" ] || die "uncommented Match block in sshd config: $_match_hit"
+        _incs=$(LC_ALL=C awk '
+            /^[ \t]*#/ || /^[ \t]*$/ { next }
+            {
+                line = $0; sub(/^[ \t]+/, "", line)
+                key = line; sub(/[ \t=].*$/, "", key)
+                if (tolower(key) == "include") {
+                    rest = substr(line, length(key) + 1)
+                    sub(/^[ \t=]+/, "", rest)
+                    n = split(rest, parts, /[ \t]+/)
+                    for (i = 1; i <= n; i++) {
+                        p = parts[i]
+                        if (p ~ /^#/) break
+                        if (p ~ /^".*"$/) p = substr(p, 2, length(p) - 2)
+                        if (p != "") print p
+                    }
+                }
+            }' "$_f")
+        _next_depth=$((_depth + 1))
+        _old_ifs=$IFS
+        IFS='
+'
+        for _pat in $_incs; do
+            IFS=$_old_ifs
+            [ -n "$_pat" ] || continue
+            case $_pat in
+                /*) _full=$_pat ;;
+                *) _full="${SSHD_BASE_DIR:-/etc/ssh}/$_pat" ;;
+            esac
+            # shellcheck disable=SC2086 # intentional glob expansion of sshd Include pattern
+            for _matched in $_full; do
+                if [ ! -e "$_matched" ] && [ ! -L "$_matched" ]; then
+                    continue
+                fi
+                if [ -d "$_matched" ] && [ ! -L "$_matched" ]; then
+                    continue
+                fi
+                if [ -n "$_queue" ]; then
+                    _queue="$_queue
+$_next_depth	$_matched"
+                else
+                    _queue="$_next_depth	$_matched"
+                fi
+            done
+        done
+        IFS=$_old_ifs
+    done
+}
+check_sshd_no_match "${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+# Evaluate sshd -T across loopback and host-facing client/guest addresses for admin and root.
+# Write raw sshd bytes to a root-only temp file under $STATE_DIR so NUL bytes are preserved
+# (bash 3.2 command substitution would drop them; A8) and require each checked key to appear
+# exactly once (A7). macOS 27.2's sshd prints CamelCase keys; stock OpenSSH prints lowercase.
+sshd_specs="user=admin,host=localhost,addr=127.0.0.1 user=root,host=localhost,addr=127.0.0.1"
+sshd_extra_addrs=${SSHD_CLIENT_ADDRS:-}
+if [ -z "$sshd_extra_addrs" ]; then
+    sshd_gw=$(route -n get default 2>/dev/null | LC_ALL=C awk '/^[[:space:]]*gateway:[[:space:]]*/ { print $2; exit }' || true)
+    sshd_en0=$(ipconfig getifaddr en0 2>/dev/null || true)
+    for sshd_a in $sshd_gw $sshd_en0; do
+        case $sshd_a in
+            ""|127.*|::1) ;;
+            *) sshd_extra_addrs="$sshd_extra_addrs $sshd_a" ;;
+        esac
+    done
+    [ -n "$sshd_extra_addrs" ] || sshd_extra_addrs="192.168.64.1"
+fi
+for sshd_a in $sshd_extra_addrs; do
+    case " $sshd_specs " in
+        *" addr=$sshd_a "*) ;;
+        *) sshd_specs="$sshd_specs user=admin,host=$sshd_a,addr=$sshd_a user=root,host=$sshd_a,addr=$sshd_a" ;;
+    esac
 done
+sshd_tmp=$(mktemp -- "$STATE_DIR/tendcf-sshd.XXXXXX")
+trap 'rm -f -- "$sshd_tmp"' EXIT
+trap 'exit 129' HUP INT TERM
+for sshd_spec in $sshd_specs; do
+    sshd_rc=0
+    /usr/sbin/sshd -T -C "$sshd_spec" >"$sshd_tmp" || sshd_rc=$?
+    [ "$sshd_rc" -eq 0 ] || die "sshd -T -C $sshd_spec failed (rc $sshd_rc)"
+    sshd_bad=$(LC_ALL=C tr '\000' '\001' <"$sshd_tmp" | LC_ALL=C awk '
+        BEGIN {
+            want["passwordauthentication"] = "passwordauthentication no"
+            want["kbdinteractiveauthentication"] = "kbdinteractiveauthentication no"
+            want["pubkeyauthentication"] = "pubkeyauthentication yes"
+            want["permitrootlogin"] = "permitrootlogin no"
+            want["gssapiauthentication"] = "gssapiauthentication no"
+            want["hostbasedauthentication"] = "hostbasedauthentication no"
+            want["authenticationmethods"] = "authenticationmethods publickey"
+            order[1] = "passwordauthentication"
+            order[2] = "kbdinteractiveauthentication"
+            order[3] = "pubkeyauthentication"
+            order[4] = "permitrootlogin"
+            order[5] = "gssapiauthentication"
+            order[6] = "hostbasedauthentication"
+            order[7] = "authenticationmethods"
+        }
+        index($0, "\001") > 0 { nul = 1 }
+        {
+            lo = tolower($0)
+            key = lo
+            sub(/^[ \t]+/, "", key)
+            sub(/[ \t=].*$/, "", key)
+            if (key in want) {
+                seen[key]++
+                if (lo == want[key]) exact[key]++
+            }
+        }
+        END {
+            if (nul) { print "output contains NUL byte"; exit }
+            for (i = 1; i <= 7; i++) {
+                k = order[i]
+                if (seen[k] + 0 > 1) { print "duplicate key: " k " (" seen[k] " times)"; exit }
+                if (exact[k] + 0 != 1) { print "sshd -T does not show: " want[k]; exit }
+            }
+        }')
+    [ -z "$sshd_bad" ] || die "sshd -T -C $sshd_spec: $sshd_bad"
+done
+rm -f -- "$sshd_tmp"
+trap - EXIT HUP INT TERM
 log "sshd: key login only"
 
 # 8. Console password. The vanilla image's is the published "admin". Replace it with a random
