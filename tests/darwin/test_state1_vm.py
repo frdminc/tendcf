@@ -87,11 +87,15 @@ SECURE_TOKEN_AFTER = (
 )
 SSHD_CAMEL = (
     "UsePAM yes\nPermitRootLogin no\nPubkeyAuthentication yes\n"
-    "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthOptions none\n"
+    "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+    "GSSAPIAuthentication no\nHostbasedAuthentication no\n"
+    "AuthenticationMethods publickey\nPubkeyAuthOptions none\n"
 )
 SSHD_LOWER = (
     "port 22\npasswordauthentication no\nkbdinteractiveauthentication no\n"
     "pubkeyauthentication yes\npermitrootlogin no\n"
+    "gssapiauthentication no\nhostbasedauthentication no\n"
+    "authenticationmethods publickey\n"
 )
 
 
@@ -140,15 +144,23 @@ class FakeWorld:
         # Versions/, Versions/Current and the top-level links: python.org leaves these
         # root:admin 775 too, and a fix-up scoped to Versions/X.Y does not reach them.
         self.fw_versions = FW_PYTHON_ORIGINAL
-        self.stat_overrides = {}  # path -> "owner:group mode" for the ancestor stat
+        self.stat_overrides = {}  # path -> "owner:group mode [perm]" for the ancestor stat
+        self.acl_paths = set()  # paths that report a macOS ACL on /bin/ls -lde
+        self.acl_check_fail = False
         self.signal_on_tart = (
             None  # deliver a real SIGTERM when this tart subcommand runs
         )
         self.signals_sent = 0
         self.screensharing_on = False
         self.sshd_output = SSHD_CAMEL  # what `sudo -n sshd -T -C ...` prints
+        self.sshd_spec_outputs = {}  # spec -> output override for multi-spec tests
+        self.sshd_specs_seen = []  # every -C spec passed to `sudo -n sshd -T -C`
+        self.sshd_call_order = []  # order of "match" vs "sshd-T" calls in 2e/10a
         self.sshd_rc = 0
         self.sshd_raw_newlines = []  # the raw_newlines flag of each sshd -T call
+        self.sshd_match_rc = 0
+        self.sshd_match_output = ""
+        self.password_login_after_reboot = False
         # `sudo -n mdutil -a -s`: the answers still to give, in order ((rc, stdout)), then
         # mdutil_default for ever; mdutil_calls counts the calls
         self.mdutil_outputs = []
@@ -669,11 +681,18 @@ class FakeWorld:
             # the output goes through the real runner's decode (a real printf), so the
             # production newline handling applies, not the fake's
             self.sshd_raw_newlines.append(self._raw_newlines)
+            spec = r[r.index("-C") + 1] if "-C" in r else ""
+            self.sshd_specs_seen.append(spec)
+            self.sshd_call_order.append("sshd-T")
+            out = self.sshd_spec_outputs.get(spec, self.sshd_output)
             real = drv.RealRunner().run(
-                ["/usr/bin/printf", "%s", self.sshd_output],
+                ["/usr/bin/printf", "%s", out],
                 raw_newlines=self._raw_newlines,
             )
             return drv.Result(self.sshd_rc, real.stdout, real.stderr)
+        if r[:5] == ["sudo", "-n", "/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH]:
+            self.sshd_call_order.append("match")
+            return drv.Result(self.sshd_match_rc, self.sshd_match_output, "")
         if r[:4] == ["sudo", "-n", "mdutil", "-a"]:
             self.mdutil_calls += 1
             self.mdutil_raw_newlines.append(self._raw_newlines)
@@ -748,32 +767,48 @@ class FakeWorld:
             return drv.Result(0, "0\n")
         if r[0].endswith("python3.14"):
             return drv.Result(0, "3.14.10\n")
-        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"] or r[:5] == [
+        if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp %Sp"] or r[:5] == [
             "sudo",
             "-n",
             "stat",
             "-f",
-            "%N %Su:%Sg %Lp",
+            "%N %Su:%Sg %Lp %Sp",
         ]:
             paths = r[5:] if r[0] == "sudo" else r[3:]
-            return drv.Result(
-                0,
-                "".join(
-                    f"{p} {self.stat_overrides.get(p, FW_PYTHON_FIXED)}\n"
-                    for p in paths
-                ),
-            )
-        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp"] or r[:5] == [
+            lines = []
+            for p in paths:
+                val = self.stat_overrides.get(p, FW_PYTHON_FIXED)
+                if len(val.split()) == 2:
+                    val = val + " drwxr-xr-x"
+                lines.append(f"{p} {val}\n")
+            return drv.Result(0, "".join(lines))
+        if r[:2] == ["/bin/ls", "-lde"] or r[:4] == ["sudo", "-n", "/bin/ls", "-lde"]:
+            if self.acl_check_fail:
+                return drv.Result(1, "", "ls: permission denied\n")
+            paths = r[4:] if r[0] == "sudo" else r[2:]
+            lines = []
+            for p in paths:
+                if p in self.acl_paths:
+                    lines.append(f"drwxr-xr-x+  2 root  wheel  64 Nov 25 00:00 {p}\n")
+                    lines.append(" 0: user:admin allow add_file\n")
+                else:
+                    lines.append(f"drwxr-xr-x   2 root  wheel  64 Nov 25 00:00 {p}\n")
+            return drv.Result(0, "".join(lines))
+        if r[:3] == ["stat", "-f", "%Su:%Sg %Lp %Sp"] or r[:5] == [
             "sudo",
             "-n",
             "stat",
             "-f",
-            "%Su:%Sg %Lp",
+            "%Su:%Sg %Lp %Sp",
         ]:
             target_p = r[5] if r[0] == "sudo" else r[3]
             if target_p in (drv.TENDCF_PREFIX, f"{self.workdir}/inputs"):
-                return drv.Result(0, FW_PYTHON_FIXED + "\n")
-            return drv.Result(0, self.fw_owner + "\n")
+                val = FW_PYTHON_FIXED
+            else:
+                val = self.fw_owner
+            if len(val.split()) == 2:
+                val = val + " drwxr-xr-x"
+            return drv.Result(0, val + "\n")
         if r[:3] == ["sysctl", "-n", "kern.bootsessionuuid"]:
             n = self.boot if self.reboot_changes_uuid else 1
             return drv.Result(0, f"3F2A-uuid-{n}\n")
@@ -787,6 +822,8 @@ class FakeWorld:
             self.ssh_down = 2
             for i in range(self.intruders_on_reboot):
                 self.vms[f"intruder{i}"] = {"Running": True}
+            if self.rebooted and self.password_login_after_reboot:
+                self.password_login = True
             if self.run_exits_on_reboot or self.die_after_reboot:
                 self._stop_current()
             return drv.Result(255, "", "Connection closed")
@@ -2072,6 +2109,210 @@ class Golden(Base):
             json.loads(self.owner_file().read_text())["key_id"], ctx2.run_id
         )
 
+    def test_issue81_check_adopt_and_golden_adopt_explicit_flags(self):
+        # Build a golden, then remove its owner marker to simulate a pre-marker golden
+        rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 0, s)
+        marker = self.owner_file()
+        rec = json.loads((self.ctx.state_dir / "golden.json").read_text())
+        marker.unlink()
+
+        # Plain check passes and NEVER writes the missing marker
+        rc, s = self.run_cmd(*self.check_args(), ctx=self.second_run_ctx("20261125T000001Z-c"))
+        self.assertEqual(rc, 0, s)
+        self.assertFalse(marker.exists())
+        # Plain golden stays strictly fail-closed
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000002Z-g"))
+        self.assertEqual(rc, 2, ev)
+
+        # check --adopt on a FAILING check does NOT write the marker
+        self.world.fail_remote.add("spctl")
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000003Z-cf"))
+        self.world.fail_remote.discard("spctl")
+        self.assertEqual(rc, 1)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.steps(s)["adopt"]["status"], "skip")
+
+        # check --adopt on a PASSING check writes the final owner marker
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000004Z-ca"))
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["adopt"]["status"], "pass")
+        self.assertTrue(marker.exists())
+        written = json.loads(marker.read_text())
+        self.assertEqual(written["state"], "final")
+        self.assertEqual(written["golden"], GOLDEN)
+        self.assertEqual(written["state_dir"], os.path.realpath(self.ctx.state_dir))
+        self.assertEqual(written["tart_home"], self.ctx.tart_home)
+        self.assertEqual(written["key_id"], rec["key_id"])
+        self.assertEqual(written["host_key"], rec["host_key"])
+
+        # Subsequent plain golden now accepts it as ours ("nothing to do")
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000005Z-g2"))
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
+        # check --adopt is idempotent when final marker already matches this state dir
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000006Z-ca2"))
+        self.assertEqual(rc, 0, s)
+        self.assertIn("already owned", self.steps(s)["adopt"]["evidence"])
+
+        # check --adopt refuses fail-closed if a final marker belongs to a DIFFERENT state dir
+        other_dir = self.tmp / "other-state"
+        other_dir.mkdir(mode=0o700)
+        write_marker(self.ctx, state_dir=os.path.realpath(other_dir), state="final", key_id=rec["key_id"], host_key=rec["host_key"])
+        clones_before = len(self.world.tart_calls("clone"))
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000007Z-ca3"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(self.world.tart_calls("clone")), clones_before)
+
+        # check --adopt refuses fail-closed if a committing marker exists (even for this state dir)
+        write_marker(self.ctx, state="committing", key_id=rec["key_id"], host_key=rec["host_key"])
+        rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000008Z-ca4"))
+        self.assertEqual(rc, 2)
+        self.assertIn("committing", s["steps"][-1]["evidence"])
+        self.assertIn("golden --adopt", s["steps"][-1]["evidence"])
+        self.assertEqual(len(self.world.tart_calls("clone")), clones_before)
+
+        # Race check: if a committing marker appears mid-check before adoption writes, check --adopt refuses
+        marker.unlink()
+        orig_reboot = self.world._guest
+
+        def plant_committing_on_reboot(r, input_text):
+            if r[:4] == ["sudo", "-n", "shutdown", "-r"]:
+                write_marker(self.ctx, state="committing", key_id=rec["key_id"], host_key=rec["host_key"])
+            return orig_reboot(r, input_text)
+
+        with mock.patch.object(self.world, "_guest", plant_committing_on_reboot):
+            rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000009Z-race"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+        # PR 112 R1 Group 5 (Adversary B2): swapping golden.json/key mid-check before adoption
+        # writes is refused (even if the new record still passes golden_usable, it does not match
+        # the initial SSH-verified credentials).
+        marker.unlink()
+        new_key_id = "20261125T000099Z-swap"
+        swap_pub, _ = drv.mint_keypair(self.ctx, new_key_id)
+        swap_rec = {
+            **rec,
+            "key_id": new_key_id,
+            "authorized_key": drv.fingerprint(swap_pub),
+        }
+
+        def swap_record_after_reboot_checks(r, input_text):
+            res = orig_reboot(r, input_text)
+            if r[0] == "dscl" and self.world.rebooted:
+                (self.ctx.state_dir / "golden.json").write_text(json.dumps(swap_rec))
+            return res
+
+        with mock.patch.object(self.world, "_guest", swap_record_after_reboot_checks):
+            rc, s = self.run_cmd("check", "--adopt", ctx=self.second_run_ctx("20261125T000009Z-swap"))
+        self.assertEqual(rc, 2, s)
+        self.assertIn("changed during check", s["steps"][-1]["evidence"])
+        self.assertFalse(marker.exists())
+
+    def test_issue81_golden_adopt_promotes_matching_committing_marker_and_refuses_otherwise(self):
+        # Simulate a commit that stopped between golden.json and the final owner marker
+        marker_name = self.owner_file().name
+        patcher, _ = self.failing_writes({marker_name: 2})
+        with patcher:
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1)
+        marker = self.owner_file()
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+        # Plain golden stays strictly fail-closed
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000010Z-p"))
+        self.assertEqual(rc, 2, ev)
+        self.assertIn("did not finish", ev)
+
+        # --adopt combined with --rebuild or --keep-on-failure is refused
+        for bad_flag in ("--rebuild", "--keep-on-failure"):
+            rc, s = self.run_cmd("golden", "--adopt", bad_flag, ctx=self.second_run_ctx("20261125T000011Z-bad"))
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot be combined", s["steps"][-1]["evidence"])
+
+        # Mismatched key_id or host_key in committing marker is refused fail-closed
+        good_committing = marker.read_text()
+        for field, bad_val in (("key_id", "wrong-key"), ("host_key", "ssh-ed25519 SHA256:wrong")):
+            m_data = json.loads(good_committing)
+            m_data[field] = bad_val
+            marker.write_text(json.dumps(m_data))
+            rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000012Z-mm"))
+            self.assertEqual(rc, 2, field)
+            self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+
+        # Committing marker owned by another state dir is refused
+        other_dir = self.tmp / "other-state-2"
+        other_dir.mkdir(mode=0o700)
+        m_data = json.loads(good_committing)
+        m_data["state_dir"] = os.path.realpath(other_dir)
+        marker.write_text(json.dumps(m_data))
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000013Z-ot"))
+        self.assertEqual(rc, 2)
+        self.assertIn("belongs to state dir", s["steps"][-1]["evidence"])
+
+        # Missing marker is refused by golden --adopt (directs to check --adopt)
+        marker.unlink()
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000014Z-no"))
+        self.assertEqual(rc, 2)
+        self.assertIn("check --adopt", s["steps"][-1]["evidence"])
+
+        # Missing golden VM in tart list is refused even with a matching committing marker
+        marker.write_text(good_committing)
+        saved_vm = self.world.vms.pop(GOLDEN)
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000015Z-vm"))
+        self.assertEqual(rc, 2)
+        self.assertIn("does not exist", s["steps"][-1]["evidence"])
+        self.world.vms[GOLDEN] = saved_vm
+
+        # PR 112 R1 Group 6 (Adversary B3): leftover <golden>-build VM refuses golden --adopt
+        self.world.vms[f"{GOLDEN}-build"] = {"Running": False}
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000015Z-bld"))
+        self.assertEqual(rc, 2)
+        self.assertIn("leftover build VM", s["steps"][-1]["evidence"])
+        self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+        self.world.vms.pop(f"{GOLDEN}-build")
+
+        # Happy path: golden --adopt promotes the matching committing marker to final AND
+        # cleans up parked .pending files left by the earlier interrupted commit (Group 6).
+        self.assertTrue(self.pending_files(), "expected parked .pending files before adopt")
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000016Z-ok"))
+        self.assertEqual(rc, 0, s)
+        self.assertEqual(self.steps(s)["adopt"]["status"], "pass")
+        self.assertEqual(self.steps(s)["pending"]["status"], "pass")
+        self.assertEqual(self.pending_files(), [])
+        self.assertEqual(json.loads(marker.read_text())["state"], "final")
+
+        # Idempotent when already final and matching
+        rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000017Z-id"))
+        self.assertEqual(rc, 0, s)
+        self.assertIn("already final", self.steps(s)["adopt"]["evidence"])
+
+        # Plain golden now says "nothing to do"
+        rc, ev, _ = self.plain(self.second_run_ctx("20261125T000018Z-p2"))
+        self.assertEqual(rc, 0, ev)
+        self.assertIn("nothing to do", ev)
+
+        # PR 112 R2 (Opus L7): OSError while unlinking parked .pending returns 1 (summary.ok False)
+        marker.write_text(good_committing)
+        stuck_pending = self.ctx.state_dir / "golden.json.pending"
+        stuck_pending.write_text("{}")
+        stuck_real = os.path.realpath(stuck_pending)
+        orig_unlink = Path.unlink
+
+        def fail_pending_unlink(p_self, *a, **kw):
+            if os.path.realpath(p_self) == stuck_real:
+                raise PermissionError("simulated pending unlink failure")
+            return orig_unlink(p_self, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", fail_pending_unlink):
+            rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000019Z-pf"))
+        self.assertEqual(rc, 1, s)
+        self.assertFalse(s["ok"])
+        self.assertEqual(self.steps(s)["pending"]["status"], "fail")
+        stuck_pending.unlink()
+
     def test_an_owner_file_that_disagrees_with_the_record_is_refused(self):
         self.run_cmd(*self.golden_args())
         good = self.owner_file().read_text()
@@ -2397,6 +2638,71 @@ class Golden(Base):
         ):
             drv.read_owner_raw(marker)
         self.assertIn("not owned by you", str(cm.exception))
+
+    def test_issue78_mid_build_intruder_vm_fails_boot_and_pin(self):
+        # Issue #78 (Fable R1 / adversary r3 low 1): an intruder VM started after preflight
+        # fails g2 (boot) and an intruder VM started before pin() fails g7 (pin) without pinning.
+        # Case 1: intruder starts right after tart clone -> g2 fails
+        real_run = self.world.run
+
+        def start_intruder_after_clone(argv, **kw):
+            res = real_run(argv, **kw)
+            if argv[:2] == ["tart", "clone"]:
+                self.world.vms["intruder-boot"] = {"Running": True}
+            return res
+
+        with mock.patch.object(self.world, "run", start_intruder_after_clone):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g2"]["status"], "fail")
+        self.assertIn("intruder-boot", self.steps(s)["g2"]["evidence"])
+        self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
+
+        # Case 2: intruder starts right after prep.sh -> g7 (pin) fails before keyscan/pinning
+        self.tearDown_world()
+        real_run2 = self.world.run
+
+        def start_intruder_after_prep(argv, **kw):
+            res = real_run2(argv, **kw)
+            if argv[:1] == ["ssh"] and "PREP-RESULT" in (kw.get("input_text") or ""):
+                self.world.vms["intruder-pin"] = {"Running": True}
+            return res
+
+        with mock.patch.object(self.world, "run", start_intruder_after_prep):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        self.assertEqual(self.steps(s)["g7"]["status"], "fail")
+        self.assertIn("intruder-pin", self.steps(s)["g7"]["evidence"])
+        self.assertFalse((self.ctx.state_dir / "known_hosts").exists())
+        self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
+
+    def test_issue78_tart_list_failing_during_commit_reports_unknown_state_and_keeps_build(
+        self,
+    ):
+        # Issue #78 (Fable R5): if tart list fails during commit AFTER the committing marker
+        # was written, g10 raises a ToolError clearly stating the build is kept and golden's
+        # state is unknown.
+        real_write = drv.atomic_write
+        marker_name = self.owner_file().name
+        intent_written = False
+
+        def fail_list_after_intent(dest, text, mode=0o600):
+            nonlocal intent_written
+            res = real_write(dest, text, mode)
+            if Path(dest).name == marker_name and not intent_written:
+                intent_written = True
+                self.world.fail_tart = {"list"}
+            return res
+
+        with mock.patch.object(drv, "atomic_write", fail_list_after_intent):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 1, s)
+        ev = self.steps(s)["g10"]["evidence"]
+        self.assertIn("during commit failed", ev)
+        self.assertIn("unknown", ev)
+        self.assertIn(f"kept as {GOLDEN}-build", ev)
+        self.assertIn(f"{GOLDEN}-build", self.world.vms)
+        self.assertEqual(json.loads(self.owner_file().read_text())["state"], "committing")
 
     def test_the_lock_directory_must_be_ours_and_not_group_or_world_writable(self):
         self.ctx.lock_path.parent.mkdir(mode=0o700)
@@ -2946,12 +3252,244 @@ class Golden(Base):
         self.assertEqual(drv.account_home({"HOME": "/ignored"}), pw)
         with mock.patch.object(drv.pwd, "getpwuid", side_effect=KeyError("uid")):
             self.assertEqual(drv.account_home({"HOME": "/h"}), "/h")
+            self.assertEqual(drv.account_home({"HOME": "relative/home"}), "/")
             self.assertEqual(drv.account_home({}), "/")
             self.assertEqual(
                 drv.resolve_tart_home({"HOME": "/h"}), os.path.realpath("/h/.tart")
             )
             ctx = self.make_ctx(self.tmp / "nopw", "20261121T000000Z-np")
         self.assertTrue(ctx.tart_home)  # no traceback for a uid without a passwd entry
+
+    def test_issue82_state_dir_ancestors_dangling_symlink_wording_and_paths(self):
+        # Item 1: non-sticky group/world-writable ancestor is refused before creating anything
+        parent = self.tmp / "writable-parent"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o777)
+        target = parent / "sub" / "state"
+        rc, s = self.run_cmd(
+            *self.golden_args(), ctx=self.make_ctx(target, "20261125T000000Z-a1")
+        )
+        self.assertEqual(rc, 2, s)
+        self.assertIn("must not be group or world writable unless sticky", s["steps"][-1]["evidence"])
+        self.assertFalse((parent / "sub").exists())
+
+        # Sticky world-writable ancestor owned by us (like /tmp 1777) is allowed
+        os.chmod(parent, 0o1777)
+        rc, s = self.run_cmd(
+            *self.golden_args(), ctx=self.make_ctx(target, "20261125T000000Z-a2")
+        )
+        self.assertEqual(rc, 0, s)
+
+        # Item 5: dangling symlink in an ancestor (--state-dir /tmp/link/sub) creates nothing
+        dangling_target = self.tmp / "dangling-anc-target"
+        dangling_link = self.tmp / "dangling-anc"
+        dangling_link.symlink_to(dangling_target)
+        rc, s = self.run_cmd(
+            *self.golden_args(),
+            ctx=self.make_ctx(dangling_link / "sub", "20261125T000000Z-a3"),
+        )
+        self.assertEqual(rc, 2, s)
+        self.assertIn("points nowhere", s["steps"][-1]["evidence"])
+        self.assertFalse(dangling_target.exists())
+
+        # Item 6: root-owned leaf symlink wording + PermissionError != "points nowhere"
+        real_dir = self.tmp / "root-target"
+        real_dir.mkdir(mode=0o700)
+        root_link = self.tmp / "root-link"
+        root_link.symlink_to(real_dir)
+        real_lstat = os.lstat
+
+        def root_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) == os.path.abspath(root_link):
+                fields = list(st)
+                fields[stat.ST_UID] = 0
+                return os.stat_result(fields)
+            return st
+
+        if os.geteuid() != 0:
+            with mock.patch.object(drv.os, "lstat", root_lstat):
+                msg = drv.state_dir_link_problem(root_link)
+            self.assertIn("root-owned symlink (uid 0), not owned by you", msg)
+            self.assertNotIn("owned by uid 0, not you", msg)
+
+        real_dir_rp = os.path.realpath(real_dir)
+        real_dir_str = str(real_dir)
+
+        def eacces_lstat(path, *a, **kw):
+            p_str = os.fspath(path)
+            if p_str in (real_dir_rp, real_dir_str):
+                raise PermissionError(errno.EACCES, "Permission denied", p_str)
+            return real_lstat(path, *a, **kw)
+
+        with mock.patch.object(drv.os, "lstat", eacces_lstat):
+            msg = drv.state_dir_link_problem(root_link)
+        self.assertIn("Permission denied", msg)
+        self.assertNotIn("points nowhere", msg)
+
+        # PR 112 R1 Group 4 (Adversary B1 + Neon #5):
+        # 1) Lexical `..` must NOT bypass a foreign symlink ancestor (/tmp/foreign_link/../sub)
+        tmp_rp = os.path.realpath(self.tmp)
+        foreign_target = self.tmp / "foreign-dotdot-target"
+        foreign_target.mkdir(mode=0o700)
+        foreign_anc = self.tmp / "foreign-anc-link"
+        foreign_anc.symlink_to(foreign_target)
+        dotdot_path = foreign_anc / ".." / "sub"
+
+        def foreign_anc_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) in (str(foreign_anc), tmp_rp + "/foreign-anc-link"):
+                fields = list(st)
+                fields[stat.ST_UID] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return st
+
+        with mock.patch.object(drv.os, "lstat", foreign_anc_lstat):
+            msg = drv.state_dir_link_problem(dotdot_path)
+        self.assertIn("not you or root", msg)
+
+        # 2) Multi-hop symlink chain (my_link -> hop2_foreign -> real_dir) checks every hop
+        hop2 = self.tmp / "hop2-foreign"
+        hop2.symlink_to(real_dir)
+        hop1 = self.tmp / "hop1-mine"
+        hop1.symlink_to(hop2)
+
+        def hop2_foreign_lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if os.fspath(path) in (str(hop2), tmp_rp + "/hop2-foreign"):
+                fields = list(st)
+                fields[stat.ST_UID] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return st
+
+        with mock.patch.object(drv.os, "lstat", hop2_foreign_lstat):
+            msg = drv.state_dir_link_problem(hop1)
+        self.assertIn("not you", msg)
+
+        # 3) Symlink loop fails cleanly with Too many levels of symbolic links
+        loop_a = self.tmp / "loop-a"
+        loop_b = self.tmp / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        msg = drv.state_dir_link_problem(loop_a)
+        self.assertIn("Too many levels of symbolic links", msg)
+        self.assertNotIn("points nowhere", msg)
+
+        # 4) Macroscope 4696228708: `..` after a missing component or regular file must not
+        # bypass symlink checks via later os.path.realpath() lexical collapse.
+        msg = drv.state_dir_link_problem(
+            self.tmp / "missing-dir" / ".." / "foreign-anc-link" / "state"
+        )
+        self.assertIn("missing component", msg)
+        msg = drv.state_dir_link_problem(self.tmp / "missing-dir" / "..")
+        self.assertIn("missing component", msg)
+        reg_file = self.tmp / "regular-file"
+        reg_file.write_text("x")
+        msg = drv.state_dir_link_problem(
+            reg_file / ".." / "foreign-anc-link" / "state"
+        )
+        self.assertIn("not a directory", msg)
+        # Normal missing tail with no `..` after missing still passes
+        self.assertEqual(
+            drv.state_dir_link_problem(self.tmp / "new_parent" / "new_state"), ""
+        )
+
+        # PR 112 R1 Group 8c: driver_lock refuses a non-sticky world-writable lock ancestor
+        bad_lock_parent = self.tmp / "bad-lock-anc"
+        bad_lock_parent.mkdir(mode=0o700)
+        os.chmod(bad_lock_parent, 0o777)
+        ctx_bad_lock = self.make_ctx(self.tmp / "state-lk", "20261125T000000Z-lka")
+        ctx_bad_lock.lock_path = bad_lock_parent / "sub" / "driver.lock"
+        rc, s = self.run_cmd(*self.golden_args(), ctx=ctx_bad_lock)
+        self.assertEqual(rc, 2, s)
+        self.assertIn("must not be group or world writable unless sticky", s["steps"][-1]["evidence"])
+        os.chmod(bad_lock_parent, 0o700)
+
+        # Item 4: resolved paths are consistent (ctx.lock_path.parent resolved like state_dir)
+        ctx_paths = self.make_ctx(self.tmp / "state-consistent", "20261125T000000Z-a4")
+        self.assertEqual(
+            str(ctx_paths.lock_path.parent),
+            os.path.realpath(self.tmp / "lockdir"),
+        )
+
+    def test_issue82_remove_vm_post_delete_local_vms_failure_keeps_committing_marker(self):
+        # Item 2: when local_vms() raises AFTER `tart delete` actually deleted the old golden,
+        # the handler must re-list on a best-effort basis and NEVER restore the old final marker
+        # when the golden is gone or the re-list fails.
+        for case in ("gone_on_relist", "relist_fails_too"):
+            with self.subTest(case=case):
+                self.tearDown_world()
+                rc, s = self.run_cmd(*self.golden_args())
+                self.assertEqual(rc, 0, s)
+                marker = drv.owner_path(self.ctx, GOLDEN)
+                self.assertEqual(json.loads(marker.read_text())["state"], "final")
+                real_run = self.world.run
+                deleted_golden = False
+                post_delete_lists = 0
+
+                def flaky_after_delete(argv, **kw):
+                    nonlocal deleted_golden, post_delete_lists
+                    if argv[:3] == ["tart", "delete", GOLDEN]:
+                        res = real_run(argv, **kw)
+                        deleted_golden = True
+                        return res
+                    if deleted_golden and argv[:3] == ["tart", "list", "--source"]:
+                        post_delete_lists += 1
+                        if post_delete_lists == 1 or case == "relist_fails_too":
+                            return drv.Result(1, "", "tart list: transient error")
+                    return real_run(argv, **kw)
+
+                with mock.patch.object(self.world, "run", flaky_after_delete):
+                    rc, s = self.run_cmd(
+                        *self.golden_args("--rebuild"), ctx=self.second_run_ctx()
+                    )
+                self.assertEqual(rc, 1, s)
+                ev = self.steps(s)["g10"]["evidence"]
+                self.assertEqual(json.loads(marker.read_text())["state"], "committing")
+                self.assertNotIn("restored", ev)
+                if case == "gone_on_relist":
+                    self.assertIn("now gone", ev)
+                else:
+                    self.assertIn("unknown", ev)
+                # If a golden is present while the marker is committing, plain golden refuses (exit 2)
+                self.world.vms[GOLDEN] = {"Running": False}
+                rc2, ev2, _ = self.plain(self.second_run_ctx("20261125T000000Z-plain"))
+                self.assertEqual(rc2, 2, ev2)
+                self.assertIn("did not finish", ev2)
+
+    def test_issue82_canonical_tart_home_folds_case_and_firmlink(self):
+        # Item 3: two spellings of one TART_HOME produce the same canonical tart_home & marker
+        d = self.tmp / "TartHomeCase"
+        d.mkdir(mode=0o700)
+        resolved = drv.canonical_dir_path(str(d))
+        if sys.platform == "darwin":
+            # Firmlink spelling (/System/Volumes/Data/...) and uppercase spelling (on case-insensitive APFS)
+            sv_data = Path("/System/Volumes/Data" + resolved)
+            if sv_data.exists():
+                self.assertEqual(drv.canonical_dir_path(str(sv_data)), resolved)
+                self.assertEqual(
+                    drv.canonical_dir_path(str(sv_data / "nonexistent-sub")),
+                    os.path.join(resolved, "nonexistent-sub"),
+                )
+            upper = str(d.parent / "TARTHOMECASE")
+            if os.path.exists(upper) and os.path.samefile(upper, d):
+                ctx1 = self.make_ctx(self.ctx.state_dir, "20261125T000000Z-c1", tart_home=str(d))
+                ctx2 = self.make_ctx(self.ctx.state_dir, "20261125T000000Z-c2", tart_home=upper)
+                self.assertEqual(ctx1.tart_home, ctx2.tart_home)
+                self.assertEqual(drv.owner_path(ctx1, GOLDEN), drv.owner_path(ctx2, GOLDEN))
+        # Also test F_GETPATH path explicitly on all platforms (including Linux CI) via mock
+        with (
+            mock.patch.object(drv, "F_GETPATH", 50),
+            mock.patch.object(
+                drv.fcntl,
+                "fcntl",
+                return_value=b"/Users/alice/.tart\x00" + b"\x00" * 1005,
+            ),
+        ):
+            self.assertEqual(drv.canonical_dir_path(str(d)), "/Users/alice/.tart")
+            self.assertEqual(
+                drv.canonical_dir_path(str(d / "sub")), "/Users/alice/.tart/sub"
+            )
 
     def test_a_dangling_link_planted_right_after_the_realpath_is_still_refused(self):
         link = self.tmp / "late-link"
@@ -3459,6 +3997,450 @@ class Check(Base):
                 st = self.steps(s)["2e"]
                 self.assertEqual(st["status"], "fail", name)
                 self.assertIn("carriage return", st["evidence"], name)
+
+    def test_sshd_hardening_multi_spec_exact_once_extra_keys_match_and_10a_2f(self):
+        # Issue #87: multi-spec -C (admin + root, loopback + guest/gateway IP),
+        # A7 exact-once keys, extra auth settings, Match refusal, and 2f repeated in 10a.
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        expected_specs = {
+            "user=admin,host=localhost,addr=127.0.0.1",
+            "user=root,host=localhost,addr=127.0.0.1",
+            "user=admin,host=192.168.64.10,addr=192.168.64.10",
+            "user=root,host=192.168.64.10,addr=192.168.64.10",
+            "user=admin,host=192.168.64.10,addr=192.168.64.1",
+            "user=root,host=192.168.64.10,addr=192.168.64.1",
+        }
+        self.assertTrue(expected_specs.issubset(set(self.world.sshd_specs_seen)))
+
+        # AuthenticationMethods any (macOS default on existing goldens) is accepted in 2e
+        self.world.sshd_output = SSHD_CAMEL.replace(
+            "AuthenticationMethods publickey", "AuthenticationMethods any"
+        )
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+
+        # Relaxing only the host-facing client spec or root spec fails 2e
+        self.world.sshd_output = SSHD_CAMEL
+        for bad_spec in (
+            "user=admin,host=192.168.64.10,addr=192.168.64.1",
+            "user=root,host=localhost,addr=127.0.0.1",
+        ):
+            with self.subTest(bad_spec=bad_spec):
+                self.world.sshd_spec_outputs = {
+                    bad_spec: SSHD_CAMEL.replace(
+                        "PasswordAuthentication no", "PasswordAuthentication yes"
+                    )
+                }
+                rc, s = self.run_cmd(*self.check_args())
+                self.assertEqual(rc, 1)
+                self.assertEqual(self.steps(s)["2e"]["status"], "fail")
+                self.assertIn(bad_spec, self.steps(s)["2e"]["evidence"])
+        self.world.sshd_spec_outputs = {}
+
+        # A7 exact-once + extra auth keys + NUL rejection
+        for name, out, want in (
+            (
+                "duplicate conflicting PasswordAuthentication",
+                SSHD_CAMEL + "PasswordAuthentication yes\n",
+                "duplicate keys",
+            ),
+            (
+                "duplicate identical PasswordAuthentication",
+                SSHD_CAMEL + "PasswordAuthentication no\n",
+                "duplicate keys",
+            ),
+            (
+                "GSSAPIAuthentication yes",
+                SSHD_CAMEL.replace("GSSAPIAuthentication no", "GSSAPIAuthentication yes"),
+                "gssapiauthentication no",
+            ),
+            (
+                "HostbasedAuthentication yes",
+                SSHD_CAMEL.replace("HostbasedAuthentication no", "HostbasedAuthentication yes"),
+                "hostbasedauthentication no",
+            ),
+            (
+                "AuthenticationMethods password",
+                SSHD_CAMEL.replace("AuthenticationMethods publickey", "AuthenticationMethods password"),
+                "authenticationmethods",
+            ),
+            (
+                "NUL byte in sshd output",
+                SSHD_CAMEL + "Banner /x\x00y\n",
+                "NUL byte",
+            ),
+            (
+                "non-ASCII duplicate PasswordAuthentication (PR 112 R1 Group 3)",
+                SSHD_CAMEL + "PasswordAuthentication \ufffdno\n",
+                "duplicate keys",
+            ),
+        ):
+            with self.subTest(name):
+                ok, ev = drv.sshd_key_only(drv.Result(0, out))
+                self.assertFalse(ok, (name, ev))
+                self.assertIn(want, ev, name)
+
+        # PR 112 R3 (Codex M3): SSHD_MATCH_CHECK_SH runs BEFORE sshd -T on passing checks,
+        # and a match/include check failure prevents sshd -T from ever being invoked
+        # (so a FIFO Include target cannot hang sshd).
+        self.world.sshd_call_order.clear()
+        self.world.sshd_specs_seen.clear()
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        self.assertGreaterEqual(len(self.world.sshd_call_order), 2)
+        self.assertEqual(self.world.sshd_call_order[0], "match")
+        self.assertEqual(self.world.sshd_call_order[1], "sshd-T")
+
+        # Uncommented Match block fails 2e BEFORE sshd -T is invoked
+        self.world.sshd_call_order.clear()
+        self.world.sshd_specs_seen.clear()
+        self.world.sshd_match_rc = 2
+        self.world.sshd_match_output = "/etc/ssh/crypto.conf:3: Match Address 192.168.64.0/20\n"
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2e"]["status"], "fail")
+        self.assertIn("Match", self.steps(s)["2e"]["evidence"])
+        # Both 2e and 10a run match check first and skip sshd -T on failure
+        self.assertEqual(self.world.sshd_call_order, ["match", "match"])
+        self.assertEqual(self.world.sshd_specs_seen, [])
+        self.world.sshd_match_rc = 0
+        self.world.sshd_match_output = ""
+
+        # Live password refusal (2f) is repeated after reboot in 10a
+        self.world.password_login_after_reboot = True
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.steps(s)["2f"]["status"], "pass")
+        self.assertEqual(self.steps(s)["10a"]["status"], "fail")
+        self.assertIn("2f", self.steps(s)["10a"]["evidence"])
+        self.assertIn("still offers", self.steps(s)["10a"]["evidence"])
+
+    def test_sshd_match_check_sh_traverses_includes_prevents_cycles_and_catches_match(self):
+        # Run SSHD_MATCH_CHECK_SH directly against real config trees with nested Includes
+        base = Path(tempfile.mkdtemp(prefix="tendcf-sshd-match-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        (base / "sshd_config.d").mkdir()
+        (base / "crypto").mkdir()
+        (base / "crypto" / "apple.conf").write_text("# comment\nCiphers aes256-gcm@openssh.com\n")
+        (base / "crypto.conf").symlink_to(base / "crypto" / "apple.conf")
+        (base / "sshd_config.d" / "100-macos.conf").write_text(
+            "UsePAM yes\nInclude crypto.conf\n"
+        )
+        (base / "sshd_config").write_text(
+            "# Match User foo\nInclude sshd_config.d/*\nPasswordAuthentication no\n"
+        )
+        run_check = lambda: subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(base / "sshd_config"), str(base)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
+        # Include cycle does not infinite-loop
+        (base / "crypto" / "apple.conf").write_text(
+            f"Include {base / 'sshd_config.d' / '100-macos.conf'}\n"
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
+        # Uncommented Match inside a recursively included symlinked file fails closed
+        (base / "crypto" / "apple.conf").write_text(
+            "Match Address 192.168.64.0/20\n    PasswordAuthentication yes\n"
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match Address", r.stdout)
+
+        # PR 112 R1 Group 1: all 5 bypasses + NUL + mid-line # + quoted keywords
+        (base / "crypto" / "apple.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        # 1) Drop-in filename with space via glob
+        spaced = base / "sshd_config.d" / "99 custom.conf"
+        spaced.write_text("Match User root\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match User", r.stdout)
+        spaced.unlink()
+
+        # 2) Quoted Include with spaces in path ("dir with space/a.conf") + mid-token # + trailing # comment
+        (base / "dir with space").mkdir()
+        (base / "dir with space" / "a.conf").write_text('"Match" all\n')
+        (base / "sshd_config").write_text(
+            'Include a#nonexistent.conf "dir with space/a.conf" # trailing \'comment\'\n'
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match", r.stdout)
+
+        # 3) Relative Include *.conf with a colliding file in cwd must expand under $base, not cwd
+        colliding_cwd = Path(tempfile.mkdtemp(prefix="tendcf-sshd-cwd-"))
+        self.addCleanup(shutil.rmtree, colliding_cwd, True)
+        (colliding_cwd / "clean.conf").write_text("# clean in cwd\n")
+        (base / "evil.conf").write_text("Match all\n")
+        (base / "sshd_config").write_text("Include *.conf\n")
+        r = subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(base / "sshd_config"), str(base)],
+            cwd=str(colliding_cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match all", r.stdout)
+        (base / "evil.conf").unlink()
+
+        # 4) Filename containing glob metacharacters (* and ?) cannot fool visited dedup
+        (base / "sshd_config.d" / "a?b.conf").write_text("# harmless\n")
+        (base / "sshd_config.d" / "a1b.conf").write_text("Match all\n")
+        (base / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match all", r.stdout)
+        (base / "sshd_config.d" / "a?b.conf").unlink()
+        (base / "sshd_config.d" / "a1b.conf").unlink()
+
+        # 5) CRLF Include and Match\rall
+        (base / "crlf_evil.conf").write_bytes(b"Match\rall\r\n")
+        (base / "sshd_config").write_bytes(b"Include crlf_evil.conf\r\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("Match", r.stdout)
+        (base / "crlf_evil.conf").unlink()
+
+        # 6) NUL byte in config fails closed
+        (base / "sshd_config").write_bytes(b"PasswordAuthentication no\x00\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
+
+        # PR 112 R2 (Opus H1 + L5): obfuscated Match/Include keywords, single quotes,
+        # backslash escapes, mid-token/unclosed quotes, leading ~, and non-regular FIFO targets
+        (base / "d").mkdir()
+        (base / "d" / "x.conf").write_text("Match User admin\n  PasswordAuthentication yes\n")
+        (base / "sshd_config").write_text('M"atch" User admin\n  PasswordAuthentication yes\n')
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn('M"atch"', r.stdout)
+
+        for cfg_line, want_err in (
+            (f'I"nclude" {base}/d/x.conf\n', "obfuscated Include keyword"),
+            (f"In'cl'ude {base}/d/x.conf\n", "obfuscated Include keyword"),
+            (f"Inc\\lude {base}/d/x.conf\n", "obfuscated Include keyword"),
+            (f"Include '{base}/dir with space/a.conf'\n", "unsupported quote/escape"),
+            (f"Include {base}/dir\\ with\\ space/a.conf\n", "unsupported quote/escape"),
+            (f'Include {base}/d/"x".conf\n', "unsupported quote/escape"),
+            (f'Include "{base}/d/""x".conf\n', "unsupported mid-token quote"),
+            (f'Include "{base}/d/x.conf\n', "unclosed quote"),
+            ("Include ~/evil.conf\n", "unsupported tilde"),
+            ('Include "~/evil.conf"\n', "unsupported Include target"),
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_err, r.stderr, (cfg_line, r.stderr))
+
+        # Opus L5: non-regular FIFO target matched by Include glob fails closed
+        fifo = base / "sshd_config.d" / "50-pipe.conf"
+        os.mkfifo(fifo)
+        (base / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("non-regular sshd config target", r.stderr)
+        fifo.unlink()
+
+        # PR 112 R3 (Codex #1, #2, #4a, #4b): strdelim_internal closing-quote boundaries,
+        # unclosed keyword quotes, interior CR / control bytes, and zero-argument Include
+        for match_line, want_tok in (
+            ('"Match"User admin\n  PasswordAuthentication yes\n', '"Match"'),
+            ('M"atch"User admin\n  PasswordAuthentication yes\n', 'M"atch"'),
+            ('"Match User admin\n  PasswordAuthentication yes\n', '"Match'),
+        ):
+            (base / "sshd_config").write_text(match_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 2, (match_line, r.stdout, r.stderr))
+            self.assertIn(want_tok, r.stdout)
+
+        for cfg_line, want_err in (
+            (f'"Include"{base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include"={base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include" = {base}/d/x.conf\n', "unsafe character in Include target"),
+            (f'I"nclude"{base}/d/x.conf\n', "ambiguous quoted keyword boundary"),
+            (f'"Include {base}/d/x.conf\n', "unclosed quote in sshd keyword"),
+            ('"Unknown foo\n', "unclosed quote in sshd keyword"),
+            ("Include\n", "Include directive with no arguments"),
+            ("Include # comment\n", "Include directive with no arguments"),
+            ("Include =\n", "Include directive with no arguments"),
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_err, r.stderr, (cfg_line, r.stderr))
+
+        # Interior CR in Include filename fails closed (not rewritten into spaces)
+        (base / "sshd_config").write_bytes(f"Include {base}/a\rb.conf\n".encode())
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("interior CR or control byte", r.stderr)
+
+        # PR 112 R4 (Codex empty first keyword): leading "=" or "" fails closed;
+        # blank lines and indented "# = Match" / '# "" Include' comments pass cleanly
+        for cfg_line in (
+            "= Match User admin\n  PasswordAuthentication yes\n",
+            f"= Include {base}/d/x.conf\n",
+            '"" Match User admin\n  PasswordAuthentication yes\n',
+            f'"" Include {base}/d/x.conf\n',
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn("empty sshd keyword", r.stderr, (cfg_line, r.stderr))
+        (base / "sshd_config").write_text(
+            '\n   \t\n# = Match User admin\n  # "" Include /etc/ssh/a.conf\nPasswordAuthentication no\n'
+        )
+        r = run_check()
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+
+    def test_sshd_match_check_real_sshd_parity(self):
+        # Verify against real /usr/sbin/sshd that every OpenSSH strdelim()/argv_split()
+        # syntax variant that honours a Match in sshd -T is refused by BOTH
+        # SSHD_MATCH_CHECK_SH and prep.sh's check_sshd_no_match.
+        sshd_bin = Path("/usr/sbin/sshd")
+        ssh_keygen = shutil.which("ssh-keygen")
+        if not (sshd_bin.is_file() and os.access(sshd_bin, os.X_OK) and ssh_keygen):
+            self.skipTest("/usr/sbin/sshd or ssh-keygen unavailable")
+        base = Path(tempfile.mkdtemp(prefix="tendcf-sshd-parity-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        hk = base / "host_ed25519"
+        subprocess.run(
+            [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(hk)],
+            check=True,
+            capture_output=True,
+        )
+        (base / "dir with space").mkdir()
+        (base / "dir with space" / "a.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "d").mkdir()
+        (base / "d" / "x.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "cr\rx.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "clean.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        prep_text = (VMDIR / "guest" / "prep.sh").read_text()
+        a = prep_text.index("sshd_canon() {")
+        b = prep_text.index('check_sshd_no_match "${SSHD_CONFIG:-/etc/ssh/sshd_config}"')
+        prep_fn = (
+            'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+            "set -eu\n"
+            + prep_text[a:b]
+            + 'check_sshd_no_match "$1"\n'
+        )
+        cfg = base / "sshd_config"
+
+        # Clean baseline with blank lines, indented "# = Match" / '# "" Include' comments,
+        # and trailing # comment containing a single quote: sshd keeps
+        # PasswordAuthentication no, and both checkers pass.
+        cfg.write_text(
+            f'\n   \n# = Match User admin\n  # "" Include {base}/d/x.conf\n'
+            f"PasswordAuthentication no\nInclude {base}/clean.conf # admin's comment\n"
+        )
+        r_sshd = subprocess.run(
+            [str(sshd_bin), "-T", "-h", str(hk), "-f", str(cfg), "-C", "user=admin,host=x,addr=10.0.0.9"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_sshd.returncode, 0, r_sshd.stderr)
+        self.assertIn("passwordauthentication no", r_sshd.stdout.lower().splitlines())
+        r_drv = subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_drv.returncode, 0, (r_drv.stdout, r_drv.stderr))
+        r_prep = subprocess.run(
+            ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+            env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_prep.returncode, 0, (r_prep.stdout, r_prep.stderr))
+
+        # All 14 live OpenSSH bypass variants (R2 Opus H1 + R3 Codex #1/#2 + R4 Codex empty keyword)
+        variants = (
+            (b'M"atch" User admin\n  PasswordAuthentication yes\n', "mid-token quoted Match"),
+            (f'I"nclude" {base}/d/x.conf\n'.encode(), "mid-token quoted Include"),
+            (f"Include '{base}/dir with space/a.conf'\n".encode(), "single-quoted Include"),
+            (f"Include {base}/dir\\ with\\ space/a.conf\n".encode(), "backslash-escaped Include"),
+            (f'Include {base}/d/"x".conf\n'.encode(), "mid-token quoted Include arg"),
+            (f'"Include"{base}/d/x.conf\n'.encode(), "adjacent quoted Include"),
+            (b'"Match"User admin\n  PasswordAuthentication yes\n', "adjacent quoted Match"),
+            (b'M"atch"User admin\n  PasswordAuthentication yes\n', "adjacent mid-quoted Match"),
+            (f'I"nclude"{base}/d/x.conf\n'.encode(), "adjacent mid-quoted Include"),
+            (f"Include {base}/cr\rx.conf\n".encode(), "interior CR in Include filename"),
+            (b"= Match User admin\n  PasswordAuthentication yes\n", "leading = before Match"),
+            (f"= Include {base}/d/x.conf\n".encode(), "leading = before Include"),
+            (b'"" Match User admin\n  PasswordAuthentication yes\n', "empty quoted keyword before Match"),
+            (f'"" Include {base}/d/x.conf\n'.encode(), "empty quoted keyword before Include"),
+        )
+        for body, label in variants:
+            cfg.write_bytes(b"PasswordAuthentication no\n" + body)
+            r_sshd = subprocess.run(
+                [str(sshd_bin), "-T", "-h", str(hk), "-f", str(cfg), "-C", "user=admin,host=x,addr=10.0.0.9"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_sshd.returncode, 0, (label, r_sshd.stderr))
+            self.assertIn(
+                "passwordauthentication yes",
+                r_sshd.stdout.lower().splitlines(),
+                f"{label}: expected real sshd to honour Match",
+            )
+            r_drv = subprocess.run(
+                ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_drv.returncode, 0, f"{label}: SSHD_MATCH_CHECK_SH failed to refuse")
+            r_prep = subprocess.run(
+                ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+                env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_prep.returncode, 0, f"{label}: prep.sh failed to refuse")
+
+        # Additional R3 fail-closed cases (quoted keyword + "=", unclosed keyword quote, zero-arg Include)
+        for body, label in (
+            (f'"Include"={base}/d/x.conf\n'.encode(), "quoted Include with ="),
+            (f'"Include {base}/d/x.conf\n'.encode(), "unclosed keyword quote"),
+            (b"Include # comment\n", "zero-arg Include with comment"),
+        ):
+            cfg.write_bytes(b"PasswordAuthentication no\n" + body)
+            r_drv = subprocess.run(
+                ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_drv.returncode, 0, f"{label}: SSHD_MATCH_CHECK_SH failed to refuse")
+            r_prep = subprocess.run(
+                ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+                env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_prep.returncode, 0, f"{label}: prep.sh failed to refuse")
 
     # -- 2g / 10a: Spotlight off, with a bounded settle (issue 70 run 2)
     def test_2g_waits_out_transitioning_and_records_polls_and_seconds(self):
@@ -4054,10 +5036,56 @@ class Check(Base):
             ("root:admin 755", True, False),  # group is not wheel
             ("root:wheel 775", True, False),  # group writable
             ("admin:wheel 755", True, False),
+            ("root:wheel 755 lrwxr-xr-x", True, False),  # PR 112 R1 Group 2: target symlink refused
         ):
             self.world.fw_owner = owner
             ok, ev = drv.check_root_owned(self.ctx, t, "/fw")
             self.assertEqual(ok, want, (owner, ev))
+        # tree=True also rejects symlink target or non-directory regular file target
+        for bad_target in ("root:wheel 755 lrwxr-xr-x", "root:wheel 644 -rw-r--r--"):
+            self.world.fw_owner = bad_target
+            ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
+            self.assertFalse(ok, (bad_target, ev))
+            self.assertIn("symlink or non-directory refused", ev)
+        # Verify TREE_CHECK_SH itself rejects symlinks and checks dotfiles via `find -exec /bin/ls -lde`
+        self.assertIn('test ! -L "$1" && test -d "$1"', drv.TREE_CHECK_SH)
+        self.assertIn('find "$1" -exec /bin/ls -lde {} +', drv.TREE_CHECK_SH)
+        td = Path(tempfile.mkdtemp(prefix="tendcf-tree-acl-"))
+        self.addCleanup(shutil.rmtree, td, True)
+        (td / ".hidden_dir").mkdir()
+        hidden_f = td / ".hidden_dir" / ".secret"
+        hidden_f.write_text("x")
+        sym = td / "sym"
+        sym.symlink_to(td / ".hidden_dir")
+        # Symlink target to TREE_CHECK_SH fails non-zero
+        r_sym = subprocess.run(
+            ["/bin/sh", "-c", drv.TREE_CHECK_SH, "sh", str(sym)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(r_sym.returncode, 0)
+        # Stub /bin/ls-like check: prove TREE_CHECK_SH's find -exec reaches hidden dotfiles
+        fake_bin = Path(tempfile.mkdtemp(prefix="tendcf-tree-ls-"))
+        self.addCleanup(shutil.rmtree, fake_bin, True)
+        fake_ls = fake_bin / "ls"
+        fake_ls.write_text(
+            '#!/bin/sh\n'
+            'for p in "$@"; do\n'
+            '  case "$p" in\n'
+            '    */.secret) echo "-rw-r--r--+ 1 root wheel 1 Nov 25 00:00 $p"; echo " 0: user:admin allow write" ;;\n'
+            '  esac\n'
+            'done\n'
+        )
+        fake_ls.chmod(0o755)
+        tree_sh_test = drv.TREE_CHECK_SH.replace("/bin/ls", str(fake_ls))
+        r_acl = subprocess.run(
+            ["/bin/sh", "-c", tree_sh_test, "sh", str(td)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn("ACL:", r_acl.stdout)
         self.world.fw_owner = FW_PYTHON_FIXED
         ok, ev = drv.check_root_owned(self.ctx, t, "/fw", tree=True)
         self.assertTrue(ok, ev)
@@ -4109,13 +5137,36 @@ class Check(Base):
         orig = self.world._guest
 
         def silent(r, input_text):
-            if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp"]:
+            if r[:3] == ["stat", "-f", "%N %Su:%Sg %Lp %Sp"]:
                 return drv.Result(1, "", "stat: boom")
             return orig(r, input_text)
 
         self.world._guest = silent
         ok, ev = drv.check_root_owned(self.ctx, t, path)
         self.assertFalse(ok)
+        self.world._guest = orig
+
+        # Issue #78: a symlink ancestor (e.g. /var -> /private/var) fails closed
+        self.world.stat_overrides = {"/Library": "root:wheel 755 lrwxr-xr-x"}
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertFalse(ok, ev)
+        self.assertIn("lrwxr-xr-x", ev)
+        self.world.stat_overrides = {}
+
+        # Issue #78: macOS ACL on the target path or any ancestor fails closed even when tree=False
+        for acl_p in (path, "/Library"):
+            with self.subTest(acl_path=acl_p):
+                self.world.acl_paths = {acl_p}
+                ok, ev = drv.check_root_owned(self.ctx, t, path)
+                self.assertFalse(ok, ev)
+                self.assertIn("ACL check failed", ev)
+        self.world.acl_paths = set()
+
+        self.world.acl_check_fail = True
+        ok, ev = drv.check_root_owned(self.ctx, t, path)
+        self.assertFalse(ok, ev)
+        self.assertIn("ACL check failed", ev)
+        self.world.acl_check_fail = False
 
     def test_a_server_that_still_offers_password_login_fails_2f(self):
         self.world.password_login = (
@@ -4614,31 +5665,57 @@ class RawNewlines(unittest.TestCase):
 
     def test_raw_decodes_utf8_with_replacement_and_passes_input_through(self):
         r = drv.RealRunner().run([self.PRINTF, "\\377x"], timeout=30, raw_newlines=True)
-        self.assertEqual(r.stdout, "�x")
+        self.assertEqual(r.stdout, "\ufffdx")
         r = drv.RealRunner().run(
             ["/bin/cat"], input_text="x\r\ny\r", timeout=30, raw_newlines=True
         )
         self.assertEqual(r.stdout, "x\r\ny\r")
+
+    def test_default_text_mode_decodes_invalid_utf8_with_replacement(self):
+        # Issue #87 Fable r3 nit 4: default text-mode path replaces invalid UTF-8
+        # instead of crashing with an uncaught UnicodeDecodeError.
+        r = drv.RealRunner().run([self.PRINTF, "\\377x"], timeout=30)
+        self.assertEqual((r.rc, r.stdout), (0, "\ufffdx"))
+
+    def test_raw_newlines_combined_with_log_path_is_refused(self):
+        # Issue #87 Fable r3 nit 3: raw_newlines=True + log_path raises ValueError.
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                drv.RealRunner().run(
+                    [self.PRINTF, "ok"],
+                    timeout=30,
+                    raw_newlines=True,
+                    log_path=Path(d) / "out.log",
+                )
 
     def test_2e_matcher_on_real_runner_output(self):
         wrong = SSHD_CAMEL.replace(
             "PasswordAuthentication no", "PasswordAuthentication yes"
         )
         smuggled = wrong + "Banner /x\rPasswordAuthentication no\n"
+        smuggled_missing = (
+            SSHD_CAMEL.replace("PasswordAuthentication no\n", "")
+            + "Banner /x\rPasswordAuthentication no\n"
+        )
         # the real, observed CamelCase output passes, raw or not
         for raw in (True, False):
             ok, ev = drv.sshd_key_only(self.printf(SSHD_CAMEL, raw_newlines=raw))
             self.assertTrue(ok, ev)
         # a CR-smuggled line and a trailing CR fail on the raw bytes ...
         for name, text in (
-            ("smuggled", smuggled),
+            ("smuggled over wrong", smuggled),
+            ("smuggled over missing", smuggled_missing),
             ("trailing CR", SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no\r\n")),
         ):  # fmt: skip
             ok, ev = drv.sshd_key_only(self.printf(text, raw_newlines=True))
             self.assertFalse(ok, (name, ev))
             self.assertIn("carriage return", ev)
-        # ... while the default runner's decode would have shown the matcher a fake line
-        ok, _ = drv.sshd_key_only(self.printf(smuggled))
+        # ... with A7 exact-once, smuggled over wrong fails even in default text mode as a duplicate,
+        # while smuggled over missing still proves why raw_newlines=True is required
+        ok, ev = drv.sshd_key_only(self.printf(smuggled))
+        self.assertFalse(ok, ev)
+        self.assertIn("duplicate keys", ev)
+        ok, _ = drv.sshd_key_only(self.printf(smuggled_missing))
         self.assertTrue(ok, "the default decode turns the CR into a newline")
 
     def test_2g_matcher_on_real_runner_output(self):
@@ -4761,6 +5838,39 @@ class Helpers(unittest.TestCase):
             check=False,
         )
         self.assertEqual((r.returncode, r.stdout), (0, "ran arg1\n"), r.stderr)
+        self.assertEqual(set(Path("/var/tmp").glob("tendcf-state1.*")), before)
+        # Issue #78 (Fable R3): actually deliver SIGTERM while the child script sleeps and
+        # assert rc 129 and zero leftover temp files in /var/tmp.
+        p = subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                'sudo() { shift; "$@"; }\n' + drv.RUN_SCRIPT_SH,
+                "sh",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            assert p.stdin is not None and p.stdout is not None
+            p.stdin.write("echo READY; sleep 30\n")
+            p.stdin.close()
+            self.assertEqual(p.stdout.readline(), "READY\n")
+            during = set(Path("/var/tmp").glob("tendcf-state1.*")) - before
+            self.assertEqual(len(during), 1, f"expected temp script while running: {during}")
+            os.killpg(p.pid, signal.SIGTERM)
+            rc = p.wait(timeout=10)
+            self.assertEqual(rc, 129)
+        finally:
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait(timeout=5)
+            for stream in (p.stdout, p.stderr):
+                if stream is not None:
+                    stream.close()
         self.assertEqual(set(Path("/var/tmp").glob("tendcf-state1.*")), before)
 
     def test_python_signer_is_validated_as_one_line_name_and_team_id(self):
@@ -5042,35 +6152,64 @@ class GuestScripts(unittest.TestCase):
                 self.assertIn(form, r.stdout, over)
 
     def test_prep_checks_sshd_effective_config_ignoring_case(self):
-        # the loop that asserts `sshd -T` shows key-only login, run against a fake sshd
+        # Issue #87: prep.sh step 7 checks Match blocks across recursive Includes, multi-spec
+        # sshd -T -C (admin + root, loopback + host-facing), exact-once keys (A7), extra auth
+        # keys, and NUL byte preservation via a temp file (A8).
         text = self.text("prep.sh")
-        a = text.index("effective=$(/usr/sbin/sshd -T")
+        a = text.index("sshd_canon() {")
         b = text.index('log "sshd: key login only"', a)
         snippet = text[a:b]
         tmp = Path(tempfile.mkdtemp(prefix="tendcf-prep7-"))
         self.addCleanup(shutil.rmtree, tmp, True)
+        state_dir = tmp / "state"
+        state_dir.mkdir()
+        ssh_dir = tmp / "ssh"
+        (ssh_dir / "sshd_config.d").mkdir(parents=True)
+        (ssh_dir / "crypto.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        (ssh_dir / "sshd_config.d" / "100-macos.conf").write_text("Include crypto.conf\n")
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        specs_log = tmp / "specs.log"
         fake = tmp / "sshd"
-        fake.write_text('#!/bin/sh\nprintf "%s" "$SSHD_OUT"\nexit "${SSHD_RC:-0}"\n')
+        fake.write_text(
+            '#!/bin/sh\n'
+            'echo "$*" >>"$SPECS_LOG"\n'
+            'if [ -n "${SSHD_FILE:-}" ]; then cat "$SSHD_FILE"; else printf "%s" "$SSHD_OUT"; fi\n'
+            'exit "${SSHD_RC:-0}"\n'
+        )
         fake.chmod(0o755)
         snippet = snippet.replace("/usr/sbin/sshd", str(fake))
-        # A2/A6: the replace must have taken, and the slice must be exactly the expected text
-        # (comments aside), so any widening fails here instead of running on the host: it can
-        # then never run the host's sshd or write anything on the host.
         self.assertNotIn("/usr/sbin/sshd", snippet)
         self.assertIn(str(fake), snippet)
-        code = "".join(
-            ln + "\n" for ln in snippet.split("\n") if ln and not ln.startswith("#")
-        )
-        self.assertEqual(
-            code,
-            f"effective=$({fake} -T -C user=admin,host=localhost,addr=127.0.0.1)\n"
-            "for want in 'passwordauthentication no' 'kbdinteractiveauthentication no'"
-            " 'pubkeyauthentication yes' 'permitrootlogin no'; do\n"
-            """    printf '%s\\n' "$effective" | LC_ALL=C grep -qixF "$want" """
-            """|| die "sshd -T does not show: $want"\n"""
-            "done\n",
-        )
         stub = 'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+        base_env = {
+            "PATH": "/usr/bin:/bin",
+            "STATE_DIR": str(state_dir),
+            "SSHD_CONFIG": str(ssh_dir / "sshd_config"),
+            "SSHD_BASE_DIR": str(ssh_dir),
+            "SSHD_CLIENT_ADDRS": "192.168.64.1",
+            "SPECS_LOG": str(specs_log),
+        }
+
+        def run_step7(out=None, *, raw_bytes=None, rc_env="0"):
+            if specs_log.exists():
+                specs_log.unlink()
+            env = {**base_env, "SSHD_RC": rc_env}
+            if raw_bytes is not None:
+                bf = tmp / "sshd.bin"
+                bf.write_bytes(raw_bytes)
+                env["SSHD_FILE"] = str(bf)
+            else:
+                env["SSHD_OUT"] = out
+            r = subprocess.run(
+                ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(list(state_dir.iterdir()), [], "leaked sshd temp file")
+            return r
+
         cases = (
             (SSHD_CAMEL, 0, ""),  # macOS 27.2, as observed
             (SSHD_LOWER, 0, ""),  # stock OpenSSH
@@ -5080,47 +6219,194 @@ class GuestScripts(unittest.TestCase):
              1, "pubkeyauthentication yes"),
             (SSHD_CAMEL.replace("PermitRootLogin no", "PermitRootLogin no-password"),
              1, "permitrootlogin no"),  # whole line, not a prefix
+            (SSHD_CAMEL.replace("GSSAPIAuthentication no", "GSSAPIAuthentication yes"),
+             1, "gssapiauthentication no"),
+            (SSHD_CAMEL.replace("HostbasedAuthentication no", "HostbasedAuthentication yes"),
+             1, "hostbasedauthentication no"),
+            (SSHD_CAMEL.replace("AuthenticationMethods publickey", "AuthenticationMethods any"),
+             1, "authenticationmethods publickey"),
+            (SSHD_CAMEL + "PasswordAuthentication yes\n", 1, "duplicate key: passwordauthentication"),
             ("", 1, "passwordauthentication no"),
-            # padding, a CR and a leading space are not the wanted line (and the driver agrees)
+            # padding, a CR on a wanted line, and a leading space are rejected
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no  \n"),
              1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication no\r\n"),
              1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", " PasswordAuthentication no\n"),
              1, "passwordauthentication no"),
-            # a separator inside a quoted value does not make a second line, in grep either
+            # a CR on an unrelated line passes prep.sh (driver rejects any CR: Fable r3 nit 1)
+            (SSHD_CAMEL.replace("UsePAM yes\n", "UsePAM yes\r\n"), 0, ""),
+            # a separator inside a quoted value does not make a second line
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
              + "Banner /x\x0cPasswordAuthentication no\n", 1, "passwordauthentication no"),
             (SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
              + "Banner /x\u2028PasswordAuthentication no\n", 1, "passwordauthentication no"),
         )  # fmt: skip
         for out, want_rc, want_msg in cases:
-            r = subprocess.run(
-                ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
-                capture_output=True,
-                text=True,
-                check=False,
-                env={"PATH": "/usr/bin:/bin", "SSHD_OUT": out},
-            )
+            r = run_step7(out)
             self.assertEqual(r.returncode, want_rc, (out, r.stdout, r.stderr))
             self.assertIn(want_msg, r.stdout + r.stderr)
-        # a lone CR inside a quoted value is part of that line for grep, as for the driver
+        # Verify all 4 specs (admin+root x loopback+host-facing) were evaluated on pass
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        seen_specs = specs_log.read_text().splitlines()
+        for want_spec in (
+            "-T -C user=admin,host=localhost,addr=127.0.0.1",
+            "-T -C user=root,host=localhost,addr=127.0.0.1",
+            "-T -C user=admin,host=192.168.64.1,addr=192.168.64.1",
+            "-T -C user=root,host=192.168.64.1,addr=192.168.64.1",
+        ):
+            self.assertIn(want_spec, seen_specs)
+        # A8: NUL bytes are preserved via the temp file and fail closed
+        r = run_step7(raw_bytes=SSHD_CAMEL.encode() + b"Banner /x\x00y\n")
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
+        # CR-smuggled line and non-zero sshd exit fail closed
         smuggled = (
             SSHD_CAMEL.replace("PasswordAuthentication no\n", "PasswordAuthentication yes\n")
             + "Banner /x\rPasswordAuthentication no\n"
         )  # fmt: skip
-        # sshd -T failing: the command substitution dies under set -e with sshd's own status,
-        # even when what it printed looks right, and nothing after it runs
-        for out, rc_env, want_rc in ((smuggled, "0", 1), (SSHD_CAMEL, "3", 3)):
-            r = subprocess.run(
-                ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
-                capture_output=True,
-                text=True,
-                check=False,
-                env={"PATH": "/usr/bin:/bin", "SSHD_OUT": out, "SSHD_RC": rc_env},
-            )
-            self.assertEqual(r.returncode, want_rc, (rc_env, r.stdout, r.stderr))
+        for out, rc_env in ((smuggled, "0"), (SSHD_CAMEL, "3")):
+            r = run_step7(out, rc_env=rc_env)
+            self.assertEqual(r.returncode, 1, (rc_env, r.stdout, r.stderr))
             self.assertNotIn("REACHED", r.stdout)
+        # Uncommented Match in a recursively included file fails closed
+        (ssh_dir / "crypto.conf").write_text("Match Address 192.168.64.0/20\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
+
+        # PR 112 R1 Group 1 & 8a in prep.sh: space in globbed drop-in, quoted Include with space,
+        # relative Include *.conf with colliding cwd, glob metachars (*, ?), CRLF Include/Match,
+        # mid-line #, NUL byte in config, and sshd_specs dedup + invalid IP filtering.
+        (ssh_dir / "crypto.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        # 1) Space in globbed drop-in
+        spaced = ssh_dir / "sshd_config.d" / "99 custom.conf"
+        spaced.write_text("Match User root\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        spaced.unlink()
+        # 2) Quoted Include with space + mid-token # + trailing # comment
+        (ssh_dir / "dir with space").mkdir()
+        (ssh_dir / "dir with space" / "a.conf").write_text('"Match" all\n')
+        (ssh_dir / "sshd_config").write_text(
+            'Include a#ignored.conf "dir with space/a.conf" # trailing \'comment\'\n'
+        )
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        # 3) Relative Include *.conf with colliding file in cwd
+        cwd_dir = Path(tempfile.mkdtemp(prefix="tendcf-prep7-cwd-"))
+        self.addCleanup(shutil.rmtree, cwd_dir, True)
+        (cwd_dir / "clean.conf").write_text("# clean\n")
+        (ssh_dir / "bad.conf").write_text("Match all\n")
+        (ssh_dir / "sshd_config").write_text("Include *.conf\n")
+        r = subprocess.run(
+            ["/bin/sh", "-c", stub + "set -eu\n" + snippet + "echo REACHED\n"],
+            cwd=str(cwd_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**base_env, "SSHD_OUT": SSHD_CAMEL, "SSHD_RC": "0"},
+        )
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "bad.conf").unlink()
+        # 4) Filename containing ? does not swallow another filename via case wildcard
+        (ssh_dir / "sshd_config.d" / "x?y.conf").write_text("# ok\n")
+        (ssh_dir / "sshd_config.d" / "x1y.conf").write_text("Match all\n")
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "sshd_config.d" / "x?y.conf").unlink()
+        (ssh_dir / "sshd_config.d" / "x1y.conf").unlink()
+        # 5) CRLF Include + Match\rall
+        (ssh_dir / "crlf.conf").write_bytes(b"Match\rall\r\n")
+        (ssh_dir / "sshd_config").write_bytes(b"Include crlf.conf\r\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("Match block", r.stderr)
+        (ssh_dir / "crlf.conf").unlink()
+        # 6) NUL byte in config file
+        (ssh_dir / "sshd_config").write_bytes(b"PasswordAuthentication no\x00\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("NUL byte", r.stderr)
+        # 6b) PR 112 R2 (Opus H1 + L5): obfuscated Match/Include, single quotes, backslash,
+        # mid-token/unclosed quotes, leading ~, and non-regular FIFO target in prep.sh
+        (ssh_dir / "d").mkdir()
+        (ssh_dir / "d" / "x.conf").write_text("Match User admin\n")
+        for cfg_line, want_msg in (
+            ('M"atch" User admin\n', "Match block"),
+            (f'I"nclude" {ssh_dir}/d/x.conf\n', "obfuscated Include keyword"),
+            (f"Include '{ssh_dir}/dir with space/a.conf'\n", "unsupported quote/escape"),
+            (f"Include {ssh_dir}/dir\\ with\\ space/a.conf\n", "unsupported quote/escape"),
+            (f'Include {ssh_dir}/d/"x".conf\n', "unsupported quote/escape"),
+            ('Include "~/evil.conf"\n', "unsupported Include target"),
+        ):
+            (ssh_dir / "sshd_config").write_text(cfg_line)
+            r = run_step7(SSHD_CAMEL)
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stderr, (cfg_line, r.stderr))
+        fifo = ssh_dir / "sshd_config.d" / "50-pipe.conf"
+        os.mkfifo(fifo)
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("non-regular sshd config target", r.stderr)
+        fifo.unlink()
+        # 6c) PR 112 R3 (Codex #1, #2, #4a, #4b) in prep.sh: closing-quote boundaries,
+        # unclosed keyword quote, interior CR in Include filename, and zero-arg Include
+        for cfg_bytes, want_msg in (
+            (b'"Match"User admin\n', "Match block"),
+            (b'M"atch"User admin\n', "Match block"),
+            (b'"Match User admin\n', "Match block"),
+            (f'"Include"{ssh_dir}/d/x.conf\n'.encode(), "ambiguous quoted keyword boundary"),
+            (f'"Include"={ssh_dir}/d/x.conf\n'.encode(), "ambiguous quoted keyword boundary"),
+            (f'"Include {ssh_dir}/d/x.conf\n'.encode(), "unclosed quote in sshd keyword"),
+            (f"Include {ssh_dir}/a\rb.conf\n".encode(), "interior CR or control byte"),
+            (b"Include\n", "Include directive with no arguments"),
+            (b"Include # comment\n", "Include directive with no arguments"),
+            # PR 112 R4 (Codex empty first keyword)
+            (b"= Match User admin\n", "empty sshd keyword"),
+            (f"= Include {ssh_dir}/d/x.conf\n".encode(), "empty sshd keyword"),
+            (b'"" Match User admin\n', "empty sshd keyword"),
+            (f'"" Include {ssh_dir}/d/x.conf\n'.encode(), "empty sshd keyword"),
+        ):
+            (ssh_dir / "sshd_config").write_bytes(cfg_bytes)
+            r = run_step7(SSHD_CAMEL)
+            self.assertEqual(r.returncode, 1, (cfg_bytes, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stderr, (cfg_bytes, r.stderr))
+        # Positive control: blank lines and indented "# = Match" / '# "" Include' comments pass
+        (ssh_dir / "sshd_config").write_text(
+            '\n   \t\n# = Match User admin\n  # "" Include /etc/ssh/a.conf\nInclude sshd_config.d/*\n'
+        )
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        # 7) Group 8a: dedup 127.0.0.1 (via ,addr=) and skip non-IP tokens like link#4
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        if specs_log.exists():
+            specs_log.unlink()
+        r = subprocess.run(
+            ["/bin/sh", "-c", stub + "set -eu\n" + snippet],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **base_env,
+                "SSHD_CLIENT_ADDRS": "127.0.0.1 link#4 192.168.64.1 192.168.64.1",
+                "SSHD_OUT": SSHD_CAMEL,
+                "SSHD_RC": "0",
+            },
+        )
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        seen_dedup = specs_log.read_text().splitlines()
+        self.assertEqual(len(seen_dedup), 4, seen_dedup)
+        self.assertFalse(any("link#4" in s for s in seen_dedup))
 
     def fake_bin(self, name, body):
         d = Path(tempfile.mkdtemp(prefix="tendcf-prep-fake-"))
@@ -5749,7 +7035,7 @@ class GuestScripts(unittest.TestCase):
         self.assertIn("PREP-HOSTKEY", text)
         self.assertIn("/etc/ssh/ssh_host_ed25519_key.pub", text)
         self.assertLess(text.index("ssh-keygen -A"), text.index('echo "PREP-HOSTKEY'))
-        self.assertIn("'permitrootlogin no'", text)
+        self.assertIn('"permitrootlogin no"', text)
 
     def test_python_install_fixes_and_asserts_ownership_after_the_installer(self):
         text = self.text("install-python.sh")
@@ -5807,7 +7093,10 @@ class GuestScripts(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="tendcf-pkgutil-"))
         self.addCleanup(shutil.rmtree, d, True)
         stub = d / "pkgutil"
-        (d / "out.txt").write_text(output)
+        if isinstance(output, bytes):
+            (d / "out.txt").write_bytes(output)
+        else:
+            (d / "out.txt").write_text(output)
         stub.write_text(f'#!/bin/sh\ncat "{d}/out.txt"\nexit {rc}\n')
         stub.chmod(0o755)
         driver = d / "run.sh"
@@ -5862,6 +7151,65 @@ class GuestScripts(unittest.TestCase):
         self.assertNotEqual(self.pkgutil_check(not_leaf).returncode, 0)
         # pkgutil itself failing, whatever it printed
         self.assertNotEqual(self.pkgutil_check(self.GOOD_SIG, rc=1).returncode, 0)
+        # Issue #78 A4: missing or untrusted Notarization line fails closed
+        no_notary = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n", ""
+        )
+        self.assertNotEqual(self.pkgutil_check(no_notary).returncode, 0)
+        bad_notary = self.GOOD_SIG.replace(
+            "trusted by the Apple notary service", "not notarized"
+        )
+        self.assertNotEqual(self.pkgutil_check(bad_notary).returncode, 0)
+        # PR 112 R1 Group 7 (Adversary B4): section anchoring, uniqueness, and CR/NUL rejection
+        # Status inside Certificate Chain fails
+        status_in_chain = self.GOOD_SIG.replace(
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+            "",
+        ) + "    Status: signed by a developer certificate issued by Apple for distribution\n"
+        self.assertNotEqual(self.pkgutil_check(status_in_chain).returncode, 0)
+        # Notarization inside Certificate Chain fails
+        notary_in_chain = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n", ""
+        ) + "    Notarization: trusted by the Apple notary service\n"
+        self.assertNotEqual(self.pkgutil_check(notary_in_chain).returncode, 0)
+        # Leaf 1. line outside (before) Certificate Chain fails
+        leaf_before_chain = (
+            "   1. Developer ID Installer: Python Software Foundation (BMM5U3QVKW)\n"
+            + self.GOOD_SIG.replace(
+                "    1. Developer ID Installer: Python Software Foundation (BMM5U3QVKW)\n",
+                "",
+            )
+        )
+        self.assertNotEqual(self.pkgutil_check(leaf_before_chain).returncode, 0)
+        # Duplicate Status / Notarization / 1. lines fail even when one matches
+        dup_status = self.GOOD_SIG.replace(
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+            "   Status: untrusted\n"
+            "   Status: signed by a developer certificate issued by Apple for distribution\n",
+        )
+        self.assertNotEqual(self.pkgutil_check(dup_status).returncode, 0)
+        dup_notary = self.GOOD_SIG.replace(
+            "   Notarization: trusted by the Apple notary service\n",
+            "   Notarization: revoked\n"
+            "   Notarization: trusted by the Apple notary service\n",
+        )
+        self.assertNotEqual(self.pkgutil_check(dup_notary).returncode, 0)
+        dup_leaf = self.GOOD_SIG + "    1. Developer ID Installer: Evil (XXXXXXXXXX)\n"
+        self.assertNotEqual(self.pkgutil_check(dup_leaf).returncode, 0)
+        # CR and NUL bytes fail closed
+        self.assertNotEqual(
+            self.pkgutil_check(self.GOOD_SIG.replace("\n", "\r\n").encode()).returncode, 0
+        )
+        self.assertNotEqual(
+            self.pkgutil_check(self.GOOD_SIG.encode() + b"\x00").returncode, 0
+        )
+        # PR 112 R2 (Opus L6): signer is passed via ENVIRON["SIGNER"], not awk -v, so
+        # backslashes in signer are compared literally instead of being escape-expanded
+        bs_signer = r"Python\nFoundation (BMM5U3QVKW)"
+        bs_sig = self.GOOD_SIG.replace(
+            "Python Software Foundation (BMM5U3QVKW)", bs_signer
+        )
+        self.assertEqual(self.pkgutil_check(bs_sig, signer=bs_signer).returncode, 0)
 
 
 class CheckRenderer(Base):

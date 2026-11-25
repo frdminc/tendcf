@@ -31,8 +31,8 @@ directory (or by path); the lead runs real passes through `bgrun`.
 ```sh
 python3 state1_vm.py resolve                         # registry digest of the tag; no tart, no pull
 python3 state1_vm.py pull                            # ~30 GB: its own job, so load-watch admits it alone
-python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo)
-python3 state1_vm.py check                           # image-only check (skips steps 3-9/9a/10b/11a)
+python3 state1_vm.py golden                          # build local VM state1-golden (add --rebuild to redo; --adopt to promote a matching committing marker)
+python3 state1_vm.py check                           # image-only check (skips steps 3-9/9a/10b/11a; add --adopt to write a missing owner marker on pass)
 python3 state1_vm.py check --tarball FILE            # full check with a local PR 95 tarball + .sha256
 python3 state1_vm.py check --artifact-run RUN_ID     # full check downloading the PR 95 artifact via gh
 ```
@@ -60,7 +60,9 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   The record files are written only after the rename succeeded, and from the moment the old
   golden is touched the finished build is never deleted by cleanup: if the delete or the rename
   fails the finished build is kept, `known_hosts`/`golden.json` still describe the old golden
-  (a failed delete puts the previous owner file back; a failed rename leaves the intent one),
+  (a failed delete re-lists on a best-effort basis and puts the previous owner file back only if
+  the old golden is confirmed still present; if the old golden is gone or the re-list fails, the
+  intent marker stays and the state is reported as unknown; a failed rename leaves the intent one),
   and the evidence says what to run (the new record is parked as `known_hosts.pending` and
   `golden.json.pending` in the state dir and `golden-owner-<golden>.json.pending` beside the
   lock; a hand finish is `tart rename` then three `mv`, the last one making this state dir the
@@ -119,15 +121,19 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   **Owner marker.** The tart golden is global to a tart home and the records are per
   `--state-dir`, so the commit writes `<passwd home>/.local/state/tendcf-state1-vm/golden-owner-<golden
   name>-<tart key>.json` beside the driver lock (`<tart key>` is the first 8 hex digits of a
-  SHA-256 of the resolved tart home): the golden, the resolved state dir, the tart home,
+  SHA-256 of the canonical tart home, folded via macOS `F_GETPATH` on an `O_DIRECTORY` fd so
+  case variants and `/System/Volumes/Data` firmlinks share one key): the golden, the resolved state dir, the tart home,
   `key_id`, `host_key` and a `state`. The lock directory must be a real directory of yours that is not group or world
   writable, and the file is read without following a symlink (a FIFO or directory is refused,
   never waited on). The state dir (`--state-dir`, which holds the pin and the record) gets the
-  same ownership and mode check (the path is resolved with `realpath` once, at startup, and
-  a symlink to such a directory is the operator's choice; a missing one is made 0700, parents
-  included; a path that is a file is refused, and so is a `--state-dir` that is itself a
-  symlink that points nowhere or is not yours: nothing is created through it; a link
-  planted after the path was resolved is not followed either). A lock directory that cannot be
+  same ownership and mode check, plus every ancestor of the resolved path up to `/` is verified
+  with `O_DIRECTORY|O_NOFOLLOW` to be a real directory owned by root or you and not group/world
+  writable unless sticky before any missing directory is created (the path is resolved with
+  `realpath` once, at startup, and a symlink of yours to such an existing directory is the
+  operator's choice; a missing one is made 0700, parents included; a path that is a file is
+  refused, and so is any dangling or foreign-owned symlink at `--state-dir` or in an ancestor, or
+  a root-owned symlink at `--state-dir` itself: nothing is created through it; a link planted
+  after the path was resolved is not followed either). A lock directory that cannot be
   made is a refusal (exit 2) naming it; the mode checks do not consider macOS ACLs. Plain `golden` with the golden present rebuilds it unattended (when the
   usability test fails) or reports "nothing to do" **only** when the owner file is `final`, names
   this golden and this state dir (the same directory: `realpath`, else `samefile`) and agrees
@@ -165,13 +171,26 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   `golden --rebuild` sweeps the kept build and builds afresh, and the run exits 1. The remaining unattended deletion is the case where the owner file already
   names this state dir (a final file that agrees with the record) but the usability test
   fails: that golden is ours and is replaced.
-  **Upgrade note:** run `golden --rebuild` once after upgrading: an older driver's
-  `golden --rebuild` from another state dir can leave the new marker agreeing with this state
-  dir's record. A golden built before owner files existed (or whose owner file is the
-  older unkeyed one) has none, so the first plain
-  `golden` after upgrading exits 2 until one `golden --rebuild` writes it; `check` does not need
-  the marker and still passes. (Letting a passing `check` write the missing marker is tracked as
-  [issue 81](https://github.com/frdminc/tendcf/issues/81).) `check` reads the marker too: a
+  **Upgrade note and explicit adoption (`--adopt`, issue 81 / `Ref: ANTIGRAVITY-12j`):** plain
+  `golden` and plain `check` stay strictly fail-closed and never silently write or promote an
+  owner marker. A golden built before owner files existed (or whose owner file is the older
+  unkeyed one) has none, so plain `golden` exits 2 while plain `check` still passes. To adopt
+  explicitly without a full `--rebuild`:
+  - **`check --adopt`**: after passing the full strict key-login check against a clone of the
+    golden, re-checks the marker inside the driver lock and writes the `final` owner marker ONLY
+    if no marker exists for this golden in this canonical `TART_HOME`, or an existing `final`
+    marker already matches this exact state dir (idempotent). Refuses fail-closed (exit 2) if a
+    `final` marker exists for a different state dir (or tart home/key), or if a `committing`
+    marker exists (directing you to `golden --adopt` or `golden --rebuild`).
+  - **`golden --adopt`**: under the driver lock, promotes an existing `committing` marker to
+    `final` ONLY if the golden exists in `tart list`, the `committing` marker belongs to this
+    exact state dir and canonical `TART_HOME`, and its `key_id` and `host_key` match this state
+    dir's `golden.json` and `known_hosts` pin (same verification as `golden_usable`), with no
+    conflicting `final` marker or leftover `<golden>-build` VM. Otherwise refuses fail-closed
+    (exit 2). `golden --adopt` does not perform an SSH login: this is sound because `golden.json`
+    and the `known_hosts` pin are written only after `tart rename` succeeds and `<golden>-build`
+    absence is enforced, so the committing marker already proves the renamed VM is this build.
+  `check` reads the marker too: a
   **final** file naming another state dir, another tart home or another key exits 2 early,
   naming it; a `committing` file of another state dir (its commit did not finish: the golden is
   the old or the new build) does not refuse, the login decides and the evidence says so; a
@@ -318,7 +337,7 @@ Recovery.
 | 3 | stage bundle, run `deploy/darwin/tendcf-install.sh install` as root, and verify `check_root_owned(..., tree=True)` on `/opt/tendcf` and `<workdir>/inputs`, `root:wheel 600` on `host_specific.json`, and no `com.apple.quarantine` | live (with `--tarball` or `--artifact-run`; skipped without an artifact) |
 | 4-9 | render as root (`run-once`, `root:wheel 0644`, `plutil -lint`, no `.cf-before-edit`), byte-compare against committed golden `tests/policy/golden/launchd/system/com.tendcf.canary.main.plist`, `launchctl print` + `kickstart -k`, idempotent re-run (`run-once` + installer `no change`), one-key drift edit repaired and reloaded, non-root negatives (installer, `cf-agent`, `launchctl bootstrap system`) | live (with `--tarball` or `--artifact-run`) |
 | 9a | `tendcf-install.sh enable` (and idempotent re-run `no change`), `org.tendcf.execd` plist `root:wheel 0644` + `plutil -lint`, loaded and running as `root` (`launchctl print` + `ps`) | live (with `--tarball` or `--artifact-run`) |
-| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2e and 2g-2l hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
+| 10, 10a | reboot; ssh returns with a new `kern.bootsessionuuid`; 2a-2l (including live password-login refusal 2f) hold again (2h's rule is the same after the reboot; a passing 10a names 2g's own `polls=N waited=Ns` after the reboot — values the driver returns, not text read back from the guest's output — plus a clipped copy of the post-reboot `mdutil -a -s` listing) | live |
 | 10b | post-reboot `launchctl print` for `com.tendcf.canary.main` and `org.tendcf.execd` (loaded from disk at boot; `org.tendcf.execd` running as `root`) | live (with `--tarball` or `--artifact-run`) |
 | 11 | stop and delete the clone, always | live |
 | 11a | canary tombstone teardown (`data` + `run-once`, plist removed, `launchctl print` fails) and `org.tendcf.execd` `disable` (plist removed, `launchctl print` fails) before step 11 | live (with `--tarball` or `--artifact-run`) |
@@ -383,18 +402,24 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
   LibreSSL 3.3.6; golden steps g1-g5 passed, g6 failed on this):** `sshd -T` prints its option
   names in CamelCase (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
   `PubkeyAuthentication yes`, `PermitRootLogin no`, `UsePAM yes`), not the lowercase of stock
-  OpenSSH. `prep.sh` (`LC_ALL=C grep -qixF`: whole line, ignoring case) and check 2e (and its
-  post-reboot repeat, 10a) accept the same lines: the driver reads sshd's bytes untranslated
-  (`raw_newlines`: no text mode, so Python does not turn a lone CR or CRLF into a newline),
-  splits on `"\n"` only, strips nothing and folds ASCII case only, so padding or a line
-  smuggled in through a quoted value (for example a `Banner` holding a form feed) does not
-  count. Any CR anywhere in the output fails 2e outright, with the reason in the evidence
-  (grep sees a CR as part of its line, so `prep.sh` rejects the same outputs). The
-  `/etc/ssh/sshd_config.d` include is honoured (`sshd_config:19` has `Include
-  /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf` is the only other drop-in and sorts
-  after ours), and the effective configuration, as `sshd -T -C user=admin,host=localhost,
-  addr=127.0.0.1` prints it, was key-only; the live refusal of a password login (g9, 2f) has not
-  run. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
+  OpenSSH. `prep.sh` (via a root-only `$STATE_DIR` temp file + `LC_ALL=C tr` + `LC_ALL=C awk` so
+  NUL bytes are preserved and rejected) and check 2e (and its post-reboot repeat, 10a) assert
+  `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`,
+  `PermitRootLogin no`, `GSSAPIAuthentication no`, `HostbasedAuthentication no`, and
+  `AuthenticationMethods` (`publickey` in `prep.sh`; `publickey` or `any` in 2e) with each
+  checked key appearing **exactly once** across loopback and host-facing guest/client `-C` specs
+  for both `admin` and `root`, and fail closed on any uncommented `Match` block across
+  `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/*`, and recursive `Include` targets (such as
+  `/etc/ssh/crypto.conf`). The driver reads sshd's bytes untranslated (`raw_newlines`: no text
+  mode, so Python does not turn a lone CR or CRLF into a newline), splits on `"\n"` only, strips
+  nothing and folds ASCII case only, so padding or a line smuggled in through a quoted value (for
+  example a `Banner` holding a form feed) does not count. Any CR or NUL anywhere in the output
+  fails 2e outright, with the reason in the evidence (prep.sh rejects every output where a CR
+  touches a wanted line; the driver rejects any CR). The `/etc/ssh/sshd_config.d` include is
+  honoured (`sshd_config:19` has `Include /etc/ssh/sshd_config.d/*`; Apple's own `100-macos.conf`
+  is the only other drop-in and sorts after ours), and the effective configuration, as `sshd -T -C`
+  prints it, was key-only; the live refusal of a password login (g9, 2f, and repeated in 10a) is
+  also checked. The same run confirmed that `tart clone` of the `@sha256:` reference works from the
   cache, `tart ip --wait` answers, and that the vanilla image's Secure Token is enabled for
   `admin`. (Run 2, below, ran the rotation.)
 - **Observed (macOS 27.2 26B123), run 2 on the merged sshd fix (2026-11-21):** `golden` passed
@@ -441,8 +466,9 @@ Items 1-3 below are wired into `state1_vm.py check` when `--tarball FILE` (with 
   changes nothing about the token; run 2 saw it still ENABLED after the rotation (issue 78, in
   part: see the run 2 bullet above).
 - Assumed from the template and docs, not run: that `launchctl disable` + `bootout` stops
-  Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status and `1.` leaf
-  lines the script compares, that python.org's installer leaves `Python.framework/Versions`
+  Screen Sharing on macOS 27, that `pkgutil --check-signature` prints the status, `Notarization:
+  trusted by the Apple notary service`, and `1.` leaf lines (anchored around `Certificate Chain:`)
+  the script compares, that python.org's installer leaves `Python.framework/Versions`
   and the tree `root:admin 775` (read from CPython's `build-installer.py` "Fix file modes" and
   `postflight.framework`; the installed modes are unverified, which is why the fix-up and the
   assertion cover the whole framework and every ancestor), that `stat -f '%N %Su:%Sg %Lp'` and

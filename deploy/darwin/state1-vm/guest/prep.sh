@@ -248,26 +248,383 @@ fi
 [ -f /etc/ssh/ssh_host_ed25519_key.pub ] || die "no ed25519 host key after regeneration"
 
 # 7. Key-only SSH login. macOS sshd_config includes sshd_config.d; first value wins.
+# Check the effective config tree (sshd_config, sshd_config.d/*, and recursive Includes with
+# cycle prevention) for any uncommented Match block, then assert sshd -T across loopback and
+# host-facing client specs for both admin and root (exact-once keys, NUL bytes preserved via a
+# root-only temp file under $STATE_DIR).
 grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config \
     || die "/etc/ssh/sshd_config does not include sshd_config.d"
 mkdir -p /etc/ssh/sshd_config.d
 tmp=$SSH_DROPIN.new
 cat >"$tmp" <<'CONF'
-# tendcf state 1 VM (issue 70 answer 3): key login only, no password login.
+# tendcf state 1 VM (issue 70 answer 3, issue 87): key login only, no password login.
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+AuthenticationMethods publickey
 CONF
 chown root:wheel "$tmp"
 chmod 644 "$tmp"
 mv -f "$tmp" "$SSH_DROPIN"
-effective=$(/usr/sbin/sshd -T -C user=admin,host=localhost,addr=127.0.0.1)
-# macOS 27.2's sshd (OpenSSH_10.5p1) prints the keys in CamelCase ("PasswordAuthentication no"),
-# stock OpenSSH in lowercase: match the whole line, ignoring case.
-for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no'; do
-    printf '%s\n' "$effective" | LC_ALL=C grep -qixF "$want" || die "sshd -T does not show: $want"
+sshd_canon() {
+    _p=$1 _hops=0
+    while [ -L "$_p" ]; do
+        _hops=$((_hops + 1))
+        [ "$_hops" -le 16 ] || die "sshd config symlink loop: $1"
+        _t=$(readlink "$_p") || die "readlink failed on $_p"
+        case $_t in
+            /*) _p=$_t ;;
+            *) _p=$(dirname "$_p")/$_t ;;
+        esac
+    done
+    _d=$(CDPATH='' cd -P -- "$(dirname "$_p")" 2>/dev/null && pwd -P) || die "cannot resolve sshd config dir for $_p"
+    printf '%s/%s\n' "${_d%/}" "$(basename "$_p")"
+}
+check_sshd_no_match() {
+    _cfg=$1
+    _base=${SSHD_BASE_DIR:-/etc/ssh}
+    [ -f "$_cfg" ] || die "missing sshd config: $_cfg"
+    _visited=""
+    _queue="0	$_cfg"
+    while [ -n "$_queue" ]; do
+        _entry=${_queue%%"
+"*}
+        case $_queue in
+            *"
+"*) _queue=${_queue#*"
+"} ;;
+            *) _queue="" ;;
+        esac
+        [ -n "$_entry" ] || continue
+        _depth=${_entry%%"	"*}
+        _f=${_entry#*"	"}
+        [ "$_depth" -le 16 ] || die "sshd Include nesting exceeds 16 levels at $_f"
+        if [ -L "$_f" ] && [ ! -e "$_f" ]; then
+            die "dangling symlink in sshd config: $_f"
+        fi
+        if [ -d "$_f" ]; then
+            continue
+        fi
+        if [ ! -f "$_f" ]; then
+            die "non-regular sshd config target: $_f"
+        fi
+        [ -r "$_f" ] || die "unreadable sshd config file: $_f"
+        _canon=$(sshd_canon "$_f")
+        case $_canon in
+            *"
+"*) die "sshd config path contains newline: $_canon" ;;
+        esac
+        if [ -n "$_visited" ] && printf '%s\n' "$_visited" | LC_ALL=C grep -qxF -- "$_canon"; then
+            continue
+        fi
+        if [ -n "$_visited" ]; then
+            _visited="$_visited
+$_canon"
+        else
+            _visited="$_canon"
+        fi
+        _raw_len=$(wc -c <"$_f")
+        _clean_len=$(LC_ALL=C tr -d '\000' <"$_f" | wc -c)
+        [ "$_raw_len" -eq "$_clean_len" ] || die "sshd config contains NUL byte: $_f"
+        _awk_rc=0
+        _incs=$(LC_ALL=C awk '
+            function fail(code, msg) {
+                printf "%s:%d: %s\n", FILENAME, FNR, msg
+                bad = code
+                exit code
+            }
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                sub(/^[ \t]+/, "", line)
+                if (line == "" || substr(line, 1, 1) == "#") next
+                # Refuse any remaining CR or ASCII control byte (other than tab) before
+                # parsing so interior CR cannot be rewritten into whitespace and split
+                # an Include filename that OpenSSH argv_split() preserves intact.
+                if (line ~ /[\001-\010\013-\037\177]/) {
+                    tmp = line
+                    gsub(/\r/, " ", tmp)
+                    sub(/^[ \t]+/, "", tmp)
+                    tkey = tmp
+                    sub(/[ \t=].*$/, "", tkey)
+                    gsub(/["\047\\]/, "", tkey)
+                    if (tolower(tkey) == "match") {
+                        fail(2, line)
+                    }
+                    fail(3, "interior CR or control byte in sshd config: " line)
+                }
+                raw_first = line
+                sub(/[ \t=].*$/, "", raw_first)
+                was_quoted_key = 0
+                if (raw_first !~ /["\047\\]/) {
+                    norm_key = tolower(raw_first)
+                    rest = substr(line, length(raw_first) + 1)
+                } else {
+                    # OpenSSH strdelim_internal() ends a quoted keyword at the closing
+                    # double quote with no whitespace required after it (e.g.
+                    # "Include"/path or "Match"User). Fail closed on unclosed quotes,
+                    # ambiguous closing-quote boundaries, or obfuscated keywords.
+                    q1 = index(line, "\"")
+                    if (q1 > 0 && q1 <= length(raw_first)) {
+                        q2_rel = index(substr(line, q1 + 1), "\"")
+                        if (q2_rel == 0) {
+                            tkey = raw_first
+                            gsub(/["\047\\]/, "", tkey)
+                            if (tolower(tkey) == "match") {
+                                fail(2, line)
+                            }
+                            fail(3, "unclosed quote in sshd keyword: " line)
+                        }
+                        q2 = q1 + q2_rel
+                        tok_q = substr(line, 1, q2)
+                        after_q = substr(line, q2 + 1)
+                        norm_q = tok_q
+                        gsub(/["\047\\]/, "", norm_q)
+                        norm_q = tolower(norm_q)
+                        if (norm_q == "match") {
+                            fail(2, line)
+                        }
+                        if (after_q != "" && substr(after_q, 1, 1) != " " && substr(after_q, 1, 1) != "\t") {
+                            tkey = raw_first
+                            gsub(/["\047\\]/, "", tkey)
+                            if (tolower(tkey) == "match") {
+                                fail(2, line)
+                            }
+                            fail(3, "ambiguous quoted keyword boundary: " line)
+                        }
+                        if (q1 != 1 || index(tok_q, "\047") > 0 || index(tok_q, "\\") > 0) {
+                            if (norm_q == "include") {
+                                fail(3, "obfuscated Include keyword: " line)
+                            }
+                            fail(3, "obfuscated sshd keyword: " line)
+                        }
+                        norm_key = norm_q
+                        rest = after_q
+                        was_quoted_key = 1
+                    } else {
+                        tkey = raw_first
+                        gsub(/["\047\\]/, "", tkey)
+                        tkey = tolower(tkey)
+                        if (tkey == "match") {
+                            fail(2, line)
+                        }
+                        if (tkey == "include") {
+                            fail(3, "obfuscated Include keyword: " line)
+                        }
+                        fail(3, "obfuscated sshd keyword: " line)
+                    }
+                }
+                if (norm_key == "") {
+                    fail(3, "empty sshd keyword: " line)
+                }
+                if (norm_key == "match") {
+                    fail(2, line)
+                }
+                if (norm_key != "include") next
+                sub(/^[ \t]+/, "", rest)
+                if (!was_quoted_key && substr(rest, 1, 1) == "=") {
+                    rest = substr(rest, 2)
+                    sub(/^[ \t]+/, "", rest)
+                }
+                # OpenSSH argv_split() stops at an unquoted word-initial "#", while
+                # mid-token or quoted "#" remains part of the filename. Fail closed on
+                # single quotes, backslashes, unclosed/mid-token double quotes, leading
+                # "~", zero arguments, or characters outside a conservative path/glob charset.
+                line_inc = 0
+                while (rest != "") {
+                    if (substr(rest, 1, 1) == "#") break
+                    if (substr(rest, 1, 1) == "\"") {
+                        q = index(substr(rest, 2), "\"")
+                        if (q == 0) {
+                            fail(3, "unclosed quote in Include: " line)
+                        }
+                        tok = substr(rest, 2, q - 1)
+                        after = substr(rest, q + 2)
+                        if (after != "" && substr(after, 1, 1) != " " && substr(after, 1, 1) != "\t") {
+                            fail(3, "unsupported mid-token quote in Include: " line)
+                        }
+                        if (index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                            fail(3, "unsupported quote/escape in Include: " line)
+                        }
+                        if (tok == "" || substr(tok, 1, 1) == "~") {
+                            fail(3, "unsupported Include target: " line)
+                        }
+                        if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[ -]+$/) {
+                            fail(3, "unsafe character in quoted Include target: " line)
+                        }
+                        incs[++n_inc] = tok
+                        line_inc++
+                        rest = after
+                    } else {
+                        tok = rest
+                        sub(/[ \t].*$/, "", tok)
+                        rest = substr(rest, length(tok) + 1)
+                        if (index(tok, "\"") > 0 || index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                            fail(3, "unsupported quote/escape in Include: " line)
+                        }
+                        if (substr(tok, 1, 1) == "~") {
+                            fail(3, "unsupported tilde Include target: " line)
+                        }
+                        if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[-]+$/) {
+                            fail(3, "unsafe character in Include target: " line)
+                        }
+                        incs[++n_inc] = tok
+                        line_inc++
+                    }
+                    sub(/^[ \t]+/, "", rest)
+                }
+                if (line_inc == 0) {
+                    fail(3, "Include directive with no arguments: " line)
+                }
+            }
+            END {
+                if (bad) exit bad
+                for (k = 1; k <= n_inc; k++) print incs[k]
+            }' "$_f") || _awk_rc=$?
+        if [ "$_awk_rc" -eq 2 ]; then
+            die "uncommented Match block in sshd config: $_incs"
+        elif [ "$_awk_rc" -ne 0 ]; then
+            die "unsupported sshd config syntax: $_incs"
+        fi
+        _next_depth=$((_depth + 1))
+        set -f
+        while [ -n "$_incs" ]; do
+            _pat=${_incs%%"
+"*}
+            case $_incs in
+                *"
+"*) _incs=${_incs#*"
+"} ;;
+                *) _incs="" ;;
+            esac
+            [ -n "$_pat" ] || continue
+            case $_pat in
+                /*) _full=$_pat ;;
+                *) _full="$_base/$_pat" ;;
+            esac
+            _old_ifs=$IFS
+            IFS=''
+            set +f
+            # shellcheck disable=SC2086 # intentional glob expansion of sshd Include pattern with IFS='' (no word splitting)
+            for _matched in $_full; do
+                set -f
+                IFS=$_old_ifs
+                case $_matched in
+                    *"
+"*) die "sshd config path contains newline: $_matched" ;;
+                esac
+                if [ ! -e "$_matched" ] && [ ! -L "$_matched" ]; then
+                    continue
+                fi
+                if [ -L "$_matched" ] && [ ! -e "$_matched" ]; then
+                    die "dangling symlink in sshd config: $_matched"
+                fi
+                if [ -d "$_matched" ]; then
+                    continue
+                fi
+                if [ ! -f "$_matched" ]; then
+                    die "non-regular sshd config target: $_matched"
+                fi
+                if [ -n "$_queue" ]; then
+                    _queue="$_queue
+$_next_depth	$_matched"
+                else
+                    _queue="$_next_depth	$_matched"
+                fi
+            done
+            set -f
+            IFS=$_old_ifs
+        done
+        set +f
+    done
+}
+check_sshd_no_match "${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+# Evaluate sshd -T across loopback and host-facing client/guest addresses for admin and root.
+# Write raw sshd bytes to a root-only temp file under $STATE_DIR so NUL bytes are preserved
+# (bash 3.2 command substitution would drop them; A8) and require each checked key to appear
+# exactly once (A7). macOS 27.2's sshd prints CamelCase keys; stock OpenSSH prints lowercase.
+sshd_is_ip() {
+    printf '%s\n' "$1" | LC_ALL=C awk '
+        /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+            n = split($0, o, ".")
+            for (i = 1; i <= 4; i++) if (o[i] + 0 > 255 || length(o[i]) > 3) exit 1
+            exit 0
+        }
+        /^[0-9A-Fa-f:]+$/ && index($0, ":") > 0 { exit 0 }
+        { exit 1 }'
+}
+sshd_specs="user=admin,host=localhost,addr=127.0.0.1 user=root,host=localhost,addr=127.0.0.1"
+sshd_extra_addrs=${SSHD_CLIENT_ADDRS:-}
+set -f
+if [ -z "$sshd_extra_addrs" ]; then
+    sshd_gw=$(route -n get default 2>/dev/null | LC_ALL=C awk '/^[[:space:]]*gateway:[[:space:]]*/ { print $2; exit }' || true)
+    sshd_en0=$(ipconfig getifaddr en0 2>/dev/null || true)
+    for sshd_a in $sshd_gw $sshd_en0; do
+        case $sshd_a in
+            ""|127.*|::1) ;;
+            *) sshd_is_ip "$sshd_a" && sshd_extra_addrs="$sshd_extra_addrs $sshd_a" || true ;;
+        esac
+    done
+    [ -n "$sshd_extra_addrs" ] || sshd_extra_addrs="192.168.64.1"
+fi
+for sshd_a in $sshd_extra_addrs; do
+    sshd_is_ip "$sshd_a" || continue
+    case " $sshd_specs " in
+        *",addr=$sshd_a "*) ;;
+        *) sshd_specs="$sshd_specs user=admin,host=$sshd_a,addr=$sshd_a user=root,host=$sshd_a,addr=$sshd_a" ;;
+    esac
 done
+sshd_tmp=$(mktemp -- "$STATE_DIR/tendcf-sshd.XXXXXX")
+trap 'rm -f -- "$sshd_tmp"' EXIT
+trap 'exit 129' HUP INT TERM
+for sshd_spec in $sshd_specs; do
+    sshd_rc=0
+    /usr/sbin/sshd -T -C "$sshd_spec" >"$sshd_tmp" || sshd_rc=$?
+    [ "$sshd_rc" -eq 0 ] || die "sshd -T -C $sshd_spec failed (rc $sshd_rc)"
+    sshd_bad=$(LC_ALL=C tr '\000' '\001' <"$sshd_tmp" | LC_ALL=C awk '
+        BEGIN {
+            want["passwordauthentication"] = "passwordauthentication no"
+            want["kbdinteractiveauthentication"] = "kbdinteractiveauthentication no"
+            want["pubkeyauthentication"] = "pubkeyauthentication yes"
+            want["permitrootlogin"] = "permitrootlogin no"
+            want["gssapiauthentication"] = "gssapiauthentication no"
+            want["hostbasedauthentication"] = "hostbasedauthentication no"
+            want["authenticationmethods"] = "authenticationmethods publickey"
+            order[1] = "passwordauthentication"
+            order[2] = "kbdinteractiveauthentication"
+            order[3] = "pubkeyauthentication"
+            order[4] = "permitrootlogin"
+            order[5] = "gssapiauthentication"
+            order[6] = "hostbasedauthentication"
+            order[7] = "authenticationmethods"
+        }
+        index($0, "\001") > 0 { nul = 1 }
+        {
+            lo = tolower($0)
+            key = lo
+            sub(/^[ \t]+/, "", key)
+            sub(/[ \t=].*$/, "", key)
+            if (key in want) {
+                seen[key]++
+                if (lo == want[key]) exact[key]++
+            }
+        }
+        END {
+            if (nul) { print "output contains NUL byte"; exit }
+            for (i = 1; i <= 7; i++) {
+                k = order[i]
+                if (seen[k] + 0 > 1) { print "duplicate key: " k " (" seen[k] " times)"; exit }
+                if (exact[k] + 0 != 1) { print "sshd -T does not show: " want[k]; exit }
+            }
+        }')
+    [ -z "$sshd_bad" ] || die "sshd -T -C $sshd_spec: $sshd_bad"
+done
+set +f
+rm -f -- "$sshd_tmp"
+trap - EXIT HUP INT TERM
 log "sshd: key login only"
 
 # 8. Console password. The vanilla image's is the published "admin". Replace it with a random
