@@ -1,6 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Root-owned tendcf install on a Linux host booted by systemd
-# (docs/architecture/linux-targets.md, step 7). Run as root.
+# (docs/architecture/linux-targets.md, step 7). Run as root directly via a
+# trusted parent/loader so /bin/bash -p suppresses BASH_ENV, ENV, and exported
+# BASH_FUNC_* functions before the script's own env -i re-exec.
 #
 # Shape, which is CFEngine's own (the book's ch. 19/21/23, cf-execd and MPF
 # docs): binaries and policy root-owned, the work directory inside the same
@@ -10,14 +12,18 @@
 # cf-promises, never assumed. Nothing here leaves a sudoers rule behind and
 # nothing a non-root user can write is read by root.
 #
-#   install [--data FILE] [--policy-src DIR] [--projector-src FILE]
+#   install [--data FILE] [--policy-src DIR] [--projector-src FILE] [--projector-sha256 HEX]
 #                    make /opt/tendcf root-owned, lay out the work directory, put the
-#                    policy, promises.cf and projector.py in place, optionally install
-#                    the CMDB data (validated by projector.py and cf-promises before
-#                    publication)
+#                    policy, promises.cf and projector.py in place (projector source
+#                    must either be root-owned and non-writable or match --projector-sha256),
+#                    optionally install the CMDB data (validated by python3 -I -S
+#                    projector.py and cf-promises --show-classes before publication)
 #   data FILE        replace the CMDB data (serialized via flock, validated by
-#                    projector.py and cf-promises --show-classes before publication,
-#                    verified post-publish with atomic rollback on failure)
+#                    projector.py and cf-promises --show-classes requiring positive
+#                    tendcf_cmdb_evaluated source=promise and zero refusal classes,
+#                    with atomic rollback on post-publish failure or catchable
+#                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss does
+#                    not run traps)
 #   run-once         one `cf-agent -K -I` pass over the installed policy
 #   enable           install and start tendcf-execd.service (root cf-execd)
 #   disable          stop and remove it
@@ -43,7 +49,7 @@ if [ "${TENDCF_CLEAN_ENV:-}" != 1 ] \
     || [ "${PATH:-}" != "/usr/sbin:/usr/bin:/sbin:/bin" ] \
     || [ "${LC_ALL:-}" != C ] \
     || [ "$_env_clean" -ne 1 ]; then
-    exec /usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash "$0" "$@"
+    exec /usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash -p "$0" "$@"
 fi
 unset _env_clean _k
 
@@ -54,7 +60,7 @@ prefix=/opt/tendcf
 # needs librsync/libb2, which the artifact bundles in $prefix/lib, and only
 # a library path finds them on a host that does not have them installed
 # (pastebin, 2026-10-31). Passed strictly per-invocation to CFEngine binaries
-# (and ldd) rather than exported globally, so python3 -I never loads bundled
+# (and ldd) rather than exported globally, so python3 -I -S never loads bundled
 # libraries from $prefix/lib.
 cf_lib_path="$prefix/lib"
 workdir=""   # set by init_paths
@@ -63,19 +69,39 @@ unit_path=/etc/systemd/system/$unit
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 policy_src="$here/../../policy"
 projector_src=""
+projector_sha256=""
 installed_projector="$prefix/share/tendcf/bin/projector.py"
 
 probe_tmp=""
+place_projector_stage=""
 place_projector_tmp=""
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
+put_data_rollback_armed=0
+put_data_had_prev=0
 
 die() { echo "tendcf-install: $*" >&2; exit 1; }
 say() { echo "tendcf-install: $*"; }
 
+# Roll back any in-flight Gate 3 publication while STILL holding FD 9, clean up
+# private staging/temp files, and only then release FD 9.
 cleanup_put_data() {
-    exec 9>&-
+    if [ "${put_data_rollback_armed:-0}" -eq 1 ]; then
+        if [ "${put_data_had_prev:-0}" -eq 1 ] && [ -n "${put_data_backup:-}" ] && [ -f "$put_data_backup" ]; then
+            if mv -f "$put_data_backup" "$data"; then
+                put_data_backup=""
+                echo "tendcf-install: interrupted during post-publish validation; previous data restored" >&2
+            else
+                echo "tendcf-install: interrupted during post-publish validation and rollback failed; backup preserved at $put_data_backup" >&2
+                put_data_backup=""
+            fi
+        elif [ "${put_data_had_prev:-0}" -eq 0 ] && [ -n "${data:-}" ]; then
+            rm -f "$data" || true
+            echo "tendcf-install: interrupted during post-publish validation; unverified new data removed" >&2
+        fi
+        put_data_rollback_armed=0
+    fi
     if [ -n "${put_data_tmp:-}" ]; then
         rm -f "$put_data_tmp" || true
         put_data_tmp=""
@@ -88,6 +114,7 @@ cleanup_put_data() {
         rm -rf "$put_data_stage_wd" || true
         put_data_stage_wd=""
     fi
+    exec 9>&-
 }
 
 cleanup_temp() {
@@ -96,12 +123,18 @@ cleanup_temp() {
         rm -f "$place_projector_tmp" || true
         place_projector_tmp=""
     fi
+    if [ -n "${place_projector_stage:-}" ] && [ -d "$place_projector_stage" ]; then
+        rm -rf "$place_projector_stage" || true
+        place_projector_stage=""
+    fi
     if [ -n "${probe_tmp:-}" ]; then
         rm -f "$probe_tmp" || true
         probe_tmp=""
     fi
 }
 trap cleanup_temp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ "$(id -u)" = 0 ] || die "run as root"
 [ "$(uname)" = Linux ] || die "Linux only"
@@ -141,6 +174,21 @@ check_regular_file_root_unwritable() {
     mode_oct=$((8#$mode))
     if [ $((mode_oct & 8#6022)) -ne 0 ]; then
         die "$f mode $mode is group/world-writable or SUID/SGID"
+    fi
+}
+
+# Verify a regular non-symlink file is root-owned (uid 0, any root/system group)
+# and not group/world-writable or SUID/SGID, and all ancestors up to / are safe.
+check_source_file_root_trusted() {
+    local f="$1" meta uid mode mode_oct
+    [ -f "$f" ] && [ ! -L "$f" ] || die "$f is missing or not a regular non-symlink file"
+    check_ancestors_ok "$f" || die "unsafe ancestor above $f (pass --projector-sha256 to pin an unprivileged source)"
+    meta="$(stat -c '%u %a' "$f")" || die "cannot stat $f"
+    read -r uid mode <<< "$meta"
+    [ "$uid" = 0 ] || die "$f owned by uid $uid, expected root (or pass --projector-sha256)"
+    mode_oct=$((8#$mode))
+    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
+        die "$f mode $mode is group/world-writable or SUID/SGID (or pass --projector-sha256)"
     fi
 }
 
@@ -301,10 +349,10 @@ find_trusted_python() {
 
 resolve_projector_src() {
     if [ -z "$projector_src" ]; then
-        if [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
-            projector_src="$here/../../bin/projector.py"
-        elif [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
+        if [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
             projector_src="$here/bin/projector.py"
+        elif [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
+            projector_src="$here/../../bin/projector.py"
         else
             die "projector.py not found (use --projector-src FILE)"
         fi
@@ -331,7 +379,7 @@ init_paths() {
     umask "$old_umask"
     probe_tmp="$probe"
     printf 'bundle agent main {}\n' > "$probe"
-    out="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --show-vars -f "$probe" 2>/dev/null | awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
+    out="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --show-vars -f "$probe" 2>/dev/null 9>&- | awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
     rm -f "$probe"
     probe_tmp=""
     case "$out" in
@@ -363,7 +411,7 @@ check_tree() {
                 "") ;;
                 *) die "$bin loads $lib, outside $prefix and the system library directories" ;;
             esac
-        done < <(LD_LIBRARY_PATH="$cf_lib_path" ldd "$bin" | awk '$2 == "=>" && $3 ~ /^\// { print $3 }')
+        done < <(LD_LIBRARY_PATH="$cf_lib_path" ldd "$bin" 9>&- | awk '$2 == "=>" && $3 ~ /^\// { print $3 }')
     done
 }
 
@@ -378,7 +426,7 @@ lay_out() {
     if [ ! -f "$workdir/ppkeys/localhost.priv" ] || [ ! -f "$workdir/ppkeys/localhost.pub" ]; then
         # A half pair (a build step can leave one file) is not a key: start over.
         rm -f "$workdir/ppkeys/localhost.priv" "$workdir/ppkeys/localhost.pub"
-        if ! keyout="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_key" 2>&1)"; then
+        if ! keyout="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_key" 2>&1 9>&-)"; then
             die "cf-key failed: $keyout"
         fi
     fi
@@ -418,6 +466,7 @@ EOF
 
 place_projector() {
     resolve_projector_src
+    check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     local d
     for d in "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
         [ ! -L "$d" ] || die "$d is a symlink; refusing"
@@ -431,7 +480,7 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real
+    local src_real dst_dir_real dst_real actual_sha
     src_real="$(readlink -f "$projector_src")" || die "cannot resolve $projector_src"
     dst_dir_real="$(readlink -f "$prefix/share/tendcf/bin")" || die "cannot resolve $prefix/share/tendcf/bin"
     dst_real="$dst_dir_real/projector.py"
@@ -439,31 +488,77 @@ place_projector() {
     if [ "$src_real" = "$dst_real" ]; then
         [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
             || die "$installed_projector is not a regular non-symlink file"
+        if [ -n "$projector_sha256" ]; then
+            actual_sha="$(sha256sum "$installed_projector" | awk '{ print tolower($1) }')"
+            if [ "$actual_sha" != "$projector_sha256" ]; then
+                die "projector sha256 mismatch for $installed_projector: expected $projector_sha256, got $actual_sha"
+            fi
+        else
+            check_source_file_root_trusted "$installed_projector"
+        fi
         chown root:root "$installed_projector"
         chmod 0644 "$installed_projector"
-    else
-        local old_umask tmp
-        old_umask="$(umask)"
-        umask 022
-        tmp="$(mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
-        umask "$old_umask"
-        place_projector_tmp="$tmp"
-        cat "$projector_src" > "$tmp"
-        chown root:root "$tmp"
-        chmod 0644 "$tmp"
-        mv -f "$tmp" "$installed_projector"
-        place_projector_tmp=""
+        verify_installed_projector
+        return 0
     fi
+
+    # Without an explicit --projector-sha256 pin, require the source file and
+    # every ancestor up to / to be root-owned and not group/world-writable.
+    if [ -z "$projector_sha256" ]; then
+        check_source_file_root_trusted "$projector_src"
+    fi
+
+    # Stage bytes ONCE into a private root-only 0700 directory (eliminates TOCTOU
+    # between integrity verification and atomic installation).
+    local old_umask stage_dir_p staged_proj tmp
+    old_umask="$(umask)"
+    umask 077
+    stage_dir_p="$(mktemp -d "$prefix/share/tendcf/bin/.proj-stage.XXXXXX")"
+    umask "$old_umask"
+    place_projector_stage="$stage_dir_p"
+    chown root:root "$stage_dir_p"
+    chmod 0700 "$stage_dir_p"
+
+    staged_proj="$stage_dir_p/projector.py"
+    old_umask="$(umask)"
+    umask 077
+    cat "$projector_src" > "$staged_proj"
+    umask "$old_umask"
+    chown root:root "$staged_proj"
+    chmod 0600 "$staged_proj"
+
+    if [ -n "$projector_sha256" ]; then
+        actual_sha="$(sha256sum "$staged_proj" | awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$projector_sha256" ]; then
+            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
+        fi
+    fi
+
+    old_umask="$(umask)"
+    umask 022
+    tmp="$(mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
+    umask "$old_umask"
+    place_projector_tmp="$tmp"
+    cat "$staged_proj" > "$tmp"
+    chown root:root "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$installed_projector"
+    place_projector_tmp=""
+
+    rm -rf "$stage_dir_p"
+    place_projector_stage=""
     verify_installed_projector
 }
 
 # Validate CMDB data in WD using cf-promises --show-classes (issue #57).
 # Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly),
-# closes FD 9 in the child, and fails closed on non-zero exit, empty output,
-# tendcf_cmdb_refused, or any tendcf_cmdb_problem_* class.
+# closes FD 9 in the child, and runs a single status-checked awk scanner that:
+#   - rejects any tendcf_cmdb_refused or tendcf_cmdb_problem_* class (exit 2),
+#   - requires positive tendcf_cmdb_evaluated with source=promise (exit 3),
+#   - fails closed on any non-zero cf-promises or awk exit status.
 validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
     local wd="$1" entry_file="$2" tmp_dir="$3"
-    local old_umask classes_file err_file refused refused_line
+    local old_umask classes_file err_file parse_msg="" awk_rc=0
     old_umask="$(umask)"
     umask 077
     classes_file="$(mktemp "$tmp_dir/.cf-classes.XXXXXX")"
@@ -479,16 +574,40 @@ validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
         echo "tendcf-install: cf-promises failed validating $wd" >&2
         return 1
     fi
-    if [ ! -s "$classes_file" ] || ! awk 'NF > 0 { n++ } END { exit (n == 0) }' "$classes_file"; then
-        rm -f "$classes_file" "$err_file"
-        echo "tendcf-install: cf-promises --show-classes produced empty output for $wd" >&2
-        return 1
-    fi
-    refused="$(awk '$1 == "tendcf_cmdb_refused" || $1 ~ /^tendcf_cmdb_problem_/ { seen[$1]=1 } END { for (c in seen) print c }' "$classes_file" | sort)"
+
+    parse_msg="$(awk '
+        $1 == "tendcf_cmdb_evaluated" && $0 ~ /(^|[[:space:],])source=promise([[:space:],]|$)/ { saw_eval = 1 }
+        $1 == "tendcf_cmdb_refused" || $1 ~ /^tendcf_cmdb_problem_/ {
+            if (!($1 in seen)) {
+                seen[$1] = 1
+                bad[++nbad] = $1
+            }
+        }
+        END {
+            if (nbad > 0) {
+                for (i = 1; i <= nbad; i++) {
+                    printf "%s%s", (i > 1 ? " " : ""), bad[i]
+                }
+                printf "\n"
+                exit 2
+            }
+            if (!saw_eval) {
+                print "missing positive tendcf_cmdb_evaluated (source=promise) marker"
+                exit 3
+            }
+            exit 0
+        }
+    ' "$classes_file")" || awk_rc=$?
     rm -f "$classes_file" "$err_file"
-    if [ -n "$refused" ]; then
-        refused_line="$(printf '%s\n' "$refused" | tr '\n' ' ')"
-        echo "tendcf-install: CMDB policy refused data in $wd (classes: ${refused_line% })" >&2
+
+    if [ "$awk_rc" -eq 2 ]; then
+        echo "tendcf-install: CMDB policy refused data in $wd (classes: $parse_msg)" >&2
+        return 1
+    elif [ "$awk_rc" -eq 3 ]; then
+        echo "tendcf-install: cf-promises --show-classes invalid for $wd: $parse_msg" >&2
+        return 1
+    elif [ "$awk_rc" -ne 0 ]; then
+        echo "tendcf-install: failed to parse cf-promises --show-classes output for $wd (awk exit $awk_rc)" >&2
         return 1
     fi
     return 0
@@ -570,9 +689,9 @@ put_data() {  # put_data FILE
     chown root:root "$staged_data"
     chmod 0600 "$staged_data"
 
-    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I,
-    # FD 9 closed in child, no LD_LIBRARY_PATH).
-    if ! "$py" -I "$installed_projector" --check "$staged_data" 9>&-; then
+    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I -S,
+    # FD 9 closed in child, no LD_LIBRARY_PATH, site-packages disabled).
+    if ! "$py" -I -S "$installed_projector" --check "$staged_data" 9>&-; then
         die "projector rejected $src; live $data untouched"
     fi
 
@@ -597,6 +716,8 @@ put_data() {  # put_data FILE
 
     # Atomic publish using unique same-directory mktemp staging/backup paths (#58).
     local tmp backup=""
+    put_data_had_prev=0
+    put_data_rollback_armed=0
     old_umask="$(umask)"
     umask 077
     tmp="$(mktemp "$workdir/data/.host_specific.new.XXXXXX")"
@@ -612,29 +733,38 @@ put_data() {  # put_data FILE
         backup="$(mktemp "$workdir/data/.host_specific.prev.XXXXXX")"
         umask "$old_umask"
         put_data_backup="$backup"
+        put_data_had_prev=1
         cat "$data" > "$backup"
         chown root:root "$backup"
         chmod 0600 "$backup"
     fi
 
+    # Arm rollback right before atomic swap so any failure or catchable
+    # SIGTERM/SIGINT during Gate 3 restores $backup (or removes first-time $data)
+    # under FD 9 instead of deleting the backup.
+    put_data_rollback_armed=1
     mv -f "$tmp" "$data"
     put_data_tmp=""
 
     # Gate 3 (#57): post-publish verification on live workdir with atomic rollback.
     if ! validate_cmdb_workdir "$workdir" "$entry" "$stage_wd"; then
-        if [ -n "$backup" ]; then
+        if [ "$put_data_had_prev" -eq 1 ]; then
             if ! mv -f "$backup" "$data"; then
                 put_data_backup=""
+                put_data_rollback_armed=0
                 die "cf-promises rejected $src and rollback failed; backup preserved at $backup"
             fi
             put_data_backup=""
+            put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; previous data restored"
         else
             rm -f "$data"
+            put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; new data removed"
         fi
     fi
 
+    put_data_rollback_armed=0
     if [ -n "$backup" ]; then
         rm -f "$backup"
         put_data_backup=""
@@ -650,6 +780,9 @@ prevalidate_install_inputs() {
     [ -f "$policy_src/tendcf_services.cf" ] && [ ! -L "$policy_src/tendcf_services.cf" ] \
         || die "no regular tendcf_services.cf at $policy_src (use --policy-src DIR)"
     resolve_projector_src
+    if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --projector-sha256 must be 64 lowercase hex characters"
+    fi
     if [ -n "$datafile" ]; then
         [ ! -L "$datafile" ] && [ -f "$datafile" ] \
             || die "data file must be a regular non-symlink file: $datafile"
@@ -663,6 +796,7 @@ cmd_install() {
             --data) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --data needs a non-empty path"; datafile="$2"; shift 2 ;;
             --policy-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --policy-src needs a non-empty path"; policy_src="$2"; shift 2 ;;
             --projector-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-src needs a non-empty path"; projector_src="$2"; shift 2 ;;
+            --projector-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-sha256 needs a 64-hex sha256"; projector_sha256="$2"; shift 2 ;;
             *) die "install: unknown argument $1" ;;
         esac
     done

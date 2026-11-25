@@ -462,16 +462,28 @@ def _walk(node: Any, path: str = "") -> Any:
     Keys are yielded as their own nodes because three of the checks below —
     expansion sequences, NFC, trust-shaped keys — are about strings wherever
     they sit, and a key is where two of the three actually appear.
+
+    Iterative pre-order traversal (explicit LIFO stack) so deeply nested
+    documents never hit Python's recursion limit and callers stream without
+    materializing every `(pointer, value)` pair in memory.
     """
-    yield path or "<root>", node
-    if isinstance(node, dict):
-        for key, value in node.items():
-            here = f"{path}/{key}" if path else key
-            yield f"{here} (key)", key
-            yield from _walk(value, here)
-    elif isinstance(node, list):
-        for i, value in enumerate(node):
-            yield from _walk(value, f"{path}/{i}" if path else str(i))
+    stack: list[tuple[bool, str, Any]] = [(False, path, node)]
+    while stack:
+        is_key, cur_path, cur = stack.pop()
+        if is_key:
+            yield cur_path, cur
+            continue
+        yield cur_path or "<root>", cur
+        if isinstance(cur, dict):
+            items = list(cur.items())
+            for key, value in reversed(items):
+                here = f"{cur_path}/{key}" if cur_path else str(key)
+                stack.append((False, here, value))
+                stack.append((True, f"{here} (key)", key))
+        elif isinstance(cur, list):
+            for i in range(len(cur) - 1, -1, -1):
+                here = f"{cur_path}/{i}" if cur_path else str(i)
+                stack.append((False, here, cur[i]))
 
 
 def project(goal_file: dict) -> bytes:
@@ -584,6 +596,7 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
             "host_specific.json limit — CFEngine truncates the read and the "
             "whole CMDB load then fails (N-8, E-9)",
         )
+        return found
 
     try:
         doc = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
@@ -873,12 +886,7 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                             )
 
     # --- string-shaped hazards, wherever they sit -------------------------
-    try:
-        walked = list(_walk(doc))
-    except RecursionError as exc:
-        flag(RULE_PROJECTION_BYTES, f"excessive nesting depth: {exc}")
-        return found
-    for pointer, node in walked:
+    for pointer, node in _walk(doc):
         if isinstance(node, bool):
             continue
         if isinstance(node, float):
@@ -979,8 +987,8 @@ def main() -> int:
         return 0
 
     try:
-        goal_file = load_goal_file(path)
-    except ValueError as exc:
+        goal_file = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, RecursionError) as exc:
         print(f"projector: ERROR: {path} is not canonical JSON: {exc}", file=sys.stderr)
         return 2
     try:

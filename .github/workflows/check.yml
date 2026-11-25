@@ -60,12 +60,12 @@ jobs:
 
       # Pure-stdlib RFC 8785 JCS fallback (bin/projector.py, issue #53): run both
       # with rfc8785 installed (byte-for-byte parity) and under isolated stdlib-only
-      # python3 -I (bare target host execution; prove rfc8785 is absent first).
+      # python3 -I -S (bare target host execution; fail loudly if rfc8785 is present).
       - name: Projector JCS stdlib fallback tests
         run: |
           uv run --with rfc8785 python -m unittest discover -s tests/projector -v
-          ! python3 -I -c 'import rfc8785' 2>/dev/null
-          python3 -I -m unittest discover -s tests/projector -v
+          python3 -I -S -c 'import importlib.util, sys; sys.exit(1 if importlib.util.find_spec("rfc8785") is not None else 0)'
+          python3 -I -S -m unittest discover -s tests/projector -v
 
       # Linux installer hardening contract & hermetic tests (#53, #57, #58).
       - name: Linux installer contract tests

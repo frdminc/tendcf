@@ -4431,6 +4431,9 @@ def cmd_check(ctx: Ctx, args) -> int:
                             ctx, t, resolved_tarball, resolved_sha
                         )
                         installer = f"{guest_stage}/tendcf-install.sh"
+                        projector_sha = hashlib.sha256(
+                            PROJECTOR_SCRIPT.read_bytes()
+                        ).hexdigest()
                         r = rssh(
                             ctx,
                             t,
@@ -4445,6 +4448,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                                 f"{guest_stage}/artifact/{sha_name}",
                                 "--policy-src",
                                 f"{guest_stage}/policy",
+                                "--projector-src",
+                                f"{guest_stage}/bin/projector.py",
+                                "--projector-sha256",
+                                projector_sha,
                                 "--data",
                                 f"{guest_stage}/canary/host_specific.json",
                             ],
@@ -4734,6 +4741,10 @@ def cmd_check(ctx: Ctx, args) -> int:
                                     f"{guest_stage}/artifact/{sha_name}",
                                     "--policy-src",
                                     f"{guest_stage}/policy",
+                                    "--projector-src",
+                                    f"{guest_stage}/bin/projector.py",
+                                    "--projector-sha256",
+                                    hashlib.sha256(PROJECTOR_SCRIPT.read_bytes()).hexdigest(),
                                     "--data",
                                     f"{guest_stage}/canary/host_specific.json",
                                 ],

@@ -46,13 +46,19 @@ systemctl status tendcf.canary.service           # active, enabled, User=nobody
 sudo $T/tendcf-install.sh status
 ```
 
-`install` refuses a binary that loads a library from outside `/opt/tendcf` and
-the system library directories, installs `/opt/tendcf/share/tendcf/bin/projector.py`
-as root-owned, and validates CMDB data before publishing it to live
-`host_specific.json` (running `projector.py --check` and
-`cf-promises --show-classes` to refuse `tendcf_cmdb_refused` /
-`tendcf_cmdb_problem_*`, serialized with `flock` and atomic rollback on any
-post-publish failure). `run-once` is `cf-agent -K -I` over the
+`install` runs directly under `/bin/bash -p` (callers must invoke the script
+directly via a trusted parent/loader so `BASH_ENV` and exported shell functions
+are suppressed before the script's own `env -i` re-exec). It refuses a binary
+that loads a library from outside `/opt/tendcf` and the system library
+directories, installs `/opt/tendcf/share/tendcf/bin/projector.py` as root-owned
+(requiring either a root-owned non-writable source or an explicit
+`--projector-sha256` digest), and validates CMDB data before publishing it to
+live `host_specific.json` (running `python3 -I -S projector.py --check` and
+`cf-promises --show-classes` to require `tendcf_cmdb_evaluated` (`source=promise`)
+and refuse `tendcf_cmdb_refused` / `tendcf_cmdb_problem_*`, serialized with
+`flock` and atomic rollback on any post-publish failure or catchable
+interruption (`SIGTERM`/`SIGINT`; uncatchable `SIGKILL`/power loss does not run
+traps)). `run-once` is `cf-agent -K -I` over the
 installed `promises.cf`; run it again and it prints no repairs.
 
 ## Stage B: let cf-execd run it

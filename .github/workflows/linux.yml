@@ -70,7 +70,12 @@ jobs:
       # cf-execd, with the canary service, on a real systemd manager. After
       # the policy tests: it takes over /var/cfengine.
       - name: Root-owned install, cf-execd and canary (step 7)
-        run: tests/deploy/linux-install.sh
+        run: |
+          # GitHub Actions Ubuntu runner images ship /opt writable (for hostedtoolcache),
+          # which tendcf-install.sh's ancestor trust check rightly refuses. Harden /opt
+          # on this throwaway VM right before the final root-install step.
+          sudo chown root:root /opt && sudo chmod 0755 /opt
+          tests/deploy/linux-install.sh
 
   # Upstream cfengine/core and libntech at the overlay bases plus the overlay
   # (docs/architecture/upstream-overlay.md §4, §7), not the pinned fork. It is
@@ -186,7 +191,8 @@ jobs:
           cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /opt/tendcf/lib/
           mkdir -p /opt/tendcf/share/tendcf/bin
           cp -R policy deploy /opt/tendcf/share/tendcf/
-          install -m 0644 bin/projector.py /opt/tendcf/share/tendcf/bin/projector.py
+          install -o root -g root -m 0644 bin/projector.py /opt/tendcf/share/tendcf/bin/projector.py
+          chown -R root:root /opt/tendcf/share/tendcf
           echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
           tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf
       # After packaging, because the test removes the system librsync/libb2

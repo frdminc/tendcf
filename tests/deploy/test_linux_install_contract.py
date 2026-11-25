@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +20,13 @@ INSTALLER = REPO / "deploy" / "linux" / "tendcf-install.sh"
 PROJECTOR = REPO / "bin" / "projector.py"
 CANARY_PRESENT = REPO / "deploy" / "linux" / "canary" / "host_specific.json"
 CANARY_ABSENT = REPO / "deploy" / "linux" / "canary" / "host_specific-absent.json"
+
+OK_CF_SCRIPT = (
+    "#!/bin/sh\n"
+    "echo 'any   hardclass'\n"
+    "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+    "exit 0\n"
+)
 
 
 def _extract_func(src: str, name: str) -> str:
@@ -27,7 +37,7 @@ def _extract_func(src: str, name: str) -> str:
 
 
 def _make_linux_shims(shim_dir: Path, *, real_uid: bool = False) -> None:
-    """Provide non-root/macOS shims for Linux-only commands (chown, GNU stat, flock) when needed."""
+    """Provide non-root/macOS shims for Linux-only commands (chown, GNU stat, sha256sum, flock)."""
     chown_shim = shim_dir / "chown"
     chown_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     chown_shim.chmod(0o755)
@@ -94,6 +104,18 @@ def _make_linux_shims(shim_dir: Path, *, real_uid: bool = False) -> None:
     )
     install_shim.chmod(0o755)
 
+    if shutil.which("sha256sum") is None:
+        sha_shim = shim_dir / "sha256sum"
+        sha_shim.write_text(
+            f"#!{sys.executable}\n"
+            "import hashlib, pathlib, sys\n"
+            "p = sys.argv[1]\n"
+            "h = hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()\n"
+            "print(f'{h}  {p}')\n",
+            encoding="utf-8",
+        )
+        sha_shim.chmod(0o755)
+
     if shutil.which("flock") is None:
         flock_shim = shim_dir / "flock"
         flock_shim.write_text(
@@ -120,12 +142,16 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_env_sanitization_scoped_ld_library_path_and_no_tmpdir(self) -> None:
+    def test_privileged_shebang_env_sanitization_scoped_ld_library_path_and_no_tmpdir(self) -> None:
+        self.assertTrue(self.src.startswith("#!/bin/bash -p\n"))
         non_comment = "\n".join(
             line for line in self.src.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertIn("compgen -e", non_comment)
-        self.assertIn("/usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash", non_comment)
+        self.assertIn(
+            "/usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash -p",
+            non_comment,
+        )
         self.assertNotIn("export LD_LIBRARY_PATH", non_comment)
         self.assertNotIn("TMPDIR", non_comment)
         self.assertIn('LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises"', non_comment)
@@ -144,9 +170,31 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         ct_fn = _extract_func(self.src, "check_tree")
         self.assertIn('check_ancestors_ok "$prefix"', ct_fn)
 
-    def test_contract_gates_locking_fd9_and_unique_paths(self) -> None:
+    def test_direct_invocation_ignores_bash_env_and_exported_bash_func(self) -> None:
+        """Codex #2: #!/bin/bash -p suppresses BASH_ENV and BASH_FUNC_* before line 1."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            marker = root / "pwned.marker"
+            bash_env = root / "evil.sh"
+            bash_env.write_text(f'echo PWN_BASH_ENV > "{marker}"\n', encoding="utf-8")
+            env = dict(os.environ)
+            env["BASH_ENV"] = str(bash_env)
+            env["BASH_FUNC_say%%"] = f'() {{ echo PWN_FUNC > "{marker}"; }}'
+            env["BASH_FUNC_die%%"] = f'() {{ echo PWN_DIE > "{marker}"; exit 99; }}'
+            r = subprocess.run(
+                [str(INSTALLER)],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertFalse(marker.exists(), "BASH_ENV or BASH_FUNC_* executed despite #!/bin/bash -p")
+
+    def test_contract_gates_locking_fd9_rollback_and_unique_paths(self) -> None:
         cmd_fn = _extract_func(self.src, "cmd_install")
         self.assertIn("--projector-src)", cmd_fn)
+        self.assertIn("--projector-sha256)", cmd_fn)
         self.assertIn('[ -n "$2" ]', cmd_fn)
         idx_preval = cmd_fn.find('prevalidate_install_inputs "$datafile"')
         idx_tree = cmd_fn.find("check_tree")
@@ -174,30 +222,39 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertIn("flock -x 9", put_code)
         self.assertIn(".host_specific.new.XXXXXX", put_code)
         self.assertIn(".host_specific.prev.XXXXXX", put_code)
-        self.assertIn('"$py" -I "$installed_projector" --check "$staged_data" 9>&-', put_code)
+        self.assertIn('"$py" -I -S "$installed_projector" --check "$staged_data" 9>&-', put_code)
 
         idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data" 9>&-')
         idx_gate2 = put_code.find('validate_cmdb_workdir "$stage_wd"')
         idx_bytes = put_code.find('data_bytes="$(wc -c < "$staged_data"')
+        idx_arm = put_code.find("put_data_rollback_armed=1")
         idx_mv = put_code.find('mv -f "$tmp" "$data"')
         idx_gate3 = put_code.find('validate_cmdb_workdir "$workdir" "$entry"', idx_mv)
         idx_cleanup = put_code.rfind("cleanup_put_data")
         self.assertLess(idx_gate1, idx_gate2)
         self.assertLess(idx_gate2, idx_bytes)
-        self.assertLess(idx_bytes, idx_mv)
+        self.assertLess(idx_bytes, idx_arm)
+        self.assertLess(idx_arm, idx_mv)
         self.assertLess(idx_mv, idx_gate3)
         self.assertLess(idx_gate3, idx_cleanup)
 
         cleanup_fn = _extract_func(self.src, "cleanup_put_data")
-        self.assertIn("exec 9>&-", cleanup_fn)
+        idx_rb = cleanup_fn.find('if [ "${put_data_rollback_armed:-0}" -eq 1 ]; then')
+        idx_unlock = cleanup_fn.find("exec 9>&-")
+        self.assertNotEqual(idx_rb, -1)
+        self.assertNotEqual(idx_unlock, -1)
         self.assertNotIn("exec 9>&- 2>/dev/null", cleanup_fn)
+        self.assertLess(idx_rb, idx_unlock, "cleanup_put_data must roll back BEFORE releasing FD 9")
 
         val_fn = _extract_func(self.src, "validate_cmdb_workdir")
         self.assertIn("--show-classes", val_fn)
         self.assertIn("9>&-", val_fn)
+        self.assertIn("tendcf_cmdb_evaluated", val_fn)
+        self.assertIn("source=promise", val_fn)
         self.assertIn("tendcf_cmdb_refused", val_fn)
         self.assertIn("tendcf_cmdb_problem_", val_fn)
-        self.assertNotIn("| awk", val_fn.split("--show-classes")[1].splitlines()[0])
+        self.assertIn("awk_rc", val_fn)
+        self.assertNotIn("| sort", val_fn)
 
     def _build_harness(
         self,
@@ -241,14 +298,13 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             "installed_projector": prefix / "share" / "tendcf" / "bin" / "projector.py",
         }
 
-    def _run_put_data(
+    def _put_data_script(
         self,
         env_paths: dict[str, Path],
         src_file: Path,
         *,
-        extra_env: dict[str, str] | None = None,
         extra_preamble: str = "",
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> str:
         funcs = "\n".join(
             _extract_func(self.src, name)
             for name in (
@@ -261,7 +317,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "put_data",
             )
         )
-        script = (
+        return (
             "set -euo pipefail\n"
             f'export PATH="{env_paths["shim_dir"]}:$PATH"\n'
             'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
@@ -278,12 +334,26 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             'put_data_stage_wd=""\n'
             'put_data_tmp=""\n'
             'put_data_backup=""\n'
+            "put_data_rollback_armed=0\n"
+            "put_data_had_prev=0\n"
             f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
             f"{extra_preamble}\n"
             f"{funcs}\n"
             "trap cleanup_put_data EXIT\n"
+            "trap 'exit 130' INT\n"
+            "trap 'exit 143' TERM\n"
             f'put_data "{src_file}"\n'
         )
+
+    def _run_put_data(
+        self,
+        env_paths: dict[str, Path],
+        src_file: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+        extra_preamble: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        script = self._put_data_script(env_paths, src_file, extra_preamble=extra_preamble)
         env = dict(os.environ)
         if extra_env:
             env.update(extra_env)
@@ -299,11 +369,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             orig_bytes = CANARY_PRESENT.read_bytes()
-            paths = self._build_harness(
-                root,
-                "#!/bin/sh\necho 'any   hardclass'\n",
-                initial_data=orig_bytes,
-            )
+            paths = self._build_harness(root, OK_CF_SCRIPT, initial_data=orig_bytes)
             before_ino = paths["data"].stat().st_ino
 
             bad = root / "noncanonical.json"
@@ -326,6 +392,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "#!/bin/sh\n"
                 f'cat "{root / "opt/tendcf/var/libntech/data/host_specific.json"}" > "{probe_log}"\n'
                 "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "echo 'tendcf_cmdb_problem_sections   source=policy'\n"
                 "echo 'tendcf_cmdb_refused   source=policy'\n"
                 "exit 0\n"
@@ -342,14 +409,42 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             self.assertEqual(paths["data"].stat().st_ino, before_ino)
             self.assertEqual(probe_log.read_bytes(), orig_bytes)
 
-    def test_empty_show_classes_output_fails_closed(self) -> None:
+    def test_validate_cmdb_workdir_fail_closed_on_empty_unmarked_untagged_and_awk_error(self) -> None:
+        """Codex #5: reject empty/diagnostic output, missing source=promise, and awk failure."""
+        cases = (
+            ("empty output", "#!/bin/sh\nexit 0\n", "missing positive tendcf_cmdb_evaluated"),
+            (
+                "diagnostic header only",
+                "#!/bin/sh\necho 'Class name   Meta tags'\necho 'any   hardclass'\nexit 0\n",
+                "missing positive tendcf_cmdb_evaluated",
+            ),
+            (
+                "marker without source=promise",
+                "#!/bin/sh\necho 'tendcf_cmdb_evaluated   source=cmdb'\nexit 0\n",
+                "missing positive tendcf_cmdb_evaluated",
+            ),
+        )
+        for name, cf_script, expect_msg in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                orig_bytes = CANARY_PRESENT.read_bytes()
+                paths = self._build_harness(root, cf_script, initial_data=orig_bytes)
+                r = self._run_put_data(paths, CANARY_ABSENT)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(expect_msg, r.stderr)
+                self.assertEqual(paths["data"].read_bytes(), orig_bytes)
+
+        # awk exits non-zero with empty stdout -> fail closed
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             orig_bytes = CANARY_PRESENT.read_bytes()
-            paths = self._build_harness(root, "#!/bin/sh\nexit 0\n", initial_data=orig_bytes)
+            paths = self._build_harness(root, OK_CF_SCRIPT, initial_data=orig_bytes)
+            awk_fail = paths["shim_dir"] / "awk"
+            awk_fail.write_text("#!/bin/sh\nexit 17\n", encoding="utf-8")
+            awk_fail.chmod(0o755)
             r = self._run_put_data(paths, CANARY_ABSENT)
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("empty output", r.stderr)
+            self.assertIn("awk exit 17", r.stderr)
             self.assertEqual(paths["data"].read_bytes(), orig_bytes)
 
     def test_gate3_postpublish_failure_rolls_back_and_preserves_backup_on_mv_error(self) -> None:
@@ -365,12 +460,12 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
                 'done\n'
                 f'if [ "$wd" = "{live_wd}" ]; then\n'
-                "  echo 'any   hardclass'\n"
+                "  echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "  echo 'tendcf_cmdb_problem_foreign_class   source=policy'\n"
                 "  echo 'tendcf_cmdb_refused   source=policy'\n"
                 "  exit 0\n"
                 "fi\n"
-                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "exit 0\n"
             )
             paths = self._build_harness(root, cf_script, initial_data=orig_bytes)
@@ -392,11 +487,11 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
                 'done\n'
                 f'if [ "$wd" = "{live_wd}" ]; then\n'
-                "  echo 'any   hardclass'\n"
+                "  echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "  echo 'tendcf_cmdb_refused   source=policy'\n"
                 "  exit 0\n"
                 "fi\n"
-                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "exit 0\n"
             )
             paths = self._build_harness(root, cf_script, initial_data=None)
@@ -417,11 +512,11 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
                 'done\n'
                 f'if [ "$wd" = "{live_wd}" ]; then\n'
-                "  echo 'any   hardclass'\n"
+                "  echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "  echo 'tendcf_cmdb_refused   source=policy'\n"
                 "  exit 0\n"
                 "fi\n"
-                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "exit 0\n"
             )
             paths = self._build_harness(root, cf_script, initial_data=orig_bytes)
@@ -439,14 +534,59 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), orig_bytes)
 
+    def test_sigterm_during_gate3_rolls_back_previous_or_removes_first_time(self) -> None:
+        """Codex #4: catchable SIGTERM during Gate 3 rolls back instead of deleting backup."""
+        for label, init_bytes in (("with_prev", CANARY_PRESENT.read_bytes()), ("first_time", None)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                live_wd = root / "opt" / "tendcf" / "var" / "libntech"
+                gate3_ready = root / "gate3.ready"
+                cf_script = (
+                    "#!/bin/sh\n"
+                    'wd=""\n'
+                    'while [ $# -gt 0 ]; do\n'
+                    '  if [ "$1" = "--workdir" ]; then wd="$2"; shift 2; else shift; fi\n'
+                    'done\n'
+                    f'if [ "$wd" = "{live_wd}" ]; then\n'
+                    f'  echo ready > "{gate3_ready}"\n'
+                    "  sleep 10\n"
+                    "fi\n"
+                    "echo 'tendcf_cmdb_evaluated   source=promise'\n"
+                    "exit 0\n"
+                )
+                paths = self._build_harness(root, cf_script, initial_data=init_bytes)
+                script = self._put_data_script(paths, CANARY_ABSENT)
+                proc = subprocess.Popen(
+                    ["/bin/bash", "-c", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                deadline = time.monotonic() + 10.0
+                while not gate3_ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(gate3_ready.exists(), "Gate 3 cf-promises never started")
+                os.killpg(proc.pid, signal.SIGTERM)
+                _out, err = proc.communicate(timeout=10)
+                self.assertNotEqual(proc.returncode, 0)
+                if init_bytes is not None:
+                    self.assertEqual(paths["data"].read_bytes(), init_bytes)
+                    self.assertIn("previous data restored", err)
+                else:
+                    self.assertFalse(paths["data"].exists())
+                    self.assertIn("unverified new data removed", err)
+                leftovers = [
+                    p.name
+                    for p in (paths["workdir"] / "data").iterdir()
+                    if ".new." in p.name or ".prev." in p.name
+                ]
+                self.assertEqual(leftovers, [])
+
     def test_fifo_lockfile_refused_before_opening_fd9(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            paths = self._build_harness(
-                root,
-                "#!/bin/sh\necho 'any   hardclass'\n",
-                initial_data=CANARY_PRESENT.read_bytes(),
-            )
+            paths = self._build_harness(root, OK_CF_SCRIPT, initial_data=CANARY_PRESENT.read_bytes())
             os.mkfifo(paths["workdir"] / "data" / ".publish.lock")
             r = self._run_put_data(paths, CANARY_ABSENT)
             self.assertNotEqual(r.returncode, 0)
@@ -469,49 +609,14 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 "  sleep 0.08\n"
                 f'  echo "LEAVE $WORKER_ID" >> "{trace}"\n'
                 "fi\n"
-                "echo 'any   hardclass'\n"
+                "echo 'tendcf_cmdb_evaluated   source=promise'\n"
                 "exit 0\n"
             )
             paths = self._build_harness(root, cf_script, initial_data=CANARY_PRESENT.read_bytes())
-
-            funcs = "\n".join(
-                _extract_func(self.src, name)
-                for name in (
-                    "cleanup_put_data",
-                    "check_dir_root_unwritable",
-                    "check_regular_file_root_unwritable",
-                    "check_dir_chain_strict_under_prefix",
-                    "verify_installed_projector",
-                    "validate_cmdb_workdir",
-                    "put_data",
-                )
-            )
             procs: list[subprocess.Popen[str]] = []
             for i in range(6):
                 src = CANARY_ABSENT if i % 2 == 0 else CANARY_PRESENT
-                script = (
-                    "set -euo pipefail\n"
-                    f'export PATH="{paths["shim_dir"]}:$PATH"\n'
-                    f'export WORKER_ID="{i}"\n'
-                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
-                    'say() { echo "tendcf-install: $*"; }\n'
-                    "check_ancestors_ok() { return 0; }\n"
-                    "check_policy_tree_root_unwritable() { return 0; }\n"
-                    f'prefix="{paths["prefix"]}"\n'
-                    f'cf_lib_path="{paths["prefix"]}/lib"\n'
-                    f'workdir="{paths["workdir"]}"\n'
-                    f'entry="{paths["entry"]}"\n'
-                    f'data="{paths["data"]}"\n'
-                    f'cf_promises="{paths["cf_promises"]}"\n'
-                    f'installed_projector="{paths["installed_projector"]}"\n'
-                    'put_data_stage_wd=""\n'
-                    'put_data_tmp=""\n'
-                    'put_data_backup=""\n'
-                    f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
-                    f"{funcs}\n"
-                    "trap cleanup_put_data EXIT\n"
-                    f'put_data "{src}"\n'
-                )
+                script = self._put_data_script(paths, src, extra_preamble=f'export WORKER_ID="{i}"')
                 procs.append(
                     subprocess.Popen(
                         ["/bin/bash", "-c", script],
@@ -545,18 +650,21 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             wd_leftovers = [p.name for p in paths["workdir"].iterdir() if p.name.startswith(".putdata.")]
             self.assertEqual(wd_leftovers, [])
 
-    def test_place_projector_installs_handles_same_realpath_and_refuses_symlink(self) -> None:
+    def test_place_projector_integrity_gate_same_realpath_and_symlink_refusal(self) -> None:
+        """Codex #3: require root-owned non-writable source OR matching --projector-sha256."""
         funcs = "\n".join(
             _extract_func(self.src, name)
             for name in (
                 "check_dir_root_unwritable",
                 "check_regular_file_root_unwritable",
+                "check_source_file_root_trusted",
                 "check_dir_chain_strict_under_prefix",
                 "resolve_projector_src",
                 "verify_installed_projector",
                 "place_projector",
             )
         )
+        proj_sha = hashlib.sha256(PROJECTOR.read_bytes()).hexdigest()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shim_dir = root / "shims"
@@ -566,36 +674,57 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             prefix.mkdir(parents=True)
             dst = prefix / "share" / "tendcf" / "bin" / "projector.py"
 
-            def run_place(proj_src: Path) -> subprocess.CompletedProcess[str]:
+            def run_place(
+                proj_src: Path,
+                *,
+                sha: str = "",
+                src_trusted: bool = True,
+            ) -> subprocess.CompletedProcess[str]:
+                anc_fn = "check_ancestors_ok() { return 0; }" if src_trusted else 'check_ancestors_ok() { [ "$1" = "'"$prefix"'" ] && return 0; return 1; }'
                 script = (
                     "set -euo pipefail\n"
                     f'export PATH="{shim_dir}:$PATH"\n'
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
-                    "check_ancestors_ok() { return 0; }\n"
                     f'prefix="{prefix}"\n'
+                    f"{anc_fn}\n"
                     f'here="{root}"\n'
                     f'projector_src="{proj_src}"\n'
+                    f'projector_sha256="{sha}"\n'
                     f'installed_projector="{dst}"\n'
+                    'place_projector_stage=""\n'
                     'place_projector_tmp=""\n'
                     f"{funcs}\n"
                     "place_projector\n"
                 )
                 return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
 
-            r1 = run_place(PROJECTOR)
-            self.assertEqual(r1.returncode, 0, r1.stderr)
+            # 1. Mutable/non-root source WITHOUT --projector-sha256 -> REFUSED
+            r_unpinned = run_place(PROJECTOR, sha="", src_trusted=False)
+            self.assertNotEqual(r_unpinned.returncode, 0)
+            self.assertIn("--projector-sha256", r_unpinned.stderr)
+
+            # 2. Wrong --projector-sha256 -> REFUSED
+            r_bad_sha = run_place(PROJECTOR, sha="0" * 64, src_trusted=False)
+            self.assertNotEqual(r_bad_sha.returncode, 0)
+            self.assertIn("sha256 mismatch", r_bad_sha.stderr)
+
+            # 3. Valid --projector-sha256 on non-root source -> ACCEPTED
+            r_ok_sha = run_place(PROJECTOR, sha=proj_sha, src_trusted=False)
+            self.assertEqual(r_ok_sha.returncode, 0, r_ok_sha.stderr)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
             self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o644)
 
-            r2 = run_place(dst)
-            self.assertEqual(r2.returncode, 0, r2.stderr)
+            # 4. Same-realpath invocation preserves bytes without self-truncation
+            r_same = run_place(dst, sha="", src_trusted=True)
+            self.assertEqual(r_same.returncode, 0, r_same.stderr)
             self.assertEqual(dst.read_bytes(), PROJECTOR.read_bytes())
 
+            # 5. Symlink source is refused
             link_src = root / "proj-link.py"
             link_src.symlink_to(PROJECTOR)
-            r3 = run_place(link_src)
-            self.assertNotEqual(r3.returncode, 0)
-            self.assertIn("regular non-symlink", r3.stderr)
+            r_link = run_place(link_src, sha=proj_sha, src_trusted=True)
+            self.assertNotEqual(r_link.returncode, 0)
+            self.assertIn("regular non-symlink", r_link.stderr)
 
     def test_trust_helpers_reject_nonroot_writable_symlink_hops_and_untrusted_python(self) -> None:
         funcs = "\n".join(
@@ -614,7 +743,6 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             shim_real.mkdir()
             _make_linux_shims(shim_real, real_uid=True)
 
-            # 1. check_ancestors_ok rejects a world-writable ancestor (e.g., 0777 dir)
             wdir = root / "writable"
             wdir.mkdir(mode=0o777)
             os.chmod(wdir, 0o777)
@@ -636,7 +764,6 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             )
             self.assertNotEqual(r_ww.returncode, 0, "world-writable ancestor must fail check_dir_chain_ok")
 
-            # 2. Symlink hop leading into a writable dir must fail check_dir_chain_ok
             hop_dir = root / "safe_hop"
             hop_dir.mkdir(mode=0o755)
             sym = hop_dir / "link"
@@ -653,7 +780,6 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             )
             self.assertNotEqual(r_hop.returncode, 0, "symlink hop through writable dir must fail")
 
-            # 3. Non-root file rejected by resolve_safe_python_ok (when running as non-root)
             fake_py = root / "fake_python3"
             fake_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_py.chmod(0o755)
@@ -670,7 +796,6 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                 )
                 self.assertNotEqual(r_nonroot.returncode, 0, "non-root python must be rejected")
 
-            # 4. Even if root-owned, a python resolving outside /usr/bin|/bin|/usr/lib|/usr/lib64 is rejected
             r_outside = subprocess.run(
                 [
                     "/bin/bash",
@@ -683,7 +808,6 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             )
             self.assertNotEqual(r_outside.returncode, 0, "python outside trusted system dirs must be rejected")
 
-            # 5. Symlink inside $workdir/inputs/tendcf rejected by check_policy_tree_root_unwritable
             pol = root / "wd" / "inputs" / "tendcf"
             pol.mkdir(parents=True)
             (pol / "evil.cf").symlink_to("/etc/hosts")

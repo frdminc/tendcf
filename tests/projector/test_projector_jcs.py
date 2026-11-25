@@ -220,8 +220,21 @@ class StdlibJcsFallbackTests(unittest.TestCase):
         finally:
             self.proj._rfc8785 = orig
 
+    def test_iterative_walk_and_oversized_early_return(self) -> None:
+        # Wide array under a long key streams iteratively without RecursionError
+        long_key = "k" * 2048
+        wide = {"vars": {long_key: list(range(2000))}}
+        walked_count = sum(1 for _ in self.proj._walk(wide))
+        self.assertGreater(walked_count, 2000)
+
+        # Oversized payload (> MAX_PROJECTION_BYTES) returns immediately with RULE_PROJECTION_BYTES
+        oversized = b'{"vars":{"a":"' + b"x" * (self.proj.MAX_PROJECTION_BYTES + 16) + b'"}}'
+        findings = self.proj.check_projection(oversized)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule, self.proj.RULE_PROJECTION_BYTES)
+
     def test_isolated_python_subprocess_cli(self) -> None:
-        """Prove `python3 -I bin/projector.py --check` works hermetically with stdlib only."""
+        """Prove `python3 -I -S bin/projector.py` works hermetically with stdlib only."""
         valid_files = [
             REPO / "examples" / "host_specific.json",
             REPO / "deploy" / "linux" / "canary" / "host_specific.json",
@@ -232,7 +245,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
         for vf in valid_files:
             with self.subTest(valid=str(vf.relative_to(REPO))):
                 r = subprocess.run(
-                    [sys.executable, "-I", str(PROJECTOR_PATH), "--check", str(vf)],
+                    [sys.executable, "-I", "-S", str(PROJECTOR_PATH), "--check", str(vf)],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -245,7 +258,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             bad_nl = Path(td) / "trailing-nl.json"
             bad_nl.write_bytes((REPO / "deploy" / "linux" / "canary" / "host_specific.json").read_bytes() + b"\n")
             r = subprocess.run(
-                [sys.executable, "-I", str(PROJECTOR_PATH), "--check", str(bad_nl)],
+                [sys.executable, "-I", "-S", str(PROJECTOR_PATH), "--check", str(bad_nl)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -262,7 +275,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
                 b'"report":true,"state":"present"}}}}'
             )
             r = subprocess.run(
-                [sys.executable, "-I", str(PROJECTOR_PATH), "--check", str(bad_argv)],
+                [sys.executable, "-I", "-S", str(PROJECTOR_PATH), "--check", str(bad_argv)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -274,12 +287,48 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             empty_vars = Path(td) / "empty.json"
             empty_vars.write_bytes(b'{"vars":{}}')
             r = subprocess.run(
-                [sys.executable, "-I", str(PROJECTOR_PATH), "--check", str(empty_vars)],
+                [sys.executable, "-I", "-S", str(PROJECTOR_PATH), "--check", str(empty_vars)],
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+            # 4. Deeply nested JSON handled cleanly (no traceback) in BOTH --check and goal-file modes
+            deep_proj = Path(td) / "deep-proj.json"
+            deep_proj.write_bytes(b'{"vars":{"a":' + b"[" * 50000 + b"]" * 50000 + b"}}")
+            r_check = subprocess.run(
+                [sys.executable, "-I", "-S", str(PROJECTOR_PATH), "--check", str(deep_proj)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_check.returncode, 1, r_check.stdout + r_check.stderr)
+            self.assertNotIn("Traceback", r_check.stderr)
+            self.assertIn("projector: FAIL:", r_check.stdout)
+
+            # In goal-file mode, Python <=3.14 hits RecursionError in json.loads (rc 2),
+            # while Python 3.15+'s iterative JSON parser parses it and hits RecursionError
+            # in copy.deepcopy / _jcs_dumps -> ProjectionRefused (rc 1). Neither leaks a traceback.
+            deep_goal = Path(td) / "deep-goal.json"
+            deep_goal.write_bytes(
+                b'{"domains":{"supervision":{"entries":{"service":{"a":{"x":'
+                + b"[" * 50000
+                + b"]" * 50000
+                + b"}}}}}}"
+            )
+            r_goal = subprocess.run(
+                [sys.executable, "-I", "-S", str(PROJECTOR_PATH), str(deep_goal)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertIn(r_goal.returncode, (1, 2), r_goal.stdout + r_goal.stderr)
+            self.assertNotIn("Traceback", r_goal.stderr)
+            self.assertTrue(
+                "projector: ERROR:" in r_goal.stderr or "projector: REFUSED:" in r_goal.stderr,
+                r_goal.stderr,
+            )
 
 
 if __name__ == "__main__":

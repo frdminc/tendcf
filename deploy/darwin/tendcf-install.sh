@@ -1,5 +1,7 @@
-#!/bin/bash
-# Root-owned tendcf install on a macOS host (issue 70, C-deploy-01). Run as root.
+#!/bin/bash -p
+# Root-owned tendcf install on a macOS host (issue 70, C-deploy-01). Run as root
+# directly via a trusted parent/loader so /bin/bash -p suppresses BASH_ENV, ENV,
+# and exported BASH_FUNC_* functions before the script's own env -i re-exec.
 #
 # Counterpart of deploy/linux/tendcf-install.sh: binaries and policy root-owned
 # (root:wheel, no group/world write, no SUID/SGID, no ACLs; every ancestor up
@@ -19,20 +21,23 @@
 # under `writer: "tendcf-install"` (`deploy/darwin/canary/goal-file*.json`,
 # `examples/launchd-writers.yml`, issue #99).
 #
-#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--projector-src FILE] [--enable]
+#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--projector-src FILE] [--projector-sha256 HEX] [--enable]
 #                    verify and extract the PR 95 macOS fork tarball (clearing
 #                    com.apple.quarantine, ACLs, flags, SUID/SGID), enforce
 #                    root:wheel and go-w on /opt/tendcf and verify ancestors up
 #                    to /, verify Mach-O dependencies and code signatures, lay
 #                    out the work directory, place the policy, promises.cf and
-#                    projector.py, optionally install CMDB data (validated by
-#                    projector.py and cf-promises --show-classes before
-#                    publication) and optionally enable org.tendcf.execd.
+#                    projector.py (requiring root-owned non-writable source or
+#                    --projector-sha256), optionally install CMDB data (validated
+#                    by python3 -I -S projector.py and cf-promises --show-classes
+#                    before publication) and optionally enable org.tendcf.execd.
 #                    Re-running when converged is a no-op that reports `no change`.
 #   data FILE        replace the CMDB data (serialized via lockf, validated by
-#                    projector.py and cf-promises --show-classes before
-#                    publication, verified post-publish with atomic rollback on
-#                    failure)
+#                    projector.py and cf-promises --show-classes requiring
+#                    tendcf_cmdb_evaluated source=promise and zero refusals, with
+#                    atomic rollback on post-publish failure or catchable
+#                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss
+#                    does not run traps)
 #   run-once         one `cf-agent -K -I` pass over the installed policy
 #   enable           write /Library/LaunchDaemons/org.tendcf.execd.plist
 #                    (root:wheel 0644, plutil -lint) and bootstrap it
@@ -58,7 +63,7 @@ if [ "${TENDCF_CLEAN_ENV:-}" != 1 ] \
     || [ "${PATH:-}" != "/usr/bin:/bin:/usr/sbin:/sbin" ] \
     || [ "${LC_ALL:-}" != C ] \
     || [ "$_env_clean" -ne 1 ]; then
-    exec /usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/bash "$0" "$@"
+    exec /usr/bin/env -i TENDCF_CLEAN_ENV=1 PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/bash -p "$0" "$@"
 fi
 unset _env_clean _k
 
@@ -79,6 +84,7 @@ installed_sha_file="$prefix/share/tendcf/INSTALLED_TARBALL.sha256"
 here="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 policy_src="$here/../../policy"
 projector_src=""
+projector_sha256=""
 installed_projector="$prefix/share/tendcf/bin/projector.py"
 
 cf_agent="$prefix/bin/cf-agent"
@@ -93,6 +99,9 @@ place_projector_tmp=""
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
+put_data_rollback_armed=0
+put_data_had_prev=0
+publish_lock_held=0
 changed=0
 upgrade_needs_execd_restart=0
 upgrade_rollback_armed=0
@@ -110,11 +119,28 @@ die() { echo "tendcf-install: $*" >&2; exit 1; }
 say() { echo "tendcf-install: $*"; }
 
 bootout_execd() {
-    /bin/launchctl bootout "system/$label"
+    /bin/launchctl bootout "system/$label" 9>&-
 }
 
 cleanup_stage() {
-    exec 9>&-
+    # Roll back any in-flight Gate 3 data publication AND any armed upgrade
+    # while STILL holding FD 9 (passing 9>&- to launchctl), and release FD 9
+    # only AFTER all rollbacks and temp cleanup finish.
+    if [ "${put_data_rollback_armed:-0}" -eq 1 ]; then
+        if [ "${put_data_had_prev:-0}" -eq 1 ] && [ -n "${put_data_backup:-}" ] && [ -f "$put_data_backup" ]; then
+            if /bin/mv -f "$put_data_backup" "$data"; then
+                put_data_backup=""
+                echo "tendcf-install: interrupted during post-publish validation; previous data restored" >&2
+            else
+                echo "tendcf-install: interrupted during post-publish validation and rollback failed; backup preserved at $put_data_backup" >&2
+                put_data_backup=""
+            fi
+        elif [ "${put_data_had_prev:-0}" -eq 0 ] && [ -n "${data:-}" ]; then
+            /bin/rm -f "$data" || true
+            echo "tendcf-install: interrupted during post-publish validation; unverified new data removed" >&2
+        fi
+        put_data_rollback_armed=0
+    fi
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
         local restored_prefix=0
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
@@ -198,8 +224,14 @@ cleanup_stage() {
         /bin/rm -f "$place_projector_tmp" || true
         place_projector_tmp=""
     fi
+    if [ "${publish_lock_held:-0}" -eq 1 ]; then
+        exec 9>&-
+        publish_lock_held=0
+    fi
 }
 trap cleanup_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ "$(/usr/bin/id -u)" = 0 ] || die "run as root"
 [ "$(/usr/bin/uname -s)" = Darwin ] || die "Darwin only"
@@ -638,13 +670,13 @@ verify_macho_tree() {
 
     local bin otool_L otool_l libs_list rpaths_list dylinker_list dyld_env_list lib rel resolved_lib rp dl
     for bin in "${machos[@]}"; do
-        if ! /usr/bin/codesign --verify --strict "$bin" >/dev/null 2>&1; then
+        if ! /usr/bin/codesign --verify --strict "$bin" >/dev/null 2>&1 9>&-; then
             /bin/rm -f "$macho_set_file"
             die "codesign verification failed for $bin"
         fi
         if [ -n "$otool_bin" ]; then
-            otool_L="$("$otool_bin" -L "$bin")" || die "otool -L failed on $bin"
-            otool_l="$("$otool_bin" -l "$bin")" || die "otool -l failed on $bin"
+            otool_L="$("$otool_bin" -L "$bin" 9>&-)" || die "otool -L failed on $bin"
+            otool_l="$("$otool_bin" -l "$bin" 9>&-)" || die "otool -l failed on $bin"
 
             libs_list="$(printf '%s\n' "$otool_L" | /usr/bin/awk 'NR > 1 && /^\t/ { sub(/^\t/, ""); sub(/ \(compatibility version [0-9.]+, current version [0-9.]+\)$/, ""); print }')"
             while IFS= read -r lib; do
@@ -694,7 +726,7 @@ verify_macho_tree() {
     /bin/rm -f "$macho_set_file"
 
     if [ -z "$otool_bin" ]; then
-        "$py" -I - "$prefix" "$canon_root" "${machos[@]}" <<'PY'
+        9>&- "$py" -I - "$prefix" "$canon_root" "${machos[@]}" <<'PY'
 import pathlib
 import struct
 import sys
@@ -836,7 +868,7 @@ PY
 execd_is_loaded() {
     # Classify strictly by exit code (0 = loaded, non-zero = not loaded),
     # never by parsing `launchctl print` output (launchctl(1), PR 96).
-    /bin/launchctl print "system/$label" >/dev/null 2>&1
+    /bin/launchctl print "system/$label" >/dev/null 2>&1 9>&-
 }
 
 wait_execd_unloaded() {
@@ -916,8 +948,8 @@ install_tarball() {
     # Capture tar listings to files in $stage_dir (never mask exit status via < <(...)).
     local tar_tv="$stage_dir/tar-tv.txt"
     local tar_t="$stage_dir/tar-t.txt"
-    /usr/bin/tar -tvzf "$staged_tar" > "$tar_tv" || die "tar -tvzf failed on $tar_base"
-    /usr/bin/tar -tzf "$staged_tar" > "$tar_t" || die "tar -tzf failed on $tar_base"
+    /usr/bin/tar -tvzf "$staged_tar" > "$tar_tv" 9>&- || die "tar -tvzf failed on $tar_base"
+    /usr/bin/tar -tzf "$staged_tar" > "$tar_t" 9>&- || die "tar -tzf failed on $tar_base"
 
     local n_tv n_t
     n_tv="$(/usr/bin/wc -l < "$tar_tv" | /usr/bin/tr -d ' ')"
@@ -958,7 +990,7 @@ install_tarball() {
     COPYFILE_DISABLE=1 /usr/bin/tar \
         --no-same-owner --no-same-permissions --no-acls --no-fflags \
         --no-mac-metadata --no-xattrs \
-        -C "$extract_dir" -xzf "$staged_tar"
+        -C "$extract_dir" -xzf "$staged_tar" 9>&-
 
     local staged_tree="$extract_dir/tendcf"
     [ -d "$staged_tree" ] || die "tarball did not extract a tendcf/ directory"
@@ -1018,7 +1050,7 @@ install_tarball() {
             was_loaded=1
             upgrade_was_loaded=1
             upgrade_rollback_armed=1
-            /bin/launchctl bootout "system/$label" || die "launchctl bootout system/$label failed before upgrade"
+            /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed before upgrade"
             wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
         fi
         local backup_prefix="$prefix.old.$$"
@@ -1075,7 +1107,7 @@ try_init_paths() {
     make_stage
     local probe="$stage_dir/probe.cf" out
     printf 'bundle agent main {}\n' > "$probe"
-    out="$("$cf_promises" --show-vars -f "$probe" 2>/dev/null | /usr/bin/awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
+    out="$("$cf_promises" --show-vars -f "$probe" 2>/dev/null 9>&- | /usr/bin/awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
     /bin/rm -f "$probe"
     case "$out" in
         "$prefix"/*) ;;
@@ -1099,7 +1131,7 @@ init_paths() {
     make_stage
     local probe="$stage_dir/probe.cf" out
     printf 'bundle agent main {}\n' > "$probe"
-    out="$("$cf_promises" --show-vars -f "$probe" 2>/dev/null | /usr/bin/awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
+    out="$("$cf_promises" --show-vars -f "$probe" 2>/dev/null 9>&- | /usr/bin/awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
     /bin/rm -f "$probe"
     case "$out" in
         "$prefix"/*) ;;
@@ -1195,7 +1227,7 @@ lay_out() {
     if [ ! -f "$workdir/ppkeys/localhost.priv" ] || [ ! -f "$workdir/ppkeys/localhost.pub" ]; then
         /bin/rm -f "$workdir/ppkeys/localhost.priv" "$workdir/ppkeys/localhost.pub"
         local keyout=""
-        if ! keyout="$("$cf_key" 2>&1)"; then
+        if ! keyout="$("$cf_key" 2>&1 9>&-)"; then
             die "cf-key failed: $keyout"
         fi
         /usr/sbin/chown root:wheel "$workdir/ppkeys/localhost.priv" "$workdir/ppkeys/localhost.pub"
@@ -1291,18 +1323,78 @@ EOF
     fi
 }
 
+# Acquire exclusive lock outside the replaceable $prefix tree so upgrades,
+# rollbacks, and standalone `data` publications serialize on one stable inode.
+acquire_publish_lock() {
+    if [ "${publish_lock_held:-0}" -eq 1 ]; then
+        return 0
+    fi
+    local lock_dir lockfile old_umask
+    lock_dir="$(/usr/bin/dirname "$prefix")"
+    if [ ! -e "$lock_dir" ] && [ ! -L "$lock_dir" ] && [ "$lock_dir" = "/opt" ]; then
+        /usr/bin/install -d -m 0755 -o root -g wheel /opt
+        changed=1
+    fi
+    check_ancestors "$lock_dir"
+    check_dir_root_unwritable "$lock_dir"
+    lockfile="$lock_dir/.tendcf-publish.lock"
+    if [ -e "$lockfile" ] || [ -L "$lockfile" ]; then
+        [ -f "$lockfile" ] && [ ! -L "$lockfile" ] || die "$lockfile is not a regular file; refusing"
+    fi
+    old_umask="$(umask)"
+    umask 077
+    exec 9>>"$lockfile"
+    umask "$old_umask"
+    if ! /usr/bin/lockf 9; then
+        exec 9>&-
+        die "failed to acquire publish lock $lockfile"
+    fi
+    if [ -L "$lockfile" ] || [ ! -f "$lockfile" ]; then
+        exec 9>&-
+        die "$lockfile is not a regular file; refusing"
+    fi
+    /usr/sbin/chown root:wheel "$lockfile"
+    /bin/chmod 0600 "$lockfile"
+    /bin/chmod -N "$lockfile" 2>/dev/null || true
+    publish_lock_held=1
+}
+
+release_publish_lock() {
+    if [ "${publish_lock_held:-0}" -eq 1 ]; then
+        exec 9>&-
+        publish_lock_held=0
+    fi
+}
+
 resolve_projector_src() {
     if [ -z "$projector_src" ]; then
-        if [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
-            projector_src="$here/../../bin/projector.py"
-        elif [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
+        if [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
             projector_src="$here/bin/projector.py"
+        elif [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
+            projector_src="$here/../../bin/projector.py"
         else
             die "projector.py not found (use --projector-src FILE)"
         fi
     fi
     [ ! -L "$projector_src" ] && [ -f "$projector_src" ] \
         || die "projector-src must be a regular non-symlink file: $projector_src"
+}
+
+check_source_file_root_trusted() {
+    local f="$1" meta owner group mode mode_oct
+    [ ! -L "$f" ] && [ -f "$f" ] || die "$f must be a regular non-symlink file"
+    check_ancestors "$f"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$f")" || die "cannot stat $f"
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] || die "$f owned by $owner, expected root (or pass --projector-sha256)"
+    [ "$group" = wheel ] || die "$f group is $group, expected wheel (or pass --projector-sha256)"
+    mode_oct=$((8#$mode))
+    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
+        die "$f mode $mode is group/world-writable or SUID/SGID (or pass --projector-sha256)"
+    fi
+    if has_acl_path "$f"; then
+        die "$f has an extended ACL; refusing (or pass --projector-sha256)"
+    fi
 }
 
 verify_installed_projector() {
@@ -1339,7 +1431,7 @@ place_projector() {
         die "$installed_projector is not a regular file; refusing"
     fi
 
-    local src_real dst_dir_real dst_real
+    local src_real dst_dir_real dst_real actual_sha
     src_real="$(resolve_realpath_ok "$projector_src")" || die "cannot resolve $projector_src"
     dst_dir_real="$(cd "$prefix/share/tendcf/bin" && pwd -P)"
     dst_real="$dst_dir_real/projector.py"
@@ -1347,6 +1439,14 @@ place_projector() {
     if [ "$src_real" = "$dst_real" ]; then
         [ -f "$installed_projector" ] && [ ! -L "$installed_projector" ] \
             || die "$installed_projector is not a regular non-symlink file"
+        if [ -n "$projector_sha256" ]; then
+            actual_sha="$(/usr/bin/shasum -a 256 "$installed_projector" | /usr/bin/awk '{ print tolower($1) }')"
+            if [ "$actual_sha" != "$projector_sha256" ]; then
+                die "projector sha256 mismatch for $installed_projector: expected $projector_sha256, got $actual_sha"
+            fi
+        else
+            check_source_file_root_trusted "$installed_projector"
+        fi
         local need_fix=0
         if [ "$(/usr/bin/stat -f '%f' "$installed_projector")" != "0" ] \
             || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1 \
@@ -1368,38 +1468,64 @@ place_projector() {
         return 0
     fi
 
+    # Without an explicit --projector-sha256 pin, require the source file and
+    # every ancestor up to / to be root:wheel, non-writable, and ACL-free.
+    if [ -z "$projector_sha256" ]; then
+        check_source_file_root_trusted "$projector_src"
+    fi
+
+    # Stage bytes ONCE inside private 0700 $stage_dir (eliminates TOCTOU
+    # between hash verification and atomic installation).
     make_stage
     local staged_proj="$stage_dir/projector.py"
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
     /bin/cat "$projector_src" > "$staged_proj"
+    umask "$old_umask"
     /usr/sbin/chown root:wheel "$staged_proj"
-    /bin/chmod 0644 "$staged_proj"
+    /bin/chmod 0600 "$staged_proj"
 
-    local proj_differs=0
+    if [ -n "$projector_sha256" ]; then
+        actual_sha="$(/usr/bin/shasum -a 256 "$staged_proj" | /usr/bin/awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$projector_sha256" ]; then
+            /bin/rm -f "$staged_proj"
+            die "projector sha256 mismatch for $projector_src: expected $projector_sha256, got $actual_sha"
+        fi
+    fi
+
+    local proj_differs=0 dst_flags=0
     if [ ! -f "$installed_projector" ]; then
         proj_differs=1
-    elif ! /usr/bin/cmp -s "$staged_proj" "$installed_projector"; then
-        proj_differs=1
-    elif [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
-        || has_acl_path "$installed_projector" \
-        || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
-        proj_differs=1
+    else
+        dst_flags="$(/usr/bin/stat -f '%f' "$installed_projector")"
+        if [ "$dst_flags" != "0" ] \
+            || ! /usr/bin/cmp -s "$staged_proj" "$installed_projector" \
+            || [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$installed_projector")" != "root:wheel 644" ] \
+            || has_acl_path "$installed_projector" \
+            || /usr/bin/xattr -p com.apple.quarantine "$installed_projector" >/dev/null 2>&1; then
+            proj_differs=1
+        fi
     fi
 
     if [ "$proj_differs" -eq 1 ]; then
-        local old_umask tmp_proj
+        local tmp_proj
         old_umask="$(umask)"
         umask 022
         tmp_proj="$(/usr/bin/mktemp "$prefix/share/tendcf/bin/.projector.py.new.XXXXXX")"
         umask "$old_umask"
         place_projector_tmp="$tmp_proj"
         /bin/cat "$staged_proj" > "$tmp_proj"
+        /usr/bin/chflags 0 "$tmp_proj"
         if /usr/bin/xattr -p com.apple.quarantine "$tmp_proj" >/dev/null 2>&1; then
             /usr/bin/xattr -d com.apple.quarantine "$tmp_proj"
         fi
-        /usr/bin/chflags 0 "$tmp_proj"
         /bin/chmod -N "$tmp_proj" 2>/dev/null || true
         /usr/sbin/chown root:wheel "$tmp_proj"
         /bin/chmod 0644 "$tmp_proj"
+        if [ -e "$installed_projector" ] && [ "$dst_flags" != "0" ]; then
+            /usr/bin/chflags 0 "$installed_projector"
+        fi
         /bin/mv -f "$tmp_proj" "$installed_projector"
         place_projector_tmp=""
         changed=1
@@ -1409,12 +1535,14 @@ place_projector() {
 }
 
 # Validate CMDB data in WD using cf-promises --show-classes (issue #57).
-# Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly)
-# and fails closed on non-zero exit, empty output, tendcf_cmdb_refused, or any
-# tendcf_cmdb_problem_* class.
+# Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly),
+# closes FD 9 in the child, and runs a single status-checked awk scanner that:
+#   - rejects any tendcf_cmdb_refused or tendcf_cmdb_problem_* class (exit 2),
+#   - requires positive tendcf_cmdb_evaluated with source=promise (exit 3),
+#   - fails closed on any non-zero cf-promises or awk exit status.
 validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
     local wd="$1" entry_file="$2" tmp_dir="$3"
-    local old_umask classes_file err_file refused refused_line
+    local old_umask classes_file err_file parse_msg="" awk_rc=0
     old_umask="$(umask)"
     umask 077
     classes_file="$(/usr/bin/mktemp "$tmp_dir/.cf-classes.XXXXXX")"
@@ -1430,16 +1558,40 @@ validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
         echo "tendcf-install: cf-promises failed validating $wd" >&2
         return 1
     fi
-    if [ ! -s "$classes_file" ] || ! /usr/bin/awk 'NF > 0 { n++ } END { exit (n == 0) }' "$classes_file"; then
-        /bin/rm -f "$classes_file" "$err_file"
-        echo "tendcf-install: cf-promises --show-classes produced empty output for $wd" >&2
-        return 1
-    fi
-    refused="$(/usr/bin/awk '$1 == "tendcf_cmdb_refused" || $1 ~ /^tendcf_cmdb_problem_/ { seen[$1]=1 } END { for (c in seen) print c }' "$classes_file" | /usr/bin/sort)"
+
+    parse_msg="$(/usr/bin/awk '
+        $1 == "tendcf_cmdb_evaluated" && $0 ~ /(^|[[:space:],])source=promise([[:space:],]|$)/ { saw_eval = 1 }
+        $1 == "tendcf_cmdb_refused" || $1 ~ /^tendcf_cmdb_problem_/ {
+            if (!($1 in seen)) {
+                seen[$1] = 1
+                bad[++nbad] = $1
+            }
+        }
+        END {
+            if (nbad > 0) {
+                for (i = 1; i <= nbad; i++) {
+                    printf "%s%s", (i > 1 ? " " : ""), bad[i]
+                }
+                printf "\n"
+                exit 2
+            }
+            if (!saw_eval) {
+                print "missing positive tendcf_cmdb_evaluated (source=promise) marker"
+                exit 3
+            }
+            exit 0
+        }
+    ' "$classes_file")" || awk_rc=$?
     /bin/rm -f "$classes_file" "$err_file"
-    if [ -n "$refused" ]; then
-        refused_line="$(printf '%s\n' "$refused" | /usr/bin/tr '\n' ' ')"
-        echo "tendcf-install: CMDB policy refused data in $wd (classes: ${refused_line% })" >&2
+
+    if [ "$awk_rc" -eq 2 ]; then
+        echo "tendcf-install: CMDB policy refused data in $wd (classes: $parse_msg)" >&2
+        return 1
+    elif [ "$awk_rc" -eq 3 ]; then
+        echo "tendcf-install: cf-promises --show-classes invalid for $wd: $parse_msg" >&2
+        return 1
+    elif [ "$awk_rc" -ne 0 ]; then
+        echo "tendcf-install: failed to parse cf-promises --show-classes output for $wd (awk exit $awk_rc)" >&2
         return 1
     fi
     return 0
@@ -1460,40 +1612,24 @@ put_data() {  # put_data FILE
     local py
     py="$(find_real_python)" || die "cannot validate projection: no verified root-owned Python 3 found"
 
-    # Serialize concurrent publishers on an exclusive lock via lockf(1) FD 9 (#58).
-    # Pre-check against symlinks, directories, FIFOs, sockets, and devices so
-    # opening FD 9 can never block on a FIFO or follow a symlink.
-    local lockfile="$workdir/data/.publish.lock"
-    if [ -e "$lockfile" ] || [ -L "$lockfile" ]; then
-        [ -f "$lockfile" ] && [ ! -L "$lockfile" ] || die "$lockfile is not a regular file; refusing"
+    # Acquire the shared publish lock outside $prefix if caller (cmd_install)
+    # is not already holding it; never release a caller-owned lock early.
+    local acquired_lock=0
+    if [ "${publish_lock_held:-0}" -eq 0 ]; then
+        acquire_publish_lock
+        acquired_lock=1
     fi
-    local old_umask
-    old_umask="$(umask)"
-    umask 077
-    exec 9>>"$lockfile"
-    umask "$old_umask"
-    if ! /usr/bin/lockf 9; then
-        exec 9>&-
-        die "failed to acquire publish lock $lockfile"
-    fi
-    if [ -L "$lockfile" ] || [ ! -f "$lockfile" ]; then
-        exec 9>&-
-        die "$lockfile is not a regular file; refusing"
-    fi
-    /usr/sbin/chown root:wheel "$lockfile"
-    /bin/chmod 0600 "$lockfile"
-    /bin/chmod -N "$lockfile" 2>/dev/null || true
 
     if [ -e "$data" ] || [ -L "$data" ]; then
         if [ -L "$data" ] || [ ! -f "$data" ]; then
-            exec 9>&-
+            if [ "$acquired_lock" -eq 1 ]; then release_publish_lock; fi
             die "$data is not a regular file; refusing"
         fi
     fi
 
     # Stage candidate bytes ONCE into a private 0700 workdir (zero TOCTOU, zero
     # pre-validation exposure to cf-execd; issues #53, #57).
-    local stage_wd staged_data data_bytes
+    local old_umask stage_wd staged_data data_bytes
     old_umask="$(umask)"
     umask 077
     stage_wd="$(/usr/bin/mktemp -d "$stage_dir/putdata.XXXXXX")"
@@ -1516,9 +1652,9 @@ put_data() {  # put_data FILE
     /bin/chmod 0600 "$staged_data"
     /bin/chmod -N "$staged_data" 2>/dev/null || true
 
-    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I,
-    # FD 9 closed in child).
-    if ! "$py" -I "$installed_projector" --check "$staged_data" 9>&-; then
+    # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I -S,
+    # FD 9 closed in child, site-packages disabled).
+    if ! "$py" -I -S "$installed_projector" --check "$staged_data" 9>&-; then
         die "projector rejected $src; live $data untouched"
     fi
 
@@ -1540,12 +1676,16 @@ put_data() {  # put_data FILE
         fi
         /bin/rm -rf "$stage_wd"
         put_data_stage_wd=""
-        exec 9>&-
+        if [ "$acquired_lock" -eq 1 ]; then
+            release_publish_lock
+        fi
         return 0
     fi
 
     # Atomic publish using unique same-directory mktemp staging/backup paths (#58).
     local tmp backup=""
+    put_data_had_prev=0
+    put_data_rollback_armed=0
     old_umask="$(umask)"
     umask 077
     tmp="$(/usr/bin/mktemp "$workdir/data/.host_specific.new.XXXXXX")"
@@ -1562,37 +1702,48 @@ put_data() {  # put_data FILE
         backup="$(/usr/bin/mktemp "$workdir/data/.host_specific.prev.XXXXXX")"
         umask "$old_umask"
         put_data_backup="$backup"
+        put_data_had_prev=1
         /bin/cat "$data" > "$backup"
         /usr/sbin/chown root:wheel "$backup"
         /bin/chmod 0600 "$backup"
         /bin/chmod -N "$backup" 2>/dev/null || true
     fi
 
+    # Arm rollback right before atomic swap so any failure or catchable
+    # SIGTERM/SIGINT during Gate 3 restores $backup (or removes first-time $data)
+    # while still holding FD 9.
+    put_data_rollback_armed=1
     /bin/mv -f "$tmp" "$data"
     put_data_tmp=""
 
     # Gate 3 (#57): post-publish verification on live workdir with atomic rollback.
     if ! validate_cmdb_workdir "$workdir" "$entry" "$stage_wd"; then
-        if [ -n "$backup" ]; then
+        if [ "$put_data_had_prev" -eq 1 ]; then
             if ! /bin/mv -f "$backup" "$data"; then
                 put_data_backup=""
+                put_data_rollback_armed=0
                 die "cf-promises rejected $src and rollback failed; backup preserved at $backup"
             fi
             put_data_backup=""
+            put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; previous data restored"
         else
             /bin/rm -f "$data"
+            put_data_rollback_armed=0
             die "post-publish CMDB validation rejected $src; new data removed"
         fi
     fi
 
+    put_data_rollback_armed=0
     if [ -n "$backup" ]; then
         /bin/rm -f "$backup"
         put_data_backup=""
     fi
     /bin/rm -rf "$stage_wd"
     put_data_stage_wd=""
-    exec 9>&-
+    if [ "$acquired_lock" -eq 1 ]; then
+        release_publish_lock
+    fi
     changed=1
     say "data installed: $data ($data_bytes bytes)"
 }
@@ -1640,11 +1791,11 @@ EOF
 }
 
 bootstrap_execd_with_retry() {
-    if /bin/launchctl bootstrap system "$plist_path"; then
+    if /bin/launchctl bootstrap system "$plist_path" 9>&-; then
         return 0
     fi
     /bin/sleep 1
-    /bin/launchctl bootstrap system "$plist_path"
+    /bin/launchctl bootstrap system "$plist_path" 9>&-
 }
 
 enable_execd() {
@@ -1680,17 +1831,17 @@ enable_execd() {
         changed=1
     fi
 
-    /bin/launchctl enable "system/$label" || die "launchctl enable system/$label failed"
+    /bin/launchctl enable "system/$label" 9>&- || die "launchctl enable system/$label failed"
 
     if execd_is_loaded; then
         if [ "$plist_changed" -eq 1 ]; then
-            /bin/launchctl bootout "system/$label" || die "launchctl bootout system/$label failed"
+            /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed"
             wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout"
             if ! bootstrap_execd_with_retry; then
                 if [ "$had_prev" -eq 1 ]; then
                     /usr/bin/install -m 0644 -o root -g wheel "$prev_plist" "$plist_path.rollback.$$" \
                         && /bin/mv -f "$plist_path.rollback.$$" "$plist_path"
-                    /bin/launchctl bootstrap system "$plist_path" >/dev/null 2>&1 || true
+                    /bin/launchctl bootstrap system "$plist_path" >/dev/null 2>&1 9>&- || true
                 fi
                 die "launchctl bootstrap system $plist_path failed; previous plist restored"
             fi
@@ -1739,6 +1890,9 @@ prevalidate_install_inputs() {
     bad_src="$(/usr/bin/find "$policy_src" ! -type f ! -type d -print -quit)"
     [ -z "$bad_src" ] || die "refusing non-regular/non-directory entry in policy-src: $bad_src"
     resolve_projector_src
+    if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --projector-sha256 must be 64 lowercase hex characters"
+    fi
     if [ -n "$datafile" ]; then
         [ ! -L "$datafile" ] && [ -f "$datafile" ] \
             || die "data file must be a regular non-symlink file: $datafile"
@@ -1754,6 +1908,7 @@ cmd_install() {
             --data) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --data needs a non-empty path"; datafile="$2"; shift 2 ;;
             --policy-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --policy-src needs a non-empty path"; policy_src="$2"; shift 2 ;;
             --projector-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-src needs a non-empty path"; projector_src="$2"; shift 2 ;;
+            --projector-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-sha256 needs a 64-hex sha256"; projector_sha256="$2"; shift 2 ;;
             --enable) do_enable=1; shift ;;
             *) die "install: unknown argument $1" ;;
         esac
@@ -1761,9 +1916,11 @@ cmd_install() {
     if [ -n "$sha256_file" ] && [ -z "$tarball" ]; then
         die "install: --sha256 requires --tarball"
     fi
-    # Fail fast on bad --policy-src, --projector-src or --data, or stale
-    # interrupted-upgrade dirs, before booting out org.tendcf.execd.
+    # Fail fast on bad --policy-src, --projector-src, --projector-sha256 or --data,
+    # then serialize the entire install/upgrade/rollback transaction under the
+    # shared lock outside $prefix BEFORE checking stale dirs or booting out execd.
     prevalidate_install_inputs "$datafile"
+    acquire_publish_lock
     check_no_stale_upgrade_dirs
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
@@ -1803,8 +1960,8 @@ cmd_install() {
             say "restarted: $label after upgrade"
         fi
     fi
-    # All post-upgrade steps and daemon restart succeeded; disarm rollback and
-    # remove the pre-upgrade backup tree.
+    # All post-upgrade steps and daemon restart succeeded; disarm rollback,
+    # remove the pre-upgrade backup tree, and only then release the shared lock.
     upgrade_rollback_armed=0
     if [ -n "$upgrade_backup_prefix" ]; then
         /bin/rm -rf "$upgrade_backup_prefix"
@@ -1818,6 +1975,7 @@ cmd_install() {
     upgrade_saved_workdir=""
     upgrade_saved_inputs=0
     upgrade_saved_data=0
+    release_publish_lock
     if [ "$changed" -eq 0 ]; then
         say "no change ($("$cf_agent" --version | /usr/bin/sed -n 1p))"
     else

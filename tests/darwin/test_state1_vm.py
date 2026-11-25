@@ -7935,7 +7935,7 @@ class DarwinInstallerAndSymlink(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         text = self.INSTALLER.read_text(encoding="utf-8")
-        self.assertTrue(text.startswith("#!/bin/bash\n"))
+        self.assertTrue(text.startswith("#!/bin/bash -p\n"))
         self.assertIn("set -euo pipefail", text)
         self.assertIn("/usr/bin/env -i TENDCF_CLEAN_ENV=1", text)
         self.assertIn("compgen -e", text)

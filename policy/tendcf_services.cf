@@ -574,6 +574,15 @@ bundle common tendcf_cmdb
 
       "tendcf_cmdb_refused"
         expression => classmatch("tendcf_cmdb_problem_.*");
+
+      # Positive marker that bundle common tendcf_cmdb evaluated during
+      # cf-promises --show-classes (even for an empty {"vars":{}} projection),
+      # so installers fail closed on truncated/diagnostic output. Cannot be
+      # forged via CMDB/augments because any source=cmdb/augments_file class
+      # trips tendcf_cmdb_problem_foreign_class -> tendcf_cmdb_refused, and
+      # callers require source=promise.
+      "tendcf_cmdb_evaluated"
+        expression => "any";
 }
 
 bundle agent tendcf_interlocks
