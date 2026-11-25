@@ -156,6 +156,7 @@ class FakeWorld:
         self.uid_raw_newlines = []
         self.print_disabled_rc = {}  # domain -> non-zero rc override
         self.print_disabled_override = {}  # domain -> raw stdout override
+        self.allowed_user_domains = None  # optional set of allowed "user/<uid>" domains
         self.launchctl_raw_newlines = []
         self.hygiene_enabled = set()  # {(domain, label)} reported as => enabled
         self.hygiene_missing = set()  # {(domain, label)} omitted from print-disabled
@@ -777,12 +778,6 @@ class FakeWorld:
         if r[:4] == ["sudo", "-n", "launchctl", "print-disabled"] and len(r) == 5:
             dom = r[4]
             self.launchctl_raw_newlines.append(self._raw_newlines)
-            if dom in self.print_disabled_rc:
-                return drv.Result(
-                    self.print_disabled_rc[dom],
-                    "",
-                    f"launchctl print-disabled {dom}: failed\n",
-                )
             if dom.startswith("gui/"):
                 # Real headless post-rotation macOS 27.2 clones have no Aqua gui/<uid> session.
                 return drv.Result(
@@ -790,6 +785,8 @@ class FakeWorld:
                     "",
                     "Could not print cache: 125: Domain does not support specified action\n",
                 )
+            rc_d = self.print_disabled_rc.get(dom, 0)
+            err_d = f"launchctl print-disabled {dom}: failed\n" if rc_d else ""
             if dom in self.print_disabled_override:
                 out_d = self.print_disabled_override[dom]
                 if "\r" in out_d:
@@ -801,7 +798,7 @@ class FakeWorld:
                         )
                         .stdout
                     )
-                return drv.Result(0, out_d)
+                return drv.Result(rc_d, out_d, err_d)
             val = "true" if self.hygiene_use_true else "disabled"
             if dom == "system":
                 lines = ['\t"com.apple.xpc.foo" => enabled']
@@ -817,6 +814,15 @@ class FakeWorld:
                     else:
                         lines.append(f'\t"{lbl}" => {val}')
             elif dom.startswith("user/"):
+                if (
+                    self.allowed_user_domains is not None
+                    and dom not in self.allowed_user_domains
+                ):
+                    return drv.Result(
+                        125,
+                        "",
+                        f"Could not print cache: 125: Domain {dom} not available\n",
+                    )
                 lines = ['\t"com.apple.xpc.user.foo" => enabled']
                 for d, lbl in drv.HYGIENE_DISABLE_LIST:
                     if d != "user":
@@ -829,7 +835,9 @@ class FakeWorld:
                         lines.append(f'\t"{lbl}" => {val}')
             else:
                 return drv.Result(125, "", f"unsupported domain {dom}\n")
-            return drv.Result(0, "disabled services = {\n" + "\n".join(lines) + "\n}\n")
+            return drv.Result(
+                rc_d, "disabled services = {\n" + "\n".join(lines) + "\n}\n", err_d
+            )
         if r[:3] == ["netstat", "-an", "-p"]:
             return drv.Result(
                 0,
@@ -2847,6 +2855,24 @@ class Golden(Base):
         self.assertTrue(self.world.ps_raw_newlines and all(self.world.ps_raw_newlines))
         rc, s = self.run_cmd(*self.golden_args())
         self.assertEqual(rc, 0, s)
+
+    def test_r3_golden_boot_vm_start_enforces_limit_1_after_assert_no_other_vm(self):
+        # PR #113 R3 (Codex #1): if 1 foreign VM appears between boot()'s assert_no_other_vm
+        # and vm.start(limit=1), vm.start() must still refuse at limit=1 (not fall back to 2).
+        real_assert_no_other = drv.assert_no_other_vm
+
+        def spawn_vz_after_boot_check(ctx, allowed=None):
+            real_assert_no_other(ctx, allowed=allowed)
+            if allowed is None:
+                self.world.extra_vz_vms = 1
+
+        with mock.patch.object(drv, "assert_no_other_vm", spawn_vz_after_boot_check):
+            rc, s = self.run_cmd(*self.golden_args())
+        self.assertEqual(rc, 2, s)
+        self.assertEqual(s["steps"][-1]["step"], "refused")
+        self.assertIn("1 other Virtualization.framework VM", s["steps"][-1]["evidence"])
+        self.assertEqual(self.world.tart_calls("run"), [])
+        self.assertNotIn(f"{GOLDEN}-build", self.world.vms)
 
     def test_issue78_tart_list_failing_during_commit_reports_unknown_state_and_keeps_build(
         self,
@@ -5734,7 +5760,8 @@ class Check(Base):
                 self.assertIn(f"user/501/{target_label}", st["10a"]["evidence"])
 
     def test_f20_2m_and_10a_fail_closed_on_print_disabled_error_and_bad_uid(self):
-        # launchctl print-disabled non-zero on system or user/<uid>
+        # launchctl print-disabled non-zero paired with otherwise-valid disabled-block stdout
+        # on system or user/<uid> (removing the rc != 0 check must fail this test).
         for dom in ("system", "user/501"):
             with self.subTest(print_disabled_fail=dom):
                 self.world.print_disabled_rc = {dom: 1}
@@ -5742,14 +5769,18 @@ class Check(Base):
                 rc, s = self.run_cmd(*self.check_args())
                 self.assertEqual(rc, 1, dom)
                 st = self.steps(s)
+                if dom == "system":
+                    self.assertEqual(st["2j"]["status"], "fail", dom)
                 self.assertEqual(st["2m"]["status"], "fail", dom)
                 self.assertIn(dom, st["2m"]["evidence"])
                 self.assertEqual(st["10a"]["status"], "fail", dom)
         self.world.print_disabled_rc = {}
 
-        # id -u admin non-zero, empty, zero, leading-zero, whitespace, CR, NUL, out-of-range, or multi-line
+        # id -u admin non-zero (with empty AND with valid "501\n" stdout), empty, zero,
+        # leading-zero, whitespace, CR, NUL, out-of-range, or multi-line
         for label, res in (
-            ("non-zero rc", (1, "", "id: admin: no such user\n")),
+            ("non-zero rc empty", (1, "", "id: admin: no such user\n")),
+            ("non-zero rc valid stdout", (1, "501\n", "id: transient error\n")),
             ("empty output", (0, "", "")),
             ("zero uid", (0, "0\n", "")),
             ("leading zero", (0, "0501\n", "")),
@@ -5771,6 +5802,18 @@ class Check(Base):
                 self.assertEqual(st["2m"]["status"], "fail", label)
                 self.assertIn("id -u admin", st["2m"]["evidence"])
                 self.assertEqual(st["10a"]["status"], "fail", label)
+
+        # Positive non-501 UID check: admin UID 502 queries user/502 (with user/501 refused)
+        self.world.admin_uid_result = (0, "502\n", "")
+        self.world.allowed_user_domains = {"user/502"}
+        self.world.hygiene_use_true = False
+        rc, s = self.run_cmd(*self.check_args())
+        self.assertEqual(rc, 0, s)
+        st = self.steps(s)
+        self.assertEqual(st["2m"]["status"], "pass")
+        self.assertIn("3/3 hygiene jobs disabled (1 system, 2 user/502)", st["2m"]["evidence"])
+        self.assertEqual(st["10a"]["status"], "pass")
+        self.world.allowed_user_domains = None
 
         # `=> true` variant passes cleanly (same semantics as 2j / prep.sh) and uses raw_newlines=True
         self.world.admin_uid_result = (0, "501\n", "")
@@ -5880,8 +5923,16 @@ class Check(Base):
         self.world.print_disabled_override = {}
 
     def test_f23_non_tart_vz_vms_enforced_in_check_and_vm_cap(self):
-        # (a) 2 other VZ processes (0 tart VMs) -> Refusal in assert_vm_cap and check
-        self.world.extra_vz_vms = 2
+        # (a) 2 other VZ processes (0 tart VMs) supplied via independent literal macOS 27.2
+        # observed path (NOT referencing drv.VZ_VM_COMM, so a typo in VZ_VM_COMM fails this test).
+        observed_vz_comm = (
+            "/System/Library/Frameworks/Virtualization.framework/Versions/A/"
+            "XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/"
+            "MacOS/com.apple.Virtualization.VirtualMachine"
+        )
+        self.world.extra_vz_vms = 0
+        self.world.extra_ps_comms = [observed_vz_comm, observed_vz_comm]
+        self.assertEqual(drv.vz_vm_count(self.ctx), 2)
         with self.assertRaises(drv.Refusal) as cm:
             drv.assert_vm_cap(self.ctx)
         self.assertIn("2 other Virtualization.framework VMs", str(cm.exception))
@@ -5892,6 +5943,7 @@ class Check(Base):
         )
         self.assertEqual(self.world.tart_calls("clone"), [])
         self.assertEqual(self.world.tart_calls("run"), [])
+        self.world.extra_ps_comms = []
 
         # (b) 1 tart VM + 1 other VZ process (2 total) -> Refusal naming both
         self.world.vms["x"] = {"Running": True}

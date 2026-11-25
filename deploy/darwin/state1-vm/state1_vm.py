@@ -950,8 +950,8 @@ class Vm:
     def __init__(self, ctx: Ctx, name: str):
         self.ctx, self.name, self.proc = ctx, name, None
 
-    def start(self) -> None:
-        assert_vm_cap(self.ctx)
+    def start(self, *, limit: int = VM_CAP) -> None:
+        assert_vm_cap(self.ctx, limit=limit)
         log = self.ctx.logs() / f"{self.name}-run.log"
         argv = ["tart", "run", "--no-graphics", self.name]
         self.ctx.err("$ " + shlex.join(argv) + f"   (log {log})")
@@ -3676,7 +3676,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
 
                 def boot() -> str:
                     assert_no_other_vm(ctx)
-                    vm.start()
+                    vm.start(limit=1)
                     state["ip"] = vm.ip()
                     return f"ip {state['ip']}"
 

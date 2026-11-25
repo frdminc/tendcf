@@ -245,8 +245,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
   an older driver and this one exclude each other when `$HOME` is the passwd home), because
   the VM names (`state1-golden-build`,
   `state1-check-*`) are global in tart: a second driver with another `--state-dir` is refused,
-  so the sweeps above cannot delete a VM another run is using. For non-`Virtualization.framework`
-  hypervisors (e.g. QEMU or VMware Fusion), the cap check remains best-effort.
+  so the sweeps above cannot delete a VM another run is using. Both `tart list` and `/bin/ps`
+  `Virtualization.framework` enumeration are point-in-time snapshots, so concurrent VM launches
+  by independent tools after the final pre-start check remain a residual best-effort race
+  (alongside non-`Virtualization.framework` hypervisors such as QEMU or VMware Fusion).
 - No `sudo`, no host launchd change, never the operator's real SSH keys (the driver is not
   handed any and reads none; it mints its own, see Credentials). It writes under `--state-dir` and the lock directory;
   `--summary FILE` may write anywhere you point it, and tart itself writes `~/.tart`.
