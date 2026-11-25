@@ -992,7 +992,8 @@ while [ -n "$queue" ]; do
     f=${entry#*"	"}
     [ "$depth" -le 16 ] || { echo "Include nesting exceeds 16 levels at $f" >&2; exit 1; }
     if [ -L "$f" ] && [ ! -e "$f" ]; then echo "dangling symlink: $f" >&2; exit 1; fi
-    [ -f "$f" ] || continue
+    if [ -d "$f" ]; then continue; fi
+    if [ ! -f "$f" ]; then echo "non-regular sshd config target: $f" >&2; exit 1; fi
     [ -r "$f" ] || { echo "unreadable config: $f" >&2; exit 1; }
     c=$(canon "$f")
     case $c in *"
@@ -1009,75 +1010,107 @@ $c"
     raw_len=$(wc -c <"$f")
     clean_len=$(LC_ALL=C tr -d '\000' <"$f" | wc -c)
     [ "$raw_len" -eq "$clean_len" ] || { echo "config contains NUL byte: $f" >&2; exit 1; }
-    hit=$(LC_ALL=C awk '
-        function unquote(s) {
-            if (length(s) >= 2 && substr(s, 1, 1) == "\"" && substr(s, length(s), 1) == "\"")
-                return substr(s, 2, length(s) - 2)
-            return s
+    awk_rc=0
+    incs=$(LC_ALL=C awk '
+        function fail(code, msg) {
+            printf "%s:%d: %s\n", FILENAME, FNR, msg
+            bad = code
+            exit code
         }
         {
             line = $0
             gsub(/\r/, " ", line)
             sub(/^[ \t]+/, "", line)
             if (line == "" || substr(line, 1, 1) == "#") next
-            if (substr(line, 1, 1) == "\"") {
-                q = index(substr(line, 2), "\"")
-                key = (q > 0) ? substr(line, 2, q - 1) : substr(line, 2)
-            } else {
-                key = line
-                sub(/[ \t=].*$/, "", key)
-            }
-            if (tolower(unquote(key)) == "match") {
-                printf "%s:%d: %s\n", FILENAME, FNR, line
-                exit
-            }
-        }' "$f")
-    if [ -n "$hit" ]; then printf '%s\n' "$hit"; exit 2; fi
-    incs=$(LC_ALL=C awk '
-        {
-            line = $0
-            gsub(/\r/, " ", line)
-            sub(/^[ \t]+/, "", line)
-            if (line == "" || substr(line, 1, 1) == "#") next
-            if (substr(line, 1, 1) == "\"") {
-                q = index(substr(line, 2), "\"")
-                if (q > 0) {
-                    key = substr(line, 2, q - 1)
-                    rest = substr(line, q + 2)
-                } else {
-                    key = substr(line, 2)
-                    rest = ""
+            in_dq = 0
+            i = 1
+            n = length(line)
+            while (i <= n) {
+                ch = substr(line, i, 1)
+                if (ch == "\"") {
+                    in_dq = !in_dq
+                } else if (!in_dq && (ch == " " || ch == "\t" || ch == "=")) {
+                    break
                 }
-            } else {
-                key = line
-                sub(/[ \t=].*$/, "", key)
-                rest = substr(line, length(key) + 1)
+                i++
             }
-            if (tolower(key) != "include") next
+            raw_key = substr(line, 1, i - 1)
+            rest = substr(line, i)
+            norm_key = raw_key
+            gsub(/["\047\\]/, "", norm_key)
+            norm_key = tolower(norm_key)
+            if (norm_key == "match") {
+                fail(2, line)
+            }
+            if (norm_key != "include") next
+            if (in_dq || index(raw_key, "\047") > 0 || index(raw_key, "\\") > 0) {
+                fail(3, "obfuscated Include keyword: " line)
+            }
+            if (index(raw_key, "\"") > 0) {
+                if (length(raw_key) < 2 || substr(raw_key, 1, 1) != "\"" || substr(raw_key, length(raw_key), 1) != "\"") {
+                    fail(3, "obfuscated Include keyword: " line)
+                }
+                inner_key = substr(raw_key, 2, length(raw_key) - 2)
+                if (index(inner_key, "\"") > 0) {
+                    fail(3, "obfuscated Include keyword: " line)
+                }
+            }
             sub(/^[ \t]+/, "", rest)
             if (substr(rest, 1, 1) == "=") {
                 rest = substr(rest, 2)
                 sub(/^[ \t]+/, "", rest)
             }
+            # OpenSSH argv_split() stops at an unquoted word-initial "#", while
+            # mid-token or quoted "#" remains part of the filename. Fail closed on
+            # single quotes, backslashes, unclosed/mid-token double quotes, leading
+            # "~", or characters outside a conservative path/glob charset.
             while (rest != "") {
+                if (substr(rest, 1, 1) == "#") break
                 if (substr(rest, 1, 1) == "\"") {
                     q = index(substr(rest, 2), "\"")
-                    if (q > 0) {
-                        tok = substr(rest, 2, q - 1)
-                        rest = substr(rest, q + 2)
-                    } else {
-                        tok = substr(rest, 2)
-                        rest = ""
+                    if (q == 0) {
+                        fail(3, "unclosed quote in Include: " line)
                     }
+                    tok = substr(rest, 2, q - 1)
+                    after = substr(rest, q + 2)
+                    if (after != "" && substr(after, 1, 1) != " " && substr(after, 1, 1) != "\t") {
+                        fail(3, "unsupported mid-token quote in Include: " line)
+                    }
+                    if (index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                        fail(3, "unsupported quote/escape in Include: " line)
+                    }
+                    if (tok == "" || substr(tok, 1, 1) == "~") {
+                        fail(3, "unsupported Include target: " line)
+                    }
+                    if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[ -]+$/) {
+                        fail(3, "unsafe character in quoted Include target: " line)
+                    }
+                    incs[++n_inc] = tok
+                    rest = after
                 } else {
                     tok = rest
                     sub(/[ \t].*$/, "", tok)
                     rest = substr(rest, length(tok) + 1)
+                    if (index(tok, "\"") > 0 || index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                        fail(3, "unsupported quote/escape in Include: " line)
+                    }
+                    if (substr(tok, 1, 1) == "~") {
+                        fail(3, "unsupported tilde Include target: " line)
+                    }
+                    if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[-]+$/) {
+                        fail(3, "unsafe character in Include target: " line)
+                    }
+                    incs[++n_inc] = tok
                 }
-                if (tok != "") print tok
                 sub(/^[ \t]+/, "", rest)
             }
-        }' "$f")
+        }
+        END {
+            if (bad) exit bad
+            for (k = 1; k <= n_inc; k++) print incs[k]
+        }' "$f") || awk_rc=$?
+    if [ "$awk_rc" -eq 2 ]; then printf '%s\n' "$incs"; exit 2; fi
+    if [ "$awk_rc" -ne 0 ]; then printf '%s\n' "$incs" >&2; exit 1; fi
     next_depth=$((depth + 1))
     set -f
     while [ -n "$incs" ]; do
@@ -1097,7 +1130,9 @@ $c"
             case $matched in *"
 "*) echo "config path contains newline: $matched" >&2; exit 1 ;; esac
             if [ ! -e "$matched" ] && [ ! -L "$matched" ]; then continue; fi
-            if [ -d "$matched" ] && [ ! -L "$matched" ]; then continue; fi
+            if [ -L "$matched" ] && [ ! -e "$matched" ]; then echo "dangling symlink: $matched" >&2; exit 1; fi
+            if [ -d "$matched" ]; then continue; fi
+            if [ ! -f "$matched" ]; then echo "non-regular sshd config target: $matched" >&2; exit 1; fi
             if [ -n "$queue" ]; then
                 queue="$queue
 $next_depth	$matched"
@@ -3292,7 +3327,7 @@ def cmd_golden(ctx: Ctx, args) -> int:
                 if adopt:
                     adopt_committing_golden(ctx, golden, names, summary)
                     emit(summary, ctx, args.summary)
-                    return 0
+                    return 0 if summary.ok else 1
                 if golden in names and not rebuild:
                     try:
                         rec = read_golden_record(ctx)

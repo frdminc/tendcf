@@ -2291,6 +2291,25 @@ class Golden(Base):
         self.assertEqual(rc, 0, ev)
         self.assertIn("nothing to do", ev)
 
+        # PR 112 R2 (Opus L7): OSError while unlinking parked .pending returns 1 (summary.ok False)
+        marker.write_text(good_committing)
+        stuck_pending = self.ctx.state_dir / "golden.json.pending"
+        stuck_pending.write_text("{}")
+        stuck_real = os.path.realpath(stuck_pending)
+        orig_unlink = Path.unlink
+
+        def fail_pending_unlink(p_self, *a, **kw):
+            if os.path.realpath(p_self) == stuck_real:
+                raise PermissionError("simulated pending unlink failure")
+            return orig_unlink(p_self, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", fail_pending_unlink):
+            rc, s = self.run_cmd("golden", "--adopt", ctx=self.second_run_ctx("20261125T000019Z-pf"))
+        self.assertEqual(rc, 1, s)
+        self.assertFalse(s["ok"])
+        self.assertEqual(self.steps(s)["pending"]["status"], "fail")
+        stuck_pending.unlink()
+
     def test_an_owner_file_that_disagrees_with_the_record_is_refused(self):
         self.run_cmd(*self.golden_args())
         good = self.owner_file().read_text()
@@ -4126,11 +4145,11 @@ class Check(Base):
         self.assertIn("Match User", r.stdout)
         spaced.unlink()
 
-        # 2) Quoted Include with spaces in path ("dir with space/a.conf") + mid-line #
+        # 2) Quoted Include with spaces in path ("dir with space/a.conf") + mid-token # + trailing # comment
         (base / "dir with space").mkdir()
         (base / "dir with space" / "a.conf").write_text('"Match" all\n')
         (base / "sshd_config").write_text(
-            'Include #nonexistent.conf "dir with space/a.conf"\n'
+            'Include a#nonexistent.conf "dir with space/a.conf" # trailing \'comment\'\n'
         )
         r = run_check()
         self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
@@ -4176,6 +4195,144 @@ class Check(Base):
         r = run_check()
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("NUL byte", r.stderr)
+
+        # PR 112 R2 (Opus H1 + L5): obfuscated Match/Include keywords, single quotes,
+        # backslash escapes, mid-token/unclosed quotes, leading ~, and non-regular FIFO targets
+        (base / "d").mkdir()
+        (base / "d" / "x.conf").write_text("Match User admin\n  PasswordAuthentication yes\n")
+        (base / "sshd_config").write_text('M"atch" User admin\n  PasswordAuthentication yes\n')
+        r = run_check()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn('M"atch"', r.stdout)
+
+        for cfg_line, want_err in (
+            (f'I"nclude" {base}/d/x.conf\n', "obfuscated Include keyword"),
+            (f"In'cl'ude {base}/d/x.conf\n", "obfuscated Include keyword"),
+            (f"Inc\\lude {base}/d/x.conf\n", "obfuscated Include keyword"),
+            (f"Include '{base}/dir with space/a.conf'\n", "unsupported quote/escape"),
+            (f"Include {base}/dir\\ with\\ space/a.conf\n", "unsupported quote/escape"),
+            (f'Include {base}/d/"x".conf\n', "unsupported quote/escape"),
+            (f'Include "{base}/d/""x".conf\n', "unsupported mid-token quote"),
+            (f'Include "{base}/d/x.conf\n', "unclosed quote"),
+            ("Include ~/evil.conf\n", "unsupported tilde"),
+            ('Include "~/evil.conf"\n', "unsupported Include target"),
+        ):
+            (base / "sshd_config").write_text(cfg_line)
+            r = run_check()
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_err, r.stderr, (cfg_line, r.stderr))
+
+        # Opus L5: non-regular FIFO target matched by Include glob fails closed
+        fifo = base / "sshd_config.d" / "50-pipe.conf"
+        os.mkfifo(fifo)
+        (base / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_check()
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("non-regular sshd config target", r.stderr)
+        fifo.unlink()
+
+    def test_sshd_match_check_real_sshd_parity(self):
+        # Verify against real /usr/sbin/sshd that every OpenSSH strdelim()/argv_split()
+        # syntax variant that honours a Match in sshd -T is refused by BOTH
+        # SSHD_MATCH_CHECK_SH and prep.sh's check_sshd_no_match.
+        sshd_bin = Path("/usr/sbin/sshd")
+        ssh_keygen = shutil.which("ssh-keygen")
+        if not (sshd_bin.is_file() and os.access(sshd_bin, os.X_OK) and ssh_keygen):
+            self.skipTest("/usr/sbin/sshd or ssh-keygen unavailable")
+        base = Path(tempfile.mkdtemp(prefix="tendcf-sshd-parity-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        hk = base / "host_ed25519"
+        subprocess.run(
+            [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(hk)],
+            check=True,
+            capture_output=True,
+        )
+        (base / "dir with space").mkdir()
+        (base / "dir with space" / "a.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "d").mkdir()
+        (base / "d" / "x.conf").write_text(
+            "Match User admin\n  PasswordAuthentication yes\n"
+        )
+        (base / "clean.conf").write_text("Ciphers aes256-gcm@openssh.com\n")
+        prep_text = (VMDIR / "guest" / "prep.sh").read_text()
+        a = prep_text.index("sshd_canon() {")
+        b = prep_text.index('check_sshd_no_match "${SSHD_CONFIG:-/etc/ssh/sshd_config}"')
+        prep_fn = (
+            'die() { printf "prep.sh: %s\\n" "$*" >&2; exit 1; }\n'
+            "set -eu\n"
+            + prep_text[a:b]
+            + 'check_sshd_no_match "$1"\n'
+        )
+        cfg = base / "sshd_config"
+
+        # Clean baseline with trailing # comment containing a single quote: sshd keeps
+        # PasswordAuthentication no, and both checkers pass.
+        cfg.write_text(
+            f"PasswordAuthentication no\nInclude {base}/clean.conf # admin's comment\n"
+        )
+        r_sshd = subprocess.run(
+            [str(sshd_bin), "-T", "-h", str(hk), "-f", str(cfg), "-C", "user=admin,host=x,addr=10.0.0.9"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_sshd.returncode, 0, r_sshd.stderr)
+        self.assertIn("passwordauthentication no", r_sshd.stdout.lower().splitlines())
+        r_drv = subprocess.run(
+            ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_drv.returncode, 0, (r_drv.stdout, r_drv.stderr))
+        r_prep = subprocess.run(
+            ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+            env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r_prep.returncode, 0, (r_prep.stdout, r_prep.stderr))
+
+        # All 5 Opus H1 OpenSSH bypass variants
+        variants = (
+            ('M"atch" User admin\n  PasswordAuthentication yes\n', "mid-token quoted Match"),
+            (f'I"nclude" {base}/d/x.conf\n', "mid-token quoted Include"),
+            (f"Include '{base}/dir with space/a.conf'\n", "single-quoted Include"),
+            (f"Include {base}/dir\\ with\\ space/a.conf\n", "backslash-escaped Include"),
+            (f'Include {base}/d/"x".conf\n', "mid-token quoted Include arg"),
+        )
+        for body, label in variants:
+            cfg.write_text("PasswordAuthentication no\n" + body)
+            r_sshd = subprocess.run(
+                [str(sshd_bin), "-T", "-h", str(hk), "-f", str(cfg), "-C", "user=admin,host=x,addr=10.0.0.9"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_sshd.returncode, 0, (label, r_sshd.stderr))
+            self.assertIn(
+                "passwordauthentication yes",
+                r_sshd.stdout.lower().splitlines(),
+                f"{label}: expected real sshd to honour Match",
+            )
+            r_drv = subprocess.run(
+                ["/bin/sh", "-c", drv.SSHD_MATCH_CHECK_SH, "sh", str(cfg), str(base)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_drv.returncode, 0, f"{label}: SSHD_MATCH_CHECK_SH failed to refuse")
+            r_prep = subprocess.run(
+                ["/bin/sh", "-c", prep_fn, "sh", str(cfg)],
+                env={"PATH": "/usr/bin:/bin", "SSHD_BASE_DIR": str(base)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_prep.returncode, 0, f"{label}: prep.sh failed to refuse")
 
     # -- 2g / 10a: Spotlight off, with a bounded settle (issue 70 run 2)
     def test_2g_waits_out_transitioning_and_records_polls_and_seconds(self):
@@ -6024,10 +6181,12 @@ class GuestScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("Match block", r.stderr)
         spaced.unlink()
-        # 2) Quoted Include with space + mid-line #
+        # 2) Quoted Include with space + mid-token # + trailing # comment
         (ssh_dir / "dir with space").mkdir()
         (ssh_dir / "dir with space" / "a.conf").write_text('"Match" all\n')
-        (ssh_dir / "sshd_config").write_text('Include #ignored.conf "dir with space/a.conf"\n')
+        (ssh_dir / "sshd_config").write_text(
+            'Include a#ignored.conf "dir with space/a.conf" # trailing \'comment\'\n'
+        )
         r = run_step7(SSHD_CAMEL)
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("Match block", r.stderr)
@@ -6069,6 +6228,29 @@ class GuestScripts(unittest.TestCase):
         r = run_step7(SSHD_CAMEL)
         self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
         self.assertIn("NUL byte", r.stderr)
+        # 6b) PR 112 R2 (Opus H1 + L5): obfuscated Match/Include, single quotes, backslash,
+        # mid-token/unclosed quotes, leading ~, and non-regular FIFO target in prep.sh
+        (ssh_dir / "d").mkdir()
+        (ssh_dir / "d" / "x.conf").write_text("Match User admin\n")
+        for cfg_line, want_msg in (
+            ('M"atch" User admin\n', "Match block"),
+            (f'I"nclude" {ssh_dir}/d/x.conf\n', "obfuscated Include keyword"),
+            (f"Include '{ssh_dir}/dir with space/a.conf'\n", "unsupported quote/escape"),
+            (f"Include {ssh_dir}/dir\\ with\\ space/a.conf\n", "unsupported quote/escape"),
+            (f'Include {ssh_dir}/d/"x".conf\n', "unsupported quote/escape"),
+            ('Include "~/evil.conf"\n', "unsupported Include target"),
+        ):
+            (ssh_dir / "sshd_config").write_text(cfg_line)
+            r = run_step7(SSHD_CAMEL)
+            self.assertEqual(r.returncode, 1, (cfg_line, r.stdout, r.stderr))
+            self.assertIn(want_msg, r.stderr, (cfg_line, r.stderr))
+        fifo = ssh_dir / "sshd_config.d" / "50-pipe.conf"
+        os.mkfifo(fifo)
+        (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
+        r = run_step7(SSHD_CAMEL)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("non-regular sshd config target", r.stderr)
+        fifo.unlink()
         # 7) Group 8a: dedup 127.0.0.1 (via ,addr=) and skip non-IP tokens like link#4
         (ssh_dir / "sshd_config").write_text("Include sshd_config.d/*\n")
         if specs_log.exists():
@@ -6885,6 +7067,13 @@ class GuestScripts(unittest.TestCase):
         self.assertNotEqual(
             self.pkgutil_check(self.GOOD_SIG.encode() + b"\x00").returncode, 0
         )
+        # PR 112 R2 (Opus L6): signer is passed via ENVIRON["SIGNER"], not awk -v, so
+        # backslashes in signer are compared literally instead of being escape-expanded
+        bs_signer = r"Python\nFoundation (BMM5U3QVKW)"
+        bs_sig = self.GOOD_SIG.replace(
+            "Python Software Foundation (BMM5U3QVKW)", bs_signer
+        )
+        self.assertEqual(self.pkgutil_check(bs_sig, signer=bs_signer).returncode, 0)
 
 
 class CheckRenderer(Base):

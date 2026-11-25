@@ -186,7 +186,10 @@ status: 0 ok, 1 a step failed, 2 refused or bad usage, 130 interrupted. `--pubke
     `final` ONLY if the golden exists in `tart list`, the `committing` marker belongs to this
     exact state dir and canonical `TART_HOME`, and its `key_id` and `host_key` match this state
     dir's `golden.json` and `known_hosts` pin (same verification as `golden_usable`), with no
-    conflicting `final` marker. Otherwise refuses fail-closed (exit 2).
+    conflicting `final` marker or leftover `<golden>-build` VM. Otherwise refuses fail-closed
+    (exit 2). `golden --adopt` does not perform an SSH login: this is sound because `golden.json`
+    and the `known_hosts` pin are written only after `tart rename` succeeds and `<golden>-build`
+    absence is enforced, so the committing marker already proves the renamed VM is this build.
   `check` reads the marker too: a
   **final** file naming another state dir, another tart home or another key exits 2 early,
   naming it; a `committing` file of another state dir (its commit did not finish: the golden is

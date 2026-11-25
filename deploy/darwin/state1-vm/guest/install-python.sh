@@ -33,7 +33,7 @@ check_signature() {
         rm -f -- "$sig_tmp"
         die "pkgutil --check-signature failed for $1 (rc $sig_rc)"
     fi
-    sig_err=$(LC_ALL=C tr '\000' '\001' <"$sig_tmp" | LC_ALL=C awk -v signer="$signer" '
+    sig_err=$(LC_ALL=C tr '\000' '\001' <"$sig_tmp" | SIGNER="$signer" LC_ALL=C awk '
         function fail(msg) { if (!bad) print msg; bad = 1; exit }
         index($0, "\001") > 0 { fail("pkgutil output contains NUL byte") }
         index($0, "\r") > 0 { fail("pkgutil output contains carriage return") }
@@ -60,7 +60,7 @@ check_signature() {
             if (line ~ /^1\. /) {
                 leaf_n++
                 if (!in_chain) fail("leaf certificate line appeared outside Certificate Chain")
-                if (line == "1. Developer ID Installer: " signer) leaf_ok++
+                if (line == "1. Developer ID Installer: " ENVIRON["SIGNER"]) leaf_ok++
                 next
             }
         }
@@ -69,7 +69,7 @@ check_signature() {
             if (chain_hdr + 0 != 1) { print "expected exactly 1 Certificate Chain section, saw " (chain_hdr + 0); exit }
             if (status_n + 0 != 1 || status_ok + 0 != 1) { print "package status is not uniquely '\''signed by a developer certificate issued by Apple for distribution'\''"; exit }
             if (notary_n + 0 != 1 || notary_ok + 0 != 1) { print "package notarization is not uniquely '\''trusted by the Apple notary service'\''"; exit }
-            if (leaf_n + 0 != 1 || leaf_ok + 0 != 1) { print "package leaf certificate is not uniquely '\''Developer ID Installer: " signer "'\''"; exit }
+            if (leaf_n + 0 != 1 || leaf_ok + 0 != 1) { print "package leaf certificate is not uniquely '\''Developer ID Installer: " ENVIRON["SIGNER"] "'\''"; exit }
         }')
     rm -f -- "$sig_tmp"
     [ -z "$sig_err" ] || die "$sig_err"

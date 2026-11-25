@@ -305,7 +305,12 @@ check_sshd_no_match() {
         if [ -L "$_f" ] && [ ! -e "$_f" ]; then
             die "dangling symlink in sshd config: $_f"
         fi
-        [ -f "$_f" ] || continue
+        if [ -d "$_f" ]; then
+            continue
+        fi
+        if [ ! -f "$_f" ]; then
+            die "non-regular sshd config target: $_f"
+        fi
         [ -r "$_f" ] || die "unreadable sshd config file: $_f"
         _canon=$(sshd_canon "$_f")
         case $_canon in
@@ -324,75 +329,110 @@ $_canon"
         _raw_len=$(wc -c <"$_f")
         _clean_len=$(LC_ALL=C tr -d '\000' <"$_f" | wc -c)
         [ "$_raw_len" -eq "$_clean_len" ] || die "sshd config contains NUL byte: $_f"
-        _match_hit=$(LC_ALL=C awk '
-            function unquote(s) {
-                if (length(s) >= 2 && substr(s, 1, 1) == "\"" && substr(s, length(s), 1) == "\"")
-                    return substr(s, 2, length(s) - 2)
-                return s
+        _awk_rc=0
+        _incs=$(LC_ALL=C awk '
+            function fail(code, msg) {
+                printf "%s:%d: %s\n", FILENAME, FNR, msg
+                bad = code
+                exit code
             }
             {
                 line = $0
                 gsub(/\r/, " ", line)
                 sub(/^[ \t]+/, "", line)
                 if (line == "" || substr(line, 1, 1) == "#") next
-                if (substr(line, 1, 1) == "\"") {
-                    q = index(substr(line, 2), "\"")
-                    key = (q > 0) ? substr(line, 2, q - 1) : substr(line, 2)
-                } else {
-                    key = line
-                    sub(/[ \t=].*$/, "", key)
-                }
-                if (tolower(unquote(key)) == "match") {
-                    printf "%s:%d: %s\n", FILENAME, FNR, line
-                    exit
-                }
-            }' "$_f")
-        [ -z "$_match_hit" ] || die "uncommented Match block in sshd config: $_match_hit"
-        _incs=$(LC_ALL=C awk '
-            {
-                line = $0
-                gsub(/\r/, " ", line)
-                sub(/^[ \t]+/, "", line)
-                if (line == "" || substr(line, 1, 1) == "#") next
-                if (substr(line, 1, 1) == "\"") {
-                    q = index(substr(line, 2), "\"")
-                    if (q > 0) {
-                        key = substr(line, 2, q - 1)
-                        rest = substr(line, q + 2)
-                    } else {
-                        key = substr(line, 2)
-                        rest = ""
+                in_dq = 0
+                i = 1
+                n = length(line)
+                while (i <= n) {
+                    ch = substr(line, i, 1)
+                    if (ch == "\"") {
+                        in_dq = !in_dq
+                    } else if (!in_dq && (ch == " " || ch == "\t" || ch == "=")) {
+                        break
                     }
-                } else {
-                    key = line
-                    sub(/[ \t=].*$/, "", key)
-                    rest = substr(line, length(key) + 1)
+                    i++
                 }
-                if (tolower(key) != "include") next
+                raw_key = substr(line, 1, i - 1)
+                rest = substr(line, i)
+                norm_key = raw_key
+                gsub(/["\047\\]/, "", norm_key)
+                norm_key = tolower(norm_key)
+                if (norm_key == "match") {
+                    fail(2, line)
+                }
+                if (norm_key != "include") next
+                if (in_dq || index(raw_key, "\047") > 0 || index(raw_key, "\\") > 0) {
+                    fail(3, "obfuscated Include keyword: " line)
+                }
+                if (index(raw_key, "\"") > 0) {
+                    if (length(raw_key) < 2 || substr(raw_key, 1, 1) != "\"" || substr(raw_key, length(raw_key), 1) != "\"") {
+                        fail(3, "obfuscated Include keyword: " line)
+                    }
+                    inner_key = substr(raw_key, 2, length(raw_key) - 2)
+                    if (index(inner_key, "\"") > 0) {
+                        fail(3, "obfuscated Include keyword: " line)
+                    }
+                }
                 sub(/^[ \t]+/, "", rest)
                 if (substr(rest, 1, 1) == "=") {
                     rest = substr(rest, 2)
                     sub(/^[ \t]+/, "", rest)
                 }
+                # OpenSSH argv_split() stops at an unquoted word-initial "#", while
+                # mid-token or quoted "#" remains part of the filename. Fail closed on
+                # single quotes, backslashes, unclosed/mid-token double quotes, leading
+                # "~", or characters outside a conservative path/glob charset.
                 while (rest != "") {
+                    if (substr(rest, 1, 1) == "#") break
                     if (substr(rest, 1, 1) == "\"") {
                         q = index(substr(rest, 2), "\"")
-                        if (q > 0) {
-                            tok = substr(rest, 2, q - 1)
-                            rest = substr(rest, q + 2)
-                        } else {
-                            tok = substr(rest, 2)
-                            rest = ""
+                        if (q == 0) {
+                            fail(3, "unclosed quote in Include: " line)
                         }
+                        tok = substr(rest, 2, q - 1)
+                        after = substr(rest, q + 2)
+                        if (after != "" && substr(after, 1, 1) != " " && substr(after, 1, 1) != "\t") {
+                            fail(3, "unsupported mid-token quote in Include: " line)
+                        }
+                        if (index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                            fail(3, "unsupported quote/escape in Include: " line)
+                        }
+                        if (tok == "" || substr(tok, 1, 1) == "~") {
+                            fail(3, "unsupported Include target: " line)
+                        }
+                        if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[ -]+$/) {
+                            fail(3, "unsafe character in quoted Include target: " line)
+                        }
+                        incs[++n_inc] = tok
+                        rest = after
                     } else {
                         tok = rest
                         sub(/[ \t].*$/, "", tok)
                         rest = substr(rest, length(tok) + 1)
+                        if (index(tok, "\"") > 0 || index(tok, "\047") > 0 || index(tok, "\\") > 0) {
+                            fail(3, "unsupported quote/escape in Include: " line)
+                        }
+                        if (substr(tok, 1, 1) == "~") {
+                            fail(3, "unsupported tilde Include target: " line)
+                        }
+                        if (tok !~ /^[]A-Za-z0-9_.\/*?@+:,#[-]+$/) {
+                            fail(3, "unsafe character in Include target: " line)
+                        }
+                        incs[++n_inc] = tok
                     }
-                    if (tok != "") print tok
                     sub(/^[ \t]+/, "", rest)
                 }
-            }' "$_f")
+            }
+            END {
+                if (bad) exit bad
+                for (k = 1; k <= n_inc; k++) print incs[k]
+            }' "$_f") || _awk_rc=$?
+        if [ "$_awk_rc" -eq 2 ]; then
+            die "uncommented Match block in sshd config: $_incs"
+        elif [ "$_awk_rc" -ne 0 ]; then
+            die "unsupported sshd config syntax: $_incs"
+        fi
         _next_depth=$((_depth + 1))
         set -f
         while [ -n "$_incs" ]; do
@@ -423,8 +463,14 @@ $_canon"
                 if [ ! -e "$_matched" ] && [ ! -L "$_matched" ]; then
                     continue
                 fi
-                if [ -d "$_matched" ] && [ ! -L "$_matched" ]; then
+                if [ -L "$_matched" ] && [ ! -e "$_matched" ]; then
+                    die "dangling symlink in sshd config: $_matched"
+                fi
+                if [ -d "$_matched" ]; then
                     continue
+                fi
+                if [ ! -f "$_matched" ]; then
+                    die "non-regular sshd config target: $_matched"
                 fi
                 if [ -n "$_queue" ]; then
                     _queue="$_queue
