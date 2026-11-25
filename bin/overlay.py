@@ -59,8 +59,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OVERLAY = ROOT / "overlay"
 MANIFEST_NAME = "overlay.json"
 
-HEX40 = re.compile(r"^[0-9a-f]{40}$")
-PATCH_NAME = re.compile(r"^(\d{4})-.*\.patch$")
+HEX40 = re.compile(r"^[0-9a-f]{40}\Z")
+PATCH_NAME = re.compile(r"^(\d{4})-.*\.patch\Z")
 FROM_LINE = re.compile(r"^From ([0-9a-f]{40}) ")
 SUBJECT_PREFIX = re.compile(r"^\[PATCH[^\]]*\]\s*")
 

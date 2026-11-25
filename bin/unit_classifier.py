@@ -43,9 +43,9 @@ from dataclasses import dataclass, field
 
 TYPES = ("service", "socket", "timer", "path")
 TYPE_RE = r"(?:service|socket|timer|path)"
-TEMPLATE_RE = re.compile(r"^(.+@)\.(" + TYPE_RE + r")$")
-INSTANCE_RE = re.compile(r"^(.+@)(.+)\.(" + TYPE_RE + r")$")
-UNIT_NAME_RE = re.compile(r"^[^/\s]+\.(?:service|socket|timer|path)$")
+TEMPLATE_RE = re.compile(r"^(.+@)\.(" + TYPE_RE + r")\Z")
+INSTANCE_RE = re.compile(r"^(.+@)(.+)\.(" + TYPE_RE + r")\Z")
+UNIT_NAME_RE = re.compile(r"^[^/\s]+\.(?:service|socket|timer|path)\Z")
 
 SHOW_PROPS = ("Id", "Names", "LoadState", "UnitFileState", "FragmentPath",
               "SourcePath", "DropInPaths", "Transient")
@@ -56,7 +56,7 @@ ALLOWED_COMMANDS = {
     "systemd-analyze": (("unit-paths",),),
     "dpkg-query": (("-S",),),
 }
-GENERATOR_DIR_RE = re.compile(r"^/run/systemd/generator(?:\.early|\.late)?$")
+GENERATOR_DIR_RE = re.compile(r"^/run/systemd/generator(?:\.early|\.late)?\Z")
 DEV_NULL = "/dev/null"
 LINK_LIMIT = 10
 # Per-command bound (seconds). A command that exceeds it is a failed command (rc 124),
@@ -437,7 +437,7 @@ def resolve_ownership(env, artifacts):
 
 def dir_variants(name):
     """Drop-in directory names systemd.unit(5) reads for one unit name."""
-    m = re.match(r"^(.*)\.([a-z]+)$", name)
+    m = re.match(r"^(.*)\.([a-z]+)\Z", name)
     if not m:
         return [name + ".d"]
     base, suffix = m.group(1), m.group(2)

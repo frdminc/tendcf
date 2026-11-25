@@ -1,6 +1,6 @@
 # Negative fixtures
 
-Two hundred thirty-six deliberately broken overlays, plus six byte-class fixtures in
+Two hundred forty-four deliberately broken overlays, plus six byte-class fixtures in
 the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
@@ -574,6 +574,21 @@ Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `uni
 | 264 | `264-services-stale-v8-user-domain` | `services.yml` service with stale v3 `launchd.domain: user` | schema (`enum`) |
 | 265 | `265-launchd-user-gui-run-as-root` | launchd goal file with `unit.launchd.domain: "user-gui"` and `run_as: "root"` | goal cross-file |
 | 266 | `266-services-launchd-user-bg-run-as-root` | `services.yml` service with `launchd.domain: user-background` and `runs_as: root` | cross-file |
+
+## Trailing-newline pattern guards (267-274)
+
+Issue #55 (operator ruling R8, no extra `schema_version` bump in the current window): Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`, where `$` matches before a trailing `\n` (unlike JSON Schema ECMA-262 `$`). Every `$`-anchored `pattern` across all 8 schemas now carries a sibling `"not": { "pattern": "\\n" }` guard, enforced mechanically by `check_schema_dollar_newline_guards()` in `bin/schema_lint.py`. Cases 267-274 pin the critical sites named in issue #55 and comment `7046830857` (each is JCS-canonical bytes with one trailing `\n` defect).
+
+| # | Case | Broken input | Caught by |
+|---|------|--------------|-----------|
+| 267 | `267-systemd-working-dir-trailing-newline` | systemd goal file with `working_dir: "/srv\n"` | schema (`not`) |
+| 268 | `268-abs-path-trailing-newline` | launchd goal file with `working_dir: "/srv\n"` (`$defs/abs_path`) | schema (`abs_path` `not`) |
+| 269 | `269-sha256-trailing-newline` | launchd goal file with `policy-tree` `sha256` ending in `\n` (`$defs/sha256`) | schema (`sha256` `not`) |
+| 270 | `270-advisor-key-trailing-newline` | launchd goal file with an `advisor-key` property name ending in `\n` | schema (`propertyNames` `not`) |
+| 271 | `271-goal-file-host-trailing-newline` | launchd goal file with top-level `host` ending in `\n` | schema (`not`) |
+| 272 | `272-goal-diff-host-trailing-newline` | `goal-diff.json` with top-level `host` ending in `\n` | schema (`not`) |
+| 273 | `273-systemd-command-trailing-newline` | systemd goal file with `command[1]` ending in `\n` (`"infinity\n"`) | schema (`not`) |
+| 274 | `274-approval-baseline-sha256-trailing-newline` | `approval-application.json` with `baseline_sha256` ending in `\n` | schema (`not`) |
 
 ## Every class has a fixture
 

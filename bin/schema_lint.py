@@ -37,7 +37,7 @@ Six layers, cheapest first:
      applying its hunks to the baseline reproduces the proposed file byte
      for byte, and the approval record's asserted ceremony class equals
      the one the validator derives (§11);
-  6. each of the two hundred thirty-six deliberately broken fixtures in examples/broken/
+  6. each of the two hundred forty-four deliberately broken fixtures in examples/broken/
      and the six byte-class fixtures in examples/broken-bytes/ is caught
      BY THE LAYER IT NAMES. A lint that only accepts good input is not a
      check; a negative harness that accepts any objection at all is barely
@@ -88,7 +88,7 @@ BYTE_CLASS_DIR = EXAMPLE_DIR / "broken-bytes"
 PROJECTION_DIR = EXAMPLE_DIR / "broken-projection"
 GOLDEN = EXAMPLE_DIR / "host_specific.json"
 PROJECTOR = Path(__file__).resolve().with_name("projector.py")
-EXPECTED_BROKEN = 236
+EXPECTED_BROKEN = 244
 EXPECTED_BYTE_CLASS = 6
 EXPECTED_PROJECTION = 28
 
@@ -1783,7 +1783,8 @@ def check_cross_file(loaded: dict[str, Any]) -> None:
 
 # A template key (`getty@.service`) names the instances of one template.
 # schema-v5-dpkg-reconciliation-2026-11-02.md §2.2(1).
-UNIT_TEMPLATE = re.compile(r"^(.+@)\.(service|socket|timer|path)$")
+# `\Z`, not `$`: Python's `$` matches before a trailing newline (issue #55).
+UNIT_TEMPLATE = re.compile(r"^(.+@)\.(service|socket|timer|path)\Z")
 
 
 def unit_key_covers(key: str, name: str) -> bool:
@@ -1880,6 +1881,8 @@ def check_unit_claim_selftest() -> None:
         ("tendcf-execd.timer", "tendcf-execd.timer", True),
         ("tendcf.canary.*", "tendcf-execd.service", False),
         ("com.tendcf.example.*", "com.tendcf.example.tailscaled", True),
+        ("getty@.service\n", "getty@tty1.service", False),
+        ("getty@.service", "getty@tty1.service\n", False),
     )
     for key, name, want in covers_table:
         if unit_key_covers(key, name) != want:
@@ -2520,6 +2523,179 @@ def check_goal_file_forbidden_refs(schemas: dict[str, dict]) -> None:
     walk(schema)
 
 
+def _has_unescaped_dollar_anchor(pattern: str) -> bool:
+    """True iff `pattern` contains an unescaped `$` outside a `[...]` class.
+
+    In Python's `re`, an unescaped `$` end anchor matches both end-of-string
+    and just before a trailing `\\n`, whereas JSON Schema's ECMA-262 `$`
+    matches end-of-string only (issue #55).
+    """
+    escaped = False
+    in_class = False
+    class_start = -1
+    for i, ch in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_class:
+            # A literal `]` right after `[` or `[^` does not close the class.
+            if ch == "]" and not (
+                i == class_start + 1
+                or (i == class_start + 2 and pattern[class_start + 1] == "^")
+            ):
+                in_class = False
+            continue
+        if ch == "[":
+            in_class = True
+            class_start = i
+            continue
+        if ch == "$":
+            return True
+    return False
+
+
+def _node_forbids_newline(
+    node: Any, root: dict[str, Any], schemas: dict[str, dict]
+) -> bool:
+    """True iff schema object `node` (or its `$ref` target) carries `not: {pattern: "\\n"}`."""
+    if not isinstance(node, dict):
+        return False
+    not_clause = node.get("not")
+    if isinstance(not_clause, dict) and not_clause.get("pattern") == r"\n":
+        return True
+    ref = node.get("$ref")
+    if isinstance(ref, str) and "#/$defs/" in ref:
+        doc_part, def_name = ref.split("#/$defs/", 1)
+        target_root = root if not doc_part else schemas.get(doc_part.split("/")[-1])
+        if isinstance(target_root, dict):
+            target = (target_root.get("$defs") or {}).get(def_name)
+            return _node_forbids_newline(target, target_root, schemas)
+    return False
+
+
+def check_schema_dollar_newline_guards(schemas: dict[str, dict]) -> None:
+    """Every `$`-anchored `pattern` (and `patternProperties` key) must forbid `\\n`.
+
+    Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`,
+    where `$` matches before a trailing `\\n` (unlike ECMA-262 `$`). Requiring
+    `"not": { "pattern": "\\n" }` beside every `$`-anchored `pattern` — and on
+    the sibling `propertyNames` of any `$`-anchored `patternProperties` key —
+    makes the invariant machine-checked so no future PR can reintroduce the
+    trailing-newline bypass (issue #55).
+    """
+    for name, schema in sorted(schemas.items()):
+
+        def walk(node: Any, pointer: str) -> None:
+            if isinstance(node, dict):
+                pat = node.get("pattern")
+                if isinstance(pat, str) and _has_unescaped_dollar_anchor(pat):
+                    if not _node_forbids_newline(node, schema, schemas):
+                        fail(
+                            f"schema/{name}:{pointer or '<root>'}: `$`-anchored "
+                            f"pattern {pat!r} lacks sibling "
+                            '`"not": { "pattern": "\\\\n" }` guard — Python `re` '
+                            "`$` matches before a trailing newline (issue #55)",
+                            rule=RULE_SCHEMA_META,
+                        )
+                pat_props = node.get("patternProperties")
+                if isinstance(pat_props, dict):
+                    for key_pat, sub in pat_props.items():
+                        sub_ptr = f"{pointer}/patternProperties[{key_pat!r}]"
+                        if isinstance(key_pat, str) and _has_unescaped_dollar_anchor(
+                            key_pat
+                        ):
+                            if not _node_forbids_newline(
+                                node.get("propertyNames"), schema, schemas
+                            ):
+                                fail(
+                                    f"schema/{name}:{sub_ptr}: `$`-anchored "
+                                    f"patternProperties key {key_pat!r} lacks a "
+                                    'sibling `propertyNames` with `"not": '
+                                    '{ "pattern": "\\\\n" }` (issue #55)',
+                                    rule=RULE_SCHEMA_META,
+                                )
+                        walk(sub, sub_ptr)
+                for key, value in node.items():
+                    if key == "patternProperties":
+                        continue
+                    walk(value, f"{pointer}/{key}")
+            elif isinstance(node, list):
+                for i, value in enumerate(node):
+                    walk(value, f"{pointer}[{i}]")
+
+        walk(schema, "")
+
+
+def check_dollar_newline_selftest() -> None:
+    """Pin check_schema_dollar_newline_guards() against becoming a no-op (issue #55)."""
+    cases = (
+        (
+            "unguarded $ pattern refused",
+            {"x.schema.json": {"type": "string", "pattern": "^[a-z]+$"}},
+            True,
+        ),
+        (
+            "guarded $ pattern accepted",
+            {
+                "x.schema.json": {
+                    "type": "string",
+                    "pattern": "^[a-z]+$",
+                    "not": {"pattern": r"\n"},
+                }
+            },
+            False,
+        ),
+        (
+            "character-class [$] without end anchor accepted",
+            {"x.schema.json": {"type": "string", "pattern": "^[^$]+"}},
+            False,
+        ),
+        (
+            "character-class [$] WITH end anchor refused when unguarded",
+            {"x.schema.json": {"type": "string", "pattern": "^[^$]+$"}},
+            True,
+        ),
+        (
+            "escaped literal \\$ without anchor accepted",
+            {"x.schema.json": {"type": "string", "pattern": r"^\$foo"}},
+            False,
+        ),
+        (
+            "unguarded patternProperties $ refused",
+            {
+                "x.schema.json": {
+                    "type": "object",
+                    "patternProperties": {r"\*$": {"type": "object"}},
+                }
+            },
+            True,
+        ),
+        (
+            "patternProperties $ with guarded propertyNames accepted",
+            {
+                "x.schema.json": {
+                    "type": "object",
+                    "propertyNames": {"pattern": r"^[a-z]+\*$", "not": {"pattern": r"\n"}},
+                    "patternProperties": {r"\*$": {"type": "object"}},
+                }
+            },
+            False,
+        ),
+    )
+    for label, synth, want_finding in cases:
+        with capture_findings(silent=True) as inner:
+            check_schema_dollar_newline_guards(synth)
+        if bool(inner) != want_finding:
+            fail(
+                f"dollar-newline self-test {label!r}: got {len(inner)} finding(s), "
+                f"expected {'at least 1' if want_finding else '0'}",
+                rule=RULE_HARNESS,
+            )
+
+
 def check_trust_inexpressible(
     loaded: dict[str, Any], schemas: dict[str, dict], registry: Registry
 ) -> None:
@@ -2639,6 +2815,7 @@ def main() -> int:
 
     check_schemas_valid(schemas)
     check_goal_file_forbidden_refs(schemas)
+    check_schema_dollar_newline_guards(schemas)
     caught = byte_caught = projection_caught = 0
     if not args.schemas_only:
         check_pairing(schemas)
@@ -2650,6 +2827,7 @@ def main() -> int:
             declared = read_declared_classes()
             check_claim_selftest()
             check_unit_claim_selftest()
+            check_dollar_newline_selftest()
             caught = check_negative_fixtures(loaded, schemas, registry, declared)
             byte_caught = check_byte_class_fixtures(declared)
             projector = load_projector()

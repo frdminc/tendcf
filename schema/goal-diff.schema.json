@@ -12,7 +12,10 @@
     "host": {
       "description": "Device public key, same identity rule as goal-file.schema.json#/properties/host.",
       "type": "string",
-      "pattern": "^ed25519:[0-9a-f]{64}$"
+      "pattern": "^ed25519:[0-9a-f]{64}$",
+      "not": {
+        "pattern": "\\n"
+      }
     },
     "baseline_sha256": {
       "description": "H(old canonical goal file) — the device's currently-approved baseline. Always present: a diff object presupposes a baseline to diff against, which is exactly what first adoption does not have (§9.4) — first adoption has no goal-diff object at all, only an approval record with no baseline_sha256.",
