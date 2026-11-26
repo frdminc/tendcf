@@ -3,7 +3,7 @@
 **Date:** 2026-08-15. **Author:** Claude Fable 5 (xhigh), independent pass.
 **Method:** the full corpus (guide, map, red-team, skeptical review,
 pre-mortem, synthesis, CFEngine feasibility note with its addendum treated as
-controlling, `schema/` + `examples/` + `bin/schema_lint.py`) was read in full
+controlling, `schema/` + `examples/` + `tools/schema_lint.py`) was read in full
 and a complete verdict — including the convergence check, a dissolution-table
 audit, a residue list, and all six schema-family decisions — was written down
 **before** opening `e1-adjudication-2026-08-15.md`. §§1–3 and §5 of this note
@@ -547,6 +547,6 @@ nothing in the corpus was unreadable or declined.
 - `docs/architecture/cfengine-feasibility-of-diff-plan-2026-08-15.md`
   (addendum controlling over body)
 - `schema/*.schema.json`, `examples/`, `examples/broken/`,
-  `bin/schema_lint.py` (the existing contract and its conventions)
+  `tools/schema_lint.py` (the existing contract and its conventions)
 - `docs/architecture/e1-adjudication-2026-08-15.md` (Part 2 only, opened
   after the §1–§3/§5 positions were written down)

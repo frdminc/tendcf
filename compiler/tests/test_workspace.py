@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from nix2cf.compile import CompileError, HostSpec, compile_host
-from nix2cf.sitemodel import Schemas, load_document, load_site_model
-from nix2cf.workspace import (
+from tendcf.compile import CompileError, HostSpec, compile_host
+from tendcf.sitemodel import Schemas, load_document, load_site_model
+from tendcf.workspace import (
     OverrideInput,
     WorkspaceError,
     _expand_path,
@@ -54,7 +54,7 @@ def _clean_env(tmp_path: Path, **extra: str) -> dict[str, str]:
     env = {
         k: v
         for k, v in os.environ.items()
-        if k not in {"TENDCF_OPS_ROOT", "TENDCF_SITE", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"}
+        if k not in {"TENDCF_DIR", "TENDCF_OPS_ROOT", "TENDCF_SITE", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"}
     }
     env["HOME"] = str(home)
     env["PYTHONPATH"] = str(REPO)
@@ -64,7 +64,7 @@ def _clean_env(tmp_path: Path, **extra: str) -> dict[str, str]:
 
 def _run_cli(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        [sys.executable, "-m", "nix2cf.cli", *args],
+        [sys.executable, "-m", "tendcf.cli", *args],
         capture_output=True,
         env=env,
         check=False,
@@ -85,8 +85,8 @@ def _plant_site(ops_root: Path, slug: str, *, with_public: bool = False, in_subd
 def _plant_tendcf_checkout(root: Path) -> Path:
     (root / "schema").mkdir(parents=True, exist_ok=True)
     (root / "schema" / "goal-file.schema.json").write_text("{}", encoding="utf-8")
-    (root / "bin").mkdir(parents=True, exist_ok=True)
-    (root / "bin" / "projector.py").write_text("", encoding="utf-8")
+    (root / "tools").mkdir(parents=True, exist_ok=True)
+    (root / "tools" / "projector.py").write_text("", encoding="utf-8")
     return root
 
 
@@ -437,7 +437,7 @@ def test_compile_result_records_override_taint_without_altering_goal_file(tmp_pa
         tainted.assert_releasable()
 
 
-# --- CLI integration: `nix2cf workspace` and `nix2cf buildfile` --------------
+# --- CLI integration: `tendcf workspace` and `tendcf compile` --------------
 
 
 def test_cli_workspace_json_human_list_and_check_releasable(tmp_path: Path) -> None:
@@ -449,7 +449,7 @@ def test_cli_workspace_json_human_list_and_check_releasable(tmp_path: Path) -> N
     override_dir = tmp_path / "local-alice"
     override_dir.mkdir()
 
-    env = _clean_env(tmp_path, TENDCF_DIR=str(_tendcf_root()))
+    env = _clean_env(tmp_path)
 
     # JSON output clean
     proc = _run_cli(["workspace", "--ops-root", str(ops), "--site-name", "djbclark", "--json", "--check-releasable"], env)
@@ -523,7 +523,7 @@ def test_cli_workspace_reads_config_file(tmp_path: Path) -> None:
     assert data["public_dir"] is None
 
 
-def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path) -> None:
+def test_cli_compile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path) -> None:
     tendcf = _tendcf_root()
     ops = tmp_path / "tendcf-ops"
     ops.mkdir()
@@ -537,7 +537,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     # Baseline compile via --site
     baseline = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -552,7 +552,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     # Compile via --ops-root + --site-name + --override-input
     ws_proc = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -567,7 +567,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     assert ws_proc.returncode == 0, ws_proc.stderr.decode()
     assert ws_proc.stdout == baseline.stdout
     err = ws_proc.stderr.decode()
-    assert "nix2cf: workspace: site=djbclark-lab source=cli" in err
+    assert "tendcf: workspace: site=djbclark-lab source=cli" in err
     assert "WARNING: dev-only --override-input active" in err
     assert "TAINTED (not releasable)" in err
     assert "not yet wired into compile_host" in err
@@ -576,7 +576,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     for extra in (["--site-name", "djbclark-lab"], ["--ops-root", str(ops)], ["--workspace"]):
         conflict = _run_cli(
             [
-                "buildfile",
+                "compile",
                 "--host", "mac",
                 "--platform", "macos",
                 "--supervisor", "launchd",
@@ -594,7 +594,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     env_with_site = _clean_env(tmp_path, TENDCF_DIR=str(tendcf), TENDCF_SITE="nonexistent-slug")
     explicit_ok = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -615,7 +615,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     )
     from_env = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -640,7 +640,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     )
     no_flag = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -655,7 +655,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     # With --workspace, XDG active-site IS read and succeeds
     with_ws_flag = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -672,7 +672,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
     # Invalid --override-input exits 2 cleanly without traceback
     bad_ov = _run_cli(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -690,7 +690,7 @@ def test_cli_buildfile_workspace_end_to_end_and_mutual_exclusion(tmp_path: Path)
 def test_extra_edge_cases_symlinks_oversized_and_fallback_tendcf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from nix2cf import cli
+    from tendcf import cli
 
     # Oversized and invalid UTF-8 active-site files fail closed.
     big = tmp_path / "big-site"
@@ -810,17 +810,17 @@ def test_extra_edge_cases_symlinks_oversized_and_fallback_tendcf(
     assert cli._tendcf_dir(None) is None
 
 
-def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
+def test_compile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from nix2cf import cli
+    from tendcf import cli
 
     ops = tmp_path / "ops-no-fallback"
     ops.mkdir()
     priv = _plant_site(ops, "alice", with_public=False)
     # Plant a fake <ops_root>/tendcf whose projector.py would raise if ever imported!
     fake_tendcf = _plant_tendcf_checkout(ops / "tendcf")
-    (fake_tendcf / "bin" / "projector.py").write_text(
+    (fake_tendcf / "tools" / "projector.py").write_text(
         "raise AssertionError('ops_root/tendcf projector must NEVER be auto-loaded')\n",
         encoding="utf-8",
     )
@@ -830,7 +830,7 @@ def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
     out_file = tmp_path / "out.json"
     rc = cli.main(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -849,7 +849,7 @@ def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
     # With --project and no --tendcf / TENDCF_DIR / in-tree checkout, buildfile fails closed (exit 2).
     rc_proj = cli.main(
         [
-            "buildfile",
+            "compile",
             "--host", "mac",
             "--platform", "macos",
             "--supervisor", "launchd",
@@ -864,7 +864,7 @@ def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
     assert rc_proj == 2
     assert "--project needs a tendcf checkout" in err_proj
 
-    # Hardening of <ops_root>/tendcf discovery: symlinks on tendcf/ or bin/projector.py fail closed.
+    # Hardening of <ops_root>/tendcf discovery: symlinks on tendcf/ or tools/projector.py fail closed.
     outside_tendcf = _plant_tendcf_checkout(tmp_path / "outside-tendcf")
     ops_link = tmp_path / "ops-tendcf-link"
     ops_link.mkdir()
@@ -877,13 +877,13 @@ def test_buildfile_never_falls_back_to_ops_root_tendcf_and_tendcf_hardening(
     assert inv_link.tendcf_dir is None
     assert any("local tendcf entry" in w for w in inv_link.warnings)
 
-    # Symlinked bin/projector.py inside real <ops_root>/tendcf fails closed.
+    # Symlinked tools/projector.py inside real <ops_root>/tendcf fails closed.
     ops_proj_link = tmp_path / "ops-proj-link"
     ops_proj_link.mkdir()
     _plant_site(ops_proj_link, "alice", with_public=False)
     td = _plant_tendcf_checkout(ops_proj_link / "tendcf")
-    (td / "bin" / "projector.py").unlink()
-    (td / "bin" / "projector.py").symlink_to(outside_tendcf / "bin" / "projector.py")
+    (td / "tools" / "projector.py").unlink()
+    (td / "tools" / "projector.py").symlink_to(outside_tendcf / "tools" / "projector.py")
     assert is_tendcf_checkout(td) is False
     with pytest.raises(WorkspaceError, match="is a symlink"):
         resolve_workspace(ops_root=ops_proj_link, site_name="alice", env={"HOME": str(tmp_path)})
@@ -991,7 +991,7 @@ def test_override_taint_output_gate_check_releasable_and_compile_host_mapping(tm
     env = _clean_env(tmp_path, TENDCF_DIR=str(tendcf))
     out_file = tmp_path / "tainted-goal.json"
     base_cmd = [
-        "buildfile",
+        "compile",
         "--host", "mac",
         "--platform", "macos",
         "--supervisor", "launchd",
@@ -1020,8 +1020,8 @@ def test_override_taint_output_gate_check_releasable_and_compile_host_mapping(tm
     assert refused_rel.returncode == 1
     assert b"REFUSED:" in refused_rel.stderr and refused_rel.stdout == b""
 
-    # --check-releasable without overrides -> exit 0!
-    ok_rel = _run_cli([*base_cmd, "--check-releasable"], env)
+    # --check-releasable without overrides and without TENDCF_DIR -> exit 0!
+    ok_rel = _run_cli([*base_cmd, "--check-releasable"], _clean_env(tmp_path))
     assert ok_rel.returncode == 0, ok_rel.stderr.decode()
 
 
@@ -1033,7 +1033,7 @@ def test_cli_hermetic_flag_checks_config_precedence_and_sole_checkout_workspace(
     env = _clean_env(tmp_path, TENDCF_DIR=str(tendcf))
 
     base = [
-        "buildfile",
+        "compile",
         "--host", "mac",
         "--platform", "macos",
         "--supervisor", "launchd",
@@ -1077,7 +1077,7 @@ def test_cli_hermetic_flag_checks_config_precedence_and_sole_checkout_workspace(
     assert all_explicit.returncode == 0, all_explicit.stderr.decode()
     assert b"workspace:" not in all_explicit.stderr
 
-    # nix2cf workspace: explicit --config beats ambient TENDCF_SITE, fails closed if missing,
+    # tendcf workspace: explicit --config beats ambient TENDCF_SITE, fails closed if missing,
     # and is mutually exclusive with --site-name.
     cfg = tmp_path / "explicit-active-site"
     cfg.write_text("alice\n", encoding="utf-8")
@@ -1100,7 +1100,7 @@ def test_cli_hermetic_flag_checks_config_precedence_and_sole_checkout_workspace(
     assert ws_conflict.returncode == 2
     assert b"cannot be combined" in ws_conflict.stderr
 
-    # CLI nix2cf workspace with no selector and a sole checkout exits 2 (no sole-dir glob).
+    # CLI tendcf workspace with no selector and a sole checkout exits 2 (no sole-dir glob).
     ws_sole = _run_cli(["workspace", "--ops-root", str(ops)], env)
     assert ws_sole.returncode == 2
     assert b"no site selected" in ws_sole.stderr

@@ -38,7 +38,7 @@ before any code.
 | `0d175ef` | `validate()` falls back to `error.schema_path` when the instance path is empty |
 | `b12ee79` | xref_lint scopes to the live corpus: 52 findings → 0 |
 | `c9e4e0e` | the projector mapping, adjudicated, three opinions checked in |
-| `d699fd6` | `bin/projector.py`, the 645-byte golden, 10 gated fixtures |
+| `d699fd6` | `tools/projector.py`, the 645-byte golden, 10 gated fixtures |
 | `630a4ed` | R21.1 withdrawn, replaced by C-1 |
 | `c6e317e` | CI gates on xref_lint as well as schema_lint |
 | `505393e` | the `Caught by` parentheticals made executable |
@@ -222,7 +222,7 @@ Four answers given up front, all still binding:
 
 1. **Settle the mapping by opinion panel, then adjudicate** — matching the
    existing `goal-file-schema-opinion-*` pattern.
-2. **`bin/projector.py` as reference implementation**, not spec-only and not
+2. **`tools/projector.py` as reference implementation**, not spec-only and not
    scaffolding tendcf-agent.
 3. **Queue:** schema_path fallback, executable README parentheticals,
    xref_lint findings, adversarial review — all four wanted.
@@ -245,7 +245,7 @@ at 12:11 the same day. The six hours passed as wall-clock, not as work.
    scratchpad/job-review-impl.md <out> opus high` (brief is also reproduced
    in that file). It asks the one question nothing else did: **can a
    projection be wrong under the reconciliation yet accepted by
-   `validate_projection()`, or can `bin/projector.py` be changed to emit
+   `validate_projection()`, or can `tools/projector.py` be changed to emit
    wrong bytes while `schema_lint` still says OK?** A ninth mutation that
    does not bite is a real hole. Nothing has verified this yet.
 2. **`device-trust`'s destination** — now the top open design question, per
@@ -266,12 +266,12 @@ at 12:11 the same day. The six hours passed as wall-clock, not as work.
 
 ```bash
 cd /Users/djbclark/src/tendcf && git log --oneline -8
-bin/schema_lint.py     # expect: OK (8 schemas, 59 negative, 6 byte-class, 10 projection)
-bin/xref_lint.py       # expect: 0 findings, 28 live / 54 frozen
-bin/xref_lint.py --why-frozen   # why each document is out of scope
-bin/projector.py examples/goal-file.json | cmp - examples/host_specific.json  # silent
+tools/schema_lint.py     # expect: OK (8 schemas, 59 negative, 6 byte-class, 10 projection)
+tools/xref_lint.py       # expect: 0 findings, 28 live / 54 frozen
+tools/xref_lint.py --why-frozen   # why each document is out of scope
+tools/projector.py examples/goal-file.json | cmp - examples/host_specific.json  # silent
 
-# The decided mapping, read this before touching bin/projector.py:
+# The decided mapping, read this before touching tools/projector.py:
 sed -n '1,60p' docs/architecture/projector-reconciliation-2026-08-16.md
 
 # Delegating a headless Claude job — do NOT use `cswap run N -- claude -p`,

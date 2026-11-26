@@ -348,7 +348,7 @@ moved from document to design on this test and are marked `[MOVED]`.**
 | DOC-5 | **Fixture wording.** Change `examples/services.yml` to say "the mesh VPN" so the guide's §16.B and the paper's §2.6 become the verbatim excerpts the paper explicitly guarantees. One edit; resolves both findings. Do **not** weaken the paper's provenance sentence. | F5, parity P1 |
 | DOC-6 | `common.schema.json` `$defs.release_stamp` cites guide §8; release stamping is §6. | F2 |
 | DOC-7 | `common.schema.json` cites `§12 Step 0` — v2 numbering. Build order is guide §18 / map §13. (`§0 rule 6` in the same file is correct against v3 — do not "fix" it.) | F3 |
-| DOC-8 | `bin/schema_lint.py` docstring says "Three layers" and lists four. | F6 |
+| DOC-8 | `tools/schema_lint.py` docstring says "Three layers" and lists four. | F6 |
 | DOC-20 | §16.A's illustrative augments carry only `LITELLM_MASTER_KEY`; the YAML declares `OPENAI_API_KEY` too. | skeptical F-16e |
 | DOC-21 | §16.A omits the second edge its own rule must derive: `caddy` requires `service:tailscaled`, on the same host in the same fixture. | skeptical F-16f |
 | DOC-23 | "Four ideas in this picture come from Bcfg2" undercounts — at least six are used (extra entries, Actions-as-interlocks, `buildfile`, revision stamping, `altsrc`, bundle-as-re-verification-scope). | skeptical F-2a |

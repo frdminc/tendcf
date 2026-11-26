@@ -33,12 +33,12 @@ Clean tree, `master` at `953b2ad`, pushed. Three commits:
 - `eeef627` — "schema: close the refused-iff-reject branch, both
   directions". 6 files.
 - `dddd31b` — "schema: make the negative harness targeted, and drop the
-  overlaid gate". 7 files, `bin/schema_lint.py` +453/-103.
+  overlaid gate". 7 files, `tools/schema_lint.py` +453/-103.
 - `953b2ad` — "schema: require refused paths to resolve, and give every
   class a fixture". 10 files.
 
-`uv run bin/schema_lint.py` → `schema-lint: OK (8 schemas, 59 negative
-fixtures, 6 byte-class fixtures)`. `python3 bin/xref_lint.py | grep -vE
+`uv run tools/schema_lint.py` → `schema-lint: OK (8 schemas, 59 negative
+fixtures, 6 byte-class fixtures)`. `python3 tools/xref_lint.py | grep -vE
 'reviews/|deprecated/|handoffs/'` → the same 3 pre-existing findings named
 in `0b22`, `7b18` and `4a48`, confirmed unchanged.
 
@@ -237,7 +237,7 @@ exactly 1 finding naming `approval-record-reject`; mutating `host` fires 2
 all absent — checked).
 
 **Files changed this session** (`git diff --stat ea5dafb..HEAD`, 19 files,
-+633/-130): `bin/schema_lint.py`, `schema/approval-record.schema.json`,
++633/-130): `tools/schema_lint.py`, `schema/approval-record.schema.json`,
 `examples/approval-record-reject.json`, `examples/broken-bytes/58-not-json.json`,
 `examples/broken/README.md`, reject-record overlays in cases 49/51/52/53/54,
 and new case dirs 59–65.
@@ -272,7 +272,7 @@ and new case dirs 59–65.
 2. **Small and concrete: the `<root>` instance path.** jsonschema reports
    an empty `error.path` for boolean subschemas, so case 57's finding names
    the offending value but not where it lives. Fix in `validate()` in
-   `bin/schema_lint.py` — fall back to `error.schema_path` when
+   `tools/schema_lint.py` — fall back to `error.schema_path` when
    `error.path` is empty. Verified empirically this session:
    `path=[] schema_path=['else','properties']`. ~15 minutes.
 3. **Decision needed, not just time: make `schema (...)` parentheticals
@@ -297,14 +297,14 @@ and new case dirs 59–65.
 ```bash
 cd ~/src/tendcf
 git log --oneline -3   # confirm HEAD is 953b2ad or a descendant
-uv run bin/schema_lint.py
+uv run tools/schema_lint.py
 # expect: schema-lint: OK (8 schemas, 59 negative fixtures, 6 byte-class fixtures)
-python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'
+python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'
 # expect: the same 3 pre-existing findings, unrelated
 
 # What governs the open item, and the vocabulary a new layer must join:
 sed -n '/^## 13\./,/^## 14\./p' docs/architecture/goal-file-schema-reconciliation-2026-08-15.md
-grep -n 'RULE_\w* = \|CLASSES_WITHOUT_FIXTURES\|DETAILED_RULE_HEADS' bin/schema_lint.py
+grep -n 'RULE_\w* = \|CLASSES_WITHOUT_FIXTURES\|DETAILED_RULE_HEADS' tools/schema_lint.py
 cat examples/broken/README.md          # all 65 cases; the "Caught by" column is executable
 ```
 
@@ -338,7 +338,7 @@ Prove the harness still bites before trusting a green run — deleting a
 rule must turn its case red, not just leave the lint green:
 
 ```bash
-cp bin/schema_lint.py /tmp/sl.bak
+cp tools/schema_lint.py /tmp/sl.bak
 python3 - <<'PY'
 import json, pathlib
 p = pathlib.Path("schema/goal-file.schema.json"); s = json.loads(p.read_text())
@@ -346,7 +346,7 @@ p.with_suffix(".json.bak").write_text(p.read_text())
 s["properties"]["schema_version"] = {"type": "integer"}   # const deleted
 p.write_text(json.dumps(s, indent=2) + "\n")
 PY
-uv run bin/schema_lint.py    # expect case 13 red: "declares 'schema', but ..."
+uv run tools/schema_lint.py    # expect case 13 red: "declares 'schema', but ..."
 mv schema/goal-file.schema.json.bak schema/goal-file.schema.json
-uv run bin/schema_lint.py    # expect OK again
+uv run tools/schema_lint.py    # expect OK again
 ```

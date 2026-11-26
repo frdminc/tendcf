@@ -17,7 +17,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 INSTALLER = REPO / "deploy" / "linux" / "tendcf-install.sh"
-PROJECTOR = REPO / "bin" / "projector.py"
+PROJECTOR = REPO / "tools" / "projector.py"
 CANARY_PRESENT = REPO / "deploy" / "linux" / "canary" / "host_specific.json"
 CANARY_ABSENT = REPO / "deploy" / "linux" / "canary" / "host_specific-absent.json"
 

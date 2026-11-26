@@ -17,7 +17,7 @@ Sources consulted: shared `mcp__firecrawl__*` search and scrape. Fetched: Gentoo
 | Piece | What it does | Evidence |
 |---|---|---|
 | `overlay/overlay.json` | Per component: upstream URL, fork URL, pinned `base`. Per patch: `file`, `commit`, `subject`, `register`, `fork_ref`, `upstream_pr` and its state, `role` (load-bearing / carrier), `retire_when`. Some patches add `why`, `load_bearing_for` or `acceptance_test`. | `overlay/overlay.json`; field dump run 2026-11-13 |
-| `bin/overlay.py` | `lint`, `status`, `check` (temporary index; the repo is never touched), `retired` (`git patch-id --stable`, RETIRE/VERIFY), `apply` (refuses a wrong base or a dirty tree), `export` (format-patch from a fork branch), `self-test` (13 behaviours on a synthetic upstream). Component names are not hardcoded. | `bin/overlay.py:135`, `:548-575`; `docs/architecture/upstream-overlay.md` §3–§6 |
+| `tools/overlay.py` | `lint`, `status`, `check` (temporary index; the repo is never touched), `retired` (`git patch-id --stable`, RETIRE/VERIFY), `apply` (refuses a wrong base or a dirty tree), `export` (format-patch from a fork branch), `self-test` (13 behaviours on a synthetic upstream). Component names are not hardcoded. | `tools/overlay.py:135`, `:548-575`; `docs/architecture/upstream-overlay.md` §3–§6 |
 | weekly `overlay-drift` job | Runs `check` against upstream master and the newest tag, then `retired --strict`. | `upstream-overlay.md` §5 |
 | `overlay/fork.json` | Since the 2026-10-29 ruling, Linux runs the **full fork** pinned by commit on `tendcf-integration`. That branch is refreshed by merging, not rebasing. | `upstream-overlay.md` §2 "Ruling, 2026-10-29" |
 | change-process rule 5 | "A tool fork is never an input of its own". Binaries enter a release only as digests. | `docs/architecture/change-process.md:121-125` |
@@ -68,7 +68,7 @@ Test of the hypothesis "Nix-style declarative patches, rebuilt by a builder, com
 3. no "upstream already has this" detection;
 4. no account a non-programmer can read.
 
-`bin/overlay.py` has items 2 and 3 already (`check`, `retired`), so overlay.py plus a Nix-style builder is closer than either alone.
+`tools/overlay.py` has items 2 and 3 already (`check`, `retired`), so overlay.py plus a Nix-style builder is closer than either alone.
 
 **The upkeep loop already happens in the wild.** In https://github.com/jdguillot/.dotfiles/pull/32 (2026-10-20), a scheduled workflow bumped inputs and `applyPatches` failed. An agent found that upstream had absorbed two of the five patches and deleted them. It checked that the other three still apply and still fix open issues (it cites the issue numbers), rebuilt all 7 hosts, and pushed to attic and cachix. It then wrote a plain account ending "Written by the agent that made the change. Read the diff outside the lock files carefully."
 
@@ -223,12 +223,12 @@ Any failed gate means no ChangePlan is issued. The device stays on the last good
 
 ### X-forks-04: require `intent` per patch in the manifest
 
-**Target:** `overlay/overlay.json` (every patch) and `bin/overlay.py` `lint()`
+**Target:** `overlay/overlay.json` (every patch) and `tools/overlay.py` `lint()`
 **Kind:** add
 **Goal:** G9, G4
 **Weight:** improves
 **Finding:** The three carriers have `why`, the three load-bearing patches have `load_bearing_for`, one has `acceptance_test`, and none has a uniform statement of what the patch is for. G9's re-derive-from-intent loop needs one plain sentence per patch, linted, and an executable check where one exists.
-**Evidence:** field dump of `overlay/overlay.json` run 2026-11-13; `bin/overlay.py:179` (`lint`)
+**Evidence:** field dump of `overlay/overlay.json` run 2026-11-13; `tools/overlay.py:179` (`lint`)
 **Proposed text:**
 
 > Each patch entry gains `"intent": "<one plain sentence a non-programmer can approve>"`, and `lint` reports a patch without one. `acceptance_test` becomes `check`: a test path or command, which `self-test` proves fails without the patch and passes with it.
@@ -315,15 +315,15 @@ Any failed gate means no ChangePlan is issued. The device stays on the last good
 
 ### X-forks-10: line-count claim is stale
 
-**Target:** `docs/architecture/upstream-overlay.md` §8 item 4, at "`bin/overlay.py` is under 600 lines"
+**Target:** `docs/architecture/upstream-overlay.md` §8 item 4, at "`tools/overlay.py` is under 600 lines"
 **Kind:** correct
 **Goal:** G7
 **Weight:** nit
 **Finding:** The file is 626 lines.
-**Evidence:** `wc -l bin/overlay.py` printed `626`
+**Evidence:** `wc -l tools/overlay.py` printed `626`
 **Proposed text:**
 
-> `bin/overlay.py` is about 600 lines with no dependency but git.
+> `tools/overlay.py` is about 600 lines with no dependency but git.
 
 **Merge:** replace that sentence
 **Checked:** verified; independently checked 2026-11-13: confirmed

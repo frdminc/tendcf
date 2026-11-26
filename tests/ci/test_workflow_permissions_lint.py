@@ -1,4 +1,4 @@
-"""Unit tests for bin/workflow_permissions_lint.py (issue #63).
+"""Unit tests for tools/workflow_permissions_lint.py (issue #63).
 
 Run with:
     uv run --with pyyaml python -m unittest discover -s tests/ci -v
@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent.parent
-LINT_PATH = REPO / "bin" / "workflow_permissions_lint.py"
+LINT_PATH = REPO / "tools" / "workflow_permissions_lint.py"
 
 spec = importlib.util.spec_from_file_location("workflow_permissions_lint", LINT_PATH)
 assert spec is not None and spec.loader is not None

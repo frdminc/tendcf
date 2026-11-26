@@ -29,7 +29,7 @@ compiler into tendcf (map D46).
 
 Site Model contract (JSON Schema, fixtures, lint):
 [`../../schema/`](../../schema/), [`../../examples/`](../../examples/),
-[`../../bin/schema_lint.py`](../../bin/schema_lint.py).
+[`../../tools/schema_lint.py`](../../tools/schema_lint.py).
 
 Older numbered versions and panel drafts live in
 [`deprecated/`](deprecated/). Dated `*-2026-08-13.md` notes in this

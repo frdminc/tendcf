@@ -28,13 +28,13 @@ up to date.
 | 134 findings; 129 byte-identical; 5 `<root>` changed (11, 41, 51, 56, 57) | 0d175ef | **FALSE** (off by one) | `validate_loaded` over all 59 cases: **133** findings. **128** byte-identical, **5** changed, **0** rule-class changes. The five are exactly 11, 41, 51, 56, 57. After-text for 57 is `<root> (schema else/properties): False schema does not allow ['hunks/supervision/service/…']`. |
 | 43 §19.x findings | b12ee79 | **FALSE** | **41** lines contain `§19.` (all in frozen reviews/E1). |
 | “Four of the seven findings” in `docs/handoffs/*` are §9.12 | b12ee79 | **FALSE** | **8** handoff findings, **6** of them `§9.12`, in 4 files. |
-| “had for weeks” (xref exit 1 / 52 findings) | b12ee79 | **FALSE** | `bin/xref_lint.py` first commit `aeb75d7` is **2026-08-15**; b12ee79 is **2026-08-16**. One day. |
+| “had for weeks” (xref exit 1 / 52 findings) | b12ee79 | **FALSE** | `tools/xref_lint.py` first commit `aeb75d7` is **2026-08-15**; b12ee79 is **2026-08-16**. One day. |
 | List-item `8. **Question?**` invents **279** ids; silently resolves `E1 §1.4` and `§6.6` | b12ee79 | **FALSE** on 279; **TRUE** on the two E1 ids | Same rule on the b12ee79 tree invents **253** ids (264 at HEAD). E1 has `## 1` / `## 6` and no `1.4`/`6.6`; the extra parser invents both. Guide §19 is an ordered list; `19.8` is item 8. |
 | `grep '"number"' schema/*.json` empty | recon P-6.6 | **TRUE** | No `"number"` in `schema/*.json`. |
 | Three `schema (pattern)` cells backticked | 505393e | **TRUE** | 31, 32, 35: `schema (pattern)` → `schema (\`pattern\`)`. |
-| Five handoffs contain the grep | b12ee79 | **TRUE** | Five `HANDOFF_*.md` files contain `python3 bin/xref_lint.py \| grep -vE 'reviews/\|deprecated/\|handoffs/'`. |
-| `check.yml` ran schema_lint alone until c6e317e | c6e317e, b12ee79 | **TRUE** | b12ee79 workflow has only Schema lint; c6e317e adds `bin/xref_lint.py`. |
-| No document edited | b12ee79 | **TRUE** | `--stat`: `bin/xref_lint.py` only. |
+| Five handoffs contain the grep | b12ee79 | **TRUE** | Five `HANDOFF_*.md` files contain `python3 tools/xref_lint.py \| grep -vE 'reviews/\|deprecated/\|handoffs/'`. |
+| `check.yml` ran schema_lint alone until c6e317e | c6e317e, b12ee79 | **TRUE** | b12ee79 workflow has only Schema lint; c6e317e adds `tools/xref_lint.py`. |
+| No document edited | b12ee79 | **TRUE** | `--stat`: `tools/xref_lint.py` only. |
 | projector PEP-723 deps ⊂ schema_lint | c6e317e | **TRUE** | projector: `rfc8785`. schema_lint: `pyyaml`, `jsonschema>=4.21`, `rfc3339-validator`, `rfc8785`. Import is `importlib` by path. |
 | Three of 27 live docs live in frozen directories | b12ee79 | **TRUE** | `docs/{handoffs,paper/reviews,architecture/deprecated}/README.md`. Still true at HEAD. |
 
@@ -66,7 +66,7 @@ All eight go red. Restore left that copy matching HEAD.
 | `propertyNames` → `additionalProperties` (case 37) | red | **TRUE** `declares 'additionalProperties' … reported ['pattern', 'propertyNames']` |
 | `abs_path` → `absent` (case 24) | stays green | **TRUE** `schema-lint: OK` |
 
-`properties` / `additionalProperties` are absent from `APPLICATORS` in `bin/schema_lint.py` as claimed.
+`properties` / `additionalProperties` are absent from `APPLICATORS` in `tools/schema_lint.py` as claimed.
 
 ---
 
@@ -118,7 +118,7 @@ R21 register at `reconciliation:1233` has no arrows: “policy-free by disciplin
 
 Fable arrow one is ``nix2cf_services`-style containers`` (same lines). C-9 demotes guide §16.A’s illustration as a shape that does not load. **TRUE.**
 
-630a4ed “no code changes beyond one stale citation”: `--stat` is `bin/projector.py` `R21.1`→`C-1` (one line of comment), plus recon + two review files. Golden / ten fixtures / mapping code untouched. **TRUE.**
+630a4ed “no code changes beyond one stale citation”: `--stat` is `tools/projector.py` `R21.1`→`C-1` (one line of comment), plus recon + two review files. Golden / ten fixtures / mapping code untouched. **TRUE.**
 
 3-0 refusal of “tombstones → the negative-promise lists”: Gemini, Grok, Cursor all refuse a sibling absent-list / split on `state`. **TRUE.**
 

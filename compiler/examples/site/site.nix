@@ -2,7 +2,7 @@
 #
 # This is the "Nix-expressed input" path in its smallest honest form: a plain
 # attribute set that `nix-instantiate --eval --strict --json` turns into the
-# JSON the compiler consumes (`nix2cf eval-nix examples/site/site.nix`). No
+# JSON the compiler consumes (`tendcf eval-nix examples/site/site.nix`). No
 # nixpkgs, no `lib`, no module system: the D12 frontend (mkOption / mkIf /
 # mkDefault, paper §2.6's illustrative edge-http.nix) is NOT built, and the
 # name nix2cf is historical — YAML/JSON stays the wire format and the path a

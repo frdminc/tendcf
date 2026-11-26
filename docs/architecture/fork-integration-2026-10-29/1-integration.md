@@ -108,18 +108,18 @@ core:
 3. Tests that asserted a non-UTF-8 byte round-trips through `\u00XX` were changed to expect the conformant decoding (`c3 a9`), in both repos. Raw-output assertions (byte must be escaped, never written raw) were kept. The register already records this as needing an upstream design decision (replacement char / error / raw field); nothing was silently dropped.
 4. `fix/process-darwin` treated as retired (upstream `process_macos.c`), per the brief's "take upstream and note it".
 5. Only libntech was compiled, as the one hand-written semantic merge: `load-watch ci decide ~/src/libntech-integration-wt local` recorded, run via `~/ops/site-private/bin/bg`, `make -j2`; `json_test`, `hash_init_fail_test`, `mustache_test` all pass (`rc=0` each; mustache "All 17 tests passed"). The first run failed 3 json assertions and led to the `length <= 1` fix; the merge commit was amended before pushing. Core was not built (brief: prefer skipping; CI builds it).
-6. Overlay check, quoted verbatim. `bin/overlay.py check` is an apply-test and cannot say "already present"; `retired` (patch-id match) is the mode that does:
+6. Overlay check, quoted verbatim. `tools/overlay.py check` is an apply-test and cannot say "already present"; `retired` (patch-id match) is the mode that does:
    ```
-   $ python3 bin/overlay.py check core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration
+   $ python3 tools/overlay.py check core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration
    core: base a0bca6aaf310; checking against tendcf-integration = 9fdf67cecf4e  (NOT the pinned base: drift check)
    DRIFT: core/0001-Rejected-CMDB-data-now-names-the-offending-entry-and.patch does not apply to tendcf-integration (9fdf67cecf4e):
        error: patch failed: libpromises/cmdb.c:67
        error: tests/acceptance/.../12-variable-references-name-offender.cf: already exists in index   (…and 3 more "already exists")
-   $ python3 bin/overlay.py retired core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration
+   $ python3 tools/overlay.py retired core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration
    core: 149 upstream commit(s) in a0bca6aaf310..tendcf-integration
      RETIRE  0001-Rejected-CMDB-data-now-names-the-offending-entry-and.patch: identical change is upstream as 958d13949d5b
      RETIRE  0002-Fixed-one-bad-CMDB-entry-discarding-every-entry-in-i.patch: identical change is upstream as 8f0076b814e8
-   $ python3 bin/overlay.py retired libntech --repo ~/src/libntech-integration-wt --against tendcf-integration
+   $ python3 tools/overlay.py retired libntech --repo ~/src/libntech-integration-wt --against tendcf-integration
    libntech: 13 upstream commit(s) in 0c0620d6c5f8..tendcf-integration
      RETIRE  0001-…JSON-string.patch: identical change is upstream as 90cf8cc08ca5
      RETIRE  0002-…decoding-backslash-esca.patch: identical change is upstream as 3c9e4573a595

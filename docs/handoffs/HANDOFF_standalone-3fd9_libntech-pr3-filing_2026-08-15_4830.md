@@ -281,5 +281,5 @@ cd ~/src/tendcf && ls docs/architecture/goal-file-schema-opinion-*.md
 #   GOAL-FILE-SCHEMA-BRIEF.md and e1-adjudication-xhigh-2026-08-15.md are the brief
 
 # Schema lint — MUST be run this way; bare python3 fails on jsonschema
-uv run --with jsonschema bin/schema_lint.py
+uv run --with jsonschema tools/schema_lint.py
 ```

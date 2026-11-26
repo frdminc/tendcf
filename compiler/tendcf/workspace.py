@@ -1,4 +1,4 @@
-"""Multi-site local ops workspace resolution for tendcf / nix2cf (issue #98).
+"""Multi-site local ops workspace resolution for tendcf (issue #98).
 
 Layout under `~/tendcf-ops` (override: `--ops-root` or `TENDCF_OPS_ROOT`):
 
@@ -125,8 +125,8 @@ class SiteInventory:
 class WorkspaceResolution:
     """Resolved pair-bound workspace for a single site slug.
 
-    `tendcf_dir` is strictly informational (for `nix2cf workspace` inspection/tooling);
-    `buildfile` never auto-loads schemas or `bin/projector.py` from `<ops_root>/tendcf`.
+    `tendcf_dir` is strictly informational (for `tendcf workspace` inspection/tooling);
+    `tendcf compile` never auto-loads schemas or `tools/projector.py` from `<ops_root>/tendcf`.
     """
 
     ops_root: Path
@@ -352,7 +352,7 @@ def _check_tendcf_dir(ops_root: Path) -> Path | None:
 
     Fails closed (`WorkspaceError`) if `<ops_root>/tendcf` exists as a symlink or
     non-directory, has wrong casing, or has symlinked/non-regular `schema/`,
-    `schema/goal-file.schema.json`, `bin/`, or `bin/projector.py`.
+    `schema/goal-file.schema.json`, `tools/`, or `tools/projector.py`.
     Returns `None` if `<ops_root>/tendcf` does not exist or is a plain directory
     that does not contain both checkout markers.
     """
@@ -374,17 +374,17 @@ def _check_tendcf_dir(ops_root: Path) -> Path | None:
         if schema_dir is not None
         else None
     )
-    bin_dir = _inspect_real_subpath(
-        tendcf_root, "bin", expect="dir", root_label="local tendcf bin directory"
+    tools_dir = _inspect_real_subpath(
+        tendcf_root, "tools", expect="dir", root_label="local tendcf tools directory"
     )
     projector_file = (
         _inspect_real_subpath(
-            bin_dir,
+            tools_dir,
             "projector.py",
             expect="file",
             root_label="local tendcf projector",
         )
-        if bin_dir is not None
+        if tools_dir is not None
         else None
     )
     if schema_file is None or projector_file is None:
@@ -410,13 +410,13 @@ def is_tendcf_checkout(path: Path) -> bool:
         schema_file = _inspect_real_subpath(
             schema_dir, "goal-file.schema.json", expect="file", root_label="tendcf goal-file schema"
         )
-        bin_dir = _inspect_real_subpath(
-            resolved, "bin", expect="dir", root_label="tendcf bin directory"
+        tools_dir = _inspect_real_subpath(
+            resolved, "tools", expect="dir", root_label="tendcf tools directory"
         )
-        if bin_dir is None:
+        if tools_dir is None:
             return False
         projector_file = _inspect_real_subpath(
-            bin_dir, "projector.py", expect="file", root_label="tendcf projector"
+            tools_dir, "projector.py", expect="file", root_label="tendcf projector"
         )
         return schema_file is not None and projector_file is not None
     except WorkspaceError:

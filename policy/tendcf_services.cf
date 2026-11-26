@@ -203,7 +203,7 @@
 #     a `variables` section (after `vars`; upstream CFEngine lets it replace a
 #     same-named variable, the fork at the pin refuses a file that names one
 #     variable twice) and a `classes` section (which can define `interlock_ok_*`);
-#     the projector emits neither (N-2, bin/projector.py check_projection), so
+#     the projector emits neither (N-2, tools/projector.py check_projection), so
 #     any other top-level key is refused rather than compared;
 #   - every key under `vars` must be a plain identifier of 1-64 characters
 #     ([A-Za-z0-9_]{1,64}). The loader reads a key as a variable reference
@@ -750,7 +750,7 @@ bundle agent tendcf_interlocks
       # argv-shifting on hand-installed/schema-skipped files (Step 2).
       #
       # Schema v9's strict `common.schema.json#/$defs/interlock_argv` alphabet
-      # and `bin/projector.py`'s matching check are intentionally kept intact
+      # and `tools/projector.py`'s matching check are intentionally kept intact
       # (no schema version bump; operator ruling 2026-11-25).
       "tendcf_interlock_$(interlock_safe_ids)"
         usebundle => tendcf_interlock_run("$(interlock_safe_ids)"),

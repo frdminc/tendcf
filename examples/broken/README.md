@@ -1,7 +1,7 @@
 # Negative fixtures
 
 Two hundred forty-six deliberately broken overlays, plus six byte-class fixtures in
-the sibling `examples/broken-bytes/`. `bin/schema_lint.py` must catch
+the sibling `examples/broken-bytes/`. `tools/schema_lint.py` must catch
 every one; a case that validates is a lint failure.
 
 Each directory here replaces the happy-path file of the same name under
@@ -10,7 +10,7 @@ family (the goal-file cases of 13-73, 93-106, 108-122, 124-142, 155-159, 161-166
 Cases 113-155 are schema v5's ([schema-v5-dpkg-reconciliation-2026-11-02.md](../../docs/architecture/schema-v5-dpkg-reconciliation-2026-11-02.md) §5; slice S2): 113-154 are the numbers that spec assigns (129-131 landed earlier, at v4, with
 the tombstone rule of that document's §2.2(4), slice S0; 145 is a projection case in `../broken-projection/`), and 155 is R5's cross-domain case, for which the spec reserves no number. Cases 156-176 are schema v6's (the Site Model ones, 160, 167-168 and 174-175, are `services.yml` contract_version 2's): the interlock `pre_action` argv alphabet (C-policy-01; below). Cases 177-183 are schema v7's: the approval record's `record_kind`, `signer` and `sig_alg` (issue 64; below).
 
-**The "Caught by" column is executable.** `bin/schema_lint.py` reads these
+**The "Caught by" column is executable.** `tools/schema_lint.py` reads these
 tables back and requires each case to be caught by the class its row
 declares — a case that fires only findings from some other layer is a lint
 failure, as is a fixture with no row here or a row naming no fixture on
@@ -33,7 +33,7 @@ machine-checked claim (see "The `Caught by` parentheticals are executable
 too"): under `schema` the keyword or def under test, under
 `family (ceremony)` the approval record that must carry the finding; bare
 words beside one are prose. The full vocabulary is `RULE_CLASSES` in
-`bin/schema_lint.py`; a cell naming anything else is a lint failure too.
+`tools/schema_lint.py`; a cell naming anything else is a lint failure too.
 
 | # | Case | Broken input | Caught by |
 | --- | --- | --- | --- |
@@ -288,7 +288,7 @@ Cases 96-99, 105 and 106 start from a valid `nixos` goal file: the happy `device
 supervisor `nixos`, `supervision` `deliberately-unmanaged`, and no other
 domain. Each case then introduces exactly one defect, so deleting the rule
 it names turns it green alone (F8). The rule-by-rule deletion table is in the
-body of https://github.com/frdminc/tendcf/pull/27; `bin/flag_coverage.py` covers `check_projection()` only, so it does
+body of https://github.com/frdminc/tendcf/pull/27; `tools/flag_coverage.py` covers `check_projection()` only, so it does
 not apply to schema rules.
 
 | # | Case | Broken input | Caught by |
@@ -577,7 +577,7 @@ Schema v9 (issue #103, `services.schema.json` `contract_version: 4`) widens `uni
 
 ## Trailing-newline pattern guards (267-274)
 
-Issue #55 (operator ruling R8, no extra `schema_version` bump in the current window): Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`, where `$` matches before a trailing `\n` (unlike JSON Schema ECMA-262 `$`). Every `$`-anchored `pattern` across all 8 schemas now carries a sibling `"not": { "pattern": "\\n" }` guard, enforced mechanically by `check_schema_dollar_newline_guards()` in `bin/schema_lint.py`. Cases 267-274 pin the critical sites named in issue #55 and comment `7046830857` (each is JCS-canonical bytes with one trailing `\n` defect).
+Issue #55 (operator ruling R8, no extra `schema_version` bump in the current window): Python's `jsonschema` evaluates JSON Schema `pattern` with Python `re`, where `$` matches before a trailing `\n` (unlike JSON Schema ECMA-262 `$`). Every `$`-anchored `pattern` across all 8 schemas now carries a sibling `"not": { "pattern": "\\n" }` guard, enforced mechanically by `check_schema_dollar_newline_guards()` in `tools/schema_lint.py`. Cases 267-274 pin the critical sites named in issue #55 and comment `7046830857` (each is JCS-canonical bytes with one trailing `\n` defect).
 
 | # | Case | Broken input | Caught by |
 |---|------|--------------|-----------|
@@ -592,7 +592,7 @@ Issue #55 (operator ruling R8, no extra `schema_version` bump in the current win
 
 ## Systemd `command[0]` prefix and uniform control/noncharacter guards (278-279)
 
-Issue #54 R1 + operator rulings Q1 & Q2 (`Ref: ANTIGRAVITY-120`, 2026-11-25, extending R8 in-place at `schema_version: 9` / `services.schema.json` `contract_version: 4` with no extra bump): systemd's `config_parse_exec()` unquotes `firstword` before parsing `;` and executable prefixes (`@`, `-`, `:`, `+`, `!`, `|`), so systemd `command[0]` requires a leading `/` and non-trailing `/` (`prefixItems[0]`), and `[\u0000-\u001f\u007f\ufffe\uffff]` is banned uniformly across `abs_path`, service `command[]`, and `bin/projector.py`.
+Issue #54 R1 + operator rulings Q1 & Q2 (`Ref: ANTIGRAVITY-120`, 2026-11-25, extending R8 in-place at `schema_version: 9` / `services.schema.json` `contract_version: 4` with no extra bump): systemd's `config_parse_exec()` unquotes `firstword` before parsing `;` and executable prefixes (`@`, `-`, `:`, `+`, `!`, `|`), so systemd `command[0]` requires a leading `/` and non-trailing `/` (`prefixItems[0]`), and `[\u0000-\u001f\u007f\ufffe\uffff]` is banned uniformly across `abs_path`, service `command[]`, and `tools/projector.py`.
 
 | # | Case | Broken input | Caught by |
 |---|------|--------------|-----------|
@@ -615,7 +615,7 @@ from.
 
 The five §13 byte-class negatives, plus one for bytes that are not JSON. These are not overlays: each is a whole
 alternate `goal-file.json` checked as **raw bytes, before the parse**, and
-`bin/schema_lint.py` runs only its byte layer over them.
+`tools/schema_lint.py` runs only its byte layer over them.
 
 That narrowness is the point, and it is measured rather than assumed. Run
 44, 45, 46 and 48 through every *other* layer in the lint — schema,
@@ -660,7 +660,7 @@ integer — neither alone is enough.
 
 These are not broken *inputs*. Each is a broken **output** — a
 `host_specific.json` a faulty or hostile projector might emit — and the
-layer that refuses them is `validate_projection()` in `bin/projector.py`,
+layer that refuses them is `validate_projection()` in `tools/projector.py`,
 invoked over raw bytes for the same reason the byte class is: a
 pretty-printed projection, a trailing newline and a float spelling all
 parse to the document the golden parses to, so nothing downstream of the
@@ -722,7 +722,7 @@ Cases 84–92 are not attacks. Each exists because neutering one `flag()` call
 site in `check_projection()` left the whole gate green — the rule had no
 fixture that tripped it *alone*, so it could be deleted unnoticed. That is
 F8 of the adversarial review, and the tool that measures it is
-`bin/flag_coverage.py`. Case 84 is the important one: the closed-container
+`tools/flag_coverage.py`. Case 84 is the important one: the closed-container
 rule is what M7 credited with catching a tombstone split, and until 84 every
 fixture that reached it also tripped the trust-key rule beside it, so the two
 masked each other.

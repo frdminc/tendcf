@@ -393,8 +393,8 @@ a book: `site-private/AGENTS.md` ("Book knowledge base").
   (the all-or-nothing loader and the strict parse; `upstream-overlay.md` §4,
   §7) and runs `cmdb_test`, libntech's `json_test`/`mustache_test`, the
   `06_host_specific_data` acceptance directory and `run.sh` with
-  `TENDCF_REQUIRE_FORK_LOADER=1` on it. Moving the pin is a commit. `check.yml` runs `bin/schema_lint.py`,
-  `bin/xref_lint.py`, `bin/overlay.py lint`, the canary check and `shellcheck`.
+  `TENDCF_REQUIRE_FORK_LOADER=1` on it. Moving the pin is a commit. `check.yml` runs `tools/schema_lint.py`,
+  `tools/xref_lint.py`, `tools/device_boundary_lint.py`, `tools/overlay.py lint`, the canary check and `shellcheck`.
 - Plan and status: `docs/architecture/linux-targets.md` §3; the NixOS side in
   `docs/architecture/nixos-passthrough-plan.md`. Live hosts: pastebin (root
   install, canary enforced), get.sipb.cloud (module installed, nothing scheduled).

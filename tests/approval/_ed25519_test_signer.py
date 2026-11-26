@@ -2,7 +2,7 @@
 
 WARNING: Uses variable-time Python big-integer scalar multiplication and is
 STRICTLY for hermetic test fixtures and RFC 8032 vector verification. NEVER use
-this helper for production private keys; `bin/approval_enforce.py` exports
+this helper for production private keys; `tools/approval_enforce.py` exports
 public-input verification only.
 """
 

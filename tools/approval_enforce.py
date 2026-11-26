@@ -2,12 +2,12 @@
 """Pure-stdlib reference enforcement engine for tendcf v9 approval records (issue #76).
 
 Runs under `python3 -I -S` with zero third-party packages, matching
-`bin/projector.py`'s bare-host stdlib guarantee.
+`tools/projector.py`'s bare-host stdlib guarantee.
 
 Implements:
   - Strict JSON parsing (duplicate-key rejection, NaN/Infinity rejection, NFC check),
     type-preserving JCS equality (`jcs_equal`), and RFC 8785 JCS canonicalization
-    reused directly from `bin/projector.py`.
+    reused directly from `tools/projector.py`.
   - Pure-stdlib RFC 8032 Ed25519 public-input verification with strict canonical
     encodings (`0 <= S < L`, canonical public key `A` and `R` with `y < p` and
     `(x == 0 && sign == 1)` rejected, small-order `A` and small-order `R` rejected,
@@ -53,7 +53,7 @@ from typing import Any, Callable, Collection, Iterator
 
 
 # ---------------------------------------------------------------------------
-# Load bin/projector.py for shared pure-stdlib RFC 8785 JCS canonicalization
+# Load tools/projector.py for shared pure-stdlib RFC 8785 JCS canonicalization
 # ---------------------------------------------------------------------------
 
 def _load_projector_module() -> Any:

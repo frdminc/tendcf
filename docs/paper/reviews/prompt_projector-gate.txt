@@ -12,7 +12,7 @@ it look tidy".
 
 ## What matters most, in order
 
-1. **`bin/projector.py` correctness.** It is 534 lines, written in one pass
+1. **`tools/projector.py` correctness.** It is 534 lines, written in one pass
    by an agent that hit its quota and died before testing it. A later audit
    said it was faithful, but that audit was itself a single pass. Read the
    code against `docs/architecture/projector-reconciliation-2026-08-16.md`
@@ -21,13 +21,13 @@ it look tidy".
    - a refusal that should be an acceptance (over-strict)
    - any place the code and the reconciliation disagree
    - crashes on malformed-but-plausible goal files
-   Probe it with real inputs in a temp dir outside the repo. `./bin/projector.py
+   Probe it with real inputs in a temp dir outside the repo. `./tools/projector.py
    examples/goal-file.json` runs it; `validate_projection(raw)` is importable.
 
 2. **Can you defeat the gate?** This is the highest-value question. Construct
    a projection that is WRONG under the reconciliation but which
-   `validate_projection()` accepts, or a change to `bin/projector.py` that
-   produces wrong output while `bin/schema_lint.py` still reports OK. The
+   `validate_projection()` accepts, or a change to `tools/projector.py` that
+   produces wrong output while `tools/schema_lint.py` still reports OK. The
    session claims eight mutations all bite; find a ninth that does not.
 
 3. **The new `schema (...)` parenthetical check** (505393e). It walks the RAW
@@ -45,7 +45,7 @@ it look tidy".
    `FROZEN` in xref_lint (b12ee79) and `OUTPUT_ONLY_EXAMPLES` in schema_lint
    (d699fd6). Each is argued as policy, not suppression. Check that argument
    — is any LIVE document or authored fixture now escaping a check it used to
-   face? `bin/xref_lint.py --all` and `--why-frozen` exist.
+   face? `tools/xref_lint.py --all` and `--why-frozen` exist.
 
 ## Rules
 

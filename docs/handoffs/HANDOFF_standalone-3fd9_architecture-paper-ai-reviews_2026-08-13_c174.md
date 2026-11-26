@@ -331,7 +331,7 @@ gemini --model gpt-oss-120b-medium --print-timeout 10m -p "$(cat full.txt)"
 
 # State:
 cd ~/src/tendcf && git log --oneline -4   # f9f8f87 at HEAD, clean, pushed
-cd ~/src/nix2cf && ./bin/schema_lint.py      # expect: OK (5 schemas), exit 0
+cd ~/src/nix2cf && ./tools/schema_lint.py      # expect: OK (5 schemas), exit 0
 ```
 
 Two gotchas worth not rediscovering: `session_log.py write` requires

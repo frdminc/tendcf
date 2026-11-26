@@ -1379,6 +1379,8 @@ resolve_projector_src() {
     if [ -z "$projector_src" ]; then
         if [ -e "$here/bin/projector.py" ] || [ -L "$here/bin/projector.py" ]; then
             projector_src="$here/bin/projector.py"
+        elif [ -e "$here/../../tools/projector.py" ] || [ -L "$here/../../tools/projector.py" ]; then
+            projector_src="$here/../../tools/projector.py"
         elif [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
             projector_src="$here/../../bin/projector.py"
         else

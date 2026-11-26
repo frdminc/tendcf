@@ -7,7 +7,7 @@ STATUS: complete (read-only run; delivered as final message)
 
 Design lead: Opus 5.5 high. Repo read: `/Users/djbclark/src/tendcf-review-policy-wt` at branch `review-policy-rule` (9118bb1).
 
-**What I could not do.** I had no shell in this run. That means I did not run `book-kb`, `graft`, `bin/schema_lint.py`, `check.py`, `nix` or anything on get. Every CFEngine claim below comes from repo code or comments, not from the book, and is marked [code]. Every jsonschema error string is written from memory and marked [mem]. Settled facts 1–4 are taken from the brief as given.
+**What I could not do.** I had no shell in this run. That means I did not run `book-kb`, `graft`, `tools/schema_lint.py`, `check.py`, `nix` or anything on get. Every CFEngine claim below comes from repo code or comments, not from the book, and is marked [code]. Every jsonschema error string is written from memory and marked [mem]. Settled facts 1–4 are taken from the brief as given.
 
 ## A. Problem, and what D1–D3 require
 
@@ -27,7 +27,7 @@ The reverse-DNS unit-writer prefix pattern (`goal-file.schema.json:243`) cannot 
   - The cost: a lint is needed to keep `supervisor` from becoming a second spelling of the unit flavour. Reconciliation §7 rejected a platform field for exactly that reason (`goal-file-schema-reconciliation-2026-08-15.md:380-383`).
 - **Q2 — where it lives.** Is it a singleton `device-trust` kind (recommended) or a literal top-level header field? See B.1.
 - **Q3 — supervision coverage on a nixos host.** Should it be `deliberately-unmanaged` (recommended) or `comprehensive` with no entries?
-  - `deliberately-unmanaged` gets "no entries" from the existing `if/then` (`goal-file.schema.json:47-51`), and leaving it later is a privileged ceremony (`bin/schema_lint.py:1502`).
+  - `deliberately-unmanaged` gets "no entries" from the existing `if/then` (`goal-file.schema.json:47-51`), and leaving it later is a privileged ceremony (`tools/schema_lint.py:1502`).
   - The cost: the device runs no extra-entry detection on that domain.
 - **Q4 — binding the Nix side.** Does v4 bind the Nix side into the signed goal file, for example a flake.lock digest in the way `policy-tree` binds policy bytes? Or is the D1 consent diff display-only?
   - Recommend display-only for v4. Under D3 tendcf actuates nothing Nix-side, so a bound digest would be a claim nobody enforces.
@@ -49,10 +49,10 @@ The reverse-DNS unit-writer prefix pattern (`goal-file.schema.json:243`) cannot 
 Reasons:
 
 1. **There is precedent.** `trust_tier` is a Site Model inventory fact (`architecture-DEFINITIVE-v3.md:178-180`). In the goal file it became a `device-trust` entry, explicitly "rather than a header field … the diff schema needs no header-hunk machinery" (`goal-file.schema.json:321`; reconciliation `:374-383`). `supervisor` is the same kind of thing: an inventory fact that sets privilege scope.
-2. **The header is closed.** The diff can change exactly one header thing, `version_bump` (`goal-diff.schema.json:26`). A top-level `supervisor` could not be changed by any diff. Every change would force a new first-adoption ceremony, and `apply_diff` (`bin/schema_lint.py:1509ff`) could not reproduce one.
-3. **Privilege comes for free.** Any hunk under `device-trust` is privileged (`bin/schema_lint.py:1498-1499`). So nixos → systemd, which unlocks CFEngine unit writes, can never pass as an ordinary ceremony.
-4. **It never reaches the device.** The projector excludes `device-trust` (`bin/projector.py:23-36`), so `{"vars":{}}` is unchanged.
-5. **The trust-region property test covers it.** `check_trust_inexpressible` iterates whatever trust kinds the happy fixture carries (`bin/schema_lint.py:1841`), so a fifth kind is covered once `examples/goal-file.json` has it.
+2. **The header is closed.** The diff can change exactly one header thing, `version_bump` (`goal-diff.schema.json:26`). A top-level `supervisor` could not be changed by any diff. Every change would force a new first-adoption ceremony, and `apply_diff` (`tools/schema_lint.py:1509ff`) could not reproduce one.
+3. **Privilege comes for free.** Any hunk under `device-trust` is privileged (`tools/schema_lint.py:1498-1499`). So nixos → systemd, which unlocks CFEngine unit writes, can never pass as an ordinary ceremony.
+4. **It never reaches the device.** The projector excludes `device-trust` (`tools/projector.py:23-36`), so `{"vars":{}}` is unchanged.
+5. **The trust-region property test covers it.** `check_trust_inexpressible` iterates whatever trust kinds the happy fixture carries (`tools/schema_lint.py:1841`), so a fifth kind is covered once `examples/goal-file.json` has it.
 
 The literal "host-level" wording in D2 could also mean a top-level header field. That is why Q2 exists.
 
@@ -118,7 +118,7 @@ Three details matter here:
 
 - **On a nixos host** there are no `unit-writer` entries in any domain; (d) forbids every domain's entries. The supervisor entry *is* the whole-namespace claim. No wildcard entry exists, as the operator ruled.
   - "Two writers on one namespace" holds structurally: there is exactly one writer, and the schema refuses a second declaration anywhere. The lint is not involved.
-  - The prefix nesting rule (`bin/schema_lint.py:1431-1441`) is unchanged and vacuous on such a host. It finds no prefixes.
+  - The prefix nesting rule (`tools/schema_lint.py:1431-1441`) is unchanged and vacuous on such a host. It finds no prefixes.
 - **On launchd/systemd/runit hosts** nothing changes: the prefix pattern, nesting and the cfengine-writer rules (`:1443-1465`) stay as they are.
 - **New goal cross-file rule** (if Q1 = required), in `check_goal_file_cross_file` after line 1465. For a supervisor in `{launchd, systemd, runit}`, every present service's single `unit` key must equal the supervisor name. Message:
 
@@ -133,7 +133,7 @@ Three details matter here:
    - `schema_version` is a `const`, so 4 fails structurally (`:9-12`); case 13 already proves this at 4.
    - The trust `entries` object is `additionalProperties: false` (`:279`), so the `supervisor` kind is refused even if the version check were bypassed.
 
-   The schema description promises "version-above-ceiling reported distinctly from schema-invalid" (`:10`). I found no code doing that dispatch in `schema_lint.py`; no grep hit for "ceiling" near validation. tendcf-agent does not exist (`bin/projector.py:14-15`). So today this is a schema-const refusal only. **Unverified that anything implements the distinct report.**
+   The schema description promises "version-above-ceiling reported distinctly from schema-invalid" (`:10`). I found no code doing that dispatch in `schema_lint.py`; no grep hit for "ceiling" near validation. tendcf-agent does not exist (`tools/projector.py:14-15`). So today this is a schema-const refusal only. **Unverified that anything implements the distinct report.**
 2. **D44 render rule.** `device_convergence.schema_ceiling` is an integer with minimum 1 and no maximum (`schema/report-row.schema.json:118-122`). The compiler refuses to render version N for a host whose reported ceiling is below N (reconciliation `:314-318`). A never-reported host renders at its enrolled version (`:309-313`). No report-row change is needed.
    - get has never reported, there is no Linux row writer (`linux-targets.md:49`, D18 open), and no enrollment ceremony exists.
    - **DECIDED (conservative):** get's first adoption, when it happens, enrolls at 4. No v3 baseline exists anywhere to migrate from.
@@ -199,13 +199,13 @@ Both turn D3 into a check rather than prose. They live in that repository's CI, 
 ## E. Migration
 
 1. **`deploy/linux/passthrough/goal-file.json`.** Set `schema_version` to 4. Add `device-trust.entries.supervisor = {"host":{"name":"nixos","state":"present"}}`. Set `supervision` to `{"coverage":"deliberately-unmanaged"}`, deleting the `org.nixos.*` unit-writer. The file stays JCS.
-   - The projection is **unchanged at `{"vars":{}}`**. The projector reads only `supervision`'s `service` and `interlock` (`bin/projector.py:120-121`), and there are none. This is reasoned from code, not run; `check.py` verifies it (`deploy/linux/canary/check.py:37,64-66`).
+   - The projection is **unchanged at `{"vars":{}}`**. The projector reads only `supervision`'s `service` and `interlock` (`tools/projector.py:120-121`), and there are none. This is reasoned from code, not run; `check.py` verifies it (`deploy/linux/canary/check.py:37,64-66`).
    - The `check.py` comment at lines 34-36 needs rewording.
 2. **Canary goal files** (`deploy/linux/canary/goal-file.json` and `goal-file-absent.json`): add supervisor `systemd`; nothing else changes. `host_specific*.json` stay byte-identical. I read `goal-file.json` but not `goal-file-absent.json`.
 3. **`examples/goal-file.json` and `goal-file-baseline.json`** (launchd): add supervisor `launchd`. Regenerate `goal-diff.json` and the approval-record hashes. `host_specific.json` is unchanged.
 4. **All 63 `examples/broken/*` goal-family overlays** are full alternate files (`README.md:50-53`). Each needs `schema_version` 4 and the supervisor entry, or it fails for a second reason. The harness tolerates extra findings only if the declared class also fires (`README.md:11-18`), but parenthetical claims are checked (`:163-167`), so fix them all. Also update:
    - case 13 to claim `5`;
-   - `EXPECTED_BROKEN` (`bin/schema_lint.py:87`) from 63 to 72;
+   - `EXPECTED_BROKEN` (`tools/schema_lint.py:87`) from 63 to 72;
    - "Sixty-three" (`README.md:3`; `schema_lint.py:36`);
    - "cases 13-73" (`README.md:9`).
 5. **Docs:**
@@ -245,7 +245,7 @@ Notes on the table:
 - Case 101 exists only if Q1 = required.
 - Case 100 exists only if Q7 is approved.
 - **Unverified:** whether the lint's `$defs` recovery attributes a top-level `allOf/if/then` failure as `if/then` (it does for `state_domain`, `README.md:181-182`). Confirm on the first run and correct the cells.
-- **Unverified:** whether fixture discovery handles 3-digit directory names. The README row regex `^\|\s*\d+\s*\|` does accept them (`bin/schema_lint.py:416`).
+- **Unverified:** whether fixture discovery handles 3-digit directory names. The README row regex `^\|\s*\d+\s*\|` does accept them (`tools/schema_lint.py:416`).
 
 **Positive cases:**
 
@@ -253,7 +253,7 @@ Notes on the table:
 - The canary and the examples are valid with supervisor `systemd` / `launchd`.
 - `check_trust_inexpressible` passes with five kinds.
 
-**Discrimination.** For each new rule, delete it on its own and confirm its case goes red alone (F8, `bin/flag_coverage.py`). Run one mutant at a time through `bg`.
+**Discrimination.** For each new rule, delete it on its own and confirm its case goes red alone (F8, `tools/flag_coverage.py`). Run one mutant at a time through `bg`.
 
 **No change** to `tests/policy/*`: the fixtures are CMDB data, not goal files; grep for `schema_version` in tests/ gave no hits. **S0 adds** check 7b: a tombstone on the symlinked layout must produce a report line.
 
@@ -303,12 +303,12 @@ Every PR gets the cross-vendor review that AGENTS.md:40-44 requires.
 | Header fixed at `schema_version` + `host`; platform rejected | `docs/architecture/goal-file-schema-reconciliation-2026-08-15.md:374-383` |
 | Render rule; never-reported host | reconciliation `:309-318` |
 | `schema_ceiling` is an integer with no maximum | `schema/report-row.schema.json:118-122` |
-| Nesting rule; cfengine-writer rule | `bin/schema_lint.py:1431-1465` |
-| Privileged derivation | `bin/schema_lint.py:1496-1506` |
-| `EXPECTED_BROKEN = 63` | `bin/schema_lint.py:87` |
-| Trust property test | `bin/schema_lint.py:1787-1846` |
-| Projector reads `supervision` `service`/`interlock` only | `bin/projector.py:23-25,120-121` |
-| tendcf-agent does not exist | `bin/projector.py:14-15` |
+| Nesting rule; cfengine-writer rule | `tools/schema_lint.py:1431-1465` |
+| Privileged derivation | `tools/schema_lint.py:1496-1506` |
+| `EXPECTED_BROKEN = 63` | `tools/schema_lint.py:87` |
+| Trust property test | `tools/schema_lint.py:1787-1846` |
+| Projector reads `supervision` `service`/`interlock` only | `tools/projector.py:23-25,120-121` |
+| tendcf-agent does not exist | `tools/projector.py:14-15` |
 | Passthrough file uses `org.nixos.*`; projection `{"vars":{}}` | `deploy/linux/passthrough/goal-file.json:1`, `host_specific.json:1` |
 | Canary shape | `deploy/linux/canary/goal-file.json:1` |
 | `check.py` pairs | `deploy/linux/canary/check.py:31-38,55-66` |

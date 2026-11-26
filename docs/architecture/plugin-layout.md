@@ -12,9 +12,13 @@
 > §4 now says how the loader proves a plugin is in-tree, that frontend
 > inputs are code, what "separate environment" means, and how what is
 > signed is tied to what was reviewed. **Every property of §4 that no
-> code enforces yet is tagged "planned", with its step.** Today there is
-> no plugin loader, no release pipeline, no gate separation, no import
-> step and no device-side validation command.
+> code enforces yet is tagged "planned", with its step.** Step 4
+> (static in-tree plugin loader, `bin/` → `tools/`, `tendcf` package and
+> `tendcf compile`, `eval-nix` D-b limits, `--check-releasable`
+> `--tendcf`/`TENDCF_DIR` refusal, and `tools/device_boundary_lint.py`)
+> landed on 2026-11-26; the release pipeline, gate separation, external
+> import step and device-side validation command remain planned (Step 5 /
+> map Step 6).
 >
 > **Amended 2026-11-14 (operator ruling, 2026-11-14, Smaller 5 (D46
 > out-of-tree plugin entry points, G-§4-01 / map Step 0, v2 C3), "1. Defer
@@ -53,9 +57,9 @@
    (the deferred design stays in §3 and §4). Every plugin in this
    repository (frontends, supervisor renderers and importers) is found
    through a static import table, never through entry points (§4,
-   activation; planned, restructure step 4: no table exists today; this
-   table is the deliverable). Supervisor renderers are in tree only; there
-   is no public `tendcf.supervisors` group (§3).
+   activation; built in restructure step 4: `compiler/tendcf/plugins.py`).
+   Supervisor renderers are in tree only; there is no public
+   `tendcf.supervisors` group (§3).
 4. Plugins run at compile time only, and they are trusted build-time code
    that the operator explicitly allows, not sandboxed code (§4).
 5. A plugin is selected only if site-private names it (§4, activation;
@@ -115,16 +119,16 @@ tendcf/
 | --- | --- | --- |
 | `schema/`, `examples/` | exist in tendcf | unchanged |
 | `policy/`, `overlay/`, `deploy/` | exist in tendcf | unchanged |
-| `tools/` | is `bin/`: standalone `uv run --script` files; tendcf has no `pyproject.toml` | `bin/` renamed `tools/` after #41 and #42 merge, with no symlink or wrapper left behind and every reference rewritten (§5, step 4) |
-| `compiler/` | exists since #45 (2026-11-13), imported from the now archived `frdminc/nix2cf`: package `nix2cf` (`nix2cf/cli.py`, `compile.py`, `sitemodel.py`), its tests run by the `compiler` job of `.github/workflows/check.yml`. Two subcommands: `buildfile`, the implemented compilation command, which renders one host; and `eval-nix`, a plain-expression evaluation hook, not the D12 module frontend | the compiler of the `tendcf` package; command `tendcf compile` (§6) |
-| `plugins/frontends/yaml/` | `nix2cf/sitemodel.py` (YAML loading with duplicate-key refusal and line numbers) | split out of the compiler, still built in |
-| `plugins/frontends/nix/` | only the hook: `nix2cf eval-nix FILE` evaluates a plain Nix expression with `nix-instantiate --eval --strict --json`; no module frontend | the D12 Nix module frontend, named `nix2cf`; `eval-nix` moves here |
+| `tools/` | exists (renamed from `bin/` in Step 4, with no symlink or wrapper and all repo paths rewritten): standalone scripts (`schema_lint.py`, `projector.py`, `approval_enforce.py`, `device_boundary_lint.py`, `xref_lint.py`, `overlay.py`, `recompute_goal_hashes.py`, `unit_classifier.py`, `workflow_permissions_lint.py`, `flag_coverage.py`) | unchanged |
+| `compiler/` | exists (imported from archived `frdminc/nix2cf` in #45, renamed `tendcf` in Step 4): package `tendcf` (`compiler/tendcf/{cli,compile,plugins,sitemodel,workspace}.py`), commands `tendcf compile`, `tendcf workspace`, `tendcf eval-nix`; renders only current `schema_version`; `--check-releasable` refuses `--tendcf` and `$TENDCF_DIR` overrides | release-pipeline integration (Step 5 / map Step 6) |
+| `plugins/frontends/yaml/` | exists (Step 4): `plugins/frontends/yaml/loader.py` (YAML/JSON loader with duplicate-key refusal and source lines), loaded via static in-tree table | built in |
+| `plugins/frontends/nix/` | exists (Step 4): `plugins/frontends/nix/eval.py` (`nix2cf`), loaded via static in-tree table; `tendcf eval-nix` enforces tested D-b `restrict-eval` limits and isolated env | the D12 Nix module frontend, named `nix2cf` |
 | `plugins/frontends/guix/` | nothing | later, and only after a sandbox design of its own (§4) |
-| `plugins/supervisors/launchd/` | inside `nix2cf/compile.py`, the only supervisor whose goal-file `unit` entry is rendered | split out |
-| `plugins/supervisors/systemd/`, `runit/` | nothing: a service selected for a systemd or runit host is a compile error (`RENDERED_SUPERVISORS` in `compile.py`) | written in tree ([`linux-targets.md`](linux-targets.md) §3, step 6) |
+| `plugins/supervisors/launchd/` | exists (Step 4): `plugins/supervisors/launchd/renderer.py`, loaded via static in-tree table | built in |
+| `plugins/supervisors/systemd/`, `runit/` | exists as in-tree refusal stubs (Step 4): `plugins/supervisors/{systemd,runit}/renderer.py` | full renderers written in tree ([`linux-targets.md`](linux-targets.md) §3, step 6) |
 | `plugins/importers/` | nothing | optional |
 | `contrib/` | nothing | as third parties contribute |
-| entry-point groups | none; nix2cf's `pyproject.toml` declares only the `nix2cf` script | none for now: the two public groups of §3 are deferred (Smaller 5, 2026-11-14); in-tree plugins are found through a static import table (§4) |
+| entry-point groups | none; enforced by `tools/device_boundary_lint.py`; in-tree plugins are found exclusively through `compiler/tendcf/plugins.py`'s static import table | none for now: the two public groups of §3 are deferred (Smaller 5, 2026-11-14) |
 
 A supervisor plugin renders a service record into the goal file's `unit`
 entry for that supervisor and resolves that supervisor's defaults (for
@@ -207,7 +211,8 @@ restructure, §5 step 4):
 2. Dependency direction: the schema lint and the projector never import
    the compiler. The contract stays outside the compiler's code even
    though both live in one repository.
-3. A CI import check enforces both. It does not exist yet.
+3. A CI import check enforces both (`tools/device_boundary_lint.py`,
+   wired into `.github/workflows/check.yml`, landed in Step 4).
 
 **Plugins are trusted build-time code.** A plugin is Python that runs in
 the compile step with the compiler's own access: the merged Site Model,
@@ -258,9 +263,9 @@ code, not data. The operator's words: "I want people to be able to easily
 share configurations, but they should be security-scanned before running
 them, including doing so with the help of AI. We can have a soft
 requirement that access to AI be present whenever an external import is
-attempted." The rules below are all **planned, Step 6**: no import step
-exists, and `nix2cf eval-nix` today runs with none of the limits in
-item 3.
+attempted." Items 1–2 and 5 below are **planned, Step 6** (no external
+import step exists yet); item 3's Nix evaluation limits are enforced by
+`plugins/frontends/nix/eval.py` (`tendcf eval-nix`, landed in Step 4).
 
 1. **Import, not fetch.** An external recipe (one from site-shared or
    from a foreign site) is imported, never fetched at compile time. This
@@ -444,9 +449,10 @@ item 3.
    "No network" therefore rests on the refusals listed in result 2 and the
    empty `allowed-uris`, not on a test of every fetching builtin.
 
-   Today `compiler/nix2cf/cli.py` (`cmd_eval_nix`) passes only
-   `--eval --strict --json`: the limits are a code change, planned with
-   the Nix frontend move (§5, step 4).
+   `plugins/frontends/nix/eval.py` (`tendcf eval-nix`, landed in Step 4)
+   now enforces all four options above, `-I <RECIPE_DIR>`, isolated Nix
+   environment variables, symlink/delimiter rejection, and a bounded
+   timeout.
 4. **No Guix frontend** until it has a sandbox design of its own.
 5. **When no AI is reachable at import**, the static scan still runs and
    the setting `external_import.without_ai` decides the rest:
@@ -663,7 +669,7 @@ plugin-free. What it means now:
 
 What this still does not give. The compiler and the gates share the
 dependencies pyyaml, jsonschema and rfc8785 (`compiler/pyproject.toml`,
-`bin/schema_lint.py`, `bin/projector.py`). Job B's locked, hash-checked
+`tools/schema_lint.py`, `tools/projector.py`). Job B's locked, hash-checked
 closure means a changed dependency is a reviewed change, not a resolution
 made at run time; it does not protect against a malicious release of a
 dependency at a locked hash. The throwaway runner of job A has network
@@ -727,7 +733,7 @@ the preview diff is **advisory**. The rule:
       every move backwards (the Rollback paragraph below limits that
       further);
    3. a changed plugin set;
-   4. a tendcf bump that changes `tools/` (today `bin/`), `schema/` or the
+   4. a tendcf bump that changes `tools/` (formerly `bin/`), `schema/` or the
       projector, which ships as its own release with unchanged data (the
       tools rule in signing rule 5);
    5. a new `site.lock` input (its `url` is new);
@@ -843,7 +849,7 @@ as the deferred design.
    work); and the loader
    resolves each table entry to a file, checks that file's realpath, and
    only then executes it by file location, the way `load_projector` in
-   `compiler/nix2cf/cli.py` already loads the projector.
+   `compiler/tendcf/cli.py` already loads the projector.
 2. **Deferred: entry points are read only for third-party plugins**, and
    only after [#47](https://github.com/frdminc/tendcf/issues/47) exists
    (until then they are not read at all, so there is no loader code for
@@ -888,10 +894,11 @@ as the deferred design.
    [nix2cf](https://pypi.org/project/nix2cf/)), which closes squatting
    and does not by itself stop dependency confusion.
 7. **The environment does not choose the projector.** `TENDCF_DIR` and
-   `--tendcf` (`compiler/nix2cf/cli.py`, `_tendcf_dir`) let the caller
-   choose which tendcf checkout's projector is executed. A release build
-   pins that to the gate-1-verified tree or refuses the override. This is
-   a code change, planned.
+   `--tendcf` (`compiler/tendcf/cli.py`, `_tendcf_dir`) let the caller
+   choose which tendcf checkout's projector is executed in dev mode. In
+   release mode (`--check-releasable`, landed in Step 4), both `--tendcf`
+   and `$TENDCF_DIR` are refused and compilation is pinned to the verified
+   in-tree checkout.
 8. **The plugin set is derived by the plugin-free job, not reported by
    the compiler.** Job B′ and job B derive the set from site-private's
    naming file and the verified tree's static import table. That derived
@@ -944,7 +951,7 @@ and the multi-version render returns with it.
 | 1 | This documentation: the guide, the paper, the map (D46), the change process, the Linux targets plan, the glossary, this file; and the rename of the illustrative `nix2cf_*` keys (§6). Moves no files and changes no code or schema. | this change |
 | 2 | Import `frdminc/nix2cf` with full history under `compiler/`; the root `README.md` follows. | done: [#45](https://github.com/frdminc/tendcf/pull/45), merged 2026-11-13 (`ca4fa90`) |
 | 3 | Archive `frdminc/nix2cf`. | done 2026-11-13, right after #45 merged (README points here) |
-| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4), which is the deliverable (~~and the two public entry-point groups, which are not read until #47~~: the groups are deferred, not part of this step, until a user needs out-of-tree plugins and they can be pinned; operator ruling, 2026-11-14, Smaller 5); `tendcf compile` replaces `nix2cf buildfile`; older-version rendering removed; the device-boundary import check (§4). No alias, symlink or wrapper. PRs #41 and #42 are merged. | planned |
+| 4 | The restructure, one pull request: `bin/` → `tools/`; the Python package renamed `tendcf`; the compiler split into `compiler/` and `plugins/` with the static import table for in-tree plugins (§4), which is the deliverable (~~and the two public entry-point groups, which are not read until #47~~: the groups are deferred, not part of this step, until a user needs out-of-tree plugins and they can be pinned; operator ruling, 2026-11-14, Smaller 5); `tendcf compile` replaces `nix2cf buildfile`; `tendcf eval-nix` enforces tested D-b `restrict-eval` limits; `--check-releasable` refuses `--tendcf`/`$TENDCF_DIR` overrides (F9); older-version rendering removed; `tools/device_boundary_lint.py` enforces the structural device boundary (§4). No alias, symlink or wrapper. PRs #41 and #42 are merged. | done (2026-11-26) |
 | 5 (map's Step 6) | The release pipeline (Step 6, [`change-process.md`](change-process.md) §10) and the §4 properties that depend on it: the plugin loader's activation steps; the two-job split and its signer backends; promotion of the pull request's artifacts and branch protection on site-private; the privileged-change checks of gate 5; the import step for external recipes with the Nix limits; the projection lint's cross-host check. None is built. The two numberings differ: this table's step 5 is the map's Step 6. | planned |
 
 Step 4 rewrites every path reference in every file, dated records
@@ -959,11 +966,11 @@ outside dated records). Rerun both over the whole tree before the
 change, because the list moves:
 
 1. **The compiler's in-tree check, and the rest of `compiler/`** (from
-   #45): `compiler/nix2cf/cli.py` accepts an enclosing tendcf checkout
-   only if it has `bin/projector.py` (`_in_tree_tendcf`), loads the
+   #45): `compiler/tendcf/cli.py` accepts an enclosing tendcf checkout
+   only if it has `tools/projector.py` (`_in_tree_tendcf`), loads the
    projector from that path (`load_projector`) and names it in an error
-   message; `compiler/nix2cf/__init__.py`, `compile.py` and
-   `sitemodel.py` cite `bin/projector.py` or `bin/schema_lint.py` in
+   message; `compiler/tendcf/__init__.py`, `compile.py` and
+   `sitemodel.py` cite `tools/projector.py` or `tools/schema_lint.py` in
    docstrings and comments; so do `compiler/README.md` (links to
    `../bin/…`), `compiler/docs/DESIGN.md`, `compiler/pyproject.toml`,
    `compiler/examples/site/launchd-writers.yml` and
@@ -974,7 +981,7 @@ change, because the list moves:
 2. **Schema description text**: `schema/common.schema.json` (three
    descriptions say nix2cf infers edges or fills in a field; under the new
    names that is the compiler), `schema/services.schema.json` and
-   `schema/launchd-writers.schema.json` (`bin/schema_lint.py`).
+   `schema/launchd-writers.schema.json` (`tools/schema_lint.py`).
 3. **Examples**: `examples/services.yml`, `examples/launchd-writers.yml`,
    and the broken fixtures `04-nested-writer-prefix`,
    `107-launchd-writers-nixos-writer` and `123-launchd-writers-dpkg-writer`
@@ -989,8 +996,8 @@ change, because the list moves:
    `.github/workflows/check.yml`, `.githooks/pre-commit`,
    `deploy/linux/canary/check.py`, `tests/unit_classifier/test_logic.py`,
    and the tools' own cross-references inside `bin/`.
-5. **Documents**: map D45 (`bin/projector.py` as the source of
-   `tendcf-validate`), every living document `bin/xref_lint.py` lints,
+5. **Documents**: map D45 (`tools/projector.py` as the source of
+   `tendcf-validate`), every living document `tools/xref_lint.py` lints,
    and, under the exception above, every dated record (handoffs, reviews,
    reconciliations, opinions, `deprecated/`): their paths are rewritten,
    their prose is not.

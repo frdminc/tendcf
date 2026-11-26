@@ -280,7 +280,7 @@ curl -s "https://northerntech.atlassian.net/rest/api/2/issue/CFE-4716?fields=sum
 gh api repos/cfengine/core/issues/comments/5340989869 -q .body
 
 # Lints (never python3)
-cd ~/src/tendcf && uv run bin/schema_lint.py && uv run bin/xref_lint.py
+cd ~/src/tendcf && uv run tools/schema_lint.py && uv run tools/xref_lint.py
 ```
 
 **Gotchas.** `gh pr list` state is unreliable — use `gh pr view <n>`.

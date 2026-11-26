@@ -2,4 +2,4 @@
 # Pre-commit: Site Model contract must still lint.
 set -e
 cd "$(git rev-parse --show-toplevel)"
-exec bin/schema_lint.py
+exec tools/schema_lint.py

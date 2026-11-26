@@ -90,7 +90,7 @@ jobs:
   # fork's bar the R1 accessor; behaviour is NOT proven equal for JSON numbers
   # (B-4, B-10 and core's rlist.c fix are not in the overlay,
   # upstream-overlay.md §7). One leg: the point is the overlay, not the
-  # platform matrix. `bin/overlay.py check` (weekly) only
+  # platform matrix. `tools/overlay.py check` (weekly) only
   # proves the patches apply to upstream master, not that they compile (R1).
   overlay-build:
     runs-on: ubuntu-24.04
@@ -119,8 +119,8 @@ jobs:
         run: |
           set -euo pipefail
           # python3, not the uv shebang: the script has no dependencies
-          python3 bin/overlay.py apply core --checkout /tmp/core
-          python3 bin/overlay.py apply libntech --checkout /tmp/core/libntech
+          python3 tools/overlay.py apply core --checkout /tmp/core
+          python3 tools/overlay.py apply libntech --checkout /tmp/core/libntech
           git -C /tmp/core add libntech
           {
             echo "### CFEngine overlay build"
@@ -224,7 +224,7 @@ jobs:
           cp -P /usr/lib/$(uname -m)-linux-gnu/librsync.so.2* /usr/lib/$(uname -m)-linux-gnu/libb2.so.1* /opt/tendcf/lib/
           mkdir -p /opt/tendcf/share/tendcf/bin
           cp -R policy deploy /opt/tendcf/share/tendcf/
-          install -o root -g root -m 0644 bin/projector.py /opt/tendcf/share/tendcf/bin/projector.py
+          install -o root -g root -m 0644 tools/projector.py /opt/tendcf/share/tendcf/bin/projector.py
           chown -R root:root /opt/tendcf/share/tendcf
           echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
           tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf

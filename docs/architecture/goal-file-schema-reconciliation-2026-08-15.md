@@ -77,7 +77,7 @@ and the losing positions are in §§2–9.
 
    *Amended 2026-11-02 (operator; `architecture-DEFINITIVE-v3.md` D45):*
    tendcf-agent is Android-only. On Linux and macOS the projector runs in
-   `tendcf-validate`, a Python command promoted from `bin/projector.py`,
+   `tendcf-validate`, a Python command promoted from `tools/projector.py`,
    which CI also calls; the Android agent's Kotlin projector is a port
    held to the same golden bytes. Device-side and after approval still
    hold everywhere.
@@ -533,7 +533,7 @@ first-class and Grok's cost argument deserves the answer:
 decision stands — device-side, after approval, nothing Augments-shaped on
 the wire — but its placement changes: tendcf-agent is Android-only and
 written in Kotlin, and on Linux and macOS the projector runs in
-`tendcf-validate`, a Python command promoted from `bin/projector.py`.
+`tendcf-validate`, a Python command promoted from `tools/projector.py`.
 Point 2's "written once in the agent's language, running wherever the
 agent already runs" no longer holds: there are two languages, the Python
 implementation normative and the one CI calls (so on Linux and macOS CI
@@ -1050,7 +1050,7 @@ in the same change.
   than `vars` is a negative (parser leniency as a backdoor — Grok's
   fixture, adopted). *Amended 2026-11-02 (`architecture-DEFINITIVE-v3.md`
   D45):* "the agent's own projector" is, on Linux and macOS,
-  `tendcf-validate`, to be promoted from `bin/projector.py`, the code this
+  `tendcf-validate`, to be promoted from `tools/projector.py`, the code this
   gate already runs; the Android agent's Kotlin port must pass the same
   goldens.
 - `EXPECTED_BROKEN` bumps as cases land; the §10 negative list plus the
@@ -1291,7 +1291,7 @@ say so.
 4. Amend guide §4 (YAML claim, C-9), §7 (removals paragraph, C-4; the
    projection sentence), §16.A (mark the Augments illustration as
    preview-channel and non-loading, C-9).
-5. Extend `bin/schema_lint.py` per §13 (`.json` pairing, byte-class
+5. Extend `tools/schema_lint.py` per §13 (`.json` pairing, byte-class
    fixtures, JCS idempotence, goal-file cross-file rules,
    no-`$ref`-of-defaulted-defs rule).
 
@@ -1302,7 +1302,7 @@ All in-repo, read 2026-08-15: the three opinions (in full);
 full); `architecture-DEFINITIVE-v3.md` §4, §5, §6, §9, §13, §14, §16;
 `docs/paper/tendcf-architecture-guide.md` §4, §7, §16;
 `schema/{common,roles,services,report-row,launchd-writers}.schema.json`;
-`bin/schema_lint.py`; `examples/` and `examples/broken/`. Empirical:
+`tools/schema_lint.py`; `examples/` and `examples/broken/`. Empirical:
 validation harness and fixtures in the session scratchpad
 (`goalfile/goal-file.schema.json`, `goalfile/test_goalfile.py` — 31/31
 negatives caught); cf-agent 3.27.1 presence confirmed; JCS-ordering and

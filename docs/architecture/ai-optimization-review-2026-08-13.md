@@ -130,7 +130,7 @@ free to satisfy together).
 Item "already validated" above notes `examples/` and `schema/` are already
 paired by convention. R13's second rule is explicit that a convention an
 agent must remember is one it will eventually break silently. **Proposal:**
-extend `bin/schema_lint.py` to fail if any `schema/*.schema.json` lacks a
+extend `tools/schema_lint.py` to fail if any `schema/*.schema.json` lacks a
 matching `examples/*.yml` (or vice versa) — turning a good habit into a
 checked invariant, at near-zero cost since the lint tooling and the pairing
 both already exist.

@@ -105,8 +105,8 @@ All three goal-family schemas (`goal-file`, `goal-diff`, `approval-record`) chan
 1. `launchd-writers.schema.json`: remove `"nixos"` from the writer enum (Q7). That file is versioned on its own `contract_version` axis, so follow its existing bump rule. **Decided (in S1, recorded here after the post-merge audit's F5): `contract_version` stays 1 and `examples/launchd-writers.yml` stays at 1.** The rule (`common.schema.json`, `contract_version`) bumps only when an existing field is renamed, retyped or removed; dropping one value from an enum is none of the three, since the `writer` field keeps its name, its type and its presence. It does invalidate an instance carrying `writer: nixos`, but the only one in the repository was changed in the same commit, and the precedent (`f814f1f` added `nixos` to the same enum without a bump) is no-bump in both directions. A reader who counts narrowing as a bump changes the rule in `common.schema.json`, not this one case.
 2. In `goal-diff.schema.json`, add to the `version_bump` description: "valid alone only when the baseline rendered at `new` differs from the baseline in `schema_version` only. A bump that adds required content, as v4 does, is a re-adoption (baseline ceremony)." `derive_ceremony_class` already returns `baseline` for `version_bump`; this records the rule (Fable F5). Mirror the sentence in `goal-file-schema-reconciliation-2026-08-15.md`, in its §11 paragraph that says "A migration diff is `version_bump` alone". The inputs said "§9.4", but that document has no §9.4.
 3. Counts that are stated as measured facts must be corrected:
-   - `bin/projector.py` (N-5 digest coverage): from "three of four" device-trust bodies to "three of five". Neither `trust-policy` nor `supervisor` carries a digest.
-   - `bin/schema_lint.py`: the comments that say "four trust bodies".
+   - `tools/projector.py` (N-5 digest coverage): from "three of four" device-trust bodies to "three of five". Neither `trust-policy` nor `supervisor` carries a digest.
+   - `tools/schema_lint.py`: the comments that say "four trust bodies".
 
 ## 3. Migration (one PR, S1)
 
@@ -138,7 +138,7 @@ Enumerate the files from disk; never use the counts below as a substitute for en
    - The passthrough projection must remain exactly `{"vars":{}}`. Prove it by running `deploy/linux/canary/check.py`, not by reasoning about it.
    - Reword the comment at `check.py:34-36` and label the passthrough file a fixture there. Add `deploy/linux/passthrough/README.md`, three lines: it is a fixture, it uses the example key, and it projects to `{"vars":{}}` (Q10).
 6. **Counts and prose.**
-   - `EXPECTED_BROKEN` (`bin/schema_lint.py`) and the "Sixty-three" in `bin/schema_lint.py` and `examples/broken/README.md`.
+   - `EXPECTED_BROKEN` (`tools/schema_lint.py`) and the "Sixty-three" in `tools/schema_lint.py` and `examples/broken/README.md`.
    - The case ranges in `examples/broken/README.md` ("cases 13-73" becomes "13-73, 93-106"; Site Model cases "1-12, 107").
    - The root `README.md` fixture total.
    - The "claims version N" notes in the README and the lint.
@@ -155,7 +155,7 @@ Cases 96–99, 105 and 106 start from a valid nixos goal file: the happy device-
 supervisor `nixos`, `supervision: {"coverage": "deliberately-unmanaged"}`, and no other
 domain. Each case then introduces exactly one defect, so deleting its rule turns it
 green alone (F8). A backticked token in a README `schema (…)` cell is machine-checked
-(`bin/schema_lint.py`), so write those cells as ``schema (`if/then`)`` with the rest as
+(`tools/schema_lint.py`), so write those cells as ``schema (`if/then`)`` with the rest as
 bare prose.
 
 | # | Directory | Broken input | Class (location) |
@@ -192,7 +192,7 @@ Positive checks:
 2. `check_trust_inexpressible` passes with five kinds.
 3. The passthrough projection is `{"vars":{}}`.
 
-Discrimination (F8): delete each new schema rule on its own. Its case must go red alone. Run `bin/flag_coverage.py` where it applies.
+Discrimination (F8): delete each new schema rule on its own. Its case must go red alone. Run `tools/flag_coverage.py` where it applies.
 
 ## 5. The D1 consent diff (S3, host-flake repositories)
 
@@ -302,7 +302,7 @@ The systemd renderer itself stays step 6 proper.
 6. **The Q6 consent channel is not cryptographic.** It is a PR review, and it is not an approval record.
 7. **get has never reported, and it enrolls at 4 on first adoption.** No v3 baseline exists anywhere (reconciliation 2026-08-15, D44 rule).
 8. **R2 lets a nixos file declare other domains with any coverage and no entries.** Only the three kinds are forbidden, so a `comprehensive` empty domain there is a claim nothing checks.
-9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `bin/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked, exclusively for a record claim (the claimed record carries the finding and no other does), against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added cases 108 (out of) and 109 (into) red, each direction alone.
+9. **Ceremony derivation is not discriminated by cases 52, 53 and 102.** Each case pairs an accept record with a reject mirror, and the lint asserts only that one of them carries a `family (ceremony)` finding. So a broken derivation moves the finding from one record to the other, and the corpus stays green. Fixing this needs a harness change in `tools/schema_lint.py`: the ceremony finding must carry evidence naming its record, and the README claim must name the record expected to fail. That is a follow-up PR, not S1. **Resolved** by the `ceremony-discrimination` PR: the finding carries its record's name as evidence, the README cells of 52, 53 and 102 claim `approval-record`, and the claim is checked, exclusively for a record claim (the claimed record carries the finding and no other does), against the findings of the declared class. Deleting the `device-trust` rule turns 52 and 102 red, exempting kind `supervisor` turns 102 red, deleting the coverage-retreat rule turns 53 red, and deleting the `deliberately-unmanaged` rule turns the added cases 108 (out of) and 109 (into) red, each direction alone.
 10. **Deliberately disguised paths to `cf-agent` or `cf-execd` are outside the hard checks' threat model** (R-S3-4). Finding B3 of astra's review of site-djbclark PR 245 and get PR 2 identified paths the textual scan can miss: file-backed and indirect execution, wrappers, source-backed files and string-built names.
     - Those mechanisms can also occur in an honest change; using one does not by itself make the change deliberate disguise.
     - R-S3-4 removes deliberate evasion from the required protection. It does not establish that every accidental activation is detected.

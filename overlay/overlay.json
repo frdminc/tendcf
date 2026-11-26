@@ -12,7 +12,7 @@
           "fork_ref": "fix/cmdb-name-offending-key",
           "jira": "CFE-4719",
           "register": "B-5a",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "carrier",
           "subject": "Rejected CMDB data now names the offending entry and the file",
           "upstream_pr": "https://github.com/cfengine/core/pull/6315",
@@ -34,7 +34,7 @@
             "B-20 (load-bearing: its null guards, as a refusal of the file; 87490bb8f)"
           ],
           "requires": "libntech patches 0005 and 0006 (B-24): the loader parses host_specific.json with JsonParseFileStrict(). Known difference from the pinned fork (decided 2026-11-17 to keep; issue 71): libntech B-4/B-10 and core's rlist.c number fix are not in the overlay, so a top-level CMDB scalar or primitive array holding 1e5 or an integer past long makes cf-agent exit in the install step (StringToLongExitOnError), and a real installs as %.2f; the projector refuses floats and writes no exponents, so only a hand-edited file reaches it (upstream-overlay.md section 7; issue 71)",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Made CMDB loading all-or-nothing: one bad entry installs nothing",
           "tests": [
@@ -56,7 +56,7 @@
           "load_bearing_for": [
             "CMDB loader (overlay/core 0002) rejects unknown top-level keys; refusing unknown keys inside class and variable metadata objects prevents typos like 'class_expression' or 'tag' from silently defining classes unconditionally or dropping metadata (frdminc/tendcf#68)"
           ],
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Refused unknown keys inside CMDB class and variable metadata objects",
           "tests": [
@@ -73,7 +73,7 @@
           "load_bearing_for": [
             "proves directly through LoadCMDBData() in cmdb_test that host_specific.json files containing an embedded NUL byte (after a valid object or inside a string) are refused and install nothing (frdminc/tendcf#69)"
           ],
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Added loader-level embedded NUL fixture to cmdb_test",
           "tests": [
@@ -98,7 +98,7 @@
           "fork_ref": "fix/json-string-codec",
           "jira": "CFE-4730",
           "register": "B-13",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "carrier",
           "subject": "Fix non-conformant \\uXXXX handling in the JSON string codec",
           "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/293",
@@ -115,7 +115,7 @@
             "any host_specific.json string containing a backslash (env values, argv) read by policy/tendcf_services.cf"
           ],
           "register": "B-14",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Fixed the JSON string parser decoding backslash escapes twice",
           "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/297",
@@ -126,7 +126,7 @@
           "file": "0003-Added-unit-tests-for-MustacheRender.patch",
           "fork_ref": "test/mustache-coverage",
           "register": "B-22",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "carrier",
           "subject": "Added unit tests for MustacheRender()",
           "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/296",
@@ -143,7 +143,7 @@
             "policy/tendcf_services.cf renders every launchd plist with template_method => mustache"
           ],
           "register": "B-23",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Fixed a log-truncation format bug and an OOB pointer construction",
           "upstream_pr": "https://github.com/NorthernTechHQ/libntech/pull/298",
@@ -157,7 +157,7 @@
             "core's CMDB loader (overlay/core 0002, B-5b replaced) reads host_specific.json through JsonParseFileStrict(): a repeated object member or non-whitespace after the document refuses the whole file"
           ],
           "register": "B-24",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Added JsonParseStrict() and JsonParseFileStrict()",
           "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/11 only"
@@ -170,7 +170,7 @@
             "fixes JsonParseFileStrict() (0005), which the CMDB loader calls: a file with an embedded null byte, such as {\"vars\": {}}<NUL>not-json, parsed as the valid object; it is refused now"
           ],
           "register": "B-24",
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Fixed JsonParseFileStrict() missing a null byte in the file",
           "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/11 only"
@@ -183,7 +183,7 @@
           "load_bearing_for": [
             "prevents out-of-bounds read past the NUL terminator in JsonParseAsString() on a truncated string ending in a trailing backslash, which JsonParseFileStrict() reaches when loading host_specific.json (frdminc/tendcf#66)"
           ],
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Fixed JsonParseAsString() reading past NUL on a trailing backslash",
           "tests": [
@@ -200,7 +200,7 @@
           "load_bearing_for": [
             "hardens JsonParseStrict() and JsonParseFileStrict() (0005/0006), which core's CMDB loader calls on host_specific.json: refuses unquoted keys, missing colons, \\u0000 escapes, and nesting deeper than 128 levels, and eliminates O(n^2) duplicate-key checks (frdminc/tendcf#67)"
           ],
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Hardened JsonParseStrict() against non-JSON forms, quadratic keys and deep nesting",
           "tests": [
@@ -217,7 +217,7 @@
           "load_bearing_for": [
             "tightens JsonParseStrict() and JsonParseFileStrict() (0005/0006/0008), which core's CMDB loader calls on host_specific.json: refuses leading/trailing commas, missing array commas, raw 0x01-0x1f control characters, invalid raw UTF-8 sequences (JSON_PARSE_ERROR_STRING_INVALID_UTF8), unrecognized escapes, malformed \\u escapes and unpaired UTF-16 surrogates, leading zeros after unary minus (-00/-01), decimal points after exponents (1e2.3, rejected unconditionally in both strict and lenient modes to prevent StringToDouble SIGABRT), and objects exceeding 65,536 members, while salting the strict duplicate-key hash seed and using O(1) strncmp for boolean/null literals (frdminc/tendcf#118)"
           ],
-          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "retire_when": "an upstream commit carries the same change (`tools/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
           "role": "load-bearing",
           "subject": "Tightened JsonParseStrict to reject remaining non-RFC-8259 forms",
           "tests": [

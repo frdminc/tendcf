@@ -17,7 +17,7 @@ writer: claude-code
 ## The Goal
 
 `goal-file-schema-reconciliation-2026-08-15.md` §18 item 5: "Extend
-`bin/schema_lint.py` per §13 (`.json` pairing, byte-class fixtures, JCS
+`tools/schema_lint.py` per §13 (`.json` pairing, byte-class fixtures, JCS
 idempotence, goal-file cross-file rules, no-`$ref`-of-defaulted-defs
 rule)." Three of those five landed in earlier sessions (`9fdf437` and
 before). This session resumed via `/baton` from handoff `7b18` to build
@@ -32,14 +32,14 @@ and which cannot be built: they need an actual projector, and none exists.
 Clean tree, `master` at `063e4e5`, pushed. One commit this session:
 
 - `063e4e5` — "schema: byte-class fixtures and family consistency,
-  closing §18 item 5". 24 files: `bin/schema_lint.py` (+~420 lines),
+  closing §18 item 5". 24 files: `tools/schema_lint.py` (+~420 lines),
   `examples/goal-file-baseline.json` (new), rewritten
   `examples/goal-diff.json` and `examples/approval-record.json`, 5 new
   byte-class fixtures, 7 new negative-fixture directories, and
   `examples/broken/README.md`.
 
-`uv run bin/schema_lint.py` → `schema-lint: OK (8 schemas, 50 negative
-fixtures, 5 byte-class fixtures)`. `python3 bin/xref_lint.py | grep -vE
+`uv run tools/schema_lint.py` → `schema-lint: OK (8 schemas, 50 negative
+fixtures, 5 byte-class fixtures)`. `python3 tools/xref_lint.py | grep -vE
 'reviews/|deprecated/|handoffs/'` → the same 3 pre-existing findings named
 in `7b18` and `4a48`, confirmed unchanged.
 
@@ -133,7 +133,7 @@ and now runs over both goal files, not just the proposed one.
 
 ## Evidence & Data
 
-- `uv run bin/schema_lint.py` → `schema-lint: OK (8 schemas, 50 negative
+- `uv run tools/schema_lint.py` → `schema-lint: OK (8 schemas, 50 negative
   fixtures, 5 byte-class fixtures)`, exit 0.
 - **Every one of the twelve new fixtures produces exactly one finding, and
   its text names the rule the case is named for.** Verified by an ad-hoc
@@ -217,9 +217,9 @@ and now runs over both goal files, not just the proposed one.
 ```bash
 cd ~/src/tendcf
 git log --oneline -3   # confirm HEAD is 063e4e5 or a descendant
-uv run bin/schema_lint.py
+uv run tools/schema_lint.py
 # expect: schema-lint: OK (8 schemas, 50 negative fixtures, 5 byte-class fixtures)
-python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'
+python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'
 # expect: the same 3 pre-existing findings, unrelated
 
 # The two new layers and what governs them:

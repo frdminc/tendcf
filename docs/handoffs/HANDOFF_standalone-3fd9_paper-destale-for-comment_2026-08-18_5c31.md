@@ -50,8 +50,8 @@ No code, schemas, fixtures or policy were touched — this was a documentation
 and upstream-communication session end to end.
 
 Both lints pass and were run after every edit batch:
-`uv run bin/xref_lint.py` → 93 live documents, 84 frozen skipped, 854
-sections, **0 findings**. `uv run bin/schema_lint.py` → **OK (8 schemas, 59
+`uv run tools/xref_lint.py` → 93 live documents, 84 frozen skipped, 854
+sections, **0 findings**. `uv run tools/schema_lint.py` → **OK (8 schemas, 59
 negative fixtures, 6 byte-class fixtures, 27 projection fixtures)**.
 
 The documents are done. Nothing has been published or sent — that is the
@@ -127,8 +127,8 @@ caution was unfounded.
 
 **Tooling gotchas, both cost a cycle:**
 
-- `python3 bin/schema_lint.py` → `ModuleNotFoundError: rfc8785`. The script
-  is a `uv` PEP-723 script; **must** be `uv run bin/schema_lint.py`.
+- `python3 tools/schema_lint.py` → `ModuleNotFoundError: rfc8785`. The script
+  is a `uv` PEP-723 script; **must** be `uv run tools/schema_lint.py`.
 - `sudo-secretspec run -- …` → usage error. **`--reason <REASON>` is
   mandatory**, before the `--`.
 - `session_log.py write` rejects a string `blockers`; it must be a **list of
@@ -273,8 +273,8 @@ cd /Users/djbclark/src/tendcf
 git log --oneline -5                      # expect de7ae63 at HEAD, clean tree
 
 # Both lints — must stay green. NOTE: uv run, not python3.
-uv run bin/xref_lint.py                   # 854 sections, 0 findings
-uv run bin/schema_lint.py                 # 8 schemas, 59/6/27 fixtures
+uv run tools/xref_lint.py                   # 854 sections, 0 findings
+uv run tools/schema_lint.py                 # 8 schemas, 59/6/27 fixtures
 
 # The two documents this session rewrote
 $EDITOR docs/paper/tendcf-architecture-paper.md   # new §7; §9.10-9.16; §1.1 limits

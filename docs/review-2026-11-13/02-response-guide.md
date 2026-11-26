@@ -178,7 +178,7 @@ Sources consulted: firecrawl_search for ShizukuPlus (found https://github.com/th
 **Goal:** G2
 **Weight:** blocks-goal
 **Finding:** The paragraph states D12 as amended 2026-10-29: two equal frontends, and "Nobody adopting the project has to know Nix". G2 makes Nix the authoring language and YAML/JSON the data layer beneath it, which can still be written by hand. The compiler today has only an `eval-nix` wrapper over `nix-instantiate`, and `site.nix` is a plain attribute set, not a module system. So the guide's "not built yet" stands, but the frontend it should promise first is the Nix one.
-**Evidence:** guide:189-198; `compiler/nix2cf/cli.py:150-171,203`; `compiler/examples/site/site.nix`; inventory report §A ("the Nix module frontend of D12 ... is not built").
+**Evidence:** guide:189-198; `compiler/tendcf/cli.py:150-171,203`; `compiler/examples/site/site.nix`; inventory report §A ("the Nix module frontend of D12 ... is not built").
 **Proposed text:**
 
 > Site Model configuration is written in Nix, with the module system
@@ -554,7 +554,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 **Kind:** add
 **Goal:** G9
 **Weight:** improves
-**Finding:** G9 (diff 8) asks for branch management built on the platform's existing patch patterns. The repo already has one: `overlay/` with `bin/overlay.py`, which keeps patches against a pinned upstream with lint, drift and retirement checks. That is "keep a fork without merging" in mechanical form, and the CFEngine fork is its first user. The guide never connects personal branches to it.
+**Finding:** G9 (diff 8) asks for branch management built on the platform's existing patch patterns. The repo already has one: `overlay/` with `tools/overlay.py`, which keeps patches against a pinned upstream with lint, drift and retirement checks. That is "keep a fork without merging" in mechanical form, and the CFEngine fork is its first user. The guide never connects personal branches to it.
 **Evidence:** guide:620-622, 1333-1338; inventory §E (overlay: 6 patches, weekly drift check).
 **Proposed text:**
 
@@ -601,7 +601,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 **Goal:** G8
 **Weight:** improves
 **Finding:** The guide itself doubts inference (§10's three ways it may fail; §20 Q1 and Q7), and the compiler marks it "NOT implemented". State 1 has a handful of services on two devices. Retry-until-stable plus explicit `depends_on` is enough, and `provides`/`requires` can stay as data that the conflict check and lookup use. Deferring inference removes a stage, the two-platform gate and its edge-origin machinery from every G8 state.
-**Evidence:** guide:689-693, 701-723, 1533-1536, 1553-1554; `compiler/nix2cf/compile.py:11-22` (inventory §A: inference "NOT implemented").
+**Evidence:** guide:689-693, 701-723, 1533-1536, 1553-1554; `compiler/tendcf/compile.py:11-22` (inventory §A: inference "NOT implemented").
 **Proposed text:**
 
 > Retry-until-stable is the substrate, and explicit `depends_on` wins
@@ -676,7 +676,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 
 > In **A** and **B** the outputs are hand-authored. Some of their shapes are
 > now emitted by code: the compiler renders the goal file,
-> `bin/projector.py` its projection, and the generic bundle the launchd
+> `tools/projector.py` its projection, and the generic bundle the launchd
 > plist. But nothing derives ordering edges (§10), and B's per-bundle
 > promise sketch is illustrative: the generic bundle, not per-bundle
 > CFEngine text, enforces interlocks (§16.C).
@@ -922,7 +922,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 >   including the systemd lifecycle and the refusal on a NixOS-shaped host.
 >   There is no macOS CI: the launchd branch is tested on a Mac development
 >   build only.
-> - **A read-only unit-namespace classifier** (`bin/unit_classifier.py`),
+> - **A read-only unit-namespace classifier** (`tools/unit_classifier.py`),
 >   the prototype of the extra-entry detector for Debian units; not wired
 >   into the bundle.
 > - In the compiler, `nix2cf eval-nix`, which evaluates a plain Nix
@@ -952,8 +952,8 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 > | 0 | **Close the open work, and restructure.** Merge #42, then #41 (after their reviews; historical: both merged 2026-11-14, #42 at acec5b5 and #41 at daa4530); the D46 restructure (`tendcf compile`, `plugins/`), with all plugins in tree, compile-time only, never on a device (Python entry-point discovery deferred); the schema additions that have been ruled, at the next unused schema version (v7 or later; shipped v6 is C-policy-01, PR 52, 83d7280): the Android profile fields and the agent id share one bump (B3 sub 1), and whether the standing-modes approval record joins it is ruled this way (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"): the next unused version (v7 or later); grouping not ruled; the schema design review (two frontier reviews) decides. | PRs #41 and #42; `plugin-layout.md` (D46). |
 > | 1 | **The fork on the Mac.** Build the pinned fork for macOS arm64 into `/opt/tendcf`, with a macOS CI job that builds the pin and runs `tests/policy/run.sh`; a root `cf-execd` under launchd on the state-1 Mac, which is a minimised macOS VM on bigmac (tart / Virtualization.framework); one canary launchd service enforced, everything else not yet named. bigmac itself runs dry-run only, as a user LaunchAgent. State 1 verifies the root launchd render path. | `overlay/fork.json` and the CI build action; `tendcf-install.sh` and the canary pattern, ported from systemd to launchd; the launchd branch of `policy/tendcf_services.cf`; `tests/policy/run.sh`. |
 > | 2 | **Nix authoring, minimal.** A module system (`lib.evalModules`) with tendcf options for services, interlocks and roles, named after nix-darwin where one exists, evaluating to today's Site Model JSON; YAML twins stay as fixtures and must be byte-identical. | `nix2cf eval-nix`; `buildfile` (renamed `tendcf compile`); the schemas and lint unchanged. |
-> | 3 | **`tendcf-validate`, first build.** Stored, integrity-checked baseline; the device computes the diff; the command-line review mode shows it and takes accept or refuse (a CLI diff and `y/N`, built first and used on the VM and dev devices before any TUI or score work); projection only after accept. Operator tier. | `bin/projector.py` (promoted, D45); `apply_diff` and `derive_ceremony_class` from `bin/schema_lint.py`; goal-diff and approval-record schemas; the validate proposal's options for trigger and atomic publication, which are platform-neutral. |
-> | 4 | **Signed releases and the handshake.** The handshake is content checks (signed by trusted keys, fresh, names this device, owner approval); the first build is the SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter), and the TUF subset of §7 follows, with the 2-of-3 offline-root floor allowed to lag until then; any device may relay a release; the device verifies it before step 3 sees it. | `change-process.md` (lockfile, release, rollback, gates); `bin/overlay.py`'s pinning discipline. |
+> | 3 | **`tendcf-validate`, first build.** Stored, integrity-checked baseline; the device computes the diff; the command-line review mode shows it and takes accept or refuse (a CLI diff and `y/N`, built first and used on the VM and dev devices before any TUI or score work); projection only after accept. Operator tier. | `tools/projector.py` (promoted, D45); `apply_diff` and `derive_ceremony_class` from `tools/schema_lint.py`; goal-diff and approval-record schemas; the validate proposal's options for trigger and atomic publication, which are platform-neutral. |
+> | 4 | **Signed releases and the handshake.** The handshake is content checks (signed by trusted keys, fresh, names this device, owner approval); the first build is the SSH-signature v0 (`ssh-keygen -Y` over goal-file bytes plus a counter), and the TUF subset of §7 follows, with the 2-of-3 offline-root floor allowed to lag until then; any device may relay a release; the device verifies it before step 3 sees it. | `change-process.md` (lockfile, release, rollback, gates); `tools/overlay.py`'s pinning discipline. |
 > | 5 | **Android client.** CFEngine in Termux fed tendcf projections; runit services via termux-services (a third bundle branch); the single Python `tendcf-validate` in Termux, with the Kotlin agent re-checking signature and high-water mark and keeping the trust anchor and approval record in app-private storage; Island/Insular work profiles as a field on entries, one host per phone; ShizukuPlus as the helper; the review is a native screen opened from the agent notification, with Termux CLI/TUI as the operator's path. | The `termux` flavour already in `services.schema.json` and the `android-termux-services` fixture; `frdminc/ShizukuTendCF`; the golden projections, which the Kotlin port must match (D45). |
 > | 6 | **Peer actions and the archive.** The Mac starts ShizukuPlus over ADB when the phone cannot (§13); JSONL capture on both devices; the Mac's `log-archive` role (the `monitor` role is state 2), a service record rendered through launchd, with a fleet-wide SQLite index over every device while each device keeps its own index; the phone buffers while the Mac sleeps. | `report-row.schema.json`; the roles schema (`{main, backups[], peers[]}`). |
 > | 7 | **Safety scan, then the TUI.** Fixed-rule scanners and an owner-chosen AI reviewer over the device-computed diff; the score, its explanation, graded highlighting; then the TUI on the borrowed scaffold (Toad and textual-diff-view). G4 stays whole in state 1. | The privileged-path list and ceremony classes already in the schemas; the fork's `--simulate-json`. |
@@ -970,7 +970,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 > | --- | --- | --- |
 > | 8 | Pull: every device self-updates from any peer; roles move by editing data; the `monitor` role (state 2). | Steps 3–4. |
 > | 9 | macOS as client: the other Macs. | Steps 1–3. |
-> | 10 | Extra-entry reporting per domain, so the `not-yet-migrated` count measures what is left. | `bin/unit_classifier.py` and the s5 detector design (Debian units); new detectors for launchd and the Android app list. |
+> | 10 | Extra-entry reporting per domain, so the `not-yet-migrated` count measures what is left. | `tools/unit_classifier.py` and the s5 detector design (Debian units); new detectors for launchd and the Android app list. |
 > | 11 | Migrate the old stack's services one domain at a time, then retire it. | Everything above. |
 > | 12 | Linux as server: the existing Debian host, from canary to full. | The systemd branch, schema v5 package claims, the root installer, Linux CI. |
 > | 13 | Linux as client, and NixOS/nix-darwin hosts as passthrough. | The NixOS refusal and passthrough stages already run on get.sipb.cloud. |
@@ -1228,7 +1228,7 @@ A reading of the ruling (L5, B2), not part of it (lead decision, PR 62 review): 
 5. **CFEngine's own handshake may be most of G3.** cf-serverd already does key-authenticated peer connections. Pairing it with TUF signatures (transport plus content) could deliver "updates from any device with the handshake" without writing a transport. This is a G7 ruling, but cheap to evaluate.
 6. **The Mac runs upstream CFEngine, not the fork.** The checked Mac has Homebrew CFEngine 3.29.0, which still carries the data-path crashes §19 lists (null in `host_specific.json` and the rest, per the guide). There is no macOS CI. State 1 Step 1 needs a macOS fork build and some macOS test leg, which the CI policy reserves for explicit request, so the operator should rule on it early.
 7. **Android in a work profile doubles everything.** Termux, CFEngine, the agent and the record may be needed once per profile, with cross-profile actions only through the profile owner. Prototyping CFEngine under Termux inside an Insular profile before writing the Android adapter would surface the hard limits cheaply.
-8. **Let the overlay be G9's first customer.** `bin/overlay.py` already does pinned patches, drift checks and retirement for the CFEngine fork. Generalising it for the operator's own forks (ShizukuTendCF, the CFEngine fork) before any non-technical user exists tests G9's core on real forks at no product cost.
+8. **Let the overlay be G9's first customer.** `tools/overlay.py` already does pinned patches, drift checks and retirement for the CFEngine fork. Generalising it for the operator's own forks (ShizukuTendCF, the CFEngine fork) before any non-technical user exists tests G9's core on real forks at no product cost.
 9. **The guide is written for reviewers, not adopters.** Its voice, length and Bcfg2 lineage serve a reviewer like Desai, while G8 state 3 needs public docs a stranger's AI can follow. Plan a separate, short adopter document instead of growing the guide. Measure the guide's line count, because the docs-to-code ratio (240 of 398 non-merge commits docs-only) is the risk the 2026-08 pre-mortem named.
 10. **Re-sequence before more Linux depth.** Open work today (PRs #41 and #42, the s5 detector, the validate picklist) is mostly Linux-specific. Without a ruling on G-§18-02, the next weeks will likely keep deepening platform 4 while platforms 1 and 2 have no code. Parking the Debian-only items explicitly would make the reorder real.
 

@@ -1,12 +1,12 @@
 [project]
-name = "nix2cf"
+name = "tendcf"
 version = "0.0.1"
-description = "tendcf compiler: Site Model -> per-host canonical goal file (buildfile first)"
+description = "tendcf compiler: Site Model -> per-host canonical goal file"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.11"
 # The same three libraries tendcf's own contract tooling uses
-# (bin/schema_lint.py, bin/projector.py), so the compiler and the lint
+# (tools/schema_lint.py, tools/projector.py), so the compiler and the lint
 # agree on JSON Schema dialect and on RFC 8785 serialization.
 dependencies = [
     "pyyaml>=6",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nix2cf = "nix2cf.cli:main"
+tendcf = "tendcf.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
@@ -25,7 +25,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nix2cf"]
+packages = ["tendcf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

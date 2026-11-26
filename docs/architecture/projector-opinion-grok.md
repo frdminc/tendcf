@@ -99,7 +99,7 @@ Deleting an interlock is a remove hunk, not a tombstone (no device-state footpri
 
 ## F. Determinism
 
-`project(x)` is the RFC 8785 (JCS) serialization of the object below, using the same `rfc8785.dumps` `bin/schema_lint.py` already pins. The golden is those bytes, compared with `==`, never pretty-printed, never normalized at the test boundary.
+`project(x)` is the RFC 8785 (JCS) serialization of the object below, using the same `rfc8785.dumps` `tools/schema_lint.py` already pins. The golden is those bytes, compared with `==`, never pretty-printed, never normalized at the test boundary.
 
 Rules that make that equality hold:
 

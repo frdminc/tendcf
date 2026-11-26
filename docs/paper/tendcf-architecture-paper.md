@@ -235,7 +235,7 @@ unit-name prefix for every supervisor, killing a two-writers hazard at the
 source. launchd is one adapter, not the model.
 
 Schemas and types belong in tendcf (`schema/`, `examples/`,
-`bin/schema_lint.py`). The compiler (`tendcf compile`, §2.2) is a tool;
+`tools/schema_lint.py`). The compiler (`tendcf compile`, §2.2) is a tool;
 its code is not the home of the contract, even though the two are moving
 into one repository. A schema change is a tendcf interface change; a
 hostname change is site data.
@@ -521,7 +521,7 @@ showing the same interlock as running code rather than as intent.
 **A note on provenance, because it matters for how to read these.** The
 *inputs* below are verbatim excerpts from
 [`examples/services.yml`](../../examples/services.yml)
-— a real fixture, schema-validated by `bin/schema_lint.py` against
+— a real fixture, schema-validated by `tools/schema_lint.py` against
 `schema/services.schema.json`, though still a fixture and not live site data
 (§8). launchd here is one adapter; the same service record would render a
 systemd unit or a runit service on another host. The *outputs* — the
@@ -1712,7 +1712,7 @@ bugs.
 ## 8. Status and validation
 
 **Implemented.** Eight schemas in this repository (`schema/`, `examples/`,
-`bin/schema_lint.py`). Five are the Site Model and its reporting — including
+`tools/schema_lint.py`). Five are the Site Model and its reporting — including
 the fields §4 argues for (`provides`/`requires` per type, `interlocks` per
 bundle, `comprehensive` plus `opt_out_reason` per domain) and the report-row
 schema of §6.3. Three are the consent contract of §2.5: the goal file, the
@@ -1723,7 +1723,7 @@ another — and a second lint checks that every cross-reference in the
 document corpus resolves.
 
 Beyond the schemas, two pieces of running code: the **reference projector**
-(`bin/projector.py`), which performs §2.5's goal-file-to-augments projection
+(`tools/projector.py`), which performs §2.5's goal-file-to-augments projection
 and is gated in CI against golden bytes; it is to be promoted to the
 `tendcf-validate` command Linux and macOS hosts run, and the Android agent's
 Kotlin port must agree with the same goldens; and the **generic bundle**

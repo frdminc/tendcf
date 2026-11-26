@@ -1,7 +1,7 @@
 # Example instance — validates against schema/launchd-writers.schema.json.
 # Fixture, not site data (D21).
 #
-# One writer per label prefix or exact label. bin/schema_lint.py rejects
+# One writer per label prefix or exact label. tools/schema_lint.py rejects
 # overlapping prefixes or an exact label under a prefix: two writers over one
 # namespace is the exact hazard this file prevents.
 

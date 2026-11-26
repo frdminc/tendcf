@@ -1,4 +1,4 @@
-"""Unit tests for bin/recompute_goal_hashes.py (issue #56 item 3 & R1/R2 hardening)."""
+"""Unit tests for tools/recompute_goal_hashes.py (issue #56 item 3 & R1/R2 hardening)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = REPO_ROOT / "bin" / "recompute_goal_hashes.py"
+SCRIPT = REPO_ROOT / "tools" / "recompute_goal_hashes.py"
 
 
 def _load_module():
@@ -43,10 +43,10 @@ class RecomputeGoalHashesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="tendcf-recompute-test-") as td:
             tmp_root = Path(td)
             shutil.copytree(REPO_ROOT / "examples", tmp_root / "examples")
-            # Plant a poisoned bin/projector.py under --root to prove the helper
+            # Plant a poisoned tools/projector.py under --root to prove the helper
             # NEVER executes code from --root (always imports bundled projector).
-            (tmp_root / "bin").mkdir()
-            (tmp_root / "bin" / "projector.py").write_text(
+            (tmp_root / "tools").mkdir()
+            (tmp_root / "tools" / "projector.py").write_text(
                 "raise RuntimeError('POISONED_ROOT_PROJECTOR_EXECUTED')\n",
                 encoding="utf-8",
             )

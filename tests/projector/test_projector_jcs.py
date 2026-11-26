@@ -1,4 +1,4 @@
-"""Unit tests for bin/projector.py's pure-stdlib RFC 8785 JCS fallback (issue #53).
+"""Unit tests for tools/projector.py's pure-stdlib RFC 8785 JCS fallback (issue #53).
 
 Runs under both:
   - `uv run --with rfc8785 python -m unittest discover -s tests/projector -v`
@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-PROJECTOR_PATH = REPO / "bin" / "projector.py"
+PROJECTOR_PATH = REPO / "tools" / "projector.py"
 
 
 def _load_projector():
@@ -222,7 +222,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
             self.proj._rfc8785 = orig
 
     def test_nul_escape_rejected_in_key_and_value_positions(self) -> None:
-        """Issue #67/#69: bin/projector.py rejects \\u0000 in both key and value positions."""
+        """Issue #67/#69: tools/projector.py rejects \\u0000 in both key and value positions."""
         # 1. Key position (in both check_projection and project)
         nul_key_raw = (
             b'{"vars":{"tendcf_service":{"demo\\u0000svc":{"bundle":"demo",'
@@ -351,7 +351,7 @@ class StdlibJcsFallbackTests(unittest.TestCase):
         self.assertEqual(findings[0].rule, self.proj.RULE_PROJECTION_BYTES)
 
     def test_isolated_python_subprocess_cli(self) -> None:
-        """Prove `python3 -I -S bin/projector.py` works hermetically with stdlib only."""
+        """Prove `python3 -I -S tools/projector.py` works hermetically with stdlib only."""
         valid_files = [
             REPO / "examples" / "host_specific.json",
             REPO / "deploy" / "linux" / "canary" / "host_specific.json",

@@ -4,7 +4,7 @@
 # ///
 """Is every rule in `check_projection()` guarded by a fixture that trips it alone?
 
-Run on demand, not from `bin/schema_lint.py`. It neuters one `flag()` call
+Run on demand, not from `tools/schema_lint.py`. It neuters one `flag()` call
 site at a time and runs the whole lint against each, so it costs ~20 lint
 runs; the lint itself is on every commit and must stay fast.
 
@@ -27,7 +27,7 @@ off. A stale `__pycache__` silently masked their first pass, which reports as
 "the rule is guarded" — the exact false negative this tool exists to prevent.
 `PYTHONDONTWRITEBYTECODE` is set for the child below.
 
-    bin/flag_coverage.py
+    tools/flag_coverage.py
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-TARGET = REPO / "bin" / "projector.py"
+TARGET = REPO / "tools" / "projector.py"
 FUNCTION = "check_projection"
-LINT = REPO / "bin" / "schema_lint.py"
+LINT = REPO / "tools" / "schema_lint.py"
 
 
 def flag_sites(source: str) -> list[int]:

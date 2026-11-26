@@ -10,7 +10,7 @@ The canary is the first service tendcf enforces on a live Linux host
 `project(goal-file.json)`, and the goal file is canonical JCS bytes that
 validate against goal-file.schema.json and pass the lint's cross-entry rules,
 which is where a systemd entry's argv/working_dir alphabet is enforced. This
-script runs that, reusing bin/schema_lint.py's own checks, and then requires
+script runs that, reusing tools/schema_lint.py's own checks, and then requires
 each `host_specific*.json` here to be byte-identical to the projection of its
 goal file, so the data a host is given cannot drift from the file that was
 reviewed.
@@ -58,8 +58,8 @@ def load(name: str, path: Path):
 
 
 def main() -> int:
-    lint = load("schema_lint", REPO / "bin" / "schema_lint.py")
-    projector = load("projector", REPO / "bin" / "projector.py")
+    lint = load("schema_lint", REPO / "tools" / "schema_lint.py")
+    projector = load("projector", REPO / "tools" / "projector.py")
     schemas, registry = lint.load_schemas()
     problems: list[str] = []
 

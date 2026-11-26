@@ -41,7 +41,7 @@ pushed to `origin/master`:
 | `0b64c32` | Closed both open CFEngine questions — **partly wrong, superseded** |
 | `957a2f7` | Corrected the above after actually running `cf-agent` |
 
-`bin/schema_lint.py` passes: `OK (5 schemas, 12 negative fixtures)`.
+`tools/schema_lint.py` passes: `OK (5 schemas, 12 negative fixtures)`.
 
 The guide itself has now been edited for the first time since the review
 round — previously every finding was still open.
@@ -164,7 +164,7 @@ Restored clean afterwards.
 **Files changed this session** (17 in `0163b70`, 1 in the two CFEngine commits):
 
 - `docs/paper/tendcf-architecture-guide.md` — DOC-1, 3, 20, 21, 23, 24, 26 + §3 pairing prose
-- `bin/schema_lint.py` — `check_pairing()`, `DEFINITION_ONLY_SCHEMAS`, docstring now "Five layers"
+- `tools/schema_lint.py` — `check_pairing()`, `DEFINITION_ONLY_SCHEMAS`, docstring now "Five layers"
 - `schema/{common,report-row,launchd-writers,services,roles}.schema.json` — cross-reference drift
 - `examples/services.yml` + 7 `examples/broken/*/` overlays — DOC-5 "the mesh VPN"
 - `examples/launchd-writers.yml` + `examples/broken/04-*/` — `map §14.1`
@@ -235,7 +235,7 @@ account from 2 to 1 mid-session. Both effectively spent.
 **Carried warnings.**
 
 - Do **not** "fix" the `map §0 rule 6` references in
-  `schema/common.schema.json` or `bin/schema_lint.py` — correct against v3 §0,
+  `schema/common.schema.json` or `tools/schema_lint.py` — correct against v3 §0,
   and now explicitly qualified so they stop looking stale.
 - **c174's action items** (paper length decision, §4.1 non sequitur,
   bibliography verification against `~/src/bcfg2/doc/papers/`, Acknowledgements)
@@ -247,7 +247,7 @@ account from 2 to 1 mid-session. Both effectively spent.
 ```bash
 cd /Users/djbclark/src/tendcf
 git log --oneline -4          # expect 957a2f7 at HEAD, clean
-bin/schema_lint.py            # expect: OK (5 schemas, 12 negative fixtures)
+tools/schema_lint.py            # expect: OK (5 schemas, 12 negative fixtures)
 
 # The two documents that carry all open findings:
 #   docs/paper/reviews/2026-08-15_opus-5-xhigh_SYNTHESIS.md   (§6 = the ordered list)

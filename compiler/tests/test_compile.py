@@ -1,10 +1,10 @@
-"""nix2cf's tests. Every test needs a tendcf checkout for the contract
+"""tendcf compiler tests. Every test needs a tendcf checkout for the contract
 (schemas, projector, fixtures): by default the enclosing repository (this
-directory is <root>/compiler/tests); set TENDCF_DIR to use another.
+directory is <root>/compiler/tests); set TENDCF_DIR to use another (dev mode).
 
 The goldens under tests/golden/ are the compiler's own regression test
 (paper §6.2): a compiler change that alters output for a host nobody touched
-fails here. Regenerate deliberately with NIX2CF_UPDATE_GOLDEN=1 and read the
+fails here. Regenerate deliberately with TENDCF_UPDATE_GOLDEN=1 and read the
 diff before committing it.
 """
 
@@ -22,9 +22,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nix2cf.cli import load_projector, main
-from nix2cf.compile import GOAL_FILE_SCHEMA_VERSION, CompileError, HostSpec, compile_host
-from nix2cf.sitemodel import Schemas, SiteModel, load_document, load_site_model, validate_site_model
+from tendcf.cli import load_projector, main
+from tendcf.compile import GOAL_FILE_SCHEMA_VERSION, CompileError, HostSpec, compile_host
+from tendcf.sitemodel import Schemas, SiteModel, load_document, load_site_model, validate_site_model
 
 REPO = Path(__file__).resolve().parent.parent
 SITE = REPO / "examples" / "site"
@@ -60,9 +60,10 @@ def projector(tendcf: Path):
 @pytest.fixture(scope="session")
 def lint(tendcf: Path):
     """tendcf's schema_lint, for its goal-file cross-file rules (no copy here)."""
-    spec = importlib.util.spec_from_file_location("tendcf_schema_lint", tendcf / "bin" / "schema_lint.py")
+    spec = importlib.util.spec_from_file_location("tendcf_schema_lint", tendcf / "tools" / "schema_lint.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -106,9 +107,9 @@ def _nixos_host(name: str = "get", trust: dict | None = None) -> HostSpec:
 
 def _check_golden(name: str, raw: bytes) -> None:
     path = GOLDEN / name
-    if os.environ.get("NIX2CF_UPDATE_GOLDEN"):
+    if os.environ.get("TENDCF_UPDATE_GOLDEN"):
         path.write_bytes(raw)
-    assert path.exists(), f"missing golden {path}; run with NIX2CF_UPDATE_GOLDEN=1"
+    assert path.exists(), f"missing golden {path}; run with TENDCF_UPDATE_GOLDEN=1"
     assert raw == path.read_bytes(), f"output for {name} changed; diff the golden before updating"
 
 
@@ -436,84 +437,12 @@ def test_unrendered_supervisor_refuses_selected_services_but_not_none(schemas: S
     assert schemas.errors("goal-file.schema.json", doc) == []
 
 
-def test_nixos_refused_below_schema_v4() -> None:
-    for version in (3, 2, 1):
-        with pytest.raises(CompileError, match="cannot state"):
-            compile_host(_model(SITE), _nixos_host(), None, schema_version=version)
-
-
-def _v7_model(site: Path) -> SiteModel:
-    """Example site without v8-only exact-label/tendcf-install launchd writers."""
-    model = _model(site)
-    model.launchd_writers.data["writers"] = [
-        w for w in model.launchd_writers.data["writers"]
-        if "prefix" in w and w.get("writer") != "tendcf-install"
-    ]
-    return model
-
-
-def test_schema_v3_drops_the_supervisor_entry_for_other_hosts() -> None:
-    result = compile_host(_v7_model(SITE), _host(SITE), None, schema_version=3)
-    doc = result.goal_file
-    assert doc["schema_version"] == 3
-    assert "supervisor" not in doc["domains"]["device-trust"]["entries"]
-    assert not any("rendered at schema_version" in d for d in result.diagnostics)  # no schema given: only the no-schema note
-
-
-def test_schema_v3_with_schema_is_noted_not_validated(schemas: Schemas) -> None:
-    result = compile_host(_v7_model(SITE), _host(SITE), schemas, schema_version=3)
-    assert result.goal_file["schema_version"] == 3
-    assert any("NOT validated" in d for d in result.diagnostics)
-
-
-def _host_shapes() -> dict[str, HostSpec]:
-    """Every host shape nix2cf renders: a launchd host with services, a nixos
-    host, and service-free systemd and runit hosts (their unit renderers are not
-    built, so a selected service is refused; none selected renders the supervisor
-    entry alone)."""
-    return {
-        "launchd": _host(SITE),
-        "nixos": _nixos_host(),
-        "systemd": _host(SITE, name="get", platform="linux", supervisor="systemd", trust=_trust(SITE, None)),
-        "runit": _host(SITE, name="get", platform="linux", supervisor="runit", trust=_trust(SITE, None)),
-    }
-
-
-@pytest.mark.parametrize("old_version", [4, 5, 6, 7, 8])
-@pytest.mark.parametrize("shape", ["launchd", "nixos", "systemd", "runit"])
-def test_older_versions_differ_only_in_the_version_for_current_inputs(schemas: Schemas, shape: str, old_version: int) -> None:
-    """For service-free hosts (nixos, systemd, runit), v4..v8 differ from v9 only in
-    `schema_version`. For launchd hosts with default `domain: "system"`, v8 differs
-    from v9 only in `schema_version` (including exact writers), while v4..v7 with
-    prefix-only writers omit `unit.launchd.domain`."""
-    host = _host_shapes()[shape]
-    use_v7 = shape == "launchd" and old_version < 8
-    model_old = _v7_model(SITE) if use_v7 else _model(SITE)
-    model_new = _v7_model(SITE) if use_v7 else _model(SITE)
-    old = compile_host(model_old, host, None, schema_version=old_version).goal_file
-    new = compile_host(model_new, host, schemas).goal_file  # validates against the current schema
-    assert old["schema_version"] == old_version and new["schema_version"] == GOAL_FILE_SCHEMA_VERSION
-    assert new["domains"]["device-trust"]["entries"]["supervisor"]["host"]["name"] == host.supervisor
-    normalized_old = copy.deepcopy(old)
-    normalized_old["schema_version"] = GOAL_FILE_SCHEMA_VERSION
-    if shape == "launchd" and old_version < 8:
-        for svc in normalized_old["domains"]["supervision"]["entries"]["service"].values():
-            assert "domain" not in svc["unit"]["launchd"]
-            svc["unit"]["launchd"]["domain"] = "system"
-    assert normalized_old == new
-    assert schemas.errors("goal-file.schema.json", new) == []
-
-
-def test_dpkg_writer_renders_at_v4_but_is_refused_at_v5(schemas: Schemas) -> None:
-    """`dpkg` left the unit-writer enum in v5 (a package claim is its only spelling).
-    v4 permitted it, so an unused `dpkg` writer in an old Site Model still renders
-    at v4 (unvalidated, as every older version is) and is refused at v5."""
-    model = _v7_model(SITE)
+def test_dpkg_writer_is_refused(schemas: Schemas) -> None:
+    """`dpkg` left the unit-writer enum in v5 (a package claim is its only spelling)."""
+    model = _model(SITE)
     writer = next(w for w in model.launchd_writers.data["writers"] if w.get("prefix") == "dev.mise.*")
     writer["writer"] = "dpkg"
-    assert validate_site_model(model, schemas) != []  # launchd-writers.schema.json dropped it too
-    old = compile_host(model, _host(SITE), None, schema_version=4).goal_file
-    assert old["domains"]["supervision"]["entries"]["unit-writer"]["dev.mise.*"]["writer"] == "dpkg"
+    assert validate_site_model(model, schemas) != []
     with pytest.raises(CompileError, match="dpkg"):
         compile_host(model, _host(SITE), schemas)
 
@@ -532,27 +461,14 @@ def test_launchd_domain_three_values_and_system_default(schemas: Schemas, lint) 
     assert _cross_file_findings(lint, doc) == []
 
 
-@pytest.mark.parametrize("version", [7, 8, 9])
-def test_launchd_stale_v8_user_domain_refused(version: int) -> None:
-    model = _v7_model(SITE) if version < 8 else _model(SITE)
+def test_launchd_stale_v8_user_domain_refused() -> None:
+    model = _model(SITE)
     model.services.data["services"][0]["launchd"]["domain"] = "user"
     with pytest.raises(CompileError) as exc:
-        compile_host(model, _host(SITE), None, schema_version=version)
+        compile_host(model, _host(SITE), None)
     msg = str(exc.value)
     assert "stale v8 launchd.domain='user'" in msg
     assert "'user-gui'" in msg and "'user-background'" in msg
-
-
-@pytest.mark.parametrize("version", [7, 8])
-@pytest.mark.parametrize("domain", ["user-gui", "user-background"])
-def test_launchd_v9_user_domains_refused_below_v9(version: int, domain: str) -> None:
-    model = _v7_model(SITE) if version < 8 else _model(SITE)
-    model.services.data["services"][0]["launchd"]["domain"] = domain
-    with pytest.raises(CompileError) as exc:
-        compile_host(model, _host(SITE), None, schema_version=version)
-    msg = str(exc.value)
-    assert f"launchd.domain={domain!r}" in msg
-    assert "render at schema_version 9" in msg
 
 
 def test_launchd_invalid_domain_refused() -> None:
@@ -564,7 +480,7 @@ def test_launchd_invalid_domain_refused() -> None:
 
 @pytest.mark.parametrize("domain", ["user-gui", "user-background"])
 def test_launchd_user_domains_with_root_runs_as_refused(domain: str, schemas: Schemas) -> None:
-    from nix2cf.compile import render_goal_file, select_services
+    from tendcf.compile import render_goal_file, select_services
 
     model = _model(SITE)
     tailscaled = next(s for s in model.services.data["services"] if s["name"] == "tailscaled")
@@ -585,31 +501,16 @@ def test_launchd_user_domains_with_root_runs_as_refused(domain: str, schemas: Sc
     assert any(f"launchd.domain={domain!r}" in e and "runs_as='root'" in e for e in errs)
 
 
-def test_render_goal_file_alone_refuses_stale_user_and_v9_domains_below_v9() -> None:
-    from nix2cf.compile import render_goal_file, select_services
+def test_render_goal_file_alone_refuses_stale_user_domain() -> None:
+    from tendcf.compile import render_goal_file, select_services
 
     host = _host(SITE)
-    for version in (7, 8, 9):
-        model = _v7_model(SITE) if version < 8 else _model(SITE)
-        model.services.data["services"][0]["launchd"]["domain"] = "user"
-        selected, _, _ = select_services(model, host)
-        doc, errs = render_goal_file(model, host, selected, schema_version=version)
-        assert "com.djbclark.caddy" not in doc["domains"]["supervision"]["entries"].get("service", {})
-        assert any("stale v8 launchd.domain='user'" in e for e in errs)
-
-    for version in (7, 8):
-        for domain in ("user-gui", "user-background"):
-            model = _v7_model(SITE) if version < 8 else _model(SITE)
-            model.services.data["services"][0]["launchd"]["domain"] = domain
-            selected, _, _ = select_services(model, host)
-            doc, errs = render_goal_file(model, host, selected, schema_version=version)
-            assert "com.djbclark.caddy" not in doc["domains"]["supervision"]["entries"].get("service", {})
-            assert any(f"launchd.domain={domain!r}" in e and "render at schema_version 9" in e for e in errs)
-
-
-def test_launchd_exact_label_and_tendcf_install_refused_below_v8() -> None:
-    with pytest.raises(CompileError, match="org.tendcf.execd"):
-        compile_host(_model(SITE), _host(SITE), None, schema_version=7)
+    model = _model(SITE)
+    model.services.data["services"][0]["launchd"]["domain"] = "user"
+    selected, _, _ = select_services(model, host)
+    doc, errs = render_goal_file(model, host, selected)
+    assert "com.djbclark.caddy" not in doc["domains"]["supervision"]["entries"].get("service", {})
+    assert any("stale v8 launchd.domain='user'" in e for e in errs)
 
 
 def test_exact_cfengine_label_covers_service(schemas: Schemas, lint) -> None:
@@ -696,18 +597,6 @@ def test_launchd_writer_covering_reserved_execd_refused(schemas: Schemas, writer
     assert "Resolution:" in msg
 
 
-def test_launchd_writer_prefix_covering_reserved_execd_refused_below_v8() -> None:
-    model = _v7_model(SITE)
-    model.launchd_writers.data["writers"].append(
-        {"prefix": "org.tendcf.*", "writer": "cfengine", "note": "Prefix covers execd at v7."}
-    )
-    with pytest.raises(CompileError) as exc:
-        compile_host(model, _host(SITE), None, schema_version=7)
-    msg = str(exc.value)
-    assert "reserved installer-owned label 'org.tendcf.execd'" in msg
-    assert "upgrade to schema_version 8" in msg
-
-
 @pytest.mark.parametrize(
     "bad_writer",
     [
@@ -717,7 +606,7 @@ def test_launchd_writer_prefix_covering_reserved_execd_refused_below_v8() -> Non
     ],
 )
 def test_launchd_writer_dual_or_missing_key_refused(bad_writer: dict[str, str]) -> None:
-    from nix2cf.compile import render_goal_file, select_services
+    from tendcf.compile import render_goal_file, select_services
 
     model = _model_without_execd_writer(SITE)
     model.launchd_writers.data["writers"].append(bad_writer)
@@ -746,7 +635,7 @@ def test_launchd_writer_dual_or_missing_key_refused(bad_writer: dict[str, str]) 
     ],
 )
 def test_service_targeting_reserved_installer_unit_refused(schemas: Schemas, bad_label: str) -> None:
-    from nix2cf.compile import render_goal_file, select_services
+    from tendcf.compile import render_goal_file, select_services
 
     model = _model(SITE)
     model.services.data["services"][0]["launchd"]["label"] = bad_label
@@ -770,7 +659,7 @@ def test_service_targeting_reserved_installer_unit_refused(schemas: Schemas, bad
     ["tendcf-execd.service", "tendcf-execd", "tendcf-execd.timer", "tendcf-execd.socket", "tendcf-execd.path"],
 )
 def test_service_targeting_reserved_systemd_unit_refused_in_conflict_check(bad_unit: str) -> None:
-    from nix2cf.compile import conflict_check, select_services
+    from tendcf.compile import conflict_check, select_services
 
     model = _model(SITE)
     model.services.data["services"][0]["systemd"] = {"unit": bad_unit}
@@ -787,15 +676,8 @@ def test_launchd_exact_execd_tendcf_install_v8_positive_control(schemas: Schemas
     assert _cross_file_findings(lint, result.goal_file) == []
 
 
-def test_render_goal_file_alone_refuses_nixos_below_v4() -> None:
-    from nix2cf.compile import render_goal_file
-
-    doc, errors = render_goal_file(_model(SITE), _nixos_host(), [], schema_version=3)
-    assert doc == {} and any("cannot state" in e for e in errors)
-
-
 def test_render_goal_file_alone_refuses_unrendered_services() -> None:
-    from nix2cf.compile import render_goal_file, select_services
+    from tendcf.compile import render_goal_file, select_services
 
     model = _model(SITE)
     _declare_on(model, "get")
@@ -807,7 +689,7 @@ def test_render_goal_file_alone_refuses_unrendered_services() -> None:
 
 
 def test_cli_platform_is_required_and_android_not_offered(tendcf: Path) -> None:
-    base = ["buildfile", "--host", "mac", "--supervisor", "launchd", "--host-key", HOST_KEY,
+    base = ["compile", "--host", "mac", "--supervisor", "launchd", "--host-key", HOST_KEY,
             "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)]
     missing = _run(base, tendcf)
     assert missing.returncode == 2 and b"--platform" in missing.stderr and missing.stdout == b""
@@ -882,7 +764,7 @@ def test_unmatched_requires_is_a_note_not_a_refusal(schemas: Schemas) -> None:
 def test_yaml_duplicate_key_refused(tmp_path: Path) -> None:
     bad = tmp_path / "services.yml"
     bad.write_text("contract_version: 1\ncontract_version: 2\n")
-    from nix2cf.sitemodel import SiteModelError
+    from tendcf.sitemodel import SiteModelError
 
     with pytest.raises(SiteModelError, match="duplicate key 'contract_version'"):
         load_document(bad)
@@ -899,12 +781,12 @@ def test_non_nfc_input_refused(schemas: Schemas) -> None:
 
 def _run(args: list[str], tendcf: Path) -> subprocess.CompletedProcess[bytes]:
     env = dict(os.environ, TENDCF_DIR=str(tendcf), PYTHONPATH=str(REPO))
-    return subprocess.run([sys.executable, "-m", "nix2cf.cli", *args], capture_output=True, env=env, check=False)
+    return subprocess.run([sys.executable, "-m", "tendcf.cli", *args], capture_output=True, env=env, check=False)
 
 
-def test_cli_buildfile_matches_library(tendcf: Path, schemas: Schemas) -> None:
+def test_cli_compile_matches_library(tendcf: Path, schemas: Schemas) -> None:
     proc = _run(
-        ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)],
+        ["compile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)],
         tendcf,
     )
     assert proc.returncode == 0, proc.stderr.decode()
@@ -913,7 +795,7 @@ def test_cli_buildfile_matches_library(tendcf: Path, schemas: Schemas) -> None:
 
 def test_cli_project_matches_projector(tendcf: Path, schemas: Schemas, projector) -> None:
     proc = _run(
-        ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE), "--project"],
+        ["compile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE), "--project"],
         tendcf,
     )
     assert proc.returncode == 0, proc.stderr.decode()
@@ -923,7 +805,7 @@ def test_cli_project_matches_projector(tendcf: Path, schemas: Schemas, projector
 
 def test_cli_requires_supervisor(tendcf: Path) -> None:
     proc = _run(
-        ["buildfile", "--host", "mac", "--platform", "macos", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)],
+        ["compile", "--host", "mac", "--platform", "macos", "--host-key", HOST_KEY, "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)],
         tendcf,
     )
     assert proc.returncode == 2 and b"--supervisor" in proc.stderr and proc.stdout == b""
@@ -932,7 +814,7 @@ def test_cli_requires_supervisor(tendcf: Path) -> None:
 def test_cli_nixos_host_projects_to_empty_vars(tendcf: Path, schemas: Schemas, projector, tmp_path: Path) -> None:
     trust = tmp_path / "device-trust.json"
     trust.write_text(json.dumps(_trust(SITE, None)))
-    args = ["buildfile", "--host", "get", "--platform", "linux", "--supervisor", "nixos", "--host-key", HOST_KEY,
+    args = ["compile", "--host", "get", "--platform", "linux", "--supervisor", "nixos", "--host-key", HOST_KEY,
             "--device-trust", str(trust), "--site", str(SITE)]
     proc = _run(args, tendcf)
     assert proc.returncode == 0, proc.stderr.decode()
@@ -944,7 +826,7 @@ def test_cli_nixos_host_projects_to_empty_vars(tendcf: Path, schemas: Schemas, p
 
 def test_cli_supervisor_disagreeing_with_document_exits_1(tendcf: Path) -> None:
     proc = _run(
-        ["buildfile", "--host", "mac", "--supervisor", "systemd", "--platform", "linux", "--host-key", HOST_KEY,
+        ["compile", "--host", "mac", "--supervisor", "systemd", "--platform", "linux", "--host-key", HOST_KEY,
          "--device-trust", str(SITE / "device-trust.json"), "--site", str(SITE)],
         tendcf,
     )
@@ -958,7 +840,7 @@ def test_cli_refusal_exits_1(tendcf: Path, tmp_path: Path) -> None:
     doc["services"][1]["launchd"]["label"] = doc["services"][0]["launchd"]["label"]
     (site / "services.yml").write_text(yaml.safe_dump(doc))
     proc = _run(
-        ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(site / "device-trust.json"), "--site", str(site)],
+        ["compile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(site / "device-trust.json"), "--site", str(site)],
         tendcf,
     )
     assert proc.returncode == 1
@@ -972,7 +854,7 @@ def test_cli_schema_invalid_input_exits_1(tendcf: Path, tmp_path: Path) -> None:
     doc["domains"]["macos-user-daemons"].pop("opt_out_reason")  # opt-out with no reason
     (site / "services.yml").write_text(yaml.safe_dump(doc))
     proc = _run(
-        ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(site / "device-trust.json"), "--site", str(site)],
+        ["compile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY, "--device-trust", str(site / "device-trust.json"), "--site", str(site)],
         tendcf,
     )
     assert proc.returncode == 1
@@ -988,17 +870,17 @@ def _run_env(args: list[str], tendcf_dir: str | None) -> subprocess.CompletedPro
     env["PYTHONPATH"] = str(REPO)
     if tendcf_dir is not None:
         env["TENDCF_DIR"] = tendcf_dir
-    return subprocess.run([sys.executable, "-m", "nix2cf.cli", *args], capture_output=True, env=env, check=False)
+    return subprocess.run([sys.executable, "-m", "tendcf.cli", *args], capture_output=True, env=env, check=False)
 
 
-def _buildfile_args(site: Path, *extra: str) -> list[str]:
-    return ["buildfile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY,
+def _compile_args(site: Path, *extra: str) -> list[str]:
+    return ["compile", "--host", "mac", "--platform", "macos", "--supervisor", "launchd", "--host-key", HOST_KEY,
             "--device-trust", str(site / "device-trust.json"), "--site", str(site), *extra]
 
 
 def test_cli_defaults_to_the_enclosing_checkout(schemas: Schemas, projector, tmp_path: Path) -> None:
-    # No --tendcf and no TENDCF_DIR: --project works (it needs bin/projector.py) ...
-    proc = _run_env(_buildfile_args(SITE, "--project"), None)
+    # No --tendcf and no TENDCF_DIR: --project works (it needs tools/projector.py) ...
+    proc = _run_env(_compile_args(SITE, "--project"), None)
     assert proc.returncode == 0, proc.stderr.decode()
     assert proc.stdout == projector.project(compile_host(_model(SITE), _host(SITE), schemas).goal_file)
     assert b"NOT validated" not in proc.stderr
@@ -1008,41 +890,50 @@ def test_cli_defaults_to_the_enclosing_checkout(schemas: Schemas, projector, tmp
     doc = yaml.safe_load((site / "services.yml").read_text())
     doc["domains"]["macos-user-daemons"].pop("opt_out_reason")
     (site / "services.yml").write_text(yaml.safe_dump(doc))
-    bad = _run_env(_buildfile_args(site), None)
+    bad = _run_env(_compile_args(site), None)
     assert bad.returncode == 1 and b"opt_out_reason" in bad.stderr and bad.stdout == b""
 
 
 def test_cli_tendcf_location_precedence(tendcf: Path, tmp_path: Path) -> None:
-    empty = tmp_path / "no-schemas"  # a directory with no *.schema.json: using it fails loudly
-    empty.mkdir()
+    empty = tmp_path / "no-schemas"  # a directory with an empty schema/ dir: using it fails loudly
+    (empty / "schema").mkdir(parents=True)
     refused = b"no *.schema.json under " + str(empty).encode()
     # --tendcf beats TENDCF_DIR: the real one in the env does not rescue the bad flag ...
-    flag = _run_env(_buildfile_args(SITE, "--tendcf", str(empty)), str(tendcf))
+    flag = _run_env(_compile_args(SITE, "--tendcf", str(empty)), str(tendcf))
     assert flag.returncode == 2 and refused in flag.stderr and flag.stdout == b""
     # ... and the good flag beats a bad TENDCF_DIR.
-    flag_ok = _run_env(_buildfile_args(SITE, "--tendcf", str(tendcf)), str(empty))
+    flag_ok = _run_env(_compile_args(SITE, "--tendcf", str(tendcf)), str(empty))
     assert flag_ok.returncode == 0, flag_ok.stderr.decode()
     # TENDCF_DIR beats the in-tree default: the enclosing checkout has schemas, the env's dir does not.
-    env = _run_env(_buildfile_args(SITE), str(empty))
+    env = _run_env(_compile_args(SITE), str(empty))
     assert env.returncode == 2 and refused in env.stderr and env.stdout == b""
 
 
-def _checkout_shape(root: Path, *, projector: bool = True, pyproject: bool = True, schema: bool = True) -> Path:
-    """Build <root>/compiler/nix2cf/cli.py's surroundings; return the fake cli.py path."""
-    (root / "compiler" / "nix2cf").mkdir(parents=True)
+def _checkout_shape(
+    root: Path,
+    *,
+    projector: bool = True,
+    pyproject: bool = True,
+    schema: bool = True,
+    plugins_dir: bool = True,
+) -> Path:
+    """Build <root>/compiler/tendcf/cli.py's surroundings; return the fake cli.py path."""
+    (root / "compiler" / "tendcf").mkdir(parents=True)
     if pyproject:
         (root / "compiler" / "pyproject.toml").write_text("")
     if schema:
         (root / "schema").mkdir()
         (root / "schema" / "goal-file.schema.json").write_text("{}")
     if projector:
-        (root / "bin").mkdir()
-        (root / "bin" / "projector.py").write_text("")
-    return root / "compiler" / "nix2cf" / "cli.py"
+        (root / "tools").mkdir()
+        (root / "tools" / "projector.py").write_text("")
+    if plugins_dir:
+        (root / "plugins").mkdir()
+    return root / "compiler" / "tendcf" / "cli.py"
 
 
 def test_in_tree_tendcf_accepts_only_a_real_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from nix2cf import cli
+    from tendcf import cli
 
     # In this repository it is the root (compiler/ sits directly under it).
     assert cli._in_tree_tendcf() == REPO.parent
@@ -1055,6 +946,7 @@ def test_in_tree_tendcf_accepts_only_a_real_checkout(monkeypatch: pytest.MonkeyP
         "no-projector": {"projector": False},
         "no-pyproject": {"pyproject": False},
         "no-schema": {"schema": False},
+        "no-plugins": {"plugins_dir": False},
     }.items():
         root = tmp_path / name
         monkeypatch.setattr(cli, "__file__", str(_checkout_shape(root, **kwargs)))
@@ -1063,7 +955,7 @@ def test_in_tree_tendcf_accepts_only_a_real_checkout(monkeypatch: pytest.MonkeyP
     other = tmp_path / "other"
     _checkout_shape(other)
     (other / "compiler").rename(other / "elsewhere")
-    monkeypatch.setattr(cli, "__file__", str(other / "elsewhere" / "nix2cf" / "cli.py"))
+    monkeypatch.setattr(cli, "__file__", str(other / "elsewhere" / "tendcf" / "cli.py"))
     assert cli._in_tree_tendcf() is None
     # With no checkout and no TENDCF_DIR there is nothing to find (no validation, as before the default existed).
     monkeypatch.delenv("TENDCF_DIR", raising=False)
@@ -1073,37 +965,38 @@ def test_in_tree_tendcf_accepts_only_a_real_checkout(monkeypatch: pytest.MonkeyP
 def _plant_tendcf(root: Path) -> None:
     (root / "schema").mkdir(parents=True)
     (root / "schema" / "goal-file.schema.json").write_text("{}")
-    (root / "bin").mkdir()
-    (root / "bin" / "projector.py").write_text("")
+    (root / "tools").mkdir()
+    (root / "tools" / "projector.py").write_text("")
+    (root / "plugins").mkdir()
 
 
 def test_in_tree_tendcf_none_for_site_packages_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from nix2cf import cli
+    from tendcf import cli
 
-    # <tmp>/lib/python3.12/site-packages/nix2cf/cli.py: parents[2] is lib/python3.12, which a
-    # planted schema/ and bin/projector.py must not turn into a tendcf checkout.
+    # <tmp>/lib/python3.12/site-packages/tendcf/cli.py: parents[2] is lib/python3.12, which a
+    # planted schema/, tools/projector.py, and plugins/ must not turn into a tendcf checkout.
     pyroot = tmp_path / "lib" / "python3.12"
     _plant_tendcf(pyroot)
-    pkg = pyroot / "site-packages" / "nix2cf"
+    pkg = pyroot / "site-packages" / "tendcf"
     pkg.mkdir(parents=True)
     monkeypatch.setattr(cli, "__file__", str(pkg / "cli.py"))
     assert cli._in_tree_tendcf() is None
 
 
 def test_in_tree_tendcf_none_for_pip_target_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from nix2cf import cli
+    from tendcf import cli
 
     # pip install --target <tmp>/pkgs (or PYTHONPATH=<tmp>/pkgs): parents[2] is <tmp>, which
     # anyone may have written to.
     _plant_tendcf(tmp_path)
-    pkg = tmp_path / "pkgs" / "nix2cf"
+    pkg = tmp_path / "pkgs" / "tendcf"
     pkg.mkdir(parents=True)
     monkeypatch.setattr(cli, "__file__", str(pkg / "cli.py"))
     assert cli._in_tree_tendcf() is None
 
 
 def test_yaml_unhashable_key_refused_cleanly(tmp_path: Path) -> None:
-    from nix2cf.sitemodel import SiteModelError
+    from tendcf.sitemodel import SiteModelError
 
     bad = tmp_path / "services.yml"
     bad.write_text("? [a, b]\n: 1\n")
@@ -1115,7 +1008,7 @@ def test_cli_unhashable_key_exits_2_without_traceback(tendcf: Path, tmp_path: Pa
     site = tmp_path / "site"
     shutil.copytree(SITE, site)
     (site / "services.yml").write_text("? [a, b]\n: 1\n")
-    proc = _run(_buildfile_args(site), tendcf)
+    proc = _run(_compile_args(site), tendcf)
     assert proc.returncode == 2 and b"not a scalar" in proc.stderr and b"Traceback" not in proc.stderr
 
 

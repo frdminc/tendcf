@@ -103,8 +103,8 @@ while JSON Schema's ECMA-262 `$` does not, so an id ending in `\n` passed
 (F5). Fixed to `\Z` and fixtured three times over, once per pattern, since
 a revert of any one of them alone is otherwise invisible.
 
-Run it:  bin/projector.py examples/goal-file.json
-         bin/projector.py --check examples/host_specific.json
+Run it:  tools/projector.py examples/goal-file.json
+         tools/projector.py --check examples/host_specific.json
 """
 
 from __future__ import annotations
@@ -308,7 +308,7 @@ MAX_PROJECTION_BYTES = 5 * 1024 * 1024
 # is a refusal and not a lint style rule.
 EXPANSION_SEQUENCES = ("$(", "${", "@(", "@{")
 
-# The two rule classes this module's checker can emit. `bin/schema_lint.py`
+# The two rule classes this module's checker can emit. `tools/schema_lint.py`
 # imports them, so the vocabulary has one spelling: the byte class is what is
 # measurable without understanding the mapping (canonical form, parse,
 # size), the other is the mapping's own invariants.
@@ -443,7 +443,7 @@ CONTAINERS = {container_name(kind): kind for kind in PROJECTING_KINDS}
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """`object_pairs_hook` refusing I-JSON's silent last-wins.
 
-    Deliberately a copy of `bin/schema_lint.py`'s, not an import of it: this
+    Deliberately a copy of `tools/schema_lint.py`'s, not an import of it: this
     module is the thing `tendcf-validate` is promoted from and the Android
     agent reproduces, and it may not depend on the repo's linter to be
     correct.
@@ -622,7 +622,7 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
     # 1e999, integers outside the IEEE-754 double domain, lone surrogates —
     # and rfc8785 raises on every one. Raising here would break two contracts
     # at once: this function is documented to RETURN findings, and
-    # bin/schema_lint.py calls it in a loop, so one such fixture aborted the
+    # tools/schema_lint.py calls it in a loop, so one such fixture aborted the
     # whole lint before the coverage checks ran. Un-canonicalizable bytes are
     # a refusal like any other, not a crash.
     try:

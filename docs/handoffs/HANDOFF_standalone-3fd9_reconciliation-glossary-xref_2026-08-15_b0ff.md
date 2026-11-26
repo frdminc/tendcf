@@ -43,7 +43,7 @@ Six commits landed, all pushed:
 - `2fcb366` — the goal-file schema reconciliation.
 - `0e4eada` — `docs/architecture/GLOSSARY.md` + README pointer.
 - `d0c306f` — guide corrections C-9 and C-4.
-- `aeb75d7` — `bin/xref_lint.py`.
+- `aeb75d7` — `tools/xref_lint.py`.
 
 **The reconciliation is the headline.** `fable-deep` (claude-fable-5, xhigh)
 produced `docs/architecture/goal-file-schema-reconciliation-2026-08-15.md`,
@@ -172,9 +172,9 @@ evidence it runs. The memory now says asking is judgment, not enforcement.
   withdrew. Eight `capability` sites classified by hand; three at paper
   §2.7/§2.8/§6.5 are the *security* sense and keep the word per DOC-4
   (`b46d6e9`). A blanket rename destroys exactly the distinction DOC-4 drew.
-- **Tests run:** no test suites. `bin/xref_lint.py` exercised against the real
+- **Tests run:** no test suites. `tools/xref_lint.py` exercised against the real
   corpus (its own false-positive rate was the test, and drove three fixes).
-  `bin/schema_lint.py` not run — no schema changed this session.
+  `tools/schema_lint.py` not run — no schema changed this session.
 
 ## Operator Feedback
 
@@ -219,7 +219,7 @@ evidence it runs. The memory now says asking is judgment, not enforcement.
 4. **`§18 item 2`:** edit `schema/report-row.schema.json` and
    `examples/report-rows.yml` per §12 (required `schema_ceiling`, optional
    `validator_version` on `device_convergence`).
-5. **`§18 item 5`:** extend `bin/schema_lint.py` per §13.
+5. **`§18 item 5`:** extend `tools/schema_lint.py` per §13.
 6. **`§18 item 4` leftover:** the "projection sentence" for guide §7. Confirm
    intent first — §7 has no such sentence, so this is an addition.
 7. **Confirm the Telegram Discussion path fires** on a real scheduled run.
@@ -264,11 +264,11 @@ sed -n '1073,1182p' docs/architecture/goal-file-schema-reconciliation-2026-08-15
 grep -nE '^### 9\.' docs/architecture/architecture-DEFINITIVE-v3.md                  # the seven targets
 
 # Cross-reference lint (stdlib only, no uv needed)
-python3 bin/xref_lint.py
-python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # live docs only
+python3 tools/xref_lint.py
+python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # live docs only
 
 # Schema lint — MUST run this way; bare python3 fails on jsonschema
-uv run --with jsonschema bin/schema_lint.py
+uv run --with jsonschema tools/schema_lint.py
 
 # Quota — `cswap list` can be stale across a reset; this is authoritative
 cswap status
