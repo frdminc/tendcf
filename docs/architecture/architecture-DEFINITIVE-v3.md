@@ -920,7 +920,7 @@ ruled; the schema design review (two frontier reviews) decides" (operator ruling
 standing-modes record are one version, and which number each takes, is
 that review's call.
 
-**Erratum (2026-11-20, PR 75):** the schema design review decided it. v7 is the standing-modes record (§9.1: `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record, X-trust-06) plus the `role` on the goal file's `advisor-key` entries (operator ruling R5, 2026-11-20, PR 75 review, "1. Role in goal file now (Recommended)"). The goal-file family moved to v7 together, and v7 is **current**: the schema is at v7, not v6. The Android `profile` field and the agent-id change did not ride it and take **v8 or later**, never v7. Current wording: `AGENTS.md`, Android item 5, and `schema/approval-record.schema.json`.
+**Erratum (2026-11-20, PR 75):** the schema design review decided it. v7 is the standing-modes record (§9.1: `record_kind`, the two standing kinds, and `signer`/`sig_alg` on every record, X-trust-06) plus the `role` on the goal file's `advisor-key` entries (operator ruling R5, 2026-11-20, PR 75 review, "1. Role in goal file now (Recommended)"). The goal-file family moved to v7 together (later updated to v8 for launchd `unit.launchd.domain` and exact `unit-writer` labels, and currently at **v9** for `user-gui` / `user-background` launchd domains; `schema/goal-file.schema.json` `const: 9`). The Android `profile` field and the agent-id change did not ride v7–v9 and take **v10 or later**. Current wording: `AGENTS.md`, Android item 5, and `schema/approval-record.schema.json`.
 
 **Amended 2026-11-13 (D46).** There is no device outside the operator's
 own hosts to strand yet, so the
@@ -1376,7 +1376,7 @@ approval record in app-private storage and shows consent; there is no
 full Kotlin port of the validator (operator ruling, 2026-11-14, B3
 sub 2, "1. Termux + Kotlin trust check"). The Python implementation is
 the one normative source on every platform. It is
-built after schema v5 lands (it has; the schema was at v6 and since 2026-11-20 is at v7, see the erratum at §9.6) and before any
+built after schema v5 lands (it has; the schema moved through v6–v8 and is currently at v9, see the erratum at §9.6) and before any
 further host is enforced (§13). Ruled exception (operator ruling, 2026-11-14, PR 62 review Q1, "2. Exception for the VM"): the §13 stage 1 macOS VM
 may enforce a root `cf-execd` early, before `tendcf-validate` exists at
 stage 4, as an explicit exception like pastebin's: canary only,
@@ -1447,7 +1447,7 @@ nothing:
    applies to the passthrough hard checks, not this consent gate. Timing:
    the schema is already at v6 (`"const": 6`, PR 52; v5 was the earlier
    state), so an id change costs the next unused schema version (v7
-   or later; since 2026-11-20 v7 is taken, see the erratum at §9.6, so v8 or later) and a baseline ceremony per device. Ruled 2026-11-14 (B3 sub
+   or later; erratum: v7–v9 are now taken, see §9.6, so v10 or later) and a baseline ceremony per device. Ruled 2026-11-14 (B3 sub
    1, "1. Field on entries"): the schema bump for the Android `profile`
    field rides this agent-id bump (M-§12-05 item 4). Ruled (operator ruling, 2026-11-14, PR 62 review Q4, "1. Decide at design review"): the next unused version (v7 or later); grouping not ruled (whether the standing-modes record, §9.1, shares that
    version included); the schema design review (two frontier reviews) decides.
