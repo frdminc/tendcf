@@ -3733,15 +3733,84 @@ check "classes-hidden: the section is reported too" \
 
 # Augments (def.json in inputs/) are loaded after the CMDB and can define classes
 # and variables just the same. tendcf ships none, so any is refused.
+# Issue #59: installed cf-agent entry points also pass `--no-augments` so
+# def.json is never loaded at all, while tendcf_cmdb keeps its
+# `source=augments_file` refusal guard as defense in depth.
 cp "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json"
 printf '%s\n' '{"classes":{"interlock_ok_demo_check":["any"]},"vars":{"probe":"x"}}' >"$work/inputs/def.json"
 out="$work/xc-augments.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-rm -f "$work/inputs/def.json"
 check "augments: refusal reported" refusal_reported "$out"
 check "augments: the foreign variable is reported" foreign_var_reported "$out"
 check "augments: the foreign class is reported" foreign_class_reported "$out"
 check "augments: nothing actuated (the class would have unblocked the bundle)" no_actuation "$out"
+
+out="$work/xc-no-augments.out"
+"$cf_agent" --no-augments -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+rm -f "$work/inputs/def.json"
+check "augments with --no-augments: policy completed" policy_completed "$out"
+check "augments with --no-augments: def.json not loaded (no CMDB cross-check refusal)" no_crosscheck "$out"
+check "augments with --no-augments: def.json class did not unblock the failing interlock" \
+    grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
+check "augments with --no-augments: nothing rendered and no launchctl/systemctl" no_render_start "$out"
+
+# Hostile control-character report sanitization fixture (issue #59 item 1):
+# real control characters (\n, \r, \x1b ESC, \t) inside a refused vars key
+# (`bad_keys` / `missing_keys`) and a refused top-level section name
+# (`extra_sections`). Both must trip tendcf_cmdb_refused with zero actuation,
+# and raw stdout/stderr must contain NO raw ESC (\x1b) and NO split/injected R:
+# line — every control char must become `?` on the single R: report line.
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "demo-check": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "demo_ok",
+                "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {},
+        "bad\nR: INJECTED_KEY\r\x1b[31m\tkey": {},
+    },
+    "sec\nR: INJECTED_SEC\r\x1b[31m\tname": {},
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/xc-ctrl-keysec.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "hostile control chars (bad_keys + extra_sections): refusal reported" refusal_reported "$out"
+check "hostile control chars (bad_keys + extra_sections): refusal reported once" refusal_once "$out"
+check "hostile control chars (bad_keys + extra_sections): nothing actuated" no_actuation "$out"
+check "hostile control chars (bad_keys + extra_sections): no raw ESC, no split R: line, sanitized markers present" \
+    python3 - "$out" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+marker = b"R: tendcf: CMDB cross-check failed: refusing to actuate anything"
+pos = raw.find(marker)
+assert pos != -1, f"refusal summary not found in output: {raw!r}"
+report_raw = raw[pos:]
+assert b"\x1b" not in report_raw, f"raw ESC byte leaked in report block: {report_raw!r}"
+assert b"\r" not in report_raw, f"raw CR byte leaked in report block: {report_raw!r}"
+assert b"\t" not in report_raw, f"raw TAB byte leaked in report block: {report_raw!r}"
+report_lines = report_raw.decode("utf-8", errors="replace").splitlines()
+assert all(
+    line.startswith(("R: tendcf: CMDB cross-check", "R: tendcf-test-done:"))
+    for line in report_lines
+), f"unexpected or split line inside report block: {report_lines!r}"
+# Note: \u001b decodes to 0x1b on the B-13 fork (one `?`) and stays `\u001b` on
+# non-B-13 builds (`?u001b`), so match either sanitized form on the single R: line.
+key_re = re.compile(r"^R: tendcf: CMDB cross-check: key 'bad\?R:\?INJECTED_KEY\?\?(?:u001b)?\?31m\?key' under 'vars'")
+missing_re = re.compile(r"^R: tendcf: CMDB cross-check: key 'bad\?R:\?INJECTED_KEY\?\?(?:u001b)?\?31m\?key' is under 'vars' in .* but CFEngine did not load")
+sec_re = re.compile(r"^R: tendcf: CMDB cross-check: .* has top-level section 'sec\?R:\?INJECTED_SEC\?\?(?:u001b)?\?31m\?name' besides 'vars'")
+assert any(key_re.search(line) for line in report_lines), f"sanitized bad_keys line not found in: {report_lines!r}"
+assert any(missing_re.search(line) for line in report_lines), f"sanitized missing_keys line not found in: {report_lines!r}"
+assert any(sec_re.search(line) for line in report_lines), f"sanitized extra_sections line not found in: {report_lines!r}"
+PYEOF
 
 # Positive control (review B3): a `vars` container that is a list of strings
 # round-trips through the loader's slist, so it is accepted and the run actuates.
@@ -3950,6 +4019,71 @@ check "half-loaded container: the whole key is not reported as missing" \
 check "half-loaded container: nothing actuated (the loaded entry is not processed either)" \
     no_actuation "$out"
 
+# Hostile control-character unloaded entry id (issue #59 item 1): feed real
+# control characters (\n, \r, \x1b ESC, \t) through an unloaded entry id in
+# `tendcf_service` (sim_service_partial loads only `demo-runit`, so the hostile
+# id lands in `unloaded_ids[tendcf_service]`).
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "demo-check": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "demo_ok",
+                "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {
+            "demo-runit": {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            },
+            "id\nR: INJECTED_ID\r\x1b[31m\tbad": {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            },
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/xc-sim-ctrl-unloaded.out"
+"$cf_agent" -K -I --no-host-specific-data -D sim_interlock,sim_service_partial -f "$work/inputs/sim-entry.cf" >"$out" 2>&1 || true
+check "hostile control chars (unloaded_ids): refusal reported" refusal_reported "$out"
+check "hostile control chars (unloaded_ids): refusal reported once" refusal_once "$out"
+check "hostile control chars (unloaded_ids): nothing actuated" no_actuation "$out"
+check "hostile control chars (unloaded_ids): no raw ESC, no split R: line, sanitized marker present" \
+    python3 - "$out" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+marker = b"R: tendcf: CMDB cross-check failed: refusing to actuate anything"
+pos = raw.find(marker)
+assert pos != -1, f"refusal summary not found in output: {raw!r}"
+report_raw = raw[pos:]
+assert b"\x1b" not in report_raw, f"raw ESC byte leaked in report block: {report_raw!r}"
+assert b"\r" not in report_raw, f"raw CR byte leaked in report block: {report_raw!r}"
+assert b"\t" not in report_raw, f"raw TAB byte leaked in report block: {report_raw!r}"
+report_lines = report_raw.decode("utf-8", errors="replace").splitlines()
+assert all(
+    line.startswith("R: tendcf: CMDB cross-check")
+    for line in report_lines
+), f"unexpected or split line inside report block: {report_lines!r}"
+id_re = re.compile(r"^R: tendcf: CMDB cross-check: key 'tendcf_service' loaded differently from .*: in the file only: \[id\?R:\?INJECTED_ID\?\?(?:u001b)?\?31m\?bad\]; loaded only: \[\]$")
+assert any(id_re.search(line) for line in report_lines), f"sanitized unloaded_ids line not found in: {report_lines!r}"
+PYEOF
+
 out="$work/xc-sim-stray.out"
 sim_run runit-pair.json sim_interlock,sim_service,sim_stray "$out"
 check "extra loaded variable: refusal reported" refusal_reported "$out"
@@ -4080,11 +4214,11 @@ if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-no-augments xc-ctrl-keysec xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
-             xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
+             xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-ctrl-unloaded xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
              reserved-systemd-nosuffix-present reserved-systemd-nosuffix-absent reserved-systemd-timer-present reserved-dry-launchd reserved-dry-systemd \
              bad-systemd-id-dot-slash-present bad-systemd-id-dot-slash-absent bad-systemd-id-parent-trav-present bad-systemd-id-parent-trav-absent bad-systemd-id-dropin-present bad-systemd-id-space-present \

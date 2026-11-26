@@ -38,7 +38,7 @@
 #                    atomic rollback on post-publish failure or catchable
 #                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss
 #                    does not run traps)
-#   run-once         one `cf-agent -K -I` pass over the installed policy
+#   run-once         one `cf-agent --no-augments -K -I` pass over the installed policy
 #   enable           write /Library/LaunchDaemons/org.tendcf.execd.plist
 #                    (root:wheel 0644, plutil -lint) and bootstrap it
 #                    idempotently (launchctl print exit-code probe)
@@ -1310,7 +1310,7 @@ body common control
 
 body executor control
 {
-      exec_command => "$(sys.cf_agent) -f $(sys.inputdir)/promises.cf";
+      exec_command => "$(sys.cf_agent) --no-augments -f $(sys.inputdir)/promises.cf";
 }
 EOF
     local entry_differs=0
@@ -2070,7 +2070,7 @@ cmd_install() {
 cmd_run_once() {
     [ -f "$entry" ] || die "not installed: run install first"
     [ -f "$data" ] || die "no CMDB data: run install --data FILE or data FILE first"
-    "$cf_agent" -K -I -f "$entry"
+    "$cf_agent" --no-augments -K -I -f "$entry"
 }
 
 cmd_enable() {
