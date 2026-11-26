@@ -528,8 +528,11 @@ Maybe have a development mode and/or build?").
    role default included, and any re-adoption are never by standing
    application; each device nonce comes from a cryptographic random source
    with at least 128 bits, is never a counter or derived from replay-store
-   state, and is bound to the scope the ceremony showed (record kind, class,
-   `developer_mode`, `grant_id`). The enforcement PR's negative-test list is tracked in
+   state, and is bound to the full scope the ceremony showed (`record_kind`,
+   `host`, `grant_id`, `mode`, `covered_signers`, `class`, `developer_mode`,
+   `hold_seconds`, `not_after` and ceremony level for enrollments; `host`,
+   `proposed_sha256` and `ceremony_class` for per-change records; PR 75 R4 #3
+   and #5). The enforcement PR's negative-test list is tracked in
    [frdminc/tendcf#76](https://github.com/frdminc/tendcf/issues/76). The 2026-11-19 rulings and R1-R11 are the
    only rulings here; everything else the schema states (terminal revocation,
    most-restrictive-wins and its tie rules, hold-window timing, persist at
