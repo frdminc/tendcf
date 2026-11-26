@@ -4726,6 +4726,196 @@ for spec in "empty-dup-vars:loader-empty-dup-vars.json:Unwilling to parse json d
         grep -q "Could not parse JSON file .*host_specific\\.json: $pattern" "$out"
 done
 
+# (g)-(j) Cluster D strict-loader & metadata hardening (fork 75dee108 / overlay
+# libntech 0007-0008, core 0003-0004; issues #66, #67, #68, #69).
+# (g) Embedded NUL bytes (issue #69 part B): JsonParseFileStrict() rejects any
+# file whose byte length exceeds its C-string length (trailing NUL + garbage, or
+# a lone trailing NUL after valid JSON) and installs nothing.
+for nul_spec in \
+    "nul-trailing:trailing" \
+    "nul-eof:"; do
+    name="${nul_spec%%:*}"; suffix="${nul_spec#*:}"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$suffix" <<'PYEOF'
+import pathlib, sys
+base = pathlib.Path(sys.argv[1]).read_bytes().rstrip(b"\r\n")
+pathlib.Path(sys.argv[2]).write_bytes(base + b"\x00" + sys.argv[3].encode("ascii"))
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    fork_only "$name: the policy refuses and reports it" refusal_reported "$out"
+    fork_only "$name: the policy reports it once" refusal_once "$out"
+    fork_only "$name: the loader refuses the embedded-NUL file" \
+        grep -q "Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with trailing non-whitespace characters" "$out"
+    fork_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    fork_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    fork_only "$name: nothing actuated" no_actuation "$out"
+    check "$name: nothing rendered, nothing started" no_render_start "$out"
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || true
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$pout"
+done
+
+# (h) Trailing-backslash truncation (issue #66): JsonParseAsString() must return
+# JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END without reading past the NUL
+# terminator. Guard execution on fork_loader=1 so stock unpatched builds do not
+# execute the OOB read, while still printing counted fork_only SKIPs.
+if [ "$fork_loader" = 1 ]; then
+    python3 - "$work/data/host_specific.json" <<'PYEOF'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(b'{"vars":{"tendcf_interlock":{"a":"x\\')
+PYEOF
+    out="$work/strict-trailing-backslash.out"
+    tb_rc=0
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || tb_rc=$?
+    pout="$work/probe-strict-trailing-backslash.out"
+    tb_prc=0
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || tb_prc=$?
+else
+    out="$work/strict-trailing-backslash.out"
+    pout="$work/probe-strict-trailing-backslash.out"
+    tb_rc=0
+    tb_prc=0
+fi
+fork_only "trailing-backslash: cf-agent did not crash on signal (rc < 128)" test "$tb_rc" -lt 128
+fork_only "trailing-backslash: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+fork_only "trailing-backslash: the loader refuses the truncated string" \
+    grep -q "Could not parse JSON file .*host_specific\\.json: Unable to parse json data as string, did not end with doublequote" "$out"
+fork_only "trailing-backslash: the policy refuses and reports it" refusal_reported "$out"
+fork_only "trailing-backslash: the policy reports it once" refusal_once "$out"
+fork_only "trailing-backslash: nothing actuated" no_actuation "$out"
+fork_only "trailing-backslash: probe cf-agent did not crash on signal (rc < 128)" test "$tb_prc" -lt 128
+fork_only "trailing-backslash: no tendcf_interlock variable" \
+    grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+fork_only "trailing-backslash: no tendcf_service variable" \
+    grep -q "cmdb-probe: tendcf_service absent" "$pout"
+
+# (i) Strict JSON non-JSON forms (issue #67): missing colon, unquoted key, and
+# \u0000 escapes in key or value positions are refused by JsonParseStrict() and
+# install nothing.
+for strict67_spec in \
+    "missing-colon:Unable to parse json data as object, ':' seen without having specified an l-value" \
+    "unquoted-key:Unable to parse json data as object, unrecognized token beginning entry" \
+    "null-escape-key:Unwilling to parse json string with a null character escape" \
+    "null-escape-val:Unwilling to parse json string with a null character escape"; do
+    name="${strict67_spec%%:*}"; expected="${strict67_spec#*:}"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$name" <<'PYEOF'
+import pathlib, sys
+base = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+mode = sys.argv[3]
+if mode == "missing-colon":
+    assert base.startswith('{"vars":')
+    payload = '{"vars" ' + base[len('{"vars":'):]
+elif mode == "unquoted-key":
+    assert base.startswith('{"vars":')
+    payload = '{vars:' + base[len('{"vars":'):]
+elif mode == "null-escape-key":
+    assert '"tendcf_service":' in base
+    payload = base.replace('"tendcf_service":', '"tendcf_service\\u0000":', 1)
+elif mode == "null-escape-val":
+    assert '"working_dir":"/"' in base
+    payload = base.replace('"working_dir":"/"', '"working_dir":"/\\u0000"', 1)
+else:
+    raise SystemExit(f"unknown mode: {mode}")
+pathlib.Path(sys.argv[2]).write_text(payload, encoding="utf-8")
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    fork_only "$name: the policy refuses and reports it" refusal_reported "$out"
+    fork_only "$name: the policy reports it once" refusal_once "$out"
+    fork_only "$name: the loader refuses the non-JSON input" \
+        grep -qF "$expected" "$out"
+    fork_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    fork_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    fork_only "$name: nothing actuated" no_actuation "$out"
+    check "$name: nothing rendered, nothing started" no_render_start "$out"
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || true
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$pout"
+done
+
+# (j) Unknown metadata keys inside CMDB `classes` and `variables` objects
+# (issue #68): a misspelled metadata key (such as singular `class_expression` or
+# `tag`) refuses the whole file and installs neither the class/variable nor any
+# sibling `vars` containers.
+cat > "$work/inputs/meta-probe.cf" <<'EOF'
+body common control
+{
+      bundlesequence => { "meta_probe" };
+}
+
+bundle agent meta_probe
+{
+  classes:
+      "interlock_present" expression => isvariable("data:variables.tendcf_interlock");
+      "service_present" expression => isvariable("data:variables.tendcf_service");
+      "var_x_present" expression => isvariable("data:variables.x");
+
+  reports:
+    interlock_present::
+      "meta-probe: tendcf_interlock present";
+    !interlock_present::
+      "meta-probe: tendcf_interlock absent";
+    service_present::
+      "meta-probe: tendcf_service present";
+    !service_present::
+      "meta-probe: tendcf_service absent";
+    var_x_present::
+      "meta-probe: var x present";
+    !var_x_present::
+      "meta-probe: var x absent";
+    maint::
+      "meta-probe: class maint present";
+    !maint::
+      "meta-probe: class maint absent";
+}
+EOF
+for meta_spec in \
+    "meta-class-unknown|classes|Invalid key 'class_expression' in CMDB class specification 'maint' (only 'class_expressions', 'regular_expressions', 'tags' and 'comment' are allowed)|meta-probe: class maint absent" \
+    "meta-var-unknown|variables|Invalid key 'tag' in CMDB variable specification 'x' (only 'value', 'tags' and 'comment' are allowed)|meta-probe: var x absent"; do
+    IFS='|' read -r name section loader_err probe_expect <<< "$meta_spec"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$name" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if sys.argv[3] == "meta-class-unknown":
+    doc["classes"] = {"maint": {"class_expression": ["!prod::"]}}
+elif sys.argv[3] == "meta-var-unknown":
+    doc["variables"] = {"x": {"value": "1", "tag": ["a"]}}
+else:
+    raise SystemExit(f"unknown meta case: {sys.argv[3]}")
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    check "$name: the policy refuses and reports it" refusal_reported "$out"
+    check "$name: the policy reports it once" refusal_once "$out"
+    check "$name: the $section section is named by the policy" \
+        grep -q "has top-level section '$section' besides 'vars'" "$out"
+    check "$name: nothing actuated" no_actuation "$out"
+    fork_only "$name: the loader refuses the unknown metadata key" \
+        grep -qF "$loader_err" "$out"
+    fork_only "$name: the loader installs none of the file" \
+        grep -q "installing none of its contents" "$out"
+    fork_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    fork_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/meta-probe.cf" >"$pout" 2>&1 || true
+    fork_only "$name: target entity not defined ($probe_expect)" \
+        grep -qF "$probe_expect" "$pout"
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "meta-probe: tendcf_interlock absent" "$pout"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "meta-probe: tendcf_service absent" "$pout"
+done
+
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
 sim_run() {  # sim_run FIXTURE|none CLASSES OUT
     if [ "$1" = none ]; then rm -f "$work/data/host_specific.json"
@@ -4965,6 +5155,11 @@ if [ "$fail" != 0 ]; then
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
+             strict-nul-trailing strict-nul-eof probe-strict-nul-trailing probe-strict-nul-eof \
+             strict-trailing-backslash probe-strict-trailing-backslash \
+             strict-missing-colon strict-unquoted-key strict-null-escape-key strict-null-escape-val \
+             probe-strict-missing-colon probe-strict-unquoted-key probe-strict-null-escape-key probe-strict-null-escape-val \
+             strict-meta-class-unknown strict-meta-var-unknown probe-strict-meta-class-unknown probe-strict-meta-var-unknown \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-ctrl-unloaded xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
              reserved-systemd-nosuffix-present reserved-systemd-nosuffix-absent reserved-systemd-timer-present reserved-dry-launchd reserved-dry-systemd \
