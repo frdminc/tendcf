@@ -101,6 +101,7 @@ EXAMPLES: dict[str, tuple[str, bool]] = {
     "roles.yml": ("roles.schema.json", False),
     "launchd-writers.yml": ("launchd-writers.schema.json", False),
     "report-rows.yml": ("report-row.schema.json", True),
+    "audit-envelopes.yml": ("audit-envelope.schema.json", True),
     "goal-file.json": ("goal-file.schema.json", False),
     "goal-file-baseline.json": ("goal-file.schema.json", False),
     "goal-diff.json": ("goal-diff.schema.json", False),
@@ -1537,7 +1538,10 @@ def validate_loaded(
                 fail(f"{label}: expected a sequence of rows", rule=RULE_SCHEMA)
                 continue
             for i, row in enumerate(data):
-                validate_row(row, schema, registry, f"{label}[{i}]")
+                if schema_name == "report-row.schema.json":
+                    validate_row(row, schema, registry, f"{label}[{i}]")
+                else:
+                    validate(row, schema, registry, f"{label}[{i}]")
         else:
             validate(data, schema, registry, label)
     check_cross_file(loaded)

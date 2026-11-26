@@ -1,0 +1,156 @@
+# Example hash-chained audit envelopes — each validates against
+# schema/audit-envelope.schema.json and forms a valid cryptographic chain
+# (verified by tests/audit/test_audit_log.py).
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 1
+  ts: "2026-11-26T12:00:01Z"
+  mono_ms: 1000
+  prev: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  type: lifecycle
+  data:
+    action: "install"
+    release: "release-1.0.0"
+    prefix_sha256: "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    policy_sha256: "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    projector_sha256: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  h: "sha256:a28b42a85b7e990dd41a708a4645313580fb776a53e607956f7abba50a9143ec"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 2
+  ts: "2026-11-26T12:00:02Z"
+  mono_ms: 2000
+  prev: "sha256:a28b42a85b7e990dd41a708a4645313580fb776a53e607956f7abba50a9143ec"
+  type: release_decision
+  data:
+    release: "release-1.0.0"
+    release_sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    goal_sha256: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    projection_sha256: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    verdict: "pass"
+    validator_version: "ops-v1.0.0"
+  h: "sha256:8f32415ab3dc9b0eb4a50d4e2dde01ff568f678f23b8d0191fbcccc1bf33b305"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 3
+  ts: "2026-11-26T12:00:03Z"
+  mono_ms: 3000
+  prev: "sha256:8f32415ab3dc9b0eb4a50d4e2dde01ff568f678f23b8d0191fbcccc1bf33b305"
+  type: consent_decision
+  data:
+    verdict: "accept"
+    key_id: "ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    decided_at: "2026-11-26T12:00:01Z"
+    decision_sha256: "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+    ceremony_class: "privileged"
+  h: "sha256:dbffa3c86d4700ae1b9bcab83ef03d0b17a78413bb2835e6434cb3bdedf31162"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 4
+  ts: "2026-11-26T12:00:04Z"
+  mono_ms: 4000
+  prev: "sha256:dbffa3c86d4700ae1b9bcab83ef03d0b17a78413bb2835e6434cb3bdedf31162"
+  type: promise_outcome
+  data:
+    release: "release-1.0.0"
+    domain: "linux-systemd-services"
+    bundle: "edge-http"
+    entry: "tendcf.canary.service"
+    mode: "enforce"
+    outcome: "repaired"
+  h: "sha256:1f8c7a1cc38e943b9704d63ccb213deccf3a5264e680c4f40cfda4fc927b2062"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 5
+  ts: "2026-11-26T12:00:05Z"
+  mono_ms: 5000
+  prev: "sha256:1f8c7a1cc38e943b9704d63ccb213deccf3a5264e680c4f40cfda4fc927b2062"
+  type: service_change
+  data:
+    action: "install"
+    supervisor: "systemd"
+    unit: "tendcf.canary.service"
+    path: "/etc/systemd/system/tendcf.canary.service"
+    new_sha256: "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+  h: "sha256:274f1b7210ff0febf55376e2b14fbc667058cc2e55c44a476a5fa9f23a5fb7a0"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 6
+  ts: "2026-11-26T12:00:06Z"
+  mono_ms: 6000
+  prev: "sha256:274f1b7210ff0febf55376e2b14fbc667058cc2e55c44a476a5fa9f23a5fb7a0"
+  type: package_change
+  data:
+    action: "upgrade"
+    package: "ca-certificates"
+    prev_version: "20240203"
+    version: "20250419"
+  h: "sha256:eb8b05d5cc4e36ef3f64f681d8d5343580798e56e87923c62f37bfc23263c733"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 7
+  ts: "2026-11-26T12:00:07Z"
+  mono_ms: 7000
+  prev: "sha256:eb8b05d5cc4e36ef3f64f681d8d5343580798e56e87923c62f37bfc23263c733"
+  type: trust_change
+  data:
+    kind: "advisor_key"
+    action: "add"
+    key_id: "ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    new_sha256: "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  h: "sha256:ac6feae55c57e1bdd4237c9214002692e36277f5e58350619efa3f0b6288b105"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 8
+  ts: "2026-11-26T12:00:08Z"
+  mono_ms: 8000
+  prev: "sha256:ac6feae55c57e1bdd4237c9214002692e36277f5e58350619efa3f0b6288b105"
+  type: tripwire
+  data:
+    tool: "aide"
+    event: "modified"
+    path: "/opt/tendcf/inputs/promises.cf"
+    expected_sha256: "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    observed_sha256: "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+  h: "sha256:6a40c05643b422cd8677712a78ceb8cbe291f774bff54b5d37411d1da0726be1"
+
+- v: 1
+  src: tendcf
+  host: pastebin
+  boot_id: "550e8400-e29b-41d4-a716-446655440000"
+  seq: 9
+  ts: "2026-11-26T12:00:09Z"
+  mono_ms: 9000
+  prev: "sha256:6a40c05643b422cd8677712a78ceb8cbe291f774bff54b5d37411d1da0726be1"
+  type: heartbeat
+  data:
+    running_release: "release-1.0.0"
+    goal_sha256: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    projection_sha256: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    converged: true
+    unshipped_count: 0
+  h: "sha256:42f122e1052ecba0fafefe3b1a1ac3f4fb1aad2b4cb6e23c40ec68b03738feb3"

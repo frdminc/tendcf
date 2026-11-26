@@ -89,6 +89,11 @@ jobs:
       - name: Approval enforcement tests
         run: python3 -I -S -m unittest discover -s tests/approval -v
 
+      # Pure-stdlib tamper-evident audit chain, redaction gate, offline spool,
+      # append-only sink & forensic verifier (tools/audit_log.py, issue #119).
+      - name: Audit log and sink contract tests
+        run: python3 -I -S -m unittest discover -s tests/audit -v
+
       # Linux installer hardening contract & hermetic tests (#53, #57, #58).
       - name: Linux installer contract tests
         run: python3 -I -m unittest discover -s tests/deploy -v
