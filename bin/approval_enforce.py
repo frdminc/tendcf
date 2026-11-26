@@ -42,6 +42,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sys
 import tempfile
 import threading
@@ -1068,7 +1069,9 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
     if pa is not None:
         if (
             not isinstance(pa, dict)
-            or set(pa) != {"proposed_sha256", "proposed_goal", "baseline_sha256"}
+            or set(pa) != {"actuation_id", "proposed_sha256", "proposed_goal", "baseline_sha256"}
+            or not isinstance(pa["actuation_id"], str)
+            or not pa["actuation_id"]
             or not isinstance(pa["proposed_sha256"], str)
             or not SHA256_RE.match(pa["proposed_sha256"])
             or not isinstance(pa["proposed_goal"], dict)
@@ -1395,6 +1398,16 @@ class ReplayStore:
             validate_goal_file_basics(baseline_snap, self.host)
         with self.locked():
             state = self.load_verified_unlocked(allow_voided=True)
+            if state.get("pending_actuation") is not None:
+                raise ReplayError(
+                    "pending_actuation_unreconciled",
+                    "cannot run recover_after_store_loss while pending_actuation is unreconciled",
+                )
+            if not state.get("voided"):
+                raise ReplayError(
+                    "store_not_voided",
+                    "recover_after_store_loss is only permitted on a voided store",
+                )
             state["voided"] = False
             state["void_reason"] = None
             state["pending_actuation"] = None
@@ -2152,6 +2165,19 @@ class ApprovalEnforcer:
                 "unreconciled pending actuation exists; call reconcile_pending_actuation() first",
             )
 
+    @staticmethod
+    def _new_pending_actuation(
+        proposed_sha256: str,
+        proposed_goal: dict[str, Any],
+        baseline_sha256: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "actuation_id": secrets.token_hex(16),
+            "proposed_sha256": proposed_sha256,
+            "proposed_goal": copy.deepcopy(proposed_goal),
+            "baseline_sha256": baseline_sha256,
+        }
+
     def _actuate_and_publish_baseline_unlocked(
         self,
         proposed_goal: dict[str, Any],
@@ -2160,18 +2186,19 @@ class ApprovalEnforcer:
         before_apply_hook: Callable[[], None] | None = None,
         before_publish_hook: Callable[[], None] | None = None,
     ) -> None:
-        """Actuate `proposed_goal` and publish baseline ONLY after callback confirmation (Codex #1, #2, #8; R2-H2).
+        """Actuate `proposed_goal` and publish baseline ONLY after callback confirmation (Codex R2/R3; R2-H2).
 
         Caller has ALREADY durably committed the pre-actuation replay reservation
         together with `pending_actuation` intent before invoking this method.
         - Nested mutations from inside `_apply_callback` are forbidden while
-          read-only calls (`store.snapshot()`, `developer_mode_indicator_active()`)
-          remain allowed.
-        - Confirmed `_apply_callback` exception clears `pending_actuation` while
-          preserving the prior baseline and consumed replay mark.
-        - Crash/failure during `before_apply_hook` or `before_publish_hook` leaves
-          `pending_actuation` persisted on disk so subsequent operations fail closed
-          until `reconcile_pending_actuation()` resolves the outcome.
+          non-expired read-only calls (`store.snapshot()`, non-expired
+          `developer_mode_indicator_active()`) remain allowed.
+        - Any exception from `before_apply_hook`, `_apply_callback`, or
+          `before_publish_hook` leaves `pending_actuation` durably persisted on
+          disk (Codex R3 #1 / Macroscope 4709558270) because a callback failure
+          cannot prove the device was left unchanged; subsequent mutating calls
+          fail closed until `reconcile_pending_actuation(actuation_id, ...)`
+          resolves the exact intent instance.
         """
         if before_apply_hook is not None:
             before_apply_hook()
@@ -2180,12 +2207,6 @@ class ApprovalEnforcer:
         try:
             if self._apply_callback is not None:
                 self._apply_callback(copy.deepcopy(proposed_goal))
-        except BaseException:
-            self.store._in_actuation_tx = False
-            fresh_abort = self.store.load_verified_unlocked()
-            fresh_abort["pending_actuation"] = None
-            self.store.commit_unlocked(fresh_abort)
-            raise
         finally:
             self.store._in_actuation_tx = False
 
@@ -2198,17 +2219,33 @@ class ApprovalEnforcer:
         self.store.commit_unlocked(fresh, before_replace_hook=before_publish_hook)
         self.actuation_count += 1
 
-    def reconcile_pending_actuation(self, *, applied_on_device: bool) -> dict[str, Any]:
-        """Reconcile an uncertain crash-interrupted actuation against the real device state (Codex R2 #1)."""
+    def reconcile_pending_actuation(
+        self, actuation_id: str, *, applied_on_device: bool
+    ) -> dict[str, Any]:
+        """Reconcile a specific crash/error-interrupted actuation intent against real device state (Codex R2 #1, R3 #3)."""
+        if not isinstance(actuation_id, str) or not actuation_id:
+            raise MalformedRecordError(
+                "invalid_actuation_id", "actuation_id must be a non-empty string"
+            )
         if not _is_exact_bool(applied_on_device):
             raise MalformedRecordError(
                 "invalid_reconcile_flag", "applied_on_device must be an exact bool"
             )
         with self.store.locked():
+            if self.store._in_actuation_tx:
+                raise ReplayError(
+                    "nested_mutation_during_actuation",
+                    "cannot reconcile pending_actuation from inside an active actuation callback",
+                )
             state = self.store.load_verified_unlocked()
             pa = state.get("pending_actuation")
             if pa is None:
                 raise ReplayError("no_pending_actuation", "no pending actuation to reconcile")
+            if not hmac.compare_digest(pa["actuation_id"], actuation_id):
+                raise ReplayError(
+                    "actuation_id_mismatch",
+                    "reconciliation actuation_id does not match current pending_actuation intent",
+                )
             if applied_on_device:
                 state["applied_baseline_goal"] = copy.deepcopy(pa["proposed_goal"])
                 state["applied_baseline_sha256"] = pa["proposed_sha256"]
@@ -2218,12 +2255,14 @@ class ApprovalEnforcer:
                 self.actuation_count += 1
                 return {
                     "status": "promoted",
+                    "actuation_id": actuation_id,
                     "applied_baseline_sha256": state["applied_baseline_sha256"],
                 }
             state["pending_actuation"] = None
             self.store.commit_unlocked(state)
             return {
                 "status": "aborted",
+                "actuation_id": actuation_id,
                 "applied_baseline_sha256": state["applied_baseline_sha256"],
             }
 
@@ -2368,7 +2407,12 @@ class ApprovalEnforcer:
                     continue
                 if scope.get("developer_mode") is True:
                     indicator_on = True
-            if observed_expired and not self.store._in_actuation_tx:
+            if observed_expired:
+                if self.store._in_actuation_tx:
+                    raise ReplayError(
+                        "expiry_observation_during_actuation",
+                        "cannot expose observed grant expiry during an actuation callback without persisting watermark",
+                    )
                 self._record_observed_expiry_unlocked(state, now_dt)
             return indicator_on
 
@@ -2979,11 +3023,9 @@ class ApprovalEnforcer:
 
             # effective_mode == "standing-approval":
             # Phase A: durably persist replay reservation + pending_actuation intent BEFORE actuation.
-            state["pending_actuation"] = {
-                "proposed_sha256": actual_proposed_hash,
-                "proposed_goal": copy.deepcopy(proposed_goal),
-                "baseline_sha256": current_baseline_hash,
-            }
+            state["pending_actuation"] = self._new_pending_actuation(
+                actual_proposed_hash, proposed_goal, current_baseline_hash
+            )
             self.store.commit_unlocked(
                 state,
                 before_replace_hook=before_replace_hook,
@@ -3247,11 +3289,9 @@ class ApprovalEnforcer:
 
             # Phase A: remove pending hold, record pending_actuation & UTC durably BEFORE actuating.
             del state["pending_holds"][proposed_sha256]
-            state["pending_actuation"] = {
-                "proposed_sha256": proposed_sha256,
-                "proposed_goal": copy.deepcopy(proposed_goal),
-                "baseline_sha256": current_baseline_hash,
-            }
+            state["pending_actuation"] = self._new_pending_actuation(
+                proposed_sha256, proposed_goal, current_baseline_hash
+            )
             self._advance_utc_clock(state, now_dt)
             self.store.commit_unlocked(state)
 
@@ -3434,14 +3474,18 @@ class ApprovalEnforcer:
                         "baseline_sha256_mismatch",
                         "per-change baseline_sha256 does not match applied baseline",
                     )
-                if proposed_goal is not None:
-                    # Enforce anti-downgrade even on re-adoption (Codex #4 / Macroscope 4708874598).
-                    if proposed_goal["schema_version"] < baseline_goal["schema_version"]:
-                        raise ScopeError(
-                            "downward_version_bump",
-                            f"refusing downward schema_version {baseline_goal['schema_version']} -> "
-                            f"{proposed_goal['schema_version']} during re-adoption",
-                        )
+                if proposed_goal is None:
+                    raise MalformedRecordError(
+                        "readoption_requires_proposal",
+                        "non-hold per-change re-adoption requires proposed_goal to verify anti-downgrade and exact hash",
+                    )
+                # Enforce anti-downgrade even on re-adoption (Codex #4 / Macroscope 4708874598).
+                if proposed_goal["schema_version"] < baseline_goal["schema_version"]:
+                    raise ScopeError(
+                        "downward_version_bump",
+                        f"refusing downward schema_version {baseline_goal['schema_version']} -> "
+                        f"{proposed_goal['schema_version']} during re-adoption",
+                    )
                 derived_class = "baseline"
             else:
                 assert baseline_goal is not None
@@ -3593,11 +3637,9 @@ class ApprovalEnforcer:
             state["persisted_rejects"].pop(proposed_sha256, None)
             if proposed_sha256 in state["pending_holds"]:
                 cancelled_holds.append(state["pending_holds"].pop(proposed_sha256)["hold_id"])
-            state["pending_actuation"] = {
-                "proposed_sha256": proposed_sha256,
-                "proposed_goal": copy.deepcopy(proposed_goal),
-                "baseline_sha256": state["applied_baseline_sha256"],
-            }
+            state["pending_actuation"] = self._new_pending_actuation(
+                proposed_sha256, proposed_goal, state["applied_baseline_sha256"]
+            )
             self._advance_utc_clock(state, now_dt)
             # Phase A: commit replay reservation + pending_actuation intent BEFORE actuation.
             self.store.commit_unlocked(

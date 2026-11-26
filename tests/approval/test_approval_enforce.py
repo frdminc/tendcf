@@ -771,15 +771,26 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
         )
         with self.assertRaises(_ActuateFailed):
             enf_fail.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=T0)
-        # Replay mark IS consumed (2), actuation_count NOT incremented, prior baseline PRESERVED!
+        # Codex R3 #1 / Macroscope 4709558270: callback exception leaves pending_actuation persisted
+        # (because callback raising cannot prove device did not change), replay mark consumed (2),
+        # actuation_count NOT incremented, prior baseline PRESERVED until reconciled!
         self.assertEqual(enf_fail.actuation_count, 0)
-        self.assertEqual(self.store.snapshot()["grants"]["reent-g"]["application_seq_mark"], 2)
+        snap_fail = self.store.snapshot()
+        self.assertEqual(snap_fail["grants"]["reent-g"]["application_seq_mark"], 2)
         self.assertEqual(AE.canonical_sha256(enf_fail.baseline_goal), prior_hash)
-        # Fresh reloaded enforcer also sees prior baseline & consumed mark!
+        self.assertIsNotNone(snap_fail["pending_actuation"])
+        fail_act_id = snap_fail["pending_actuation"]["actuation_id"]
+        # Fresh reloaded enforcer sees prior baseline & pending_actuation blocking operations!
         reloaded_enf = AE.ApprovalEnforcer(KEY_HOST, AE.ReplayStore(self.store_dir, KEY_HOST, anchor=self.anchor))
         self.assertEqual(AE.canonical_sha256(reloaded_enf.baseline_goal), prior_hash)
-        with self.assertRaises(AE.ReplayError):
+        with self.assertRaises(AE.ReplayError) as ctx_pa:
             reloaded_enf.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=T0)
+        self.assertEqual(ctx_pa.exception.code, "pending_actuation_unreconciled")
+        # After explicit abort reconciliation, replay mark 2 STILL blocks app2!
+        reloaded_enf.reconcile_pending_actuation(fail_act_id, applied_on_device=False)
+        with self.assertRaises(AE.ReplayError) as ctx_stale:
+            reloaded_enf.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=T0)
+        self.assertEqual(ctx_stale.exception.code, "stale_application_seq")
 
     def test_item02_enrollment_nonce_bound_to_full_shown_scope(self) -> None:
         # 1. An ordinary per-change nonce offered for a baseline enrollment -> refused.
@@ -1003,7 +1014,8 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             self.enforcer.process_standing_application(app7, proposed_goal=prop1, diff=diff1, now_utc=T0)
         self.assertEqual(ctx_pend.exception.code, "pending_actuation_unreconciled")
 
-        rec_abort = self.enforcer.reconcile_pending_actuation(applied_on_device=False)
+        act_id_5 = self.store.snapshot()["pending_actuation"]["actuation_id"]
+        rec_abort = self.enforcer.reconcile_pending_actuation(act_id_5, applied_on_device=False)
         self.assertEqual(rec_abort["status"], "aborted")
         self.assertIsNone(self.store.snapshot()["pending_actuation"])
 
@@ -2965,14 +2977,20 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
         readonly_ok: list[bool] = []
 
         def mutating_cb(_goal: dict[str, Any]) -> None:
-            # Read-only inspection succeeds even when an active grant is expired (stays zero-write inside tx!).
+            # Non-expired read-only inspection succeeds without mutating or deadlocking!
             snap = self.store.snapshot()
             self.assertIsNotNone(snap["pending_actuation"])
-            readonly_ok.append(self.enforcer.developer_mode_indicator_active(T_AFTER_EXP))
+            readonly_ok.append(self.enforcer.developer_mode_indicator_active(T0))
             # Direct store.commit_unlocked inside actuation tx MUST fail closed!
             with self.assertRaises(AE.ReplayError) as raw_c:
                 self.store.commit_unlocked(snap)
             self.assertEqual(raw_c.exception.code, "nested_mutation_during_actuation")
+            # Reconciling inside actuation tx MUST fail closed!
+            with self.assertRaises(AE.ReplayError) as rec_c:
+                self.enforcer.reconcile_pending_actuation(
+                    snap["pending_actuation"]["actuation_id"], applied_on_device=True
+                )
+            self.assertEqual(rec_c.exception.code, "nested_mutation_during_actuation")
             # Attempting a nested enforcer mutation MUST fail closed with nested_mutation_during_actuation!
             try:
                 self.enforcer.issue_enrollment_nonce(
@@ -2998,13 +3016,16 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
             enf_mut.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
         self.assertEqual(ctx_nest.exception.code, "nested_mutation_during_actuation")
         self.assertEqual(nested_err, ["nested_mutation_during_actuation"])
-        self.assertEqual(readonly_ok, [False])
-        # Because callback raised, pending_actuation was cleared, prior baseline preserved, mark consumed!
+        self.assertEqual(readonly_ok, [True])
+        # Codex R3 #1: callback raising preserves pending_actuation until reconciled; mark stays consumed!
         snap_after = self.store.snapshot()
-        self.assertIsNone(snap_after["pending_actuation"])
+        self.assertIsNotNone(snap_after["pending_actuation"])
         self.assertEqual(snap_after["applied_baseline_sha256"], AE.canonical_sha256(self.baseline))
         self.assertEqual(snap_after["grants"]["nested-g"]["application_seq_mark"], 1)
-        self.assertIsNone(snap_after["last_seen_utc"] if snap_after["last_seen_utc"] == "2028-01-01T00:00:00Z" else None)
+        enf_mut.reconcile_pending_actuation(
+            snap_after["pending_actuation"]["actuation_id"], applied_on_device=False
+        )
+        self.assertIsNone(self.store.snapshot()["pending_actuation"])
 
         # 2. CAS anchor generation conflict in commit_unlocked fails closed with StoreRollbackError!
         with self.store.locked():
@@ -3069,8 +3090,10 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
         self.assertEqual(c4.exception.code, "pending_actuation_unreconciled")
 
         # 3. Reconcile with applied_on_device=True -> promotes baseline, clears pending_actuation, increments actuation_count!
-        res_prom = reopened_enf.reconcile_pending_actuation(applied_on_device=True)
+        act_id_1 = snap["pending_actuation"]["actuation_id"]
+        res_prom = reopened_enf.reconcile_pending_actuation(act_id_1, applied_on_device=True)
         self.assertEqual(res_prom["status"], "promoted")
+        self.assertEqual(res_prom["actuation_id"], act_id_1)
         self.assertEqual(res_prom["applied_baseline_sha256"], AE.canonical_sha256(prop1))
         self.assertEqual(reopened_enf.actuation_count, 1)
         self.assertEqual(AE.canonical_sha256(reopened_enf.baseline_goal), AE.canonical_sha256(prop1))
@@ -3078,7 +3101,7 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
 
         # Reconciling again when none pending raises no_pending_actuation.
         with self.assertRaises(AE.ReplayError) as c_none:
-            reopened_enf.reconcile_pending_actuation(applied_on_device=False)
+            reopened_enf.reconcile_pending_actuation(act_id_1, applied_on_device=False)
         self.assertEqual(c_none.exception.code, "no_pending_actuation")
 
         # 4. Also verify per-change accept crash before publish + reconcile(applied_on_device=False) preserves prior baseline!
@@ -3103,8 +3126,10 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
                 now_utc=T0,
                 before_publish_hook=lambda: (_ for _ in ()).throw(_PublishCrash("pc crash")),
             )
-        res_ab = reopened_enf.reconcile_pending_actuation(applied_on_device=False)
+        act_id_2 = reopened_store.snapshot()["pending_actuation"]["actuation_id"]
+        res_ab = reopened_enf.reconcile_pending_actuation(act_id_2, applied_on_device=False)
         self.assertEqual(res_ab["status"], "aborted")
+        self.assertEqual(res_ab["actuation_id"], act_id_2)
         self.assertEqual(res_ab["applied_baseline_sha256"], AE.canonical_sha256(prop1))
         self.assertEqual(reopened_store.snapshot()["approval_seq"], 0)
 
@@ -3362,6 +3387,232 @@ class TestSectionFR2SecurityAndCrashSafety(_EnforcerTestBase):
             boot_epoch="boot-epoch-3",
         )
         self.assertEqual(res_done2.decision, "applied")
+
+
+# ===========================================================================
+# Section G: Round 3 Reconciliation, Recovery, Callback Expiry & Re-adoption
+# ===========================================================================
+
+class TestSectionGR3ReconciliationAndEvidence(_EnforcerTestBase):
+    def test_r3_codex1_macroscope_callback_apply_then_raise_preserves_pending_actuation(self) -> None:
+        # Callback externally applies the goal (e.g. removes Owner 2 on device) and THEN raises TimeoutError!
+        device_state: dict[str, Any] = {"applied": None}
+
+        def apply_then_timeout(goal: dict[str, Any]) -> None:
+            device_state["applied"] = copy.deepcopy(goal)
+            raise TimeoutError("ack lost after device actuation")
+
+        enf = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=apply_then_timeout)
+        prop_rm = copy.deepcopy(self.baseline)
+        prop_rm["domains"]["device-trust"]["entries"]["advisor-key"][KEY_OWNER2]["state"] = "absent"
+        diff_rm = AE.compute_authoritative_diff(self.baseline, prop_rm, KEY_HOST)
+        pc_n = enf.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_rm), ceremony_class="privileged", now_utc=T0
+        )
+        pc_raw = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop_rm),
+                "nonce": pc_n,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "privileged",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(TimeoutError):
+            enf.process_per_change(pc_raw, proposed_goal=prop_rm, diff=diff_rm, now_utc=T0)
+        self.assertIsNotNone(device_state["applied"])
+
+        # Reopen fresh store + enforcer: pending_actuation MUST remain persisted and block new operations
+        # (so removed Owner 2 cannot slip through using the old baseline)!
+        reopened_store = AE.ReplayStore(self.store_dir, KEY_HOST, anchor=self.anchor)
+        reopened_enf = AE.ApprovalEnforcer(KEY_HOST, reopened_store)
+        snap = reopened_store.snapshot()
+        self.assertIsNotNone(snap["pending_actuation"])
+        act_id = snap["pending_actuation"]["actuation_id"]
+        with self.assertRaises(AE.ReplayError) as ctx_blk:
+            reopened_enf.process_enrollment(
+                self.make_revocation_bytes(grant_id="any-g", generation=1, owner_seed=SEED_OWNER2, owner_key=KEY_OWNER2),
+                now_utc=T0,
+            )
+        self.assertEqual(ctx_blk.exception.code, "pending_actuation_unreconciled")
+
+        # Reconcile against device_state (applied_on_device=True) -> promotes new baseline (Owner 2 absent)!
+        res = reopened_enf.reconcile_pending_actuation(act_id, applied_on_device=True)
+        self.assertEqual(res["status"], "promoted")
+        self.assertEqual(res["applied_baseline_sha256"], AE.canonical_sha256(prop_rm))
+        # Now Owner 2 is properly rejected as signer_not_owner!
+        with self.assertRaises(AE.TrustRootError) as ctx_o2:
+            reopened_enf.process_enrollment(
+                self.make_revocation_bytes(grant_id="any-g", generation=1, owner_seed=SEED_OWNER2, owner_key=KEY_OWNER2),
+                now_utc=T0,
+            )
+        self.assertEqual(ctx_o2.exception.code, "signer_not_owner")
+
+    def test_r3_codex2_recover_after_store_loss_requires_voided_and_no_pending_actuation(self) -> None:
+        # 1. Healthy store (voided=False) -> refused with store_not_voided, protected bytes bit-for-bit untouched!
+        cur_path = self.store.current_store_path
+        assert cur_path is not None
+        bytes_before = cur_path.read_bytes()
+        anchor_before = self.anchor.read()
+        writes_before = self.store.write_count
+        with self.assertRaises(AE.ReplayError) as ctx_nv:
+            self.store.recover_after_store_loss(baseline_goal=self.baseline)
+        self.assertEqual(ctx_nv.exception.code, "store_not_voided")
+        self.assertEqual(cur_path.read_bytes(), bytes_before)
+        self.assertEqual(self.anchor.read(), anchor_before)
+        self.assertEqual(self.store.write_count, writes_before)
+
+        # 2. Store with pending_actuation -> refused with pending_actuation_unreconciled, bytes untouched!
+        enf_crash = AE.ApprovalEnforcer(
+            KEY_HOST, self.store, apply_callback=lambda _g: (_ for _ in ()).throw(RuntimeError("uncertain"))
+        )
+        _, nonce, _ = self.enroll_active(grant_id="rec-pa", mode="standing-approval", enforcer=enf_crash)
+        prop, diff = make_ordinary_service_change(self.baseline, service_id="com.tendcf.recpa")
+        app = self.make_app_bytes(
+            grant_id="rec-pa", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop
+        )
+        with self.assertRaises(RuntimeError):
+            enf_crash.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
+
+        pa_path = self.store.current_store_path
+        assert pa_path is not None
+        pa_bytes_before = pa_path.read_bytes()
+        pa_anchor_before = self.anchor.read()
+        pa_writes_before = self.store.write_count
+        with self.assertRaises(AE.ReplayError) as ctx_pa:
+            self.store.recover_after_store_loss(baseline_goal=self.baseline)
+        self.assertEqual(ctx_pa.exception.code, "pending_actuation_unreconciled")
+        self.assertEqual(pa_path.read_bytes(), pa_bytes_before)
+        self.assertEqual(self.anchor.read(), pa_anchor_before)
+        self.assertEqual(self.store.write_count, pa_writes_before)
+
+    def test_r3_codex3_stale_actuation_id_cannot_resolve_successor_pending_actuation(self) -> None:
+        # Two sequential uncertain actuations for the EXACT SAME proposed_sha256 (e.g. retried with seq 1 then seq 2):
+        # Worker A reads act_id_1; Worker B reconciles act_id_1 (aborted); seq 2 becomes pending with act_id_2;
+        # Worker A's stale answer for act_id_1 MUST be refused and leave act_id_2 untouched!
+        enf = AE.ApprovalEnforcer(
+            KEY_HOST, self.store, apply_callback=lambda _g: (_ for _ in ()).throw(TimeoutError("uncertain"))
+        )
+        _, nonce, _ = self.enroll_active(grant_id="id-bind", mode="standing-approval", enforcer=enf)
+        prop, diff = make_ordinary_service_change(self.baseline, service_id="com.tendcf.sameprop")
+
+        app1 = self.make_app_bytes(
+            grant_id="id-bind", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop
+        )
+        with self.assertRaises(TimeoutError):
+            enf.process_standing_application(app1, proposed_goal=prop, diff=diff, now_utc=T0)
+        act_id_1 = self.store.snapshot()["pending_actuation"]["actuation_id"]
+
+        # Worker B resolves intent #1 as aborted.
+        enf.reconcile_pending_actuation(act_id_1, applied_on_device=False)
+
+        # Intent #2 arrives for the SAME proposed_sha256 -> gets distinct act_id_2!
+        app2 = self.make_app_bytes(
+            grant_id="id-bind", generation=1, application_seq=2, enrollment_nonce=nonce, proposed=prop
+        )
+        with self.assertRaises(TimeoutError):
+            enf.process_standing_application(app2, proposed_goal=prop, diff=diff, now_utc=T0)
+        act_id_2 = self.store.snapshot()["pending_actuation"]["actuation_id"]
+        self.assertNotEqual(act_id_1, act_id_2)
+
+        # Delayed Worker A sends stale act_id_1 -> REFUSED with actuation_id_mismatch; act_id_2 remains pending!
+        writes_before = self.store.write_count
+        with self.assertRaises(AE.ReplayError) as ctx_stale:
+            enf.reconcile_pending_actuation(act_id_1, applied_on_device=True)
+        self.assertEqual(ctx_stale.exception.code, "actuation_id_mismatch")
+        self.assertEqual(self.store.write_count, writes_before)
+        cur_pa = self.store.snapshot()["pending_actuation"]
+        self.assertIsNotNone(cur_pa)
+        self.assertEqual(cur_pa["actuation_id"], act_id_2)
+        self.assertEqual(AE.canonical_sha256(enf.baseline_goal), AE.canonical_sha256(self.baseline))
+
+        # Reconciling with the exact successor act_id_2 succeeds!
+        res2 = enf.reconcile_pending_actuation(act_id_2, applied_on_device=True)
+        self.assertEqual(res2["status"], "promoted")
+        self.assertEqual(res2["actuation_id"], act_id_2)
+        self.assertIsNone(self.store.snapshot()["pending_actuation"])
+
+    def test_r3_codex4_expired_indicator_refused_during_actuation_callback(self) -> None:
+        raw_dev, _, _ = self.enroll_active(
+            grant_id="dev-cb-exp", covered_signers=[KEY_DEV], developer_mode=True, not_after=T_EXP, now_utc=T0
+        )
+        _, sa_nonce, _ = self.enroll_active(grant_id="sa-cb", mode="standing-approval", now_utc=T0)
+
+        # Option B identical redelivery of live grant remains strictly zero-write.
+        w0 = self.store.write_count
+        self.enforcer.process_enrollment(raw_dev, now_utc=T0)
+        self.assertEqual(self.store.write_count, w0)
+
+        cb_results: list[Any] = []
+
+        def indicator_cb(_goal: dict[str, Any]) -> None:
+            # Non-expired query succeeds read-only during callback.
+            cb_results.append(("live", self.enforcer.developer_mode_indicator_active(T0)))
+            # Expired query MUST fail closed rather than exposing an unpersisted expiry observation!
+            with self.assertRaises(AE.ReplayError) as ctx_exp:
+                self.enforcer.developer_mode_indicator_active(T_AFTER_EXP)
+            cb_results.append(("expired_err", ctx_exp.exception.code))
+
+        enf_cb = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=indicator_cb)
+        prop, diff = make_ordinary_service_change(self.baseline, service_id="com.tendcf.indcb")
+        app = self.make_app_bytes(
+            grant_id="sa-cb", generation=1, application_seq=1, enrollment_nonce=sa_nonce, proposed=prop
+        )
+        res = enf_cb.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
+        self.assertEqual(res.decision, "applied")
+        self.assertEqual(
+            cb_results,
+            [("live", True), ("expired_err", "expiry_observation_during_actuation")],
+        )
+
+    def test_r3_codex5_readoption_non_hold_reject_and_withdraw_require_proposal(self) -> None:
+        prop_up = pure_version_bump_migrate(self.baseline, 10)
+        diff_up = AE.compute_authoritative_diff(self.baseline, prop_up, KEY_HOST)
+
+        for idx, verdict in enumerate(("reject", "withdraw")):
+            with self.subTest(verdict=verdict):
+                pc_n = self.enforcer.issue_per_change_nonce(
+                    proposed_sha256=AE.canonical_sha256(prop_up), ceremony_class="baseline", now_utc=T0
+                )
+                rec: dict[str, Any] = {
+                    "schema_version": 9,
+                    "record_kind": "per-change",
+                    "host": KEY_HOST,
+                    "signer": KEY_OWNER,
+                    "sig_alg": "ed25519",
+                    "baseline_sha256": AE.canonical_sha256(self.baseline),
+                    "proposed_sha256": AE.canonical_sha256(prop_up),
+                    "nonce": pc_n,
+                    "approval_seq": idx,
+                    "verdict": verdict,
+                    "ceremony_class": "baseline",
+                }
+                if verdict == "reject":
+                    rec["refused"] = ["schema_version"]
+                raw = sign_json(rec, SEED_OWNER)
+                seq_before = self.store.snapshot()["approval_seq"]
+
+                # Missing proposed_goal with is_readoption=True + version_bump diff -> refused BEFORE nonce/seq!
+                with self.assertRaises(AE.MalformedRecordError) as ctx_ra:
+                    self.enforcer.process_per_change(
+                        raw, proposed_goal=None, diff=diff_up, is_readoption=True, now_utc=T0
+                    )
+                self.assertEqual(ctx_ra.exception.code, "readoption_requires_proposal")
+                self.assertIn(pc_n, self.store.snapshot()["outstanding_nonces"])
+                self.assertEqual(self.store.snapshot()["approval_seq"], seq_before)
+
+                # With valid proposed_goal -> succeeds cleanly!
+                res = self.enforcer.process_per_change(
+                    raw, proposed_goal=prop_up, diff=diff_up, is_readoption=True, now_utc=T0
+                )
+                self.assertEqual(res.decision, "rejected" if verdict == "reject" else "withdrawn")
 
 
 if __name__ == "__main__":
