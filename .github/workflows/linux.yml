@@ -150,12 +150,18 @@ jobs:
           UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
           make -j"$(nproc)" -C /tmp/core-asan/libntech/tests/unit \
             CFLAGS="$san_cflags" LDFLAGS="$san_ldflags" \
-            check TESTS=json_test VERBOSE=1
+            check_PROGRAMS=json_test check TESTS=json_test VERBOSE=1
           ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1" \
           UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
           make -j"$(nproc)" -C /tmp/core-asan/tests/unit \
             CFLAGS="$san_cflags" LDFLAGS="$san_ldflags" \
-            check TESTS=cmdb_test VERBOSE=1
+            check_PROGRAMS=cmdb_test check TESTS=cmdb_test VERBOSE=1
+          for b in /tmp/core-asan/libntech/tests/unit/.libs/json_test /tmp/core-asan/tests/unit/.libs/cmdb_test; do
+            [ -x "$b" ] || b="${b/.libs\//}"
+            test -x "$b" || { echo "missing sanitizer test binary: $b"; exit 1; }
+            ldd "$b" | grep -q libasan || { echo "missing libasan linkage on $b"; exit 1; }
+            nm -D -u "$b" | grep -q __ubsan_ || { echo "missing __ubsan_ symbols on $b"; exit 1; }
+          done
           rm -rf /tmp/core-asan
       - name: Configure and build
         shell: bash

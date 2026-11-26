@@ -80,7 +80,7 @@
             "tests/unit/cmdb_test.c"
           ],
           "upstream_pr": "none: fork PR https://github.com/djbclark/core/pull/100 only; upstream requires operator approval",
-          "why": "closes frdminc/tendcf#69 part B: adds test_embedded_nul_byte_installs_nothing to tests/unit/cmdb_test.c verifying LoadCMDBData() fails closed on embedded NUL bytes"
+          "why": "closes frdminc/tendcf#69 part B: adds test_embedded_nul_byte_installs_nothing to tests/unit/cmdb_test.c verifying LoadCMDBData() fails closed on embedded NUL bytes; carried in the overlay as a deliberate test-coverage companion for overlay-build's ASan/UBSan cmdb_test pass"
         }
       ],
       "upstream": "https://github.com/cfengine/core"
