@@ -12,9 +12,13 @@
 > §4 now says how the loader proves a plugin is in-tree, that frontend
 > inputs are code, what "separate environment" means, and how what is
 > signed is tied to what was reviewed. **Every property of §4 that no
-> code enforces yet is tagged "planned", with its step.** Today there is
-> no plugin loader, no release pipeline, no gate separation, no import
-> step and no device-side validation command.
+> code enforces yet is tagged "planned", with its step.** Step 4
+> (static in-tree plugin loader, `bin/` → `tools/`, `tendcf` package and
+> `tendcf compile`, `eval-nix` D-b limits, `--check-releasable`
+> `--tendcf`/`TENDCF_DIR` refusal, and `tools/device_boundary_lint.py`)
+> landed on 2026-11-26; the release pipeline, gate separation, external
+> import step and device-side validation command remain planned (Step 5 /
+> map Step 6).
 >
 > **Amended 2026-11-14 (operator ruling, 2026-11-14, Smaller 5 (D46
 > out-of-tree plugin entry points, G-§4-01 / map Step 0, v2 C3), "1. Defer
@@ -53,9 +57,9 @@
    (the deferred design stays in §3 and §4). Every plugin in this
    repository (frontends, supervisor renderers and importers) is found
    through a static import table, never through entry points (§4,
-   activation; planned, restructure step 4: no table exists today; this
-   table is the deliverable). Supervisor renderers are in tree only; there
-   is no public `tendcf.supervisors` group (§3).
+   activation; built in restructure step 4: `compiler/tendcf/plugins.py`).
+   Supervisor renderers are in tree only; there is no public
+   `tendcf.supervisors` group (§3).
 4. Plugins run at compile time only, and they are trusted build-time code
    that the operator explicitly allows, not sandboxed code (§4).
 5. A plugin is selected only if site-private names it (§4, activation;
@@ -207,7 +211,8 @@ restructure, §5 step 4):
 2. Dependency direction: the schema lint and the projector never import
    the compiler. The contract stays outside the compiler's code even
    though both live in one repository.
-3. A CI import check enforces both. It does not exist yet.
+3. A CI import check enforces both (`tools/device_boundary_lint.py`,
+   wired into `.github/workflows/check.yml`, landed in Step 4).
 
 **Plugins are trusted build-time code.** A plugin is Python that runs in
 the compile step with the compiler's own access: the merged Site Model,
@@ -258,9 +263,9 @@ code, not data. The operator's words: "I want people to be able to easily
 share configurations, but they should be security-scanned before running
 them, including doing so with the help of AI. We can have a soft
 requirement that access to AI be present whenever an external import is
-attempted." The rules below are all **planned, Step 6**: no import step
-exists, and `nix2cf eval-nix` today runs with none of the limits in
-item 3.
+attempted." Items 1–2 and 5 below are **planned, Step 6** (no external
+import step exists yet); item 3's Nix evaluation limits are enforced by
+`plugins/frontends/nix/eval.py` (`tendcf eval-nix`, landed in Step 4).
 
 1. **Import, not fetch.** An external recipe (one from site-shared or
    from a foreign site) is imported, never fetched at compile time. This
@@ -444,9 +449,10 @@ item 3.
    "No network" therefore rests on the refusals listed in result 2 and the
    empty `allowed-uris`, not on a test of every fetching builtin.
 
-   Today `compiler/tendcf/cli.py` (`cmd_eval_nix`) passes only
-   `--eval --strict --json`: the limits are a code change, planned with
-   the Nix frontend move (§5, step 4).
+   `plugins/frontends/nix/eval.py` (`tendcf eval-nix`, landed in Step 4)
+   now enforces all four options above, `-I <RECIPE_DIR>`, isolated Nix
+   environment variables, symlink/delimiter rejection, and a bounded
+   timeout.
 4. **No Guix frontend** until it has a sandbox design of its own.
 5. **When no AI is reachable at import**, the static scan still runs and
    the setting `external_import.without_ai` decides the rest:
@@ -727,7 +733,7 @@ the preview diff is **advisory**. The rule:
       every move backwards (the Rollback paragraph below limits that
       further);
    3. a changed plugin set;
-   4. a tendcf bump that changes `tools/` (today `bin/`), `schema/` or the
+   4. a tendcf bump that changes `tools/` (formerly `bin/`), `schema/` or the
       projector, which ships as its own release with unchanged data (the
       tools rule in signing rule 5);
    5. a new `site.lock` input (its `url` is new);
@@ -889,9 +895,10 @@ as the deferred design.
    and does not by itself stop dependency confusion.
 7. **The environment does not choose the projector.** `TENDCF_DIR` and
    `--tendcf` (`compiler/tendcf/cli.py`, `_tendcf_dir`) let the caller
-   choose which tendcf checkout's projector is executed. A release build
-   pins that to the gate-1-verified tree or refuses the override. This is
-   a code change, planned.
+   choose which tendcf checkout's projector is executed in dev mode. In
+   release mode (`--check-releasable`, landed in Step 4), both `--tendcf`
+   and `$TENDCF_DIR` are refused and compilation is pinned to the verified
+   in-tree checkout.
 8. **The plugin set is derived by the plugin-free job, not reported by
    the compiler.** Job B′ and job B derive the set from site-private's
    naming file and the verified tree's static import table. That derived

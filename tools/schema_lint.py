@@ -825,7 +825,7 @@ def load_projector() -> Any | None:
     """Import tools/projector.py as a module.
 
     Not a package import: both files are `uv run --script` entry points with
-    their own PEP-723 metadata, and bin/ is deliberately not importable. The
+    their own PEP-723 metadata, and tools/ is deliberately not importable. The
     projector is loaded by path so this lint runs the SAME code a device
     would, rather than a copy of its rules restated here — a restatement
     would be the second spelling that projector-reconciliation §9 (R22)

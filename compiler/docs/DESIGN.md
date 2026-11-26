@@ -17,8 +17,8 @@ defaults, no prose, no nulls, no floats (goal-file reconciliation §2.1).
 reconciliation (§9) are explicit that the goal file never reaches CFEngine and
 that `host_specific.json` is produced *device-side, after approval* by a
 policy-free projection whose reference implementation is
-`tendcf/tools/projector.py`. nix2cf therefore renders the goal file, and
-`buildfile --project` runs tendcf's projector over it as a preview of what
+`tools/projector.py`. `tendcf compile` therefore renders the goal file, and
+`tendcf compile --project` runs tendcf's projector over it as a preview of what
 `cf-agent` would read. Two implementations of the projection would drift; the
 oracle for the one that exists is `tendcf/examples/host_specific.json`.
 
@@ -55,18 +55,21 @@ reasons:
    `rfc8785`). Using the same JSON Schema dialect implementation and the same
    JCS implementation means the compiler and the lint cannot disagree on what
    "valid" or "canonical" means.
-2. `buildfile --project` imports tendcf's projector in-process, so the preview
+2. `tendcf compile --project` imports tendcf's projector in-process, so the preview
    is the reference projection, not a reimplementation.
 3. **No flake, no Nix at build time.** D12 says the Nix module frontend "MAY"
    author the Site Model later; the guide (§1, §3) says nobody adopting the
    project has to know Nix and YAML/JSON is the stranger path. Making Nix a
    toolchain requirement of the compiler would invert that. Nix is also not
    installed on the machine this was built on, so a flake could not have been
-   tested. The frontend hook is `nix2cf eval-nix FILE`, which shells out to
-   `nix-instantiate --eval --strict --json` (the stable, flake-free evaluator
-   per the Nix 2.26 manual) and prints the Site Model JSON. `examples/site/
-   site.nix` is the same Site Model as `services.yml` as a plain attribute set;
-   the test that evaluates it is skipped without a Nix install.
+   tested. The Nix frontend plugin (`plugins/frontends/nix/eval.py`, named
+   `nix2cf`) is invoked by `tendcf eval-nix FILE`, which shells out to
+   `nix-instantiate --eval --strict --json` under the tested D-b restricted
+   evaluation limits (`restrict-eval true`, no IFD, empty `allowed-uris`, no
+   unsafe native code, isolated Nix env, `-I <RECIPE_DIR>`) and prints the
+   Site Model JSON. `examples/site/site.nix` is the same Site Model as
+   `services.yml` as a plain attribute set; the integration test is skipped
+   without a Nix install.
 
 ## The contract is consumed, not copied
 
@@ -82,7 +85,7 @@ not site data, like tendcf's.
 
 ## Merge rules (stage 1) — the open choices, decided conservatively
 
-Each of these is marked `TODO(operator)` in `nix2cf/compile.py` at the spot.
+Each of these is documented in `tendcf/compile.py` (and `plugins/supervisors/launchd/renderer.py`).
 
 | Choice | Decision here | Where the paper leaves it open |
 | --- | --- | --- |
@@ -92,7 +95,7 @@ Each of these is marked `TODO(operator)` in `nix2cf/compile.py` at the spot.
 | `managed_by` ≠ `cfengine` | Skipped with a note. | v1 service entries are cfengine-actuated; "present and not ours" has no spelling. |
 | `working_dir` omitted | `/` for launchd. | Stated by the goal-file schema (F-1). Not open. |
 | `run_at_load` / `keep_alive` omitted | `false` (launchd's own default when the plist omits the key). | The Site Model schema states no default. |
-| `launchd.domain` omitted | `system` (schema v9 / services v4; operator rulings 2026-11-23 #94 and 2026-11-24 #103). | Resolved explicitly into `unit.launchd.domain` (`system` \| `user-gui` \| `user-background`); stale v8 `user` is refused everywhere, and `user-gui`/`user-background` are refused below v9. Moving an existing launchd label across privilege tiers (`system` ↔ `user-gui`/`user-background`) is a two-step procedure because each tier's `cf-agent` skips valid entries targeting the opposite tier (Q1) and a goal file holds one entry per id: (1) tombstone the label (`{"state": "absent"}`) in the goal file and converge both tiers so the old tier boots out the job and removes its plist, then (2) re-add the label under the new domain. Note: `nix2cf` cannot currently emit tombstones (see the `Tombstones` row below) — deleting a service from `services.yml` does **not** stop or remove the old job; until the Site Model can express `"absent"`, step (1) requires a hand-authored goal-file tombstone (or another operator-approved route). |
+| `launchd.domain` omitted | `system` (schema v9 / services v4; operator rulings 2026-11-23 #94 and 2026-11-24 #103). | Resolved explicitly into `unit.launchd.domain` (`system` \| `user-gui` \| `user-background`); stale v8 `user` is refused everywhere (older-version rendering was removed in D46 Step 4). Moving an existing launchd label across privilege tiers (`system` ↔ `user-gui`/`user-background`) is a two-step procedure because each tier's `cf-agent` skips valid entries targeting the opposite tier (Q1) and a goal file holds one entry per id: (1) tombstone the label (`{"state": "absent"}`) in the goal file and converge both tiers so the old tier boots out the job and removes its plist, then (2) re-add the label under the new domain. Note: the compiler cannot currently emit tombstones (see the `Tombstones` row below) — deleting a service from `services.yml` does **not** stop or remove the old job; until the Site Model can express `"absent"`, step (1) requires a hand-authored goal-file tombstone (or another operator-approved route). |
 | Interlock `expect_exit` / `timeout_seconds` omitted | `0` / `30`. | Stated as `default` in `common.schema.json`. Not open. |
 | Interlock without `defines_class` | Compile error. | Optional in the Site Model, required in the goal file; deriving one would be a second spelling of identity. |
 | Unit-writer registry | Every declared prefix or exact label is carried (the device runs extra-entry detection without the Site Model, reconciliation §8). | — |
@@ -121,12 +124,12 @@ member's.
 ## Multi-site local workspace and dev-only overrides (issue #98)
 
 Operator rulings `2026-11-24` (`Ref: ANTIGRAVITY-we`, `Ref: ANTIGRAVITY-wf`)
-establish the local workspace resolver (`nix2cf/workspace.py`) and
-`nix2cf workspace` subcommand:
+establish the local workspace resolver (`tendcf/workspace.py`) and
+`tendcf workspace` subcommand:
 
 - **Base directory:** `~/tendcf-ops`, overridden by `--ops-root` >
   `TENDCF_OPS_ROOT` > `~/tendcf-ops`. Holds optional `tendcf/` (strictly
-  informational in `nix2cf workspace`; `buildfile` never auto-loads schemas or
+  informational in `tendcf workspace`; `tendcf compile` never auto-loads schemas or
   `tools/projector.py` from it), required `tendcf-private-<site>/`, optional
   `tendcf-public-<site>/`, and read-only foreign `tendcf-public-<other>/`
   clones. Development worktrees live outside the site scan namespace (`~/src/`
@@ -139,15 +142,15 @@ establish the local workspace resolver (`nix2cf/workspace.py`) and
   on `workspace` (mutually exclusive with `--site-name`, taking precedence over
   ambient `TENDCF_SITE`, failing closed if missing). There is no sole-directory
   glob, no legacy alias (`tendcf-private`, `site-private`, `.mysite`), and no
-  uncoupled public/private selector. On `buildfile`, XDG `active-site` requires
+  uncoupled public/private selector. On `compile`, XDG `active-site` requires
   explicit opt-in (`--workspace`, `--ops-root`, or ambient `TENDCF_SITE` with
   no `--site` or explicit file flags). `--site DIR` and explicit file flags
   stay backward compatible and are mutually exclusive with workspace flags.
-- **Dev-only `--override-input <ns>=<path>`:** repeatable on `buildfile` and
+- **Dev-only `--override-input <ns>=<path>`:** repeatable on `compile` and
   `workspace`. Today it validates `<ns>` as a strict slug, refuses duplicate
   namespaces (never last-wins), verifies `<path>` exists as a directory,
   records the canonical path on `WorkspaceResolution` and `CompileResult`
-  (`tainted = True`), warns loudly on stderr, blocks `buildfile -o` artifact
+  (`tainted = True`), warns loudly on stderr, blocks `compile -o` artifact
   writes unless `--allow-tainted` is passed, and fails
   `refuse_release_if_tainted()` / `assert_releasable()` / `--check-releasable`.
   Foreign-input substitution itself awaits `site.lock` composition; future

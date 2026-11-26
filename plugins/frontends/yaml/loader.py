@@ -3,28 +3,23 @@
 Loaded exclusively through tendcf's static in-tree plugin table
 (`compiler/tendcf/plugins.py`).
 
-Provides two guarantees plain `yaml.safe_load` / `json.loads` do not:
-1. Source locations: records the 1-based line number of every YAML mapping so
-   compiler conflict diagnostics cite `file:line`.
-2. Duplicate keys refused: both YAML and JSON reject duplicate mapping keys
-   at parse time instead of silently resolving last-wins.
+Uses the canonical `Document`, `SiteModel`, `SiteModelError`, and `SITE_FILES`
+types from `tendcf.sitemodel` so exception and dataclass identity never split
+across reloads.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from tendcf.sitemodel import SITE_FILES, Document, SiteModel, SiteModelError
+
 PLUGIN_KIND = "frontend"
 PLUGIN_NAME = "yaml"
-
-
-class SiteModelError(Exception):
-    """An input could not be read, parsed, or validated."""
 
 
 class _LineLoader(yaml.SafeLoader):
@@ -71,22 +66,6 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return dict(pairs)
 
 
-@dataclass
-class Document:
-    """A parsed input file plus the line of every mapping in it."""
-
-    path: Path
-    data: Any
-    lines: dict[int, int] = field(default_factory=dict)
-
-    def line_of(self, mapping: Any) -> int | None:
-        return self.lines.get(id(mapping))
-
-    def where(self, mapping: Any) -> str:
-        line = self.line_of(mapping)
-        return f"{self.path}:{line}" if line else str(self.path)
-
-
 def load_document(path: Path) -> Document:
     """Parse a `.yml`/`.yaml` or `.json` file, refusing duplicate keys."""
     try:
@@ -109,23 +88,21 @@ def load_document(path: Path) -> Document:
     return Document(path, data, loader.lines)
 
 
-@dataclass
-class SiteModel:
-    services: Document
-    roles: Document
-    launchd_writers: Document
-
-
-SITE_FILES = {
-    "services": "services.yml",
-    "roles": "roles.yml",
-    "launchd_writers": "launchd-writers.yml",
-}
-
-
 def load_site_model(services: Path, roles: Path, launchd_writers: Path) -> SiteModel:
     return SiteModel(
         services=load_document(services),
         roles=load_document(roles),
         launchd_writers=load_document(launchd_writers),
     )
+
+
+__all__ = [
+    "PLUGIN_KIND",
+    "PLUGIN_NAME",
+    "SITE_FILES",
+    "Document",
+    "SiteModel",
+    "SiteModelError",
+    "load_document",
+    "load_site_model",
+]

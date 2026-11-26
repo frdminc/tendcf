@@ -403,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         "--root",
         type=Path,
         default=REPO_ROOT,
-        help="Repository root containing examples/ (default: parent of bin/).",
+        help="Repository root containing examples/ (default: parent of tools/).",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

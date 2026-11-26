@@ -10,18 +10,20 @@ Implements `docs/architecture/plugin-layout.md` §3–§4 (decision D-a, amended
 2. Before executing any plugin module, `resolve_plugin_path()` resolves the
    verified tendcf root and `plugins/` directory, walks every path component
    under `plugins/` refusing any symlink (`os.lstat`) or traversal segment,
-   verifies the resolved file is a regular file strictly inside
-   `<resolved_root>/plugins/`, and only then executes it by file location via
-   `importlib.util.spec_from_file_location`.
-3. `sys.modules[mod_name]` is registered before `exec_module` (required on
-   Python 3.14+ for `dataclasses` / postponed annotations) and cleaned up on
-   failure.
+   and verifies the resolved file is a regular file strictly inside
+   `<resolved_root>/plugins/`.
+3. `load_plugin()` opens the verified path with `O_RDONLY | O_NOFOLLOW |
+   O_NONBLOCK`, verifies `S_ISREG(fstat)`, reads source bytes directly from
+   that file descriptor, compiles and executes them into a fresh module
+   registered in `sys.modules` BEFORE execution — bypassing `__pycache__/*.pyc`
+   completely and eliminating leaf symlink TOCTOU.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
-import importlib.util
+import importlib.machinery
 import os
 import stat
 import sys
@@ -113,6 +115,9 @@ RESERVED_PLUGIN_NAMES: Mapping[str, frozenset[str]] = MappingProxyType(
 # passing distinct synthetic roots never receive another tree's cached module.
 _LOADED_MODULES: dict[tuple[str, str, str], ModuleType] = {}
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
 
 def _is_real_dir(path: Path) -> bool:
     try:
@@ -130,20 +135,22 @@ def _is_real_file(path: Path) -> bool:
     return stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode)
 
 
-def in_tree_tendcf_root() -> Path | None:
-    """Return the enclosing tendcf checkout root if this file sits in `<root>/compiler/tendcf/plugins.py`.
+def in_tree_tendcf_for_file(file_path: str | Path) -> Path | None:
+    """Return the enclosing tendcf checkout root if `file_path` sits in `<root>/compiler/tendcf/<file>`.
 
-    Accepts the root only when `compiler/` is a real directory holding
-    `pyproject.toml` and `<root>` beside it holds real `schema/goal-file.schema.json`,
-    `tools/projector.py`, and `plugins/`. Any installed site-packages / pip --target
-    layout returns `None`.
+    Accepts the root only when `tendcf/` and `compiler/` are real non-symlink
+    directories with `compiler/pyproject.toml`, and `<root>` beside them holds
+    real non-symlink `schema/goal-file.schema.json`, `tools/projector.py`, and
+    `plugins/`. Any installed site-packages / pip --target layout returns `None`.
     """
-    here = Path(__file__).resolve()
+    here = Path(file_path).resolve()
     if len(here.parents) < 3:
         return None
-    compiler_dir, root = here.parents[1], here.parents[2]
+    pkg_dir, compiler_dir, root = here.parents[0], here.parents[1], here.parents[2]
     ok = (
-        compiler_dir.name == "compiler"
+        pkg_dir.name == "tendcf"
+        and _is_real_dir(pkg_dir)
+        and compiler_dir.name == "compiler"
         and _is_real_dir(compiler_dir)
         and _is_real_file(compiler_dir / "pyproject.toml")
         and _is_real_dir(root / "schema")
@@ -153,6 +160,11 @@ def in_tree_tendcf_root() -> Path | None:
         and _is_real_dir(root / "plugins")
     )
     return root if ok else None
+
+
+def in_tree_tendcf_root() -> Path | None:
+    """Return the enclosing tendcf checkout root for this module."""
+    return in_tree_tendcf_for_file(__file__)
 
 
 def list_plugins(kind: str | None = None) -> tuple[PluginSpec, ...]:
@@ -187,8 +199,8 @@ def _verify_containment_path(resolved_root: Path, relpath: str) -> Path:
     parts = relpath.split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise PluginError(f"unsafe traversal component in static plugin path: {relpath!r}")
-    if parts[0] != "plugins" or len(parts) < 2:
-        raise PluginError(f"static plugin path must live under 'plugins/': {relpath!r}")
+    if parts[0] != "plugins" or len(parts) < 2 or not parts[-1].endswith(".py"):
+        raise PluginError(f"static plugin path must be a .py file under 'plugins/': {relpath!r}")
 
     plugins_dir = resolved_root / "plugins"
     try:
@@ -267,6 +279,70 @@ def resolve_plugin_path(
     return spec, resolved_file
 
 
+def exec_verified_source_module(module_name: str, resolved_file: Path) -> ModuleType:
+    """Open `resolved_file` with `O_NOFOLLOW`, verify `S_ISREG`, and exec source directly.
+
+    Bypasses `__pycache__/*.pyc` completely and eliminates leaf symlink TOCTOU.
+    Registers `sys.modules[module_name]` before execution (Python 3.14+ dataclasses
+    requirement) and cleans up on failure while preserving `KeyboardInterrupt`/`SystemExit`.
+    """
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
+    try:
+        fd = os.open(resolved_file, flags)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)):
+            raise PluginError(
+                f"in-tree module is a symlink (refused on open): {resolved_file}"
+            ) from exc
+        raise PluginError(f"cannot open verified module {resolved_file}: {exc}") from exc
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PluginError(f"verified module is not a regular file: {resolved_file}")
+        fh = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+    with fh:
+        try:
+            raw = fh.read()
+        except OSError as exc:
+            raise PluginError(f"cannot read verified module {resolved_file}: {exc}") from exc
+
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PluginError(f"verified module {resolved_file} is not valid UTF-8: {exc}") from exc
+
+    try:
+        code = compile(source, str(resolved_file), "exec")
+    except SyntaxError as exc:
+        raise PluginError(f"syntax error in verified module {resolved_file}: {exc}") from exc
+
+    module = ModuleType(module_name)
+    module.__file__ = str(resolved_file)
+    module.__package__ = ""
+    module.__spec__ = importlib.machinery.ModuleSpec(
+        module_name, loader=None, origin=str(resolved_file)
+    )
+    sys.modules[module_name] = module
+    try:
+        exec(code, module.__dict__)  # noqa: S102 - verified in-tree source file
+    except (KeyboardInterrupt, SystemExit):
+        sys.modules.pop(module_name, None)
+        raise
+    except PluginError:
+        sys.modules.pop(module_name, None)
+        raise
+    except Exception as exc:
+        sys.modules.pop(module_name, None)
+        raise PluginError(f"failed to execute verified module {resolved_file}: {exc}") from exc
+
+    return module
+
+
 def load_plugin(
     kind: str,
     name: str,
@@ -282,18 +358,16 @@ def load_plugin(
 
     path_tag = hashlib.sha256(str(resolved_file).encode("utf-8")).hexdigest()[:12]
     module_name = f"{spec.module_prefix}_{path_tag}"
-    mod_spec = importlib.util.spec_from_file_location(module_name, resolved_file)
-    if mod_spec is None or mod_spec.loader is None:
-        raise PluginError(f"cannot create module spec for in-tree plugin {resolved_file}")
-    module = importlib.util.module_from_spec(mod_spec)
-    sys.modules[module_name] = module
-    try:
-        mod_spec.loader.exec_module(module)
-    except BaseException as exc:
+    module = exec_verified_source_module(module_name, resolved_file)
+
+    mod_kind = getattr(module, "PLUGIN_KIND", None)
+    mod_name = getattr(module, "PLUGIN_NAME", None)
+    if mod_kind != spec.kind or mod_name != spec.name:
         sys.modules.pop(module_name, None)
-        if isinstance(exc, PluginError):
-            raise
-        raise PluginError(f"failed to load in-tree {spec.kind} plugin {spec.name!r} ({resolved_file}): {exc}") from exc
+        raise PluginError(
+            f"in-tree plugin {resolved_file} declared PLUGIN_KIND={mod_kind!r}, "
+            f"PLUGIN_NAME={mod_name!r}; expected ({spec.kind!r}, {spec.name!r})"
+        )
 
     _LOADED_MODULES[cache_key] = module
     return module

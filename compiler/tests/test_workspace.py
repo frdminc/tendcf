@@ -449,7 +449,7 @@ def test_cli_workspace_json_human_list_and_check_releasable(tmp_path: Path) -> N
     override_dir = tmp_path / "local-alice"
     override_dir.mkdir()
 
-    env = _clean_env(tmp_path, TENDCF_DIR=str(_tendcf_root()))
+    env = _clean_env(tmp_path)
 
     # JSON output clean
     proc = _run_cli(["workspace", "--ops-root", str(ops), "--site-name", "djbclark", "--json", "--check-releasable"], env)

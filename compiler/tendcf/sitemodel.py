@@ -1,15 +1,21 @@
-"""Load and validate Site Model inputs.
+"""Site Model data contract, schema validation, and lazy YAML frontend bridge.
 
-YAML/JSON loading (with source-line tracking and duplicate-key refusal) lives
-in the built-in YAML frontend plugin (`plugins/frontends/yaml/loader.py`),
-loaded exclusively through tendcf's static in-tree plugin table
-(`tendcf.plugins.load_plugin`). This module re-exports the YAML frontend's
-types/loaders and provides JSON Schema validation against `schema/*.schema.json`.
+`SiteModelError`, `Document`, `SiteModel`, and `SITE_FILES` live directly in
+this module so exception and dataclass identity never split across plugin
+reloads and importing `tendcf.cli` executes ZERO plugin code until a Site Model
+is actually loaded (`load_document` / `load_site_model`).
+
+YAML/JSON parsing (source-line tracking and duplicate-key refusal) lives in
+the built-in YAML frontend plugin (`plugins/frontends/yaml/loader.py`), loaded
+lazily through `tendcf.plugins.load_plugin("frontend", "yaml")`.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import stat
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,17 +24,41 @@ from referencing import Registry, Resource
 
 from .plugins import load_plugin
 
-_YAML_FRONTEND = load_plugin("frontend", "yaml")
 
-SiteModelError = _YAML_FRONTEND.SiteModelError
-Document = _YAML_FRONTEND.Document
-SiteModel = _YAML_FRONTEND.SiteModel
-SITE_FILES: dict[str, str] = _YAML_FRONTEND.SITE_FILES
-load_document = _YAML_FRONTEND.load_document
-load_site_model = _YAML_FRONTEND.load_site_model
+class SiteModelError(Exception):
+    """An input could not be read, parsed, or validated."""
 
+
+@dataclass
+class Document:
+    """A parsed input file plus the line of every mapping in it."""
+
+    path: Path
+    data: Any
+    lines: dict[int, int] = field(default_factory=dict)
+
+    def line_of(self, mapping: Any) -> int | None:
+        return self.lines.get(id(mapping))
+
+    def where(self, mapping: Any) -> str:
+        line = self.line_of(mapping)
+        return f"{self.path}:{line}" if line else str(self.path)
+
+
+@dataclass
+class SiteModel:
+    services: Document
+    roles: Document
+    launchd_writers: Document
+
+
+SITE_FILES: dict[str, str] = {
+    "services": "services.yml",
+    "roles": "roles.yml",
+    "launchd_writers": "launchd-writers.yml",
+}
 # Site Model file -> the tendcf schema that checks it.
-SCHEMA_FOR = {
+SCHEMA_FOR: dict[str, str] = {
     "services": "services.schema.json",
     "roles": "roles.schema.json",
     "launchd_writers": "launchd-writers.schema.json",
@@ -36,24 +66,70 @@ SCHEMA_FOR = {
 GOAL_FILE_SCHEMA = "goal-file.schema.json"
 
 
+def load_document(path: Path, *, tendcf_root: Path | None = None) -> Document:
+    """Parse a `.yml`/`.yaml` or `.json` file via the in-tree YAML frontend plugin."""
+    yaml_plugin = load_plugin("frontend", "yaml", tendcf_root=tendcf_root)
+    return yaml_plugin.load_document(path)
+
+
+def load_site_model(
+    services: Path,
+    roles: Path,
+    launchd_writers: Path,
+    *,
+    tendcf_root: Path | None = None,
+) -> SiteModel:
+    """Load all three Site Model documents via the in-tree YAML frontend plugin."""
+    yaml_plugin = load_plugin("frontend", "yaml", tendcf_root=tendcf_root)
+    return yaml_plugin.load_site_model(services, roles, launchd_writers)
+
+
 class Schemas:
     """tendcf's `schema/` directory, loaded into one `$ref` registry.
 
     The registry is built the way `tools/schema_lint.py` builds its own,
     from each schema's `$id`, so a `$ref` across files resolves identically
-    here and in the lint.
+    here and in the lint. Refuses symlinked `schema_dir` or symlinked/escaping
+    `*.schema.json` files.
     """
 
     def __init__(self, schema_dir: Path) -> None:
-        self.schema_dir = schema_dir
+        try:
+            st_dir = os.lstat(schema_dir)
+        except OSError as exc:
+            raise SiteModelError(f"cannot inspect schema directory {schema_dir}: {exc}") from exc
+        if stat.S_ISLNK(st_dir.st_mode) or not stat.S_ISDIR(st_dir.st_mode):
+            raise SiteModelError(f"schema directory must be a real non-symlink directory: {schema_dir}")
+        try:
+            resolved_dir = schema_dir.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SiteModelError(f"cannot resolve schema directory {schema_dir}: {exc}") from exc
+
+        self.schema_dir = resolved_dir
         self.schemas: dict[str, dict] = {}
         registry: Registry = Registry()
-        paths = sorted(schema_dir.glob("*.schema.json"))
+        paths = sorted(resolved_dir.glob("*.schema.json"))
         if not paths:
             raise SiteModelError(f"no *.schema.json under {schema_dir}")
         for path in paths:
             try:
-                schema = json.loads(path.read_text(encoding="utf-8"))
+                st_file = os.lstat(path)
+            except OSError as exc:
+                raise SiteModelError(f"cannot inspect schema {path}: {exc}") from exc
+            if stat.S_ISLNK(st_file.st_mode) or not stat.S_ISREG(st_file.st_mode):
+                raise SiteModelError(
+                    f"schema file must be a real non-symlink regular file: {path}"
+                )
+            try:
+                resolved_file = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise SiteModelError(f"cannot resolve schema {path}: {exc}") from exc
+            if resolved_file.parent != resolved_dir:
+                raise SiteModelError(
+                    f"schema file {path} resolves outside {resolved_dir}: {resolved_file}"
+                )
+            try:
+                schema = json.loads(resolved_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise SiteModelError(f"cannot read schema {path}: {exc}") from exc
             if "$id" not in schema:

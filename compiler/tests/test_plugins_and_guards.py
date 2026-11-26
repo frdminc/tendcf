@@ -1,12 +1,13 @@
 """Tests for D46 Step 4: static in-tree plugin loader, restricted Nix eval,
---check-releasable TENDCF_DIR/--tendcf guard, tendcf compile CLI, and
-current-schema-version-only enforcement.
+--check-releasable TENDCF_DIR/--tendcf guard, tendcf compile CLI,
+load_projector/Schemas containment, and current-schema-version-only enforcement.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -20,13 +21,14 @@ from tendcf.plugins import (
     RESERVED_PLUGIN_NAMES,
     STATIC_PLUGIN_TABLE,
     PluginError,
+    clear_plugin_cache,
     get_plugin_spec,
     in_tree_tendcf_root,
     list_plugins,
     load_plugin,
     resolve_plugin_path,
 )
-from tendcf.sitemodel import load_document, load_site_model
+from tendcf.sitemodel import Schemas, SiteModelError, load_document, load_site_model
 
 REPO = Path(__file__).resolve().parent.parent
 TENDCF_ROOT = REPO.parent
@@ -58,7 +60,7 @@ def _compile_args(site: Path, *extra: str) -> list[str]:
     ]
 
 
-# --- static in-tree plugin table & containment proofs (D-a / Smaller 5) ---
+# --- static in-tree plugin table & containment proofs (D-a / Smaller 5 / M1 / L1) ---
 
 
 def test_static_plugin_table_resolves_and_loads_all_builtins() -> None:
@@ -82,6 +84,7 @@ def test_static_plugin_table_resolves_and_loads_all_builtins() -> None:
         assert path.is_file() and not path.is_symlink()
         mod = load_plugin(spec.kind, spec.name)
         assert mod.PLUGIN_KIND == spec.kind
+        assert mod.PLUGIN_NAME == spec.name
 
     assert load_plugin("supervisor", "launchd").RENDERED is True
     assert load_plugin("supervisor", "systemd").RENDERED is False
@@ -99,11 +102,14 @@ def test_static_plugin_table_refuses_unknown_kind_or_name() -> None:
         load_plugin("importer", "ansible")
 
 
-def _plant_plugin_tree(root: Path, *, payload: str = "PLUGIN_KIND = 'frontend'\nSENTINEL = True\n") -> Path:
+def _plant_plugin_tree(root: Path) -> Path:
     for spec in list_plugins():
         p = root / spec.relpath
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(payload, encoding="utf-8")
+        p.write_text(
+            f"PLUGIN_KIND = {spec.kind!r}\nPLUGIN_NAME = {spec.name!r}\nSENTINEL = True\n",
+            encoding="utf-8",
+        )
     return root
 
 
@@ -165,19 +171,147 @@ def test_plugin_loader_refuses_symlinks_and_outside_tree_before_exec(tmp_path: P
         load_plugin("frontend", "yaml", tendcf_root=r6)
 
 
-# --- Nix frontend D-b restricted evaluation (`plugins/frontends/nix/eval.py`) ---
+def test_plugin_loader_ignores_pycache_verifies_metadata_and_reraises_base_exceptions(tmp_path: Path) -> None:
+    # M1: Poisoned __pycache__/.pyc must NEVER be executed; source is compiled directly from fd.
+    root = _plant_plugin_tree(tmp_path / "pyc-root")
+    leaf = root / STATIC_PLUGIN_TABLE["frontend"]["yaml"].relpath
+    pycache = leaf.parent / "__pycache__"
+    pycache.mkdir()
+    (pycache / f"loader.{sys.implementation.cache_tag}.pyc").write_bytes(b"NOT_VALID_PYC_POISON")
+    mod = load_plugin("frontend", "yaml", tendcf_root=root)
+    assert mod.SENTINEL is True
+
+    # L1: Mismatched PLUGIN_KIND / PLUGIN_NAME is refused cleanly.
+    bad_meta = _plant_plugin_tree(tmp_path / "bad-meta")
+    bad_leaf = bad_meta / STATIC_PLUGIN_TABLE["frontend"]["yaml"].relpath
+    bad_leaf.write_text("PLUGIN_KIND = 'frontend'\nPLUGIN_NAME = 'impostor'\n", encoding="utf-8")
+    with pytest.raises(PluginError, match="declared PLUGIN_KIND"):
+        load_plugin("frontend", "yaml", tendcf_root=bad_meta)
+
+    # M1: SystemExit / KeyboardInterrupt are NOT swallowed into PluginError.
+    exit_root = _plant_plugin_tree(tmp_path / "sys-exit")
+    exit_leaf = exit_root / STATIC_PLUGIN_TABLE["frontend"]["yaml"].relpath
+    exit_leaf.write_text("raise SystemExit(42)\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
+        load_plugin("frontend", "yaml", tendcf_root=exit_root)
+    assert exc_info.value.code == 42
+
+
+# --- H2: Lazy plugin load, non-in-tree CLI survival, and single SiteModelError identity ---
+
+
+def test_non_in_tree_package_runs_version_and_refuses_check_releasable_cleanly(tmp_path: Path) -> None:
+    # Copy compiler/tendcf into an isolated site-packages dir with NO checkout around it.
+    site_pkgs = tmp_path / "site-packages"
+    shutil.copytree(REPO / "tendcf", site_pkgs / "tendcf")
+    env = {k: v for k, v in os.environ.items() if k != "TENDCF_DIR"}
+    env["PYTHONPATH"] = str(site_pkgs)
+
+    # --version must work without loading any plugin (run from tmp_path so CWD
+    # does not shadow site_pkgs with the editable checkout).
+    ver = subprocess.run(
+        [sys.executable, "-m", "tendcf.cli", "--version"],
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert ver.returncode == 0, ver.stderr.decode()
+    assert ver.stdout.decode().strip().startswith("tendcf ")
+
+    # --check-releasable outside a verified checkout must exit 1 with REFUSED (not traceback!).
+    rel = subprocess.run(
+        [sys.executable, "-m", "tendcf.cli", *_compile_args(SITE, "--check-releasable")],
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert rel.returncode == 1
+    assert b"REFUSED:" in rel.stderr and b"Traceback" not in rel.stderr
+
+
+def test_clear_plugin_cache_preserves_sitemodel_error_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # H2: clear_plugin_cache() before cmd_compile on malformed YAML must exit 2 cleanly (no traceback).
+    site = tmp_path / "bad-yaml-site"
+    shutil.copytree(SITE, site)
+    (site / "services.yml").write_text("contract_version: 1\ncontract_version: 2\n", encoding="utf-8")
+
+    clear_plugin_cache()
+    rc = cli.main(_compile_args(site))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "duplicate key" in err
+
+
+# --- H3 + M2: load_projector and Schemas containment proofs ---
+
+
+def test_load_projector_refuses_symlinked_root_tools_and_leaf(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-tools"
+    outside.mkdir()
+    (outside / "projector.py").write_text(
+        "raise AssertionError('ESCAPED_PROJECTOR_MUST_NEVER_EXECUTE')\n", encoding="utf-8"
+    )
+
+    # 1. Symlinked tools/ directory inside real root -> refused.
+    r1 = tmp_path / "sym-tools-root"
+    r1.mkdir()
+    (r1 / "tools").symlink_to(outside)
+    with pytest.raises(SiteModelError, match="tools directory must be a real non-symlink"):
+        cli.load_projector(r1)
+
+    # 2. Symlinked root itself -> refused.
+    r2_real = tmp_path / "real-root"
+    (r2_real / "tools").mkdir(parents=True)
+    (r2_real / "tools" / "projector.py").write_text("X = 1\n", encoding="utf-8")
+    r2_link = tmp_path / "sym-root"
+    r2_link.symlink_to(r2_real)
+    with pytest.raises(SiteModelError, match="tendcf checkout must be a real non-symlink"):
+        cli.load_projector(r2_link)
+
+    # 3. Symlinked tools/projector.py leaf -> refused.
+    r3 = tmp_path / "sym-leaf-root"
+    (r3 / "tools").mkdir(parents=True)
+    (r3 / "tools" / "projector.py").symlink_to(outside / "projector.py")
+    with pytest.raises(SiteModelError, match="regular non-symlink file"):
+        cli.load_projector(r3)
+
+
+def test_schemas_refuses_symlinked_schema_dir_and_schema_files(tmp_path: Path) -> None:
+    real_schemas = TENDCF_ROOT / "schema"
+
+    # 1. Symlinked schema directory -> refused.
+    sym_dir = tmp_path / "sym-schema"
+    sym_dir.symlink_to(real_schemas)
+    with pytest.raises(SiteModelError, match="real non-symlink directory"):
+        Schemas(sym_dir)
+
+    # 2. Symlinked schema file inside real schema directory -> refused.
+    dir_with_link = tmp_path / "schema-with-link"
+    shutil.copytree(real_schemas, dir_with_link)
+    target_schema = dir_with_link / "services.schema.json"
+    target_schema.unlink()
+    target_schema.symlink_to(real_schemas / "services.schema.json")
+    with pytest.raises(SiteModelError, match="real non-symlink regular file"):
+        Schemas(dir_with_link)
+
+
+# --- Nix frontend D-b restricted evaluation & H1 hardening (`plugins/frontends/nix/eval.py`) ---
 
 
 def test_nix_frontend_builds_exact_restricted_argv_and_isolated_env(tmp_path: Path) -> None:
     nix_plugin = load_plugin("frontend", "nix")
-    assert nix_plugin.PLUGIN_NAME == "nix2cf"
+    assert nix_plugin.PLUGIN_NAME == "nix"
+    assert nix_plugin.FRONTEND_DISPLAY_NAME == "nix2cf"
 
     recipe_dir = tmp_path / "recipe"
     recipe_dir.mkdir()
     recipe = recipe_dir / "site.nix"
     recipe.write_text("{ ok = true; }\n", encoding="utf-8")
 
-    # Fake nix-instantiate that dumps its argv and Nix env vars as JSON.
     fake_nix = tmp_path / "fake-nix-instantiate"
     fake_nix.write_text(
         f"#!{sys.executable}\n"
@@ -228,36 +362,79 @@ def test_nix_frontend_builds_exact_restricted_argv_and_isolated_env(tmp_path: Pa
     assert result["user_conf_is_empty_file"] is True
 
 
-def test_nix_frontend_refuses_symlink_escape_and_duplicate_json_keys(tmp_path: Path) -> None:
+def test_nix_frontend_h1_hardening_empty_dir_delimiters_symlinks_and_timeout(tmp_path: Path) -> None:
     nix_plugin = load_plugin("frontend", "nix")
-
-    # 1. Symlink recipe escaping allowed directory is refused before invoking nix-instantiate.
-    outside = tmp_path / "outside.nix"
-    outside.write_text("{ secret = 1; }\n", encoding="utf-8")
-    recipe_dir = tmp_path / "recipe"
-    recipe_dir.mkdir()
-    escape = recipe_dir / "escape.nix"
-    escape.symlink_to(outside)
-
     never_run = tmp_path / "never-run"
     never_run.write_text("#!/bin/sh\necho SHOULD_NOT_RUN >&2\nexit 99\n", encoding="utf-8")
     never_run.chmod(stat.S_IRWXU)
 
-    with pytest.raises(nix_plugin.NixEvalError, match="outside allowed directory"):
+    # 1. CLI --recipe-dir "" must exit 2 (never silently become Path(".") / CWD).
+    clean_env = {k: v for k, v in os.environ.items() if k != "TENDCF_DIR"}
+    empty_dir_cli = _run_cli(["eval-nix", "--recipe-dir", "", str(SITE / "site.nix")], env=clean_env)
+    assert empty_dir_cli.returncode == 2
+    assert b"--recipe-dir must not be empty" in empty_dir_cli.stderr
+    empty_file_cli = _run_cli(["eval-nix", ""], env=clean_env)
+    assert empty_file_cli.returncode == 2
+    assert b"must not be empty" in empty_file_cli.stderr
+
+    # 2. '=' and ':' in allowed_dir refused before launching nix-instantiate (-I injection).
+    for bad_dirname in ("x=y", "a:b"):
+        bad_dir = tmp_path / bad_dirname
+        bad_dir.mkdir()
+        bad_file = bad_dir / "site.nix"
+        bad_file.write_text("{ ok = 1; }\n", encoding="utf-8")
+        with pytest.raises(nix_plugin.NixEvalError, match="contains '=' or ':'"):
+            nix_plugin.eval_nix_file(bad_file, nix_instantiate=str(never_run))
+
+    # 3. Symlinked --recipe-dir refused.
+    real_dir = tmp_path / "real-recipe"
+    real_dir.mkdir()
+    real_file = real_dir / "site.nix"
+    real_file.write_text("{ ok = 1; }\n", encoding="utf-8")
+    sym_dir = tmp_path / "sym-recipe"
+    sym_dir.symlink_to(real_dir)
+    with pytest.raises(nix_plugin.NixEvalError, match="real non-symlink directory"):
+        nix_plugin.eval_nix_file(real_file, recipe_dir=sym_dir, nix_instantiate=str(never_run))
+
+    # 4. Symlinked parent directory when recipe_dir is omitted refused.
+    with pytest.raises(nix_plugin.NixEvalError, match="parent directory must not be a symlink"):
+        nix_plugin.eval_nix_file(sym_dir / "site.nix", nix_instantiate=str(never_run))
+
+    # 5. Symlinked intermediate subdirectory under explicit recipe_dir refused.
+    outer = tmp_path / "outer-recipe"
+    outer.mkdir()
+    (outer / "sub_link").symlink_to(real_dir)
+    with pytest.raises(nix_plugin.NixEvalError, match="symlinked directory"):
+        nix_plugin.eval_nix_file(
+            outer / "sub_link" / "site.nix",
+            recipe_dir=outer,
+            nix_instantiate=str(never_run),
+        )
+
+    # 6. Symlinked leaf recipe file refused.
+    outside = tmp_path / "outside.nix"
+    outside.write_text("{ secret = 1; }\n", encoding="utf-8")
+    escape = real_dir / "escape.nix"
+    escape.symlink_to(outside)
+    with pytest.raises(nix_plugin.NixEvalError, match="regular non-symlink file"):
         nix_plugin.eval_nix_file(escape, nix_instantiate=str(never_run))
 
-    # 2. Duplicate JSON key in nix-instantiate output is refused (no last-wins).
-    good = recipe_dir / "good.nix"
-    good.write_text("{ a = 1; }\n", encoding="utf-8")
+    # 7. Duplicate JSON key in nix-instantiate output refused (no last-wins).
     dup_nix = tmp_path / "dup-nix"
     dup_nix.write_text('#!/bin/sh\nprintf \'{"a": 1, "a": 2}\\n\'\n', encoding="utf-8")
     dup_nix.chmod(stat.S_IRWXU)
-
     with pytest.raises(nix_plugin.NixEvalError, match="duplicate JSON key"):
-        nix_plugin.eval_nix_file(good, nix_instantiate=str(dup_nix))
+        nix_plugin.eval_nix_file(real_file, nix_instantiate=str(dup_nix))
+
+    # 8. Timeout converts cleanly to NixEvalError.
+    slow_nix = tmp_path / "slow-nix"
+    slow_nix.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(5)\n", encoding="utf-8")
+    slow_nix.chmod(stat.S_IRWXU)
+    with pytest.raises(nix_plugin.NixEvalError, match="timed out"):
+        nix_plugin.eval_nix_file(real_file, nix_instantiate=str(slow_nix), timeout=0.1)
 
 
-# --- --check-releasable F9 guard (refuses --tendcf and $TENDCF_DIR) ---
+# --- --check-releasable F9 guard (refuses --tendcf and $TENDCF_DIR on compile & workspace) ---
 
 
 def test_check_releasable_refuses_tendcf_flag_and_env_override(tmp_path: Path) -> None:
@@ -283,6 +460,17 @@ def test_check_releasable_refuses_tendcf_flag_and_env_override(tmp_path: Path) -
         assert env_refused.returncode == 1
         assert b"REFUSED:" in env_refused.stderr and b"TENDCF_DIR" in env_refused.stderr
         assert env_refused.stdout == b""
+
+    # M2 parity: `tendcf workspace --check-releasable` also refuses ambient TENDCF_DIR.
+    ops = tmp_path / "ops-ws"
+    (ops / "tendcf-private-alice").mkdir(parents=True)
+    ws_env = dict(clean_env, TENDCF_DIR=str(TENDCF_ROOT))
+    ws_refused = _run_cli(
+        ["workspace", "--ops-root", str(ops), "--site-name", "alice", "--check-releasable"],
+        env=ws_env,
+    )
+    assert ws_refused.returncode == 1
+    assert b"REFUSED:" in ws_refused.stderr and b"TENDCF_DIR" in ws_refused.stderr
 
 
 def test_check_releasable_refuses_when_not_in_verified_checkout(

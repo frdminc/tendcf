@@ -22,9 +22,10 @@ release build runs strictly from the verified in-tree tendcf checkout.
 
 Resolves or lists the multi-site local ops workspace (`~/tendcf-ops`,
 `tendcf-{private,public}-<site>`, issue #98) with deterministic, fail-closed
-slug pairing and dev-only override taint tracking.
+slug pairing and dev-only override taint tracking. `--check-releasable` also
+refuses ambient `$TENDCF_DIR` overrides for parity with `tendcf compile`.
 
-    tendcf eval-nix site.nix
+    tendcf eval-nix site.nix [--recipe-dir DIR]
 
 Evaluates a Nix expression to Site Model JSON via the in-tree Nix frontend
 plugin (`plugins/frontends/nix/eval.py`, named `nix2cf`) under the tested D-b
@@ -37,7 +38,6 @@ Exit codes mirror tendcf's tooling: 0 clean, 1 compile/release refused, 2 cannot
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import stat
@@ -47,7 +47,12 @@ from typing import Any
 
 from . import __version__
 from .compile import SUPERVISORS, CompileError, HostSpec, compile_host
-from .plugins import PluginError, load_plugin
+from .plugins import (
+    PluginError,
+    exec_verified_source_module,
+    in_tree_tendcf_for_file,
+    load_plugin,
+)
 from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, validate_site_model
 from .workspace import (
     WorkspaceError,
@@ -61,46 +66,9 @@ from .workspace import (
 )
 
 
-def _is_real_dir(path: Path) -> bool:
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
-
-
-def _is_real_file(path: Path) -> bool:
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode)
-
-
 def _in_tree_tendcf() -> Path | None:
-    """The enclosing tendcf checkout: this file is `<root>/compiler/tendcf/cli.py`.
-
-    The root is accepted only if the package really sits in a checkout: the
-    directory two levels up is a real directory named `compiler` holding
-    `pyproject.toml`, and `<root>` beside it holds real `schema/goal-file.schema.json`,
-    `tools/projector.py`, and `plugins/`. Anything else (pip --target,
-    PYTHONPATH, a venv's site-packages, ...) returns None.
-    """
-    here = Path(__file__).resolve()
-    if len(here.parents) < 3:
-        return None
-    compiler_dir, root = here.parents[1], here.parents[2]
-    ok = (
-        compiler_dir.name == "compiler"
-        and _is_real_dir(compiler_dir)
-        and _is_real_file(compiler_dir / "pyproject.toml")
-        and _is_real_dir(root / "schema")
-        and _is_real_file(root / "schema" / "goal-file.schema.json")
-        and _is_real_dir(root / "tools")
-        and _is_real_file(root / "tools" / "projector.py")
-        and _is_real_dir(root / "plugins")
-    )
-    return root if ok else None
+    """The enclosing tendcf checkout: this file is `<root>/compiler/tendcf/cli.py`."""
+    return in_tree_tendcf_for_file(__file__)
 
 
 def _tendcf_dir(arg: str | None) -> Path | None:
@@ -112,26 +80,63 @@ def _tendcf_dir(arg: str | None) -> Path | None:
 
 
 def load_projector(tendcf: Path) -> Any:
-    """Import tendcf's reference projector (`tools/projector.py`) from its checkout."""
-    path = tendcf / "tools" / "projector.py"
+    """Import tendcf's reference projector (`tools/projector.py`) with full containment checks.
+
+    Verifies `tendcf`, `tendcf/tools`, and `tendcf/tools/projector.py` are all
+    real non-symlink entries staying strictly inside `tendcf/tools/`, then
+    loads source directly via `O_NOFOLLOW` (no `__pycache__` trust, no leaf TOCTOU).
+    """
     try:
-        st = os.lstat(path)
+        st_root = os.lstat(tendcf)
+    except OSError as exc:
+        raise SiteModelError(f"cannot inspect tendcf checkout {tendcf}: {exc}") from exc
+    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
+        raise SiteModelError(
+            f"tendcf checkout must be a real non-symlink directory: {tendcf}"
+        )
+    try:
+        resolved_root = tendcf.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SiteModelError(f"cannot resolve tendcf checkout {tendcf}: {exc}") from exc
+
+    tools_dir = resolved_root / "tools"
+    try:
+        st_tools = os.lstat(tools_dir)
+    except OSError as exc:
+        raise SiteModelError(f"cannot inspect tools directory {tools_dir}: {exc}") from exc
+    if stat.S_ISLNK(st_tools.st_mode) or not stat.S_ISDIR(st_tools.st_mode):
+        raise SiteModelError(
+            f"tools directory must be a real non-symlink directory: {tools_dir}"
+        )
+    try:
+        resolved_tools = tools_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SiteModelError(f"cannot resolve tools directory {tools_dir}: {exc}") from exc
+    if resolved_tools.parent != resolved_root or resolved_tools.name != "tools":
+        raise SiteModelError(
+            f"tools directory {tools_dir} resolves outside {resolved_root}: {resolved_tools}"
+        )
+
+    path = resolved_tools / "projector.py"
+    try:
+        st_proj = os.lstat(path)
     except OSError as exc:
         raise SiteModelError(f"cannot read projector at {path}: {exc}") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    if stat.S_ISLNK(st_proj.st_mode) or not stat.S_ISREG(st_proj.st_mode):
         raise SiteModelError(f"projector must be a regular non-symlink file: {path}")
-    resolved = path.resolve(strict=True)
-    spec = importlib.util.spec_from_file_location("tendcf_projector", resolved)
-    if spec is None or spec.loader is None:
-        raise SiteModelError(f"cannot import {resolved}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
     try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(spec.name, None)
-        raise
-    return module
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SiteModelError(f"cannot resolve projector at {path}: {exc}") from exc
+    if resolved.parent != resolved_tools:
+        raise SiteModelError(
+            f"projector {path} resolves outside {resolved_tools}: {resolved}"
+        )
+
+    try:
+        return exec_verified_source_module("tendcf_projector", resolved)
+    except PluginError as exc:
+        raise SiteModelError(str(exc)) from exc
 
 
 def cmd_compile(args: argparse.Namespace) -> int:
@@ -430,6 +435,13 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         print(f"cache_dir: {ws.cache_dir}")
 
     if args.check_releasable:
+        if "TENDCF_DIR" in os.environ:
+            print(
+                "tendcf: REFUSED: --check-releasable forbids TENDCF_DIR environment override; "
+                "release builds must use the verified in-tree tendcf checkout",
+                file=sys.stderr,
+            )
+            return 1
         try:
             ws.assert_releasable()
         except WorkspaceError as exc:
@@ -439,6 +451,12 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 
 def cmd_eval_nix(args: argparse.Namespace) -> int:
+    if not args.file.strip() or "\x00" in args.file:
+        print("tendcf: ERROR: Nix recipe file path must not be empty or contain NUL bytes", file=sys.stderr)
+        return 2
+    if args.recipe_dir is not None and (not args.recipe_dir.strip() or "\x00" in args.recipe_dir):
+        print("tendcf: ERROR: --recipe-dir must not be empty or contain NUL bytes", file=sys.stderr)
+        return 2
     try:
         nix_plugin = load_plugin("frontend", "nix")
     except PluginError as exc:
@@ -446,8 +464,8 @@ def cmd_eval_nix(args: argparse.Namespace) -> int:
         return 2
     try:
         value = nix_plugin.eval_nix_file(
-            Path(args.file),
-            recipe_dir=Path(args.recipe_dir) if args.recipe_dir is not None else None,
+            args.file,
+            recipe_dir=args.recipe_dir,
         )
     except nix_plugin.NixEvalError as exc:
         print(f"tendcf: ERROR: {exc}", file=sys.stderr)
@@ -554,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-releasable",
         dest="check_releasable",
         action="store_true",
-        help="exit 1 if any dev-only --override-input is active",
+        help="exit 1 if any dev-only --override-input or $TENDCF_DIR override is active",
     )
     w.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     w.set_defaults(func=cmd_workspace)

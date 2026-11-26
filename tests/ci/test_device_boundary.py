@@ -32,8 +32,10 @@ def _plant_clean_repo(root: Path) -> None:
         'from dataclasses import dataclass\n'
         '@dataclass(frozen=True)\n'
         'class PluginSpec:\n'
+        '    kind: str\n'
+        '    name: str\n'
         '    relpath: str\n'
-        'TABLE = {"yaml": PluginSpec(relpath="plugins/frontends/yaml/loader.py")}\n',
+        'TABLE = {"yaml": PluginSpec(kind="frontend", name="yaml", relpath="plugins/frontends/yaml/loader.py")}\n',
         encoding="utf-8",
     )
     (root / "compiler" / "pyproject.toml").write_text(
@@ -70,19 +72,33 @@ class DeviceBoundaryLintTests(unittest.TestCase):
             findings = self.lint.check_repo(root)
             self.assertTrue(any("bin/:" in f for f in findings), findings)
 
-    def test_refuses_tool_importing_compiler_plugins_contrib_or_tendcf(self) -> None:
+    def test_refuses_tool_imports_aliases_kwargs_and_indirect_bypasses(self) -> None:
         for snippet in (
             "import tendcf\n",
             "from compiler.tendcf import cli\n",
             "import plugins\n",
             "from contrib import foo\n",
             "import nix2cf\n",
+            "from .. import compiler\n",
             "from importlib.metadata import entry_points\n",
             "import importlib.metadata\n",
             "from importlib import metadata\n",
-            "import importlib\nimportlib.import_module('tendcf.cli')\n",
+            "import importlib\nx = importlib.metadata.distributions()\n",
+            "import importlib as il\nil.import_module('tendcf')\n",
+            "from importlib import import_module as im\nim('tendcf')\n",
+            "from importlib.util import spec_from_file_location as s\ns('x', location='plugins/frontends/yaml/loader.py')\n",
             "import importlib.util\nimportlib.util.spec_from_file_location('x', 'plugins/frontends/yaml/loader.py')\n",
+            "import importlib\ngetattr(importlib, 'metadata')\n",
+            "import runpy\nrunpy.run_path('compiler/tendcf/cli.py')\n",
+            "import pkgutil\n",
+            "from importlib.machinery import SourceFileLoader\n",
+            "exec('import tendcf')\n",
+            "eval('1+1')\n",
             "import sys\nsys.path.insert(0, 'compiler')\n",
+            "import sys as s\ns.path.extend(['compiler'])\n",
+            "from sys import path\npath.append('compiler')\n",
+            "import sys\nsys.path += ['compiler']\n",
+            "import sys\nsys.path[0:0] = ['compiler']\n",
         ):
             with self.subTest(snippet=snippet.strip()):
                 with tempfile.TemporaryDirectory() as td:
@@ -92,29 +108,55 @@ class DeviceBoundaryLintTests(unittest.TestCase):
                     findings = self.lint.check_repo(root)
                     self.assertTrue(findings, f"expected violation for {snippet!r}")
 
-    def test_refuses_entry_points_in_compiler_plugins_or_pyproject(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            _plant_clean_repo(root)
-            (root / "compiler" / "tendcf" / "bad.py").write_text(
-                "import importlib.metadata\neps = importlib.metadata.entry_points()\n",
-                encoding="utf-8",
-            )
-            findings = self.lint.check_repo(root)
-            self.assertTrue(any("entry_points" in f or "importlib.metadata" in f for f in findings), findings)
+    def test_refuses_entry_points_in_compiler_plugins_contrib_scripts_and_pyproject(self) -> None:
+        for rel_target, snippet in (
+            ("compiler/tendcf/bad.py", "import importlib.metadata\neps = importlib.metadata.entry_points()\n"),
+            ("compiler/tendcf/bad2.py", "import importlib as il\nx = il.metadata.distributions()\n"),
+            ("compiler/tendcf/bad3.py", "import importlib\ngetattr(importlib, 'metadata')\n"),
+            ("compiler/scripts/bad.py", "from importlib.metadata import entry_points\n"),
+            ("contrib/bad.py", "import importlib.metadata\n"),
+        ):
+            with self.subTest(rel_target=rel_target):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _plant_clean_repo(root)
+                    p = root / rel_target
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(snippet, encoding="utf-8")
+                    findings = self.lint.check_repo(root)
+                    self.assertTrue(findings, f"expected violation in {rel_target}")
 
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            _plant_clean_repo(root)
-            (root / "compiler" / "pyproject.toml").write_text(
-                '[project]\nname = "tendcf"\n\n[project.scripts]\ntendcf = "tendcf.cli:main"\n\n'
+        for bad_toml, needle in (
+            (
+                '[project]\nname = "tendcf"\n[project.scripts]\ntendcf = "tendcf.cli:main"\n'
                 '[project.entry-points."tendcf.frontends"]\nfoo = "foo:bar"\n',
-                encoding="utf-8",
-            )
-            findings = self.lint.check_repo(root)
-            self.assertTrue(any("entry-points" in f for f in findings), findings)
+                "entry-points",
+            ),
+            (
+                '[project]\nname = "tendcf"\ndynamic = ["entry-points"]\n'
+                '[project.scripts]\ntendcf = "tendcf.cli:main"\n',
+                "dynamic",
+            ),
+            (
+                '[project]\nname = "tendcf"\n[project.scripts]\ntendcf = "tendcf.cli:main"\n'
+                '[project.gui-scripts]\nnix2cf = "tendcf.cli:main"\n',
+                "gui-scripts",
+            ),
+            (
+                'project = "malformed"\n',
+                "[project] table",
+            ),
+        ):
+            with self.subTest(needle=needle):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _plant_clean_repo(root)
+                    (root / "compiler" / "pyproject.toml").write_text(bad_toml, encoding="utf-8")
+                    findings = self.lint.check_repo(root)
+                    self.assertTrue(any(needle in f for f in findings), findings)
 
-    def test_refuses_symlink_in_static_plugin_table(self) -> None:
+    def test_refuses_symlinks_and_non_constant_static_plugin_specs(self) -> None:
+        # 1. Leaf symlink in plugins/
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _plant_clean_repo(root)
@@ -125,6 +167,34 @@ class DeviceBoundaryLintTests(unittest.TestCase):
             target.symlink_to(outside)
             findings = self.lint.check_repo(root)
             self.assertTrue(any("symlink" in f for f in findings), findings)
+
+        # 2. Nested symlinked subdirectory under tools/
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _plant_clean_repo(root)
+            ext = root / "ext"
+            ext.mkdir()
+            (ext / "evil.py").write_text("import tendcf\n", encoding="utf-8")
+            (root / "tools" / "sub").symlink_to(ext)
+            findings = self.lint.check_repo(root)
+            self.assertTrue(any("symlinked directory" in f for f in findings), findings)
+
+        # 3. Positional/non-constant or non-.py PluginSpec relpath
+        for bad_spec in (
+            'PluginSpec("frontend", "evil", "../outside.py")\n',
+            'VAR = "plugins/frontends/yaml/loader.py"\nPluginSpec(kind="frontend", name="x", relpath=VAR)\n',
+            'PluginSpec(kind="frontend", name="x", relpath="plugins/frontends/yaml/loader.txt")\n',
+        ):
+            with self.subTest(bad_spec=bad_spec.strip()):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _plant_clean_repo(root)
+                    (root / "compiler" / "tendcf" / "plugins.py").write_text(
+                        "class PluginSpec:\n    pass\n" + bad_spec,
+                        encoding="utf-8",
+                    )
+                    findings = self.lint.check_repo(root)
+                    self.assertTrue(findings, f"expected finding for {bad_spec!r}")
 
 
 if __name__ == "__main__":

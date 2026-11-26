@@ -895,8 +895,8 @@ def test_cli_defaults_to_the_enclosing_checkout(schemas: Schemas, projector, tmp
 
 
 def test_cli_tendcf_location_precedence(tendcf: Path, tmp_path: Path) -> None:
-    empty = tmp_path / "no-schemas"  # a directory with no *.schema.json: using it fails loudly
-    empty.mkdir()
+    empty = tmp_path / "no-schemas"  # a directory with an empty schema/ dir: using it fails loudly
+    (empty / "schema").mkdir(parents=True)
     refused = b"no *.schema.json under " + str(empty).encode()
     # --tendcf beats TENDCF_DIR: the real one in the env does not rescue the bad flag ...
     flag = _run_env(_compile_args(SITE, "--tendcf", str(empty)), str(tendcf))
