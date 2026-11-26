@@ -1,0 +1,89 @@
+From e61d689391d1e5ff2a34299598ea8a9a643f2140 Mon Sep 17 00:00:00 2001
+From: Daniel JB Clark <djbclark@gmail.com>
+Date: Wed, 25 Nov 2026 23:24:28 -0500
+Subject: [PATCH] Added loader-level embedded NUL fixture to cmdb_test
+
+Verify directly through LoadCMDBData() that host_specific.json files
+containing an embedded NUL byte (after a valid object or inside a string)
+are rejected and install nothing.
+
+Changelog: None
+Ticket: none
+
+diff --git a/tests/unit/cmdb_test.c b/tests/unit/cmdb_test.c
+index d1d43c902d1d869d4014dc42f25bb2a5cff1cafd..2b8a806f18b16e6ee819501d8d41c1f0ace2d1de 100644
+--- a/tests/unit/cmdb_test.c
++++ b/tests/unit/cmdb_test.c
+@@ -44,17 +44,22 @@ static void CMDBFilePath(char *path, size_t size)
+     xsnprintf(path, size, "%s/host_specific.json", GetDataDir());
+ }
+ 
+-static void WriteCMDBFile(const char *json)
++static void WriteCMDBFileBytes(const char *bytes, size_t len)
+ {
+     char path[CF_BUFSIZE];
+     CMDBFilePath(path, sizeof(path));
+ 
+-    FILE *f = fopen(path, "w");
++    FILE *f = fopen(path, "wb");
+     assert_true(f != NULL);
+-    assert_true(fputs(json, f) >= 0);
++    assert_int_equal(fwrite(bytes, 1, len, f), len);
+     assert_int_equal(fclose(f), 0);
+ }
+ 
++static void WriteCMDBFile(const char *json)
++{
++    WriteCMDBFileBytes(json, strlen(json));
++}
++
+ static void RemoveCMDBFile(void)
+ {
+     char path[CF_BUFSIZE];
+@@ -789,6 +794,38 @@ static void test_unknown_metadata_key_installs_nothing(void)
+     RemoveCMDBFile();
+ }
+ 
++static void test_embedded_nul_byte_installs_nothing(void)
++{
++    /* Loader-level proof that host_specific.json containing an embedded NUL
++     * byte (after a valid object or inside a string) is refused and installs
++     * nothing. */
++    const char trailing_nul[] =
++        "{ \"vars\": { \"good_var\": \"x\" },"
++        "  \"classes\": { \"good_class\": \"any::\" } }\0not-json";
++    const char inner_nul[] =
++        "{ \"vars\": { \"good_var\": \"a\0b\" },"
++        "  \"classes\": { \"good_class\": \"any::\" } }\n";
++    const struct
++    {
++        const char *bytes;
++        size_t len;
++    } cases[] = {
++        { trailing_nul, sizeof(trailing_nul) - 1 },
++        { inner_nul, sizeof(inner_nul) - 1 },
++    };
++
++    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
++    {
++        WriteCMDBFileBytes(cases[i].bytes, cases[i].len);
++        EvalContext *ctx = EvalContextNew();
++        assert_false(LoadCMDBData(ctx));
++        assert_false(VariableIsInstalled(ctx, "data:variables.good_var"));
++        assert_false(ClassIsInstalled(ctx, "good_class"));
++        EvalContextDestroy(ctx);
++        RemoveCMDBFile();
++    }
++}
++
+ int main()
+ {
+     PRINT_TEST_BANNER();
+@@ -821,6 +858,7 @@ int main()
+         unit_test(test_repeated_member_or_trailing_input_installs_nothing),
+         unit_test(test_whitespace_after_document_is_fine),
+         unit_test(test_unknown_metadata_key_installs_nothing),
++        unit_test(test_embedded_nul_byte_installs_nothing),
+     };
+ 
+     int ret = run_tests(tests);
