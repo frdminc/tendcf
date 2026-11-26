@@ -1,4 +1,4 @@
-"""Unit tests for bin/recompute_goal_hashes.py (issue #56 item 3 & R1 hardening)."""
+"""Unit tests for bin/recompute_goal_hashes.py (issue #56 item 3 & R1/R2 hardening)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -243,6 +244,141 @@ class RecomputeGoalHashesTests(unittest.TestCase):
             self.assertEqual(r2.returncode, 2, r2.stdout + r2.stderr)
             self.assertIn("symlink", r2.stderr.lower())
 
+            # Case 3: symlinked examples/ directory itself
+            tree3 = root / "tree3"
+            tree3.mkdir()
+            ext_ex = root / "ext-examples"
+            shutil.copytree(REPO_ROOT / "examples", ext_ex)
+            (tree3 / "examples").symlink_to(ext_ex)
+            r3 = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), "--root", str(tree3)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r3.returncode, 2, r3.stdout + r3.stderr)
+            self.assertIn("symlink", r3.stderr.lower())
+
+    def test_dir_fd_anchored_reads_writes_fchmod_replace_and_cleanup(self) -> None:
+        """Deterministic proof that all fixture traversal, reads, exclusive temp
+        creation, fchmod, atomic replace, and failure unlink stay anchored to
+        opened directory file descriptors (zero path-based os.chmod)."""
+        mod = _load_module()
+        with tempfile.TemporaryDirectory(prefix="tendcf-recompute-dirfd-") as td:
+            tmp_root = Path(td)
+            shutil.copytree(REPO_ROOT / "examples", tmp_root / "examples")
+            jcs = mod._load_bundled_jcs_dumps()
+            base_p = tmp_root / "examples" / "goal-file-baseline.json"
+            base_doc = json.loads(base_p.read_text(encoding="utf-8"))
+            base_doc["schema_version"] += 1
+            base_p.write_bytes(jcs(base_doc))
+
+            real_open = os.open
+            real_fchmod = os.fchmod
+            real_replace = os.replace
+            real_unlink = os.unlink
+
+            dir_opens: list[tuple[str, int, int | None]] = []
+            read_opens: list[tuple[str, int, int | None]] = []
+            tmp_opens: list[tuple[str, int, int, int | None]] = []
+            fchmod_calls: list[tuple[int, int]] = []
+            replace_calls: list[tuple[str, str, int | None, int | None]] = []
+            unlink_calls: list[tuple[str, int | None]] = []
+
+            def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                if dir_fd is not None:
+                    name = os.fspath(path)
+                    if flags & os.O_DIRECTORY:
+                        dir_opens.append((name, flags, dir_fd))
+                    elif flags & os.O_CREAT:
+                        tmp_opens.append((name, flags, mode, dir_fd))
+                    else:
+                        read_opens.append((name, flags, dir_fd))
+                return fd
+
+            def spy_fchmod(fd, mode):
+                fchmod_calls.append((fd, mode))
+                return real_fchmod(fd, mode)
+
+            def spy_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                replace_calls.append((os.fspath(src), os.fspath(dst), src_dir_fd, dst_dir_fd))
+                return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+            def spy_unlink(path, *, dir_fd=None):
+                unlink_calls.append((os.fspath(path), dir_fd))
+                return real_unlink(path, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(os, "open", side_effect=spy_open),
+                mock.patch.object(os, "fchmod", side_effect=spy_fchmod),
+                mock.patch.object(os, "chmod", side_effect=AssertionError("path-based os.chmod forbidden")),
+                mock.patch.object(os, "replace", side_effect=spy_replace),
+                mock.patch.object(os, "unlink", side_effect=spy_unlink),
+            ):
+                changes = mod.recompute_hashes(tmp_root, write=True)
+
+            self.assertTrue(changes, "expected fixture updates")
+            # 1. Directory traversal uses dir_fd + O_DIRECTORY | O_NOFOLLOW.
+            opened_dir_names = {name for name, _, _ in dir_opens}
+            self.assertIn("examples", opened_dir_names)
+            self.assertIn("broken", opened_dir_names)
+            for name, flags, dfd in dir_opens:
+                self.assertNotIn("/", name)
+                self.assertIsNotNone(dfd)
+                self.assertTrue(flags & os.O_DIRECTORY)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+
+            # 2. Regular-file reads use dir_fd + O_NOFOLLOW with bare names.
+            self.assertTrue(read_opens)
+            for name, flags, dfd in read_opens:
+                self.assertNotIn("/", name)
+                self.assertIsNotNone(dfd)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+
+            # 3. Exclusive sibling temp creation uses O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, mode 0o600, dir_fd.
+            self.assertEqual(len(tmp_opens), len(changes))
+            for name, flags, mode, dfd in tmp_opens:
+                self.assertNotIn("/", name)
+                self.assertTrue(name.startswith(".") and name.endswith(".tmp"))
+                self.assertEqual(mode, 0o600)
+                self.assertIsNotNone(dfd)
+                self.assertTrue(flags & os.O_WRONLY)
+                self.assertTrue(flags & os.O_CREAT)
+                self.assertTrue(flags & os.O_EXCL)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+
+            # 4. Permissions applied via fchmod(fd, mode) while fd is open.
+            self.assertEqual(len(fchmod_calls), len(changes))
+            for fd, _mode in fchmod_calls:
+                self.assertIsInstance(fd, int)
+                self.assertGreaterEqual(fd, 0)
+
+            # 5. Atomic replace uses matching src_dir_fd == dst_dir_fd with bare names.
+            self.assertEqual(len(replace_calls), len(changes))
+            for src, dst, src_dfd, dst_dfd in replace_calls:
+                self.assertNotIn("/", src)
+                self.assertNotIn("/", dst)
+                self.assertIsNotNone(src_dfd)
+                self.assertEqual(src_dfd, dst_dfd)
+            self.assertEqual(unlink_calls, [], "successful writes should not unlink")
+
+            # 6. Error cleanup unlinks via dir_fd with bare temp name.
+            base_doc["schema_version"] += 1
+            base_p.write_bytes(jcs(base_doc))
+            unlink_calls.clear()
+            with (
+                mock.patch.object(os, "replace", side_effect=OSError("forced replace fail")),
+                mock.patch.object(os, "unlink", side_effect=spy_unlink),
+            ):
+                with self.assertRaises(OSError):
+                    mod.recompute_hashes(tmp_root, write=True)
+            self.assertEqual(len(unlink_calls), 1)
+            unlinked_name, unlinked_dfd = unlink_calls[0]
+            self.assertNotIn("/", unlinked_name)
+            self.assertTrue(unlinked_name.startswith(".") and unlinked_name.endswith(".tmp"))
+            self.assertIsNotNone(unlinked_dfd)
+
     def test_failed_replace_preserves_original_and_cleans_up_temp_file(self) -> None:
         mod = _load_module()
         with tempfile.TemporaryDirectory(prefix="tendcf-recompute-fail-") as td:
@@ -254,14 +390,31 @@ class RecomputeGoalHashesTests(unittest.TestCase):
             base_doc["schema_version"] += 1
             base_p.write_bytes(jcs(base_doc))
 
-            diff_p = tmp_root / "examples" / "goal-diff.json"
-            orig_bytes = diff_p.read_bytes()
+            # Snapshot every top-level JSON file before the run so we assert the
+            # exact file whose os.replace actually failed (not a hard-coded name).
+            top_snapshots = {
+                p.name: p.read_bytes()
+                for p in (tmp_root / "examples").glob("*.json")
+            }
+            failed_targets: list[tuple[str, str, int | None, int | None]] = []
 
-            with mock.patch.object(os, "replace", side_effect=OSError("simulated replace failure")):
+            def fail_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                failed_targets.append((os.fspath(src), os.fspath(dst), src_dir_fd, dst_dir_fd))
+                raise OSError("simulated replace failure")
+
+            with mock.patch.object(os, "replace", side_effect=fail_replace):
                 with self.assertRaises(OSError):
                     mod.recompute_hashes(tmp_root, write=True)
 
-            self.assertEqual(diff_p.read_bytes(), orig_bytes)
+            self.assertEqual(len(failed_targets), 1)
+            _, failed_dst, src_dfd, dst_dfd = failed_targets[0]
+            self.assertIn(failed_dst, top_snapshots)
+            self.assertIsNotNone(src_dfd)
+            self.assertEqual(src_dfd, dst_dfd)
+            # Assert the exact file whose replace failed kept its exact original bytes.
+            self.assertEqual((tmp_root / "examples" / failed_dst).read_bytes(), top_snapshots[failed_dst])
+            for name, orig in top_snapshots.items():
+                self.assertEqual((tmp_root / "examples" / name).read_bytes(), orig, name)
             leftovers = list((tmp_root / "examples").glob("*.tmp"))
             self.assertEqual(leftovers, [], f"leftover temp files found: {leftovers}")
 
@@ -276,12 +429,59 @@ class RecomputeGoalHashesTests(unittest.TestCase):
             base_doc["schema_version"] += 1
             base_p.write_bytes(jcs(base_doc))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                f1 = pool.submit(mod.recompute_hashes, tmp_root, write=True)
-                f2 = pool.submit(mod.recompute_hashes, tmp_root, write=True)
-                f1.result()
-                f2.result()
+            # Deterministically overlap both threads on the first updated fixture
+            # (`approval-application.json`): both read the stale file before either
+            # writes it, then both meet at os.replace holding distinct live sibling
+            # temp files simultaneously.
+            target_name = "approval-application.json"
+            read_barrier = threading.Barrier(2, timeout=10.0)
+            replace_barrier = threading.Barrier(2, timeout=10.0)
+            read_seen: set[int] = set()
+            replace_seen: set[int] = set()
+            seen_lock = threading.Lock()
+            overlapping_tmp_names: list[str] = []
 
+            real_read = mod._read_regular_file_at
+            real_replace = os.replace
+
+            def sync_read(dfd, name, display):
+                res = real_read(dfd, name, display)
+                if name == target_name and display.parent.name == "examples":
+                    tid = threading.get_ident()
+                    wait = False
+                    with seen_lock:
+                        if tid not in read_seen:
+                            read_seen.add(tid)
+                            wait = True
+                    if wait:
+                        read_barrier.wait()
+                return res
+
+            def sync_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                if os.fspath(dst) == target_name:
+                    tid = threading.get_ident()
+                    wait = False
+                    with seen_lock:
+                        if tid not in replace_seen:
+                            replace_seen.add(tid)
+                            overlapping_tmp_names.append(os.fspath(src))
+                            wait = True
+                    if wait:
+                        replace_barrier.wait()
+                return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+            with (
+                mock.patch.object(mod, "_read_regular_file_at", side_effect=sync_read),
+                mock.patch.object(os, "replace", side_effect=sync_replace),
+            ):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    f1 = pool.submit(mod.recompute_hashes, tmp_root, write=True)
+                    f2 = pool.submit(mod.recompute_hashes, tmp_root, write=True)
+                    f1.result()
+                    f2.result()
+
+            self.assertEqual(len(overlapping_tmp_names), 2)
+            self.assertEqual(len(set(overlapping_tmp_names)), 2, f"temp names collided: {overlapping_tmp_names}")
             self.assertEqual(mod.recompute_hashes(tmp_root, write=False), [])
             leftovers = list((tmp_root / "examples").rglob("*.tmp"))
             self.assertEqual(leftovers, [], f"leftover temp files found: {leftovers}")

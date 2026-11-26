@@ -794,10 +794,11 @@ def check_projection(raw: bytes) -> list[ProjectionFinding]:
                         f"{where}/pre_action/command: missing/malformed pre_action "
                         "or violates common.schema.json#/$defs/interlock_argv "
                         "(absolute command[0], [A-Za-z0-9._+@:=,/-]+ only). "
-                        "policy/tendcf_services.cf joins pre_action.command "
-                        "with spaces under useshell => noshell, where "
-                        "CFEngine's ArgSplitCommand splits on whitespace "
-                        "and opens quotes on leading \", ' or ` (issue #54)",
+                        "policy/tendcf_services.cf passes command[1:] via "
+                        "CFEngine arglist under useshell => noshell (while "
+                        "command[0] still goes through ArgSplitCommand), and "
+                        "schema v9 keeps this conservative argv alphabet "
+                        "(issue #54 / #56)",
                     )
             elif kind == "service":
                 unit = body.get("unit")

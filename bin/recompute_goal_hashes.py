@@ -19,12 +19,13 @@ newline).
 Security boundaries:
   - Always imports the bundled `bin/projector.py` next to this script (never
     loads code from `--root`).
+  - Anchors all fixture directory traversal, regular-file reads, exclusive
+    sibling temp-file creation, `os.fchmod`, atomic `os.replace`, and error
+    cleanup `os.unlink` to opened directory file descriptors (`O_RDONLY |
+    O_DIRECTORY | O_NOFOLLOW` via `dir_fd`), closing every descriptor in
+    `finally`.
   - Rejects symlinks on `examples/`, `examples/broken/`, every case directory,
-    and every `.json` file (`O_RDONLY | O_NOFOLLOW` + regular-file check), and
-    enforces resolved containment inside `examples/`.
-  - Writes updates via an exclusive `O_CREAT | O_EXCL` sibling temp file
-    (`tempfile.NamedTemporaryFile`) followed by `os.replace`, cleaning up on
-    any error.
+    and every `.json` file (`O_NOFOLLOW` + `fstat` regular-file check).
 
 Exit codes:
   0  clean (or updated successfully)
@@ -35,13 +36,14 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
 import os
+import secrets
 import stat
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +68,9 @@ COMPACT_JSON_FALLBACK_CASES: frozenset[str] = frozenset({
 })
 
 HASH_FIELDS = ("baseline_sha256", "proposed_sha256")
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 def _load_bundled_jcs_dumps():
@@ -86,71 +91,127 @@ def canonical_sha256(doc: Any, jcs_dumps) -> str:
     return "sha256:" + hashlib.sha256(jcs_dumps(doc)).hexdigest()
 
 
-def _check_real_dir_contained(path: Path, root_real: Path) -> Path:
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        raise ValueError(f"refusing symlink directory: {path}")
-    if not stat.S_ISDIR(st.st_mode):
-        raise ValueError(f"expected directory: {path}")
-    resolved = path.resolve(strict=True)
-    if not resolved.is_relative_to(root_real):
-        raise ValueError(f"directory escapes examples root: {path} -> {resolved}")
-    return resolved
+def _open_root_dir_fd(root: Path) -> int:
+    """Open caller-specified `--root` as a directory descriptor."""
+    resolved = root.resolve(strict=True)
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC
+    try:
+        fd = os.open(resolved, flags)
+    except NotADirectoryError as exc:
+        raise ValueError(f"root is not a directory: {root}") from exc
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISDIR(fst.st_mode):
+            raise ValueError(f"root is not a directory: {root}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
-def _read_regular_file_contained(path: Path, root_real: Path) -> bytes:
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        raise ValueError(f"refusing symlink file: {path}")
-    if not stat.S_ISREG(st.st_mode):
-        raise ValueError(f"refusing non-regular file: {path}")
-    resolved = path.resolve(strict=True)
-    if not resolved.is_relative_to(root_real):
-        raise ValueError(f"file escapes examples root: {path} -> {resolved}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+def _open_child_dir_fd(name: str, parent_fd: int, display: Path) -> int:
+    """Open immediate child directory `name` relative to `parent_fd` without
+    following symlinks."""
+    if "/" in name or name in ("", ".", ".."):
+        raise ValueError(f"invalid child directory name {name!r} at {display}")
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"refusing symlink directory: {display}") from exc
+        if exc.errno == errno.ENOTDIR:
+            # On Linux, O_DIRECTORY | O_NOFOLLOW may return ENOTDIR when a
+            # symlink targets a non-directory; distinguish via lstat(dir_fd).
+            try:
+                st = os.lstat(name, dir_fd=parent_fd)
+                if stat.S_ISLNK(st.st_mode):
+                    raise ValueError(f"refusing symlink directory: {display}") from exc
+            except OSError:
+                pass
+            raise ValueError(f"expected directory: {display}") from exc
+        raise
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISDIR(fst.st_mode):
+            raise ValueError(f"expected directory: {display}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_regular_file_at(dfd: int, name: str, display: Path) -> tuple[bytes, int]:
+    """Read a regular non-symlink file `name` anchored to directory fd `dfd`.
+
+    Returns `(raw_bytes, permission_mode)`.
+    """
+    if "/" in name or name in ("", ".", ".."):
+        raise ValueError(f"invalid filename {name!r} at {display}")
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dfd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"refusing symlink file: {display}") from exc
+        raise
     try:
         fst = os.fstat(fd)
         if not stat.S_ISREG(fst.st_mode):
-            raise ValueError(f"refusing non-regular file descriptor: {path}")
+            raise ValueError(f"refusing non-regular file: {display}")
+        mode = stat.S_IMODE(fst.st_mode)
         with os.fdopen(fd, "rb") as fh:
             fd = -1
-            return fh.read()
+            return fh.read(), mode
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def _atomic_write_regular_contained(path: Path, data: bytes, root_real: Path) -> None:
-    # Verify target and parent are still real, non-symlink, and inside root_real.
-    _check_real_dir_contained(path.parent, root_real)
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise ValueError(f"refusing to replace non-regular or symlink target: {path}")
-    resolved = path.resolve(strict=True)
-    if not resolved.is_relative_to(root_real):
-        raise ValueError(f"target escapes examples root: {path} -> {resolved}")
+def _atomic_write_at(dfd: int, name: str, data: bytes, mode: int, display: Path) -> None:
+    """Atomically replace regular file `name` inside opened directory `dfd`.
 
-    tmp_path: Path | None = None
+    Creates an exclusive sibling temp file with `O_WRONLY | O_CREAT | O_EXCL |
+    O_NOFOLLOW` via `dir_fd=dfd`, writes + flushes + `os.fsync` + `os.fchmod`
+    while the descriptor is open (zero path-based `os.chmod`), publishes via
+    `os.replace(..., src_dir_fd=dfd, dst_dir_fd=dfd)`, and cleans up via
+    `os.unlink(..., dir_fd=dfd)` on any failure.
+    """
+    if "/" in name or name in ("", ".", ".."):
+        raise ValueError(f"invalid filename {name!r} at {display}")
+    st = os.lstat(name, dir_fd=dfd)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"refusing to replace non-regular or symlink target: {display}")
+
+    tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC
+    tmp_name: str | None = None
+    tmp_fd = -1
+    for _ in range(64):
+        candidate = f".{name}.{secrets.token_hex(8)}.tmp"
+        try:
+            tmp_fd = os.open(candidate, tmp_flags, 0o600, dir_fd=dfd)
+            tmp_name = candidate
+            break
+        except FileExistsError:
+            continue
+    if tmp_fd < 0 or tmp_name is None:
+        raise RuntimeError(f"could not create exclusive temp file for {display}")
+
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tf:
-            tmp_path = Path(tf.name)
+        with os.fdopen(tmp_fd, "wb") as tf:
+            tmp_fd = -1
             tf.write(data)
             tf.flush()
             os.fsync(tf.fileno())
-        os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
-        os.replace(tmp_path, path)
-        tmp_path = None
+            os.fchmod(tf.fileno(), mode)
+        os.replace(tmp_name, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        tmp_name = None
     finally:
-        if tmp_path is not None:
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
+        if tmp_name is not None:
             try:
-                tmp_path.unlink(missing_ok=True)
+                os.unlink(tmp_name, dir_fd=dfd)
             except OSError:
                 pass
 
@@ -164,124 +225,52 @@ def _defect_mode(case_dir: str | None, filename: str, field: str) -> str | None:
     return INTENTIONAL_DEFECTS.get((case_dir, "*", field))
 
 
-def _target_files(examples_dir: Path, examples_real: Path) -> list[tuple[Path, str | None]]:
-    """Return sorted (path, broken_case_name_or_None) for every hash-coupled
-    JSON fixture under `examples/`, rejecting symlinked dirs/files."""
-    targets: list[tuple[Path, str | None]] = []
-    for p in sorted(examples_dir.glob("*.json")):
-        if p.name in ("goal-file.json", "goal-file-baseline.json", "host_specific.json"):
-            continue
-        targets.append((p, None))
-
-    broken_dir = examples_dir / "broken"
-    if broken_dir.exists() or broken_dir.is_symlink():
-        _check_real_dir_contained(broken_dir, examples_real)
-        for case_dir in sorted(broken_dir.iterdir()):
-            if case_dir.is_symlink():
-                raise ValueError(f"refusing symlink entry in examples/broken: {case_dir}")
-            if not case_dir.is_dir():
-                continue
-            _check_real_dir_contained(case_dir, examples_real)
-            for p in sorted(case_dir.glob("*.json")):
-                if p.name in ("goal-file.json", "goal-file-baseline.json"):
-                    continue
-                targets.append((p, case_dir.name))
-    return targets
-
-
-def recompute_hashes(
-    root: Path,
+def _process_dir_fd(
+    dfd: int,
+    dir_path: Path,
     *,
-    write: bool = False,
-) -> list[tuple[Path, dict[str, tuple[str, str]]]]:
-    """Recompute expected hashes for all fixtures under `root/examples`.
-
-    Returns a list of `(path, {field: (old_val, new_val)})` for every file whose
-    canonical bytes differ from its current on-disk bytes. When `write=True`,
-    writes the updated canonical JCS bytes (no trailing newline).
-    """
-    examples_dir = root / "examples"
-    if not examples_dir.exists() and not examples_dir.is_symlink():
-        raise FileNotFoundError(f"missing examples directory: {examples_dir}")
-    st_ex = os.lstat(examples_dir)
-    if stat.S_ISLNK(st_ex.st_mode) or not stat.S_ISDIR(st_ex.st_mode):
-        raise ValueError(f"examples must be a real non-symlink directory: {examples_dir}")
-    examples_real = examples_dir.resolve(strict=True)
-
-    top_baseline_path = examples_dir / "goal-file-baseline.json"
-    top_proposed_path = examples_dir / "goal-file.json"
-    if not (top_baseline_path.exists() or top_baseline_path.is_symlink()):
-        raise FileNotFoundError(f"missing {top_baseline_path}")
-    if not (top_proposed_path.exists() or top_proposed_path.is_symlink()):
-        raise FileNotFoundError(f"missing {top_proposed_path}")
-
-    jcs_dumps = _load_bundled_jcs_dumps()
-    top_baseline_hash = canonical_sha256(
-        json.loads(_read_regular_file_contained(top_baseline_path, examples_real).decode("utf-8")),
-        jcs_dumps,
-    )
-    top_proposed_hash = canonical_sha256(
-        json.loads(_read_regular_file_contained(top_proposed_path, examples_real).decode("utf-8")),
-        jcs_dumps,
-    )
-
-    dir_cache: dict[Path, tuple[str, str]] = {}
-
-    def expected_for_dir(parent: Path) -> tuple[str, str]:
-        if parent in dir_cache:
-            return dir_cache[parent]
-        local_base = parent / "goal-file-baseline.json"
-        local_prop = parent / "goal-file.json"
-        base_h = (
-            canonical_sha256(
-                json.loads(_read_regular_file_contained(local_base, examples_real).decode("utf-8")),
-                jcs_dumps,
-            )
-            if (local_base.exists() or local_base.is_symlink())
-            else top_baseline_hash
-        )
-        prop_h = (
-            canonical_sha256(
-                json.loads(_read_regular_file_contained(local_prop, examples_real).decode("utf-8")),
-                jcs_dumps,
-            )
-            if (local_prop.exists() or local_prop.is_symlink())
-            else top_proposed_hash
-        )
-        dir_cache[parent] = (base_h, prop_h)
-        return base_h, prop_h
-
-    changes: list[tuple[Path, dict[str, tuple[str, str]]]] = []
-    for path, case_name in _target_files(examples_dir, examples_real):
-        raw = _read_regular_file_contained(path, examples_real)
+    case_name: str | None,
+    skip_names: frozenset[str],
+    exp_base: str,
+    exp_prop: str,
+    jcs_dumps,
+    write: bool,
+    changes: list[tuple[Path, dict[str, tuple[str, str]]]],
+) -> None:
+    """Inspect (and optionally update) every hash-coupled `*.json` file in `dfd`."""
+    expected_map = {
+        "baseline_sha256": exp_base,
+        "proposed_sha256": exp_prop,
+    }
+    for name in sorted(os.listdir(dfd)):
+        if not name.endswith(".json") or name in skip_names:
+            continue
+        display = dir_path / name
+        raw, mode = _read_regular_file_at(dfd, name, display)
         try:
             doc = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             if case_name is None:
-                raise ValueError(f"invalid JSON in top-level fixture {path}: {exc}") from exc
+                raise ValueError(f"invalid JSON in top-level fixture {display}: {exc}") from exc
             continue
         if not isinstance(doc, dict):
             if case_name is None:
-                raise ValueError(f"top-level fixture {path} must be a JSON object, got {type(doc).__name__}")
+                raise ValueError(
+                    f"top-level fixture {display} must be a JSON object, got {type(doc).__name__}"
+                )
             continue
         if not any(k in doc for k in HASH_FIELDS):
             continue
-
-        exp_base, exp_prop = expected_for_dir(path.parent)
-        expected_map = {
-            "baseline_sha256": exp_base,
-            "proposed_sha256": exp_prop,
-        }
 
         file_diffs: dict[str, tuple[str, str]] = {}
         for field in HASH_FIELDS:
             if field not in doc:
                 continue
-            mode = _defect_mode(case_name, path.name, field)
-            if mode == "preserve":
+            dmode = _defect_mode(case_name, name, field)
+            if dmode == "preserve":
                 continue
             want = expected_map[field]
-            if mode == "trailing_newline":
+            if dmode == "trailing_newline":
                 want = want + "\n"
             cur = doc[field]
             if cur != want:
@@ -301,9 +290,106 @@ def recompute_hashes(
                     doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True
                 ).encode("utf-8")
             if new_bytes != raw:
-                changes.append((path, file_diffs))
+                changes.append((display, file_diffs))
                 if write:
-                    _atomic_write_regular_contained(path, new_bytes, examples_real)
+                    _atomic_write_at(dfd, name, new_bytes, mode, display)
+
+
+def _optional_local_hash(dfd: int, name: str, dir_path: Path, default_hash: str, jcs_dumps) -> str:
+    display = dir_path / name
+    try:
+        raw, _ = _read_regular_file_at(dfd, name, display)
+    except FileNotFoundError:
+        return default_hash
+    return canonical_sha256(json.loads(raw.decode("utf-8")), jcs_dumps)
+
+
+def recompute_hashes(
+    root: Path,
+    *,
+    write: bool = False,
+) -> list[tuple[Path, dict[str, tuple[str, str]]]]:
+    """Recompute expected hashes for all fixtures under `root/examples`.
+
+    Returns a list of `(path, {field: (old_val, new_val)})` for every file whose
+    canonical bytes differ from its current on-disk bytes. When `write=True`,
+    writes the updated canonical JCS bytes (no trailing newline).
+    """
+    jcs_dumps = _load_bundled_jcs_dumps()
+    changes: list[tuple[Path, dict[str, tuple[str, str]]]] = []
+
+    examples_path = root / "examples"
+    root_fd = _open_root_dir_fd(root)
+    examples_fd = -1
+    broken_fd = -1
+    try:
+        try:
+            examples_fd = _open_child_dir_fd("examples", root_fd, examples_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"missing examples directory: {examples_path}") from exc
+
+        top_base_raw, _ = _read_regular_file_at(
+            examples_fd, "goal-file-baseline.json", examples_path / "goal-file-baseline.json"
+        )
+        top_prop_raw, _ = _read_regular_file_at(
+            examples_fd, "goal-file.json", examples_path / "goal-file.json"
+        )
+        top_baseline_hash = canonical_sha256(json.loads(top_base_raw.decode("utf-8")), jcs_dumps)
+        top_proposed_hash = canonical_sha256(json.loads(top_prop_raw.decode("utf-8")), jcs_dumps)
+
+        _process_dir_fd(
+            examples_fd,
+            examples_path,
+            case_name=None,
+            skip_names=frozenset({"goal-file.json", "goal-file-baseline.json", "host_specific.json"}),
+            exp_base=top_baseline_hash,
+            exp_prop=top_proposed_hash,
+            jcs_dumps=jcs_dumps,
+            write=write,
+            changes=changes,
+        )
+
+        broken_path = examples_path / "broken"
+        try:
+            broken_fd = _open_child_dir_fd("broken", examples_fd, broken_path)
+        except FileNotFoundError:
+            broken_fd = -1
+
+        if broken_fd >= 0:
+            for entry_name in sorted(os.listdir(broken_fd)):
+                entry_display = broken_path / entry_name
+                st = os.lstat(entry_name, dir_fd=broken_fd)
+                if stat.S_ISLNK(st.st_mode):
+                    raise ValueError(f"refusing symlink entry in examples/broken: {entry_display}")
+                if not stat.S_ISDIR(st.st_mode):
+                    continue
+                case_fd = _open_child_dir_fd(entry_name, broken_fd, entry_display)
+                try:
+                    case_base = _optional_local_hash(
+                        case_fd, "goal-file-baseline.json", entry_display, top_baseline_hash, jcs_dumps
+                    )
+                    case_prop = _optional_local_hash(
+                        case_fd, "goal-file.json", entry_display, top_proposed_hash, jcs_dumps
+                    )
+                    _process_dir_fd(
+                        case_fd,
+                        entry_display,
+                        case_name=entry_name,
+                        skip_names=frozenset({"goal-file.json", "goal-file-baseline.json"}),
+                        exp_base=case_base,
+                        exp_prop=case_prop,
+                        jcs_dumps=jcs_dumps,
+                        write=write,
+                        changes=changes,
+                    )
+                finally:
+                    os.close(case_fd)
+    finally:
+        if broken_fd >= 0:
+            os.close(broken_fd)
+        if examples_fd >= 0:
+            os.close(examples_fd)
+        os.close(root_fd)
 
     return changes
 
