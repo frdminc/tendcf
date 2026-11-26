@@ -55,9 +55,12 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORKFLOWS_DIR = ROOT / ".github" / "workflows"
 
-# Generous finite node-visit budget for walking parsed YAML graphs so an
-# exponential alias DAG ("billion laughs") or cyclic alias fails closed quickly.
+# Generous finite structural and diagnostic limits so an exponential alias DAG
+# ("billion laughs"), cyclic alias, or pathological workflow fails closed quickly
+# with bounded memory and output.
 MAX_WALK_NODES = 100_000
+MAX_WALK_DEPTH = 64
+MAX_FINDINGS = 200
 
 _IDENT_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 _IDENT_CONT = _IDENT_START | set("0123456789-")
@@ -67,6 +70,41 @@ _ALLOWED_YAML_TAGS = frozenset({
     "tag:yaml.org,2002:seq",
     "tag:yaml.org,2002:map",
 })
+
+
+def _describe_value(val: object, max_scalar: int = 80) -> str:
+    """Return a bounded, non-recursive summary of `val` (never repr()s collections)."""
+    if isinstance(val, dict):
+        return f"mapping ({len(val)} entries)"
+    if isinstance(val, list):
+        return f"sequence ({len(val)} items)"
+    if isinstance(val, str):
+        if len(val) > max_scalar:
+            return repr(val[:max_scalar] + "...")
+        return repr(val)
+    return type(val).__name__
+
+
+class _FindingsCap:
+    """Bounded findings collector that stops emitting after `max_findings` entries."""
+
+    def __init__(self, max_findings: int, label: str) -> None:
+        self.max_findings = max_findings
+        self.label = label
+        self.items: list[str] = []
+        self.truncated = False
+
+    def add(self, message: str) -> bool:
+        if self.truncated:
+            return False
+        if len(self.items) >= self.max_findings:
+            self.truncated = True
+            self.items.append(
+                f"{self.label}: findings output truncated after {self.max_findings} finding(s)"
+            )
+            return False
+        self.items.append(f"{self.label}: {message}")
+        return True
 
 
 class _StrictLoader(yaml.BaseLoader):
@@ -126,7 +164,7 @@ class _StrictLoader(yaml.BaseLoader):
                 raise yaml.constructor.ConstructorError(
                     "while constructing a mapping",
                     node.start_mark,
-                    f"found duplicate key {key!r}",
+                    f"found duplicate key {_describe_value(key)}",
                     key_node.start_mark,
                 )
             if isinstance(key, str):
@@ -135,7 +173,7 @@ class _StrictLoader(yaml.BaseLoader):
                     raise yaml.constructor.ConstructorError(
                         "while constructing a mapping",
                         node.start_mark,
-                        f"found duplicate key {key!r} (case-insensitive conflict with {seen_lower[lower]!r})",
+                        f"found duplicate key {_describe_value(key)} (case-insensitive conflict with {_describe_value(seen_lower[lower])})",
                         key_node.start_mark,
                     )
                 seen_lower[lower] = key
@@ -266,54 +304,59 @@ def scan_expression_for_secrets(expr: str) -> tuple[bool, bool]:
     return has_secrets, False
 
 
-def _check_expression_body(expr: str, is_unclosed: bool, where: str, findings: list[str]) -> None:
+def _check_expression_body(expr: str, is_unclosed: bool, where: str, emit) -> None:
     if is_unclosed:
-        findings.append(f"{where}: malformed expression (unclosed '${{{{' delimiter)")
+        if not emit(f"{where}: malformed expression (unclosed '${{{{' delimiter)"):
+            return
     has_secrets, has_unclosed_quote = scan_expression_for_secrets(expr)
     if has_unclosed_quote:
-        findings.append(f"{where}: malformed expression (unclosed single-quoted string literal)")
+        if not emit(f"{where}: malformed expression (unclosed single-quoted string literal)"):
+            return
     if has_secrets:
-        findings.append(f"{where}: expression references `secrets` context: {expr.strip()!r}")
+        emit(f"{where}: expression references `secrets` context: {_describe_value(expr.strip())}")
 
 
-def _check_string_value(text: str, where: str, *, is_bare_expr: bool, findings: list[str]) -> None:
+def _check_string_value(text: str, where: str, *, is_bare_expr: bool, emit) -> None:
     if is_bare_expr:
         if "${{" in text:
             spans, outside = _split_expressions(text)
             for expr, is_unclosed in spans:
-                _check_expression_body(expr, is_unclosed, where, findings)
+                _check_expression_body(expr, is_unclosed, where, emit)
             for chunk in outside:
                 if chunk.strip():
-                    _check_expression_body(chunk, False, where, findings)
+                    _check_expression_body(chunk, False, where, emit)
         else:
-            _check_expression_body(text, False, where, findings)
+            _check_expression_body(text, False, where, emit)
         return
 
     for expr, is_unclosed in extract_expressions(text):
-        _check_expression_body(expr, is_unclosed, where, findings)
+        _check_expression_body(expr, is_unclosed, where, emit)
 
 
-def _check_permissions(val: object, where: str, findings: list[str]) -> None:
+def _check_permissions(val: object, where: str, emit) -> None:
     if not isinstance(val, dict):
-        findings.append(
+        emit(
             f"{where}: must be an explicit YAML mapping (e.g. `contents: read` or `{{}}`), "
-            f"got {type(val).__name__} ({val!r})"
+            f"got {_describe_value(val)}"
         )
         return
     for scope, level in val.items():
         if not isinstance(scope, str) or not isinstance(level, str):
-            findings.append(
-                f"{where}: scope and level must be strings, got {scope!r}: {level!r}"
-            )
+            if not emit(
+                f"{where}: scope and level must be strings, got {_describe_value(scope)}: {_describe_value(level)}"
+            ):
+                return
             continue
         if scope == "contents" and level in ("read", "none"):
             continue
         if level == "none":
             continue
-        findings.append(
-            f"{where}.{scope}: disallowed permission level {level!r} "
-            f"(only `contents: read` and `<scope>: none` are permitted)"
-        )
+        scope_label = scope if len(scope) <= 80 else _describe_value(scope)
+        if not emit(
+            f"{where}.{scope_label}: disallowed permission level {_describe_value(level)} "
+            "(only `contents: read` and `<scope>: none` are permitted)"
+        ):
+            return
 
 
 def _is_non_empty_secrets_field(val: object) -> bool:
@@ -339,50 +382,159 @@ def _format_path(path: tuple[str | int, ...]) -> str:
     return ".".join(parts)
 
 
-def _walk_for_secrets(
-    root: object,
-    findings: list[str],
+def _check_structure_limits(
+    doc: object,
+    label: str,
     *,
-    bare_expr_paths: set[tuple[str | int, ...]],
-    max_nodes: int = MAX_WALK_NODES,
-) -> None:
-    """Iterative, node-budgeted traversal over the resolved YAML object graph."""
-    stack: list[tuple[object, tuple[str | int, ...]]] = [(root, ())]
-    visited = 0
+    max_nodes: int | None = None,
+    max_depth: int | None = None,
+) -> str | None:
+    """Bounded iterator-stack preflight over `doc` before any policy pass runs.
+
+    Accounts for every edge as it is encountered (never eagerly materializing
+    child lists), rejecting excessive node counts (e.g. alias DAG bombs) or
+    excessive nesting depth (e.g. cyclic aliases).
+    """
+    node_limit = MAX_WALK_NODES if max_nodes is None else max_nodes
+    depth_limit = MAX_WALK_DEPTH if max_depth is None else max_depth
+
+    visited = 1
+    if visited > node_limit:
+        return (
+            f"{label}: YAML structure exceeds node traversal limit ({node_limit}); "
+            "possible alias expansion bomb or cycle"
+        )
+    if 0 > depth_limit:
+        return (
+            f"{label}: YAML structure exceeds nesting depth limit ({depth_limit}); "
+            "possible alias expansion bomb or cycle"
+        )
+
+    stack: list[tuple[object, int]] = []
+    if isinstance(doc, dict) and doc:
+        stack.append((iter(doc.values()), 1))
+    elif isinstance(doc, list) and doc:
+        stack.append((iter(doc), 1))
 
     while stack:
-        obj, path = stack.pop()
+        it, child_depth = stack[-1]
+        try:
+            child = next(it)  # type: ignore[arg-type]
+        except StopIteration:
+            stack.pop()
+            continue
+
         visited += 1
-        if visited > max_nodes:
-            findings.append(
-                f"YAML structure exceeds node traversal limit ({max_nodes}); "
+        if visited > node_limit:
+            return (
+                f"{label}: YAML structure exceeds node traversal limit ({node_limit}); "
+                "possible alias expansion bomb or cycle"
+            )
+        if child_depth > depth_limit:
+            return (
+                f"{label}: YAML structure exceeds nesting depth limit ({depth_limit}); "
+                "possible alias expansion bomb or cycle"
+            )
+
+        if isinstance(child, dict) and child:
+            stack.append((iter(child.values()), child_depth + 1))
+        elif isinstance(child, list) and child:
+            stack.append((iter(child), child_depth + 1))
+
+    return None
+
+
+def _walk_for_secrets(
+    root: object,
+    collector: _FindingsCap,
+    *,
+    bare_expr_paths: set[tuple[str | int, ...]],
+    max_nodes: int | None = None,
+    max_depth: int | None = None,
+) -> None:
+    """Streaming, node- and depth-budgeted traversal over the resolved YAML graph."""
+    node_limit = MAX_WALK_NODES if max_nodes is None else max_nodes
+    depth_limit = MAX_WALK_DEPTH if max_depth is None else max_depth
+
+    visited = 1
+    if visited > node_limit:
+        collector.add(
+            f"YAML structure exceeds node traversal limit ({node_limit}); "
+            "possible alias expansion bomb or cycle"
+        )
+        return
+    if 0 > depth_limit:
+        collector.add(
+            f"YAML structure exceeds nesting depth limit ({depth_limit}); "
+            "possible alias expansion bomb or cycle"
+        )
+        return
+
+    stack: list[tuple[str, object, tuple[str | int, ...], int]] = []
+    if isinstance(root, dict) and root:
+        stack.append(("dict", iter(root.items()), (), 1))
+    elif isinstance(root, list) and root:
+        stack.append(("list", enumerate(root), (), 1))
+    elif isinstance(root, str):
+        _check_string_value(root, "", is_bare_expr=(() in bare_expr_paths), emit=collector.add)
+        return
+
+    while stack and not collector.truncated:
+        kind, it, parent_path, child_depth = stack[-1]
+        try:
+            item = next(it)  # type: ignore[arg-type]
+        except StopIteration:
+            stack.pop()
+            continue
+
+        visited += 1
+        if visited > node_limit:
+            collector.add(
+                f"YAML structure exceeds node traversal limit ({node_limit}); "
+                "possible alias expansion bomb or cycle"
+            )
+            return
+        if child_depth > depth_limit:
+            collector.add(
+                f"YAML structure exceeds nesting depth limit ({depth_limit}); "
                 "possible alias expansion bomb or cycle"
             )
             return
 
-        if isinstance(obj, dict):
-            items = list(obj.items())
-            for k, _ in items:
-                if isinstance(k, str):
-                    key_where = f"{_format_path(path + (k,))} (mapping key)"
-                    _check_string_value(k, key_where, is_bare_expr=False, findings=findings)
-            for k, v in reversed(items):
-                stack.append((v, path + (str(k),)))
-        elif isinstance(obj, list):
-            for idx in range(len(obj) - 1, -1, -1):
-                stack.append((obj[idx], path + (idx,)))
-        elif isinstance(obj, str):
+        if kind == "dict":
+            k, child = item
+            child_path = parent_path + (str(k),)
+            if isinstance(k, str):
+                key_where = f"{_format_path(child_path)} (mapping key)"
+                _check_string_value(k, key_where, is_bare_expr=False, emit=collector.add)
+                if collector.truncated:
+                    return
+        else:
+            idx, child = item
+            child_path = parent_path + (idx,)
+
+        if isinstance(child, dict) and child:
+            stack.append(("dict", iter(child.items()), child_path, child_depth + 1))
+        elif isinstance(child, list) and child:
+            stack.append(("list", enumerate(child), child_path, child_depth + 1))
+        elif isinstance(child, str):
             _check_string_value(
-                obj,
-                _format_path(path),
-                is_bare_expr=(path in bare_expr_paths),
-                findings=findings,
+                child,
+                _format_path(child_path),
+                is_bare_expr=(child_path in bare_expr_paths),
+                emit=collector.add,
             )
 
 
-def lint_workflow_text(text: str, label: str, *, max_nodes: int = MAX_WALK_NODES) -> list[str]:
+def lint_workflow_text(
+    text: str,
+    label: str,
+    *,
+    max_nodes: int | None = None,
+    max_depth: int | None = None,
+    max_findings: int | None = None,
+) -> list[str]:
     """Validate a single workflow YAML document string. Returns list of finding strings."""
-    findings: list[str] = []
     try:
         doc = yaml.load(text, Loader=_StrictLoader)
     except yaml.YAMLError as exc:
@@ -391,14 +543,22 @@ def lint_workflow_text(text: str, label: str, *, max_nodes: int = MAX_WALK_NODES
         return [f"{label}: YAML parse error: nesting depth exceeded recursion limit"]
 
     if not isinstance(doc, dict):
-        return [f"{label}: workflow root must be a YAML mapping, got {type(doc).__name__}"]
+        return [f"{label}: workflow root must be a YAML mapping, got {_describe_value(doc)}"]
+
+    # 0. Bounded structural preflight BEFORE any policy pass or collection inspection.
+    limit_err = _check_structure_limits(doc, label, max_nodes=max_nodes, max_depth=max_depth)
+    if limit_err is not None:
+        return [limit_err]
+
+    finding_limit = MAX_FINDINGS if max_findings is None else max_findings
+    collector = _FindingsCap(finding_limit, label)
 
     # 1. Required explicit top-level permissions (case-insensitive lookup).
     has_perms, _, perms_val = _ci_lookup(doc, "permissions")
     if not has_perms:
-        findings.append(f"{label}: missing required top-level `permissions:` mapping")
+        collector.add("missing required top-level `permissions:` mapping")
     else:
-        _check_permissions(perms_val, f"{label}: permissions", findings)
+        _check_permissions(perms_val, "permissions", collector.add)
 
     # 2. Reusable workflow callee `on.workflow_call.secrets`.
     has_on, _, on_val = _ci_lookup(doc, "on")
@@ -407,8 +567,8 @@ def lint_workflow_text(text: str, label: str, *, max_nodes: int = MAX_WALK_NODES
         if has_wc and isinstance(wc_val, dict):
             has_wc_sec, _, wc_sec = _ci_lookup(wc_val, "secrets")
             if has_wc_sec and _is_non_empty_secrets_field(wc_sec):
-                findings.append(
-                    f"{label}: on.workflow_call.secrets: secrets declaration is disallowed ({wc_sec!r})"
+                collector.add(
+                    f"on.workflow_call.secrets: secrets declaration is disallowed ({_describe_value(wc_sec)})"
                 )
 
     # 3. Job-level permissions, reusable-workflow secrets, and bare `if:` expression paths.
@@ -417,26 +577,26 @@ def lint_workflow_text(text: str, label: str, *, max_nodes: int = MAX_WALK_NODES
     if has_jobs:
         assert jobs_key is not None
         if not isinstance(jobs_val, dict):
-            findings.append(f"{label}: jobs: must be a YAML mapping, got {type(jobs_val).__name__}")
+            collector.add(f"jobs: must be a YAML mapping, got {_describe_value(jobs_val)}")
         else:
             for job_id, job in jobs_val.items():
+                if collector.truncated:
+                    break
                 job_id_str = str(job_id)
                 job_path: tuple[str | int, ...] = (jobs_key, job_id_str)
                 job_prefix = f"jobs.{job_id_str}"
                 if not isinstance(job, dict):
-                    findings.append(
-                        f"{label}: {job_prefix}: must be a YAML mapping, got {type(job).__name__}"
-                    )
+                    collector.add(f"{job_prefix}: must be a YAML mapping, got {_describe_value(job)}")
                     continue
 
                 has_jp, _, jp_val = _ci_lookup(job, "permissions")
                 if has_jp:
-                    _check_permissions(jp_val, f"{label}: {job_prefix}.permissions", findings)
+                    _check_permissions(jp_val, f"{job_prefix}.permissions", collector.add)
 
                 has_js, _, js_val = _ci_lookup(job, "secrets")
                 if has_js and _is_non_empty_secrets_field(js_val):
-                    findings.append(
-                        f"{label}: {job_prefix}.secrets: secrets forwarding is disallowed ({js_val!r})"
+                    collector.add(
+                        f"{job_prefix}.secrets: secrets forwarding is disallowed ({_describe_value(js_val)})"
                     )
 
                 has_jif, jif_key, jif_val = _ci_lookup(job, "if")
@@ -458,12 +618,16 @@ def lint_workflow_text(text: str, label: str, *, max_nodes: int = MAX_WALK_NODES
                                 bare_expr_paths.add(job_path + (steps_key, idx, stif_key))
 
     # 4. Walk entire resolved document for `${{ ... }}` and bare `if:` `secrets` references.
-    doc_findings: list[str] = []
-    _walk_for_secrets(doc, doc_findings, bare_expr_paths=bare_expr_paths, max_nodes=max_nodes)
-    for item in doc_findings:
-        findings.append(f"{label}: {item}")
+    if not collector.truncated:
+        _walk_for_secrets(
+            doc,
+            collector,
+            bare_expr_paths=bare_expr_paths,
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+        )
 
-    return findings
+    return collector.items
 
 
 def _read_regular_utf8(path: Path) -> str:

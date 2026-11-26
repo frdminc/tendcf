@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent.parent
 LINT_PATH = REPO / "bin" / "workflow_permissions_lint.py"
@@ -364,7 +365,159 @@ jobs:
         lines.append("jobs: {}")
         wf = "\n".join(lines) + "\n"
         findings = lint.lint_workflow_text(wf, "bomb.yml")
-        self.assertTrue(any("exceeds node traversal limit" in f for f in findings), findings)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("exceeds node traversal limit", findings[0])
+
+    def test_preflight_node_limit_stops_before_permissions_and_jobs_prepass(self) -> None:
+        wf_perms = """\
+name: P
+on: push
+x-a: &a [v1, v2, v3]
+permissions: [*a, *a]
+jobs: {}
+"""
+        with mock.patch.object(lint, "MAX_WALK_NODES", 5):
+            findings = lint.lint_workflow_text(wf_perms, "pre-perms.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("exceeds node traversal limit (5)", findings[0])
+        self.assertFalse(any("must be an explicit YAML mapping" in f for f in findings), findings)
+
+        wf_jobs = """\
+name: J
+on: push
+permissions:
+  contents: read
+x-s: &s
+  - run: echo a
+  - run: echo b
+  - run: echo c
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    secrets:
+      tok: *s
+    steps: *s
+"""
+        with mock.patch.object(lint, "MAX_WALK_NODES", 8):
+            findings = lint.lint_workflow_text(wf_jobs, "pre-jobs.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("exceeds node traversal limit (8)", findings[0])
+        self.assertFalse(any("secrets forwarding is disallowed" in f for f in findings), findings)
+
+    def test_preflight_depth_limit_stops_immediately_and_catches_cycles(self) -> None:
+        wf_deep = """\
+name: Deep
+on: push
+permissions: write-all
+a:
+  b:
+    c:
+      d:
+        e: x
+jobs: {}
+"""
+        with mock.patch.object(lint, "MAX_WALK_DEPTH", 3):
+            findings = lint.lint_workflow_text(wf_deep, "deep.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("exceeds nesting depth limit (3)", findings[0])
+        self.assertFalse(any("must be an explicit YAML mapping" in f for f in findings), findings)
+
+        wf_cycle = """\
+name: Cycle
+on: push
+permissions:
+  contents: read
+x-c: &c
+  - *c
+jobs: {}
+"""
+        findings = lint.lint_workflow_text(wf_cycle, "cycle.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("YAML parse error: found unconstructable recursive node", findings[0])
+
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        err = lint._check_structure_limits({"x": cyclic}, "memcycle.yml")
+        self.assertIsNotNone(err)
+        self.assertIn("exceeds nesting depth limit", err or "")
+
+    def test_collection_diagnostics_use_type_size_summaries_not_raw_repr(self) -> None:
+        wf_perm_seq = """\
+name: SeqPerm
+on: push
+permissions: [sentinel_alpha, sentinel_beta]
+jobs: {}
+"""
+        findings = lint.lint_workflow_text(wf_perm_seq, "seqperm.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("must be an explicit YAML mapping", findings[0])
+        self.assertIn("sequence (2 items)", findings[0])
+        self.assertNotIn("sentinel_alpha", findings[0])
+        self.assertNotIn("sentinel_beta", findings[0])
+
+        wf_nested_perm = """\
+name: NestedPerm
+on: push
+permissions:
+  contents: [nested_sentinel]
+jobs: {}
+"""
+        findings = lint.lint_workflow_text(wf_nested_perm, "nestedperm.yml")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("scope and level must be strings", findings[0])
+        self.assertIn("sequence (1 items)", findings[0])
+        self.assertNotIn("nested_sentinel", findings[0])
+
+        wf_secrets_maps = """\
+name: SecMaps
+on:
+  workflow_call:
+    secrets:
+      wc_key_sentinel:
+        required: true
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: org/repo/.github/workflows/other.yml@main
+    secrets:
+      job_key_sentinel: job_val_sentinel
+"""
+        findings = lint.lint_workflow_text(wf_secrets_maps, "secmaps.yml")
+        self.assertEqual(len(findings), 2, findings)
+        self.assertTrue(
+            any(
+                "on.workflow_call.secrets: secrets declaration is disallowed (mapping (1 entries))" in f
+                and "wc_key_sentinel" not in f
+                for f in findings
+            ),
+            findings,
+        )
+        self.assertTrue(
+            any(
+                "jobs.call.secrets: secrets forwarding is disallowed (mapping (1 entries))" in f
+                and "job_key_sentinel" not in f
+                and "job_val_sentinel" not in f
+                for f in findings
+            ),
+            findings,
+        )
+
+    def test_findings_cap_truncates_diagnostic_volume(self) -> None:
+        wf = """\
+name: Many
+on: push
+permissions:
+  contents: write
+  actions: write
+  packages: write
+  id-token: write
+jobs: {}
+"""
+        with mock.patch.object(lint, "MAX_FINDINGS", 2):
+            findings = lint.lint_workflow_text(wf, "many.yml")
+        self.assertEqual(len(findings), 3, findings)
+        self.assertIn("findings output truncated after 2 finding(s)", findings[-1])
 
     # ---- Negative cases: secrets & malformed expressions
 
