@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/frdminc/tendcf/schema/audit-envelope.schema.json",
+  "title": "Tamper-evident audit envelope (issue #119 / shared djbclark-ade#1013 contract)",
+  "description": "One hash-chained JSONL audit record emitted by tendcf to its local capture/spool and shipped off-device to an append-only sink. Reuses the shared envelope contract from djbclark/djbclark-ade#1013 (`v`, `src`, `host`, `boot_id`, `seq`, `ts`, `mono_ms`, `prev`, `type`, `data`, `h`, where `h = sha256(prev || jcs(entry_without_h))`). Every event payload uses a closed allowlist (`additionalProperties: false`) so CMDB values, goal-file/config contents, command output, environment variables, secrets, key material, and consent free-text cannot enter the audit stream.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "description": "Envelope format version (shared contract v1).",
+      "const": 1
+    },
+    "src": {
+      "description": "Producer stream identifier bound to the sink forced command (`audit-append`). Fixed to `tendcf` for tendcf records.",
+      "const": "tendcf"
+    },
+    "host": {
+      "description": "Host emitting this record; bound on the sink to the authenticated client SSH key.",
+      "$ref": "common.schema.json#/$defs/host_name"
+    },
+    "boot_id": {
+      "description": "Host boot identifier (e.g., Linux `/proc/sys/kernel/random/boot_id` or macOS `kern.bootsessionuuid`) recorded beside `mono_ms` to detect reboots and clock jumps.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "not": { "pattern": "\\n" }
+    },
+    "seq": {
+      "description": "Strictly monotonic per-(host, src) sequence number starting at 1.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "ts": {
+      "description": "UTC RFC 3339 wall-clock timestamp with Z suffix. The sink's own receive timestamp is the authoritative no-later-than bound.",
+      "$ref": "#/$defs/utc_timestamp"
+    },
+    "mono_ms": {
+      "description": "Non-negative monotonic clock reading in milliseconds paired with `boot_id` (stays within RFC 8785 IEEE-754 exact safe integer bounds for >285,000 years of uptime).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "prev": {
+      "description": "Hash of the immediately preceding record (`seq - 1`), or the all-zero genesis sentinel (`sha256:0000...0000`) when `seq == 1`.",
+      "$ref": "#/$defs/sha256"
+    },
+    "type": {
+      "description": "Closed vocabulary of tendcf audit events (issue #119).",
+      "enum": [
+        "release_decision",
+        "consent_decision",
+        "promise_outcome",
+        "service_change",
+        "package_change",
+        "trust_change",
+        "lifecycle",
+        "tripwire",
+        "heartbeat"
+      ]
+    },
+    "data": {
+      "description": "Event-specific metadata matching `type`. Strictly allowlisted; never carries CMDB values, goal-file contents, command output, env vars, secrets, key material, or consent free-text.",
+      "type": "object"
+    },
+    "h": {
+      "description": "Self-hash of the envelope: `sha256:` followed by lowercase hex `SHA-256(ascii(prev) || rfc8785_jcs(envelope_without_h))`.",
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": ["v", "src", "host", "boot_id", "seq", "ts", "mono_ms", "prev", "type", "data", "h"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "seq": { "const": 1 } }, "required": ["seq"] },
+      "then": {
+        "properties": {
+          "prev": {
+            "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "release_decision" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_release_decision" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "consent_decision" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_consent_decision" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "promise_outcome" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_promise_outcome" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "service_change" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_service_change" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "package_change" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_package_change" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "trust_change" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_trust_change" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "lifecycle" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_lifecycle" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "tripwire" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_tripwire" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "heartbeat" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/data_heartbeat" } } }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "not": { "pattern": "\\n" }
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^ed25519:[0-9a-f]{64}$",
+      "not": { "pattern": "\\n" }
+    },
+    "utc_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])(\\.[0-9]{1,9})?Z$",
+      "not": { "pattern": "\\n" }
+    },
+    "abs_path": {
+      "description": "Normalized absolute path with conservative printable ASCII characters and no `..` traversal or control characters.",
+      "type": "string",
+      "pattern": "^/[A-Za-z0-9._+@:,/-]{1,255}$",
+      "not": { "pattern": "(\\n|\\.\\.|//)" }
+    },
+    "unit_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$",
+      "not": { "pattern": "\\n" }
+    },
+    "package_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.+:-]{0,127}$",
+      "not": { "pattern": "\\n" }
+    },
+    "version_str": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$",
+      "not": { "pattern": "\\n" }
+    },
+    "grant_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "not": { "pattern": "\\n" }
+    },
+    "data_release_decision": {
+      "type": "object",
+      "properties": {
+        "release": { "$ref": "common.schema.json#/$defs/release_stamp" },
+        "release_sha256": { "$ref": "#/$defs/sha256" },
+        "goal_sha256": { "$ref": "#/$defs/sha256" },
+        "projection_sha256": { "$ref": "#/$defs/sha256" },
+        "verdict": { "enum": ["pass", "fail", "refused"] },
+        "validator_version": { "$ref": "common.schema.json#/$defs/release_stamp" }
+      },
+      "required": ["release", "release_sha256", "goal_sha256", "projection_sha256", "verdict"],
+      "additionalProperties": false
+    },
+    "data_consent_decision": {
+      "type": "object",
+      "properties": {
+        "verdict": { "enum": ["accept", "reject", "withdraw"] },
+        "key_id": { "$ref": "#/$defs/key_id" },
+        "decided_at": { "$ref": "#/$defs/utc_timestamp" },
+        "decision_sha256": { "$ref": "#/$defs/sha256" },
+        "ceremony_class": { "enum": ["ordinary", "privileged", "baseline"] },
+        "grant_id": { "$ref": "#/$defs/grant_id" }
+      },
+      "required": ["verdict", "key_id", "decided_at", "decision_sha256", "ceremony_class"],
+      "additionalProperties": false
+    },
+    "data_promise_outcome": {
+      "type": "object",
+      "properties": {
+        "release": { "$ref": "common.schema.json#/$defs/release_stamp" },
+        "domain": { "$ref": "common.schema.json#/$defs/identifier" },
+        "bundle": { "$ref": "common.schema.json#/$defs/identifier" },
+        "entry": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9/_.:@+-]{1,128}$",
+          "not": { "pattern": "\\n" }
+        },
+        "mode": { "enum": ["enforce", "audit"] },
+        "outcome": { "type": "string" },
+        "blocked_by_interlock": { "$ref": "common.schema.json#/$defs/identifier" }
+      },
+      "required": ["release", "domain", "bundle", "entry", "mode", "outcome"],
+      "additionalProperties": false,
+      "if": { "properties": { "mode": { "const": "enforce" } }, "required": ["mode"] },
+      "then": { "properties": { "outcome": { "$ref": "common.schema.json#/$defs/outcome_enforce" } } },
+      "else": { "properties": { "outcome": { "$ref": "common.schema.json#/$defs/outcome_audit" } } }
+    },
+    "data_service_change": {
+      "type": "object",
+      "properties": {
+        "action": { "enum": ["install", "change", "remove"] },
+        "supervisor": { "enum": ["launchd", "systemd", "runit"] },
+        "unit": { "$ref": "#/$defs/unit_name" },
+        "path": { "$ref": "#/$defs/abs_path" },
+        "new_sha256": { "$ref": "#/$defs/sha256" },
+        "prev_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["action", "supervisor", "unit", "path"],
+      "additionalProperties": false,
+      "if": { "properties": { "action": { "const": "remove" } }, "required": ["action"] },
+      "then": { "properties": { "new_sha256": false } },
+      "else": { "required": ["new_sha256"] }
+    },
+    "data_package_change": {
+      "type": "object",
+      "properties": {
+        "action": { "enum": ["install", "upgrade", "remove"] },
+        "package": { "$ref": "#/$defs/package_name" },
+        "version": { "$ref": "#/$defs/version_str" },
+        "prev_version": { "$ref": "#/$defs/version_str" }
+      },
+      "required": ["action", "package"],
+      "additionalProperties": false
+    },
+    "data_trust_change": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": ["advisor_key", "peer_allowlist", "trust_policy", "emergency_revocation"]
+        },
+        "action": { "enum": ["add", "update", "remove", "revoke"] },
+        "key_id": { "$ref": "#/$defs/key_id" },
+        "new_sha256": { "$ref": "#/$defs/sha256" },
+        "prev_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["kind", "action"],
+      "additionalProperties": false
+    },
+    "data_lifecycle": {
+      "type": "object",
+      "properties": {
+        "action": { "enum": ["install", "rollback", "uninstall"] },
+        "release": { "$ref": "common.schema.json#/$defs/release_stamp" },
+        "prefix_sha256": { "$ref": "#/$defs/sha256" },
+        "policy_sha256": { "$ref": "#/$defs/sha256" },
+        "projector_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["action", "release"],
+      "additionalProperties": false
+    },
+    "data_tripwire": {
+      "type": "object",
+      "properties": {
+        "tool": { "enum": ["aide", "tripwire", "auditd", "eslogger", "osquery"] },
+        "event": {
+          "enum": ["modified", "created", "deleted", "permission_change", "unexpected_exec", "decoy_read"]
+        },
+        "path": { "$ref": "#/$defs/abs_path" },
+        "expected_sha256": { "$ref": "#/$defs/sha256" },
+        "observed_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["tool", "event", "path"],
+      "additionalProperties": false
+    },
+    "data_heartbeat": {
+      "type": "object",
+      "properties": {
+        "running_release": { "$ref": "common.schema.json#/$defs/release_stamp" },
+        "goal_sha256": { "$ref": "#/$defs/sha256" },
+        "projection_sha256": { "$ref": "#/$defs/sha256" },
+        "converged": { "type": "boolean" },
+        "unshipped_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      },
+      "required": ["running_release", "goal_sha256", "projection_sha256", "converged"],
+      "additionalProperties": false
+    }
+  }
+}
