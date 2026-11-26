@@ -61,6 +61,8 @@ DEFAULT_WORKFLOWS_DIR = ROOT / ".github" / "workflows"
 MAX_WALK_NODES = 100_000
 MAX_WALK_DEPTH = 64
 MAX_FINDINGS = 200
+MAX_COMPONENT_LEN = 64
+MAX_PATH_LEN = 160
 
 _IDENT_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 _IDENT_CONT = _IDENT_START | set("0123456789-")
@@ -83,6 +85,29 @@ def _describe_value(val: object, max_scalar: int = 80) -> str:
             return repr(val[:max_scalar] + "...")
         return repr(val)
     return type(val).__name__
+
+
+def _format_component(text: str, max_len: int = MAX_COMPONENT_LEN) -> str:
+    """Render one path/key component on a single line, escaping control chars and capping length."""
+    truncated = len(text) > max_len
+    snippet = text[:max_len] if truncated else text
+    out: list[str] = []
+    for ch in snippet:
+        code = ord(ch)
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    rendered = "".join(out)
+    if truncated or len(rendered) > max_len:
+        return rendered[: max(0, max_len - 3)] + "..."
+    return rendered
 
 
 class _FindingsCap:
@@ -118,7 +143,7 @@ class _StrictLoader(yaml.BaseLoader):
             raise yaml.constructor.ConstructorError(
                 None,
                 None,
-                f"unsupported YAML tag {node.tag!r}",
+                f"unsupported YAML tag {_describe_value(node.tag)}",
                 node.start_mark,
             )
         return super().construct_object(node, deep=deep)
@@ -304,11 +329,14 @@ def scan_expression_for_secrets(expr: str) -> tuple[bool, bool]:
     return has_secrets, False
 
 
-def _check_expression_body(expr: str, is_unclosed: bool, where: str, emit) -> None:
+def _check_expression_body(expr: str, is_unclosed: bool, where_fn, emit) -> None:
+    has_secrets, has_unclosed_quote = scan_expression_for_secrets(expr)
+    if not (is_unclosed or has_unclosed_quote or has_secrets):
+        return
+    where = where_fn()
     if is_unclosed:
         if not emit(f"{where}: malformed expression (unclosed '${{{{' delimiter)"):
             return
-    has_secrets, has_unclosed_quote = scan_expression_for_secrets(expr)
     if has_unclosed_quote:
         if not emit(f"{where}: malformed expression (unclosed single-quoted string literal)"):
             return
@@ -316,21 +344,21 @@ def _check_expression_body(expr: str, is_unclosed: bool, where: str, emit) -> No
         emit(f"{where}: expression references `secrets` context: {_describe_value(expr.strip())}")
 
 
-def _check_string_value(text: str, where: str, *, is_bare_expr: bool, emit) -> None:
+def _check_string_value(text: str, where_fn, *, is_bare_expr: bool, emit) -> None:
     if is_bare_expr:
         if "${{" in text:
             spans, outside = _split_expressions(text)
             for expr, is_unclosed in spans:
-                _check_expression_body(expr, is_unclosed, where, emit)
+                _check_expression_body(expr, is_unclosed, where_fn, emit)
             for chunk in outside:
                 if chunk.strip():
-                    _check_expression_body(chunk, False, where, emit)
+                    _check_expression_body(chunk, False, where_fn, emit)
         else:
-            _check_expression_body(text, False, where, emit)
+            _check_expression_body(text, False, where_fn, emit)
         return
 
     for expr, is_unclosed in extract_expressions(text):
-        _check_expression_body(expr, is_unclosed, where, emit)
+        _check_expression_body(expr, is_unclosed, where_fn, emit)
 
 
 def _check_permissions(val: object, where: str, emit) -> None:
@@ -351,7 +379,7 @@ def _check_permissions(val: object, where: str, emit) -> None:
             continue
         if level == "none":
             continue
-        scope_label = scope if len(scope) <= 80 else _describe_value(scope)
+        scope_label = _format_component(scope)
         if not emit(
             f"{where}.{scope_label}: disallowed permission level {_describe_value(level)} "
             "(only `contents: read` and `<scope>: none` are permitted)"
@@ -369,17 +397,29 @@ def _is_non_empty_secrets_field(val: object) -> bool:
     return True
 
 
-def _format_path(path: tuple[str | int, ...]) -> str:
+def _format_path(path: tuple[str | int, ...], max_len: int = MAX_PATH_LEN) -> str:
     parts: list[str] = []
+    total = 0
     for elem in path:
         if isinstance(elem, int):
+            suffix = f"[{elem}]"
             if parts:
-                parts[-1] = f"{parts[-1]}[{elem}]"
+                parts[-1] = f"{parts[-1]}{suffix}"
             else:
-                parts.append(f"[{elem}]")
+                parts.append(suffix)
+            total += len(suffix)
         else:
-            parts.append(elem)
-    return ".".join(parts)
+            comp = _format_component(elem)
+            if parts:
+                total += 1
+            parts.append(comp)
+            total += len(comp)
+        if total > max_len:
+            break
+    rendered = ".".join(parts)
+    if len(rendered) > max_len:
+        return rendered[: max(0, max_len - 3)] + "..."
+    return rendered
 
 
 def _check_structure_limits(
@@ -476,7 +516,7 @@ def _walk_for_secrets(
     elif isinstance(root, list) and root:
         stack.append(("list", enumerate(root), (), 1))
     elif isinstance(root, str):
-        _check_string_value(root, "", is_bare_expr=(() in bare_expr_paths), emit=collector.add)
+        _check_string_value(root, lambda: "", is_bare_expr=(() in bare_expr_paths), emit=collector.add)
         return
 
     while stack and not collector.truncated:
@@ -505,8 +545,12 @@ def _walk_for_secrets(
             k, child = item
             child_path = parent_path + (str(k),)
             if isinstance(k, str):
-                key_where = f"{_format_path(child_path)} (mapping key)"
-                _check_string_value(k, key_where, is_bare_expr=False, emit=collector.add)
+                _check_string_value(
+                    k,
+                    lambda p=child_path: f"{_format_path(p)} (mapping key)",
+                    is_bare_expr=False,
+                    emit=collector.add,
+                )
                 if collector.truncated:
                     return
         else:
@@ -520,7 +564,7 @@ def _walk_for_secrets(
         elif isinstance(child, str):
             _check_string_value(
                 child,
-                _format_path(child_path),
+                lambda p=child_path: _format_path(p),
                 is_bare_expr=(child_path in bare_expr_paths),
                 emit=collector.add,
             )
@@ -584,7 +628,7 @@ def lint_workflow_text(
                     break
                 job_id_str = str(job_id)
                 job_path: tuple[str | int, ...] = (jobs_key, job_id_str)
-                job_prefix = f"jobs.{job_id_str}"
+                job_prefix = f"jobs.{_format_component(job_id_str)}"
                 if not isinstance(job, dict):
                     collector.add(f"{job_prefix}: must be a YAML mapping, got {_describe_value(job)}")
                     continue

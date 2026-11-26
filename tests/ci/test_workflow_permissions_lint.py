@@ -519,6 +519,35 @@ jobs: {}
         self.assertEqual(len(findings), 3, findings)
         self.assertIn("findings output truncated after 2 finding(s)", findings[-1])
 
+    def test_long_multiline_keys_and_job_ids_produce_bounded_single_line_diagnostics(self) -> None:
+        long_parent = "x-line1\\nline2\\r" + ("a" * 300)
+        long_job = "job-line1\\nline2\\r" + ("j" * 300)
+        wf = (
+            "name: Multiline\n"
+            "on: push\n"
+            "permissions:\n"
+            "  contents: read\n"
+            f'"{long_parent}":\n'
+            '  first: "${{ secrets.ONE }}"\n'
+            '  second: "${{ secrets.TWO }}"\n'
+            "jobs:\n"
+            f'  "{long_job}":\n'
+            "    runs-on: ubuntu-latest\n"
+            "    permissions:\n"
+            "      id-token: write\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+        )
+        findings = lint.lint_workflow_text(wf, "multiline.yml")
+        self.assertEqual(len(findings), 3, findings)
+        self.assertTrue(any("disallowed permission level 'write'" in f for f in findings), findings)
+        self.assertTrue(any("expression references `secrets` context: 'secrets.ONE'" in f for f in findings), findings)
+        self.assertTrue(any("expression references `secrets` context: 'secrets.TWO'" in f for f in findings), findings)
+        for f in findings:
+            self.assertNotIn("\n", f)
+            self.assertNotIn("\r", f)
+            self.assertLessEqual(len(f), 320, f)
+
     # ---- Negative cases: secrets & malformed expressions
 
     def test_expression_secrets_references_fail(self) -> None:
