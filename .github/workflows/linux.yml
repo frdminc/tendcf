@@ -81,9 +81,10 @@ jobs:
 
   # Upstream cfengine/core and libntech at the overlay bases plus the overlay
   # (docs/architecture/upstream-overlay.md §4, §7), not the pinned fork. It is
-  # the proof that the overlay's all-or-nothing loader (overlay/core/0002) and
-  # the strict JSON parse (overlay/libntech/0005, 0006) build, and that the
-  # loader's unit and acceptance tests and run.sh (TENDCF_REQUIRE_FORK_LOADER=1;
+  # the proof that the overlay's all-or-nothing loader (overlay/core/0002..0004)
+  # and the strict JSON parse (overlay/libntech/0005..0008) build (both plain
+  # debug and ASan/UBSan/LSan for json_test and cmdb_test, issue #69), and that
+  # the loader's unit and acceptance tests and run.sh (TENDCF_REQUIRE_FORK_LOADER=1;
   # its check 4b probes the loader and fails on any build that kept a
   # per-entry skip) pass on them as on the fork build. The loader source is the
   # fork's bar the R1 accessor; behaviour is NOT proven equal for JSON numbers
@@ -132,6 +133,36 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Build dependencies (core's own script; Debian/Ubuntu branch)
         run: /tmp/core/ci/dependencies.sh
+      - name: ASan/UBSan/LSan loader and JSON unit tests (json_test, cmdb_test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build in a clean copy before /tmp/core runs autogen.sh so the
+          # sanitizer build cannot interfere with /tmp/core or /tmp/overlay-cf.
+          rm -rf /tmp/core-asan
+          cp -a /tmp/core /tmp/core-asan
+          cd /tmp/core-asan
+          ./autogen.sh --enable-debug --with-systemd-service=no
+          san_cflags="-Wall -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all"
+          san_ldflags="-fsanitize=address,undefined"
+          make -j"$(nproc)" CFLAGS="$san_cflags" LDFLAGS="$san_ldflags"
+          ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1" \
+          UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+          make -j"$(nproc)" -C /tmp/core-asan/libntech/tests/unit \
+            CFLAGS="$san_cflags" LDFLAGS="$san_ldflags" \
+            check_PROGRAMS=json_test check TESTS=json_test VERBOSE=1
+          ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1" \
+          UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+          make -j"$(nproc)" -C /tmp/core-asan/tests/unit \
+            CFLAGS="$san_cflags" LDFLAGS="$san_ldflags" \
+            check_PROGRAMS=cmdb_test check TESTS=cmdb_test VERBOSE=1
+          for b in /tmp/core-asan/libntech/tests/unit/.libs/json_test /tmp/core-asan/tests/unit/.libs/cmdb_test; do
+            [ -x "$b" ] || b="${b/.libs\//}"
+            test -x "$b" || { echo "missing sanitizer test binary: $b"; exit 1; }
+            ldd "$b" | grep -q libasan || { echo "missing libasan linkage on $b"; exit 1; }
+            nm -D -u "$b" | grep -q __ubsan_ || { echo "missing __ubsan_ symbols on $b"; exit 1; }
+          done
+          rm -rf /tmp/core-asan
       - name: Configure and build
         shell: bash
         run: |

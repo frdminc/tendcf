@@ -143,7 +143,7 @@
 #      container that is a list of strings is the positive control: accepted,
 #      actuates. A plain-identifier key longer than 64 characters is refused and
 #      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
-#      NB: the fork at the pin (overlay/fork.json, core 4443504) loads
+#      NB: the fork at the pin (overlay/fork.json, core 75dee108; previously 4443504) loads
 #      all-or-nothing (PR #41, operator ruling R13): a file in which an entry is
 #      invalid, a class cannot be inserted, a `vars` member or section is
 #      repeated, or non-whitespace follows the document, installs none of its
@@ -155,16 +155,27 @@
 #      one entry and installs the rest; the fork did before R13 (`8f0076b81`,
 #      B-5b), which is the 2026-11-02 fail-open.
 #  9b. the loader's strict-parse and class refusals, one fixture each in
-#      tests/policy/fixtures/loader-*.json, each beside a valid interlock and a
-#      present service: a repeated member of `vars` (dup-member), a repeated
+#      tests/policy/fixtures/loader-*.json plus inline Cluster D fixtures (g)-(j)
+#      for fork 75dee108 (overlay libntech 0007-0008, core 0003-0004; issues
+#      #66, #67, #68, #69), each beside a valid interlock and a present service:
+#      (a)-(f) a repeated member of `vars` (dup-member), a repeated
 #      top-level `vars` whose later section drops the interlock (dup-vars),
 #      non-whitespace after a valid document (trailing), a whitespace-only
-#      default-namespace class name (class-space). Each must be refused and
-#      reported once by PR 42's cross-check and actuate nothing (fork_only for
-#      the first three, the integration assertions above; unconditional for
-#      class-space, whose `classes` section the cross-check refuses on any
-#      loader); on the fork each also loads nothing, logs the loader's reason and
-#      reports each key as not loaded (fork_only). A class that already exists (class-exists,
+#      default-namespace class name (class-space), an existing hard class
+#      (class-exists), and two empty-view controls (empty-dup-vars,
+#      empty-trailing); (g) embedded NUL bytes (nul-trailing, nul-eof; #69B);
+#      (h) trailing-backslash truncation (gated on the Cluster D capability probe
+#      so unpatched builds never execute the OOB read; #66); (i) strict JSON
+#      non-JSON forms (missing-colon, unquoted-key, null-escape-key,
+#      null-escape-val) plus the escaped-backslash-u0000 positive control (#67);
+#      and (j) unknown metadata keys in `classes`/`variables` objects with a
+#      `data:maint` + `data:variables.x` positive control (#68). Each must be
+#      refused and reported once by PR 42's cross-check and actuate nothing
+#      (fork_only for the first three, the integration assertions above;
+#      unconditional for class-space and (j), whose `classes`/`variables`
+#      sections the cross-check refuses on any loader); on the fork each also
+#      loads nothing, logs the loader's reason and reports each key as not
+#      loaded (fork_only). A class that already exists (class-exists,
 #      the host's own hard class) is not an error: the fork leaves it as it is
 #      and installs the rest, so no refusal is expected; the case asserts that
 #      `classes` beside good vars is still refused by the cross-check's own
@@ -285,11 +296,17 @@ check() {  # check NAME COND...
 # CI legs set because they build the pinned fork, turns "not the fork's loader"
 # into a failure, so CI cannot pass by skipping.
 fork_loader=unknown
+cluster_d_loader=unknown
 skipped=0
 platform_skipped=0
 fork_only() {  # fork_only NAME COND...
     if [ "$fork_loader" = 1 ]; then check "$@"; return 0; fi
     echo "SKIP (loader not all-or-nothing): $1"
+    skipped=$((skipped + 1))
+}
+cluster_d_only() {  # cluster_d_only NAME COND...
+    if [ "$cluster_d_loader" = 1 ]; then check "$@"; return 0; fi
+    echo "SKIP (loader lacks Cluster D strict-JSON hardening): $1"
     skipped=$((skipped + 1))
 }
 platform_skip() {  # platform_skip REASON NAME
@@ -419,9 +436,28 @@ else
     fork_loader=0
     echo "# loader capability: NOT the pinned fork's loader; fork-only assertions print SKIP"
 fi
+# Cluster D capability probe (issues #66/#67/#68/#69): an inert unquoted-key
+# input `{plain: true}` is accepted by stock CFEngine AND pre-Cluster-D fork
+# 4443504 (failing only later as an unknown CMDB key), whereas Cluster D builds
+# (fork 75dee108 / overlay libntech 0007+0008) refuse it at JsonParseStrict()
+# with JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL. Gating 9b (h) trailing-backslash on
+# this probe ensures neither stock 3.29.0 nor unpatched 4443504 ever executes
+# the #66 OOB read.
+printf '%s\n' '{plain: true}' > "$work/data/host_specific.json"
+"$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$work/probe-cluster-d.out" 2>&1 || true
+if [ "$fork_loader" = 1 ] &&
+   grep -q "Could not parse JSON file .*host_specific\\.json: Unable to parse json data as object, unrecognized token beginning entry" "$work/probe-cluster-d.out"; then
+    cluster_d_loader=1
+    echo "# loader capability: Cluster D strict-JSON hardening present (fork 75dee108 / overlay 0007-0008)"
+else
+    cluster_d_loader=0
+    echo "# loader capability: Cluster D strict-JSON hardening NOT present; Cluster-D OOB guard prints SKIP"
+fi
 if [ "${TENDCF_REQUIRE_FORK_LOADER:-0}" = 1 ]; then
     check "TENDCF_REQUIRE_FORK_LOADER=1: the loader is the pinned fork's (no skipping)" \
         test "$fork_loader" = 1
+    check "TENDCF_REQUIRE_FORK_LOADER=1: the loader includes Cluster D strict-JSON hardening (no skipping)" \
+        test "$cluster_d_loader" = 1
 fi
 
 malformed_case() {  # malformed_case NAME FIXTURE ERROR-PATTERN
@@ -4568,7 +4604,7 @@ check "list of strings in vars: no cross-check report" no_crosscheck "$out"
 check "list of strings in vars: actuates normally (the pre_action ran)" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
 
-echo "# 9b. the real loader's strict parse and class handling (fork 4443504), policy level"
+echo "# 9b. the real loader's strict parse and class handling (fork 4443504 / Cluster D 75dee108), policy level"
 # What the pinned loader does with each file is read from libpromises/cmdb.c at
 # 4443504 (line numbers there), and each case asserts it. The cross-check's
 # refusal and the absence of actuation are asserted unconditionally only where
@@ -4724,6 +4760,252 @@ for spec in "empty-dup-vars:loader-empty-dup-vars.json:Unwilling to parse json d
         grep -q "cmdb-probe: tendcf_service absent" "$work/probe-strict-$name.out"
     fork_only "$name: the loader refuses the file" \
         grep -q "Could not parse JSON file .*host_specific\\.json: $pattern" "$out"
+done
+
+# (g)-(j) Cluster D strict-loader & metadata hardening (fork 75dee108 / overlay
+# libntech 0007-0008, core 0003-0004; issues #66, #67, #68, #69).
+# (g) Embedded NUL bytes (issue #69 part B): JsonParseFileStrict() rejects any
+# file whose byte length exceeds its C-string length (trailing NUL + garbage, or
+# a lone trailing NUL after valid JSON) and installs nothing.
+for nul_spec in \
+    "nul-trailing:trailing" \
+    "nul-eof:"; do
+    name="${nul_spec%%:*}"; suffix="${nul_spec#*:}"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$suffix" <<'PYEOF'
+import pathlib, sys
+base = pathlib.Path(sys.argv[1]).read_bytes().rstrip(b"\r\n")
+pathlib.Path(sys.argv[2]).write_bytes(base + b"\x00" + sys.argv[3].encode("ascii"))
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    fork_only "$name: the policy refuses and reports it" refusal_reported "$out"
+    fork_only "$name: the policy reports it once" refusal_once "$out"
+    fork_only "$name: the loader refuses the embedded-NUL file" \
+        grep -q "Could not parse JSON file .*host_specific\\.json: Unwilling to parse json data with trailing non-whitespace characters" "$out"
+    fork_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    fork_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    fork_only "$name: nothing actuated" no_actuation "$out"
+    check "$name: nothing rendered, nothing started" no_render_start "$out"
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || true
+    fork_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+    fork_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$pout"
+done
+
+# (h) Trailing-backslash truncation (issue #66): JsonParseAsString() must return
+# JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END without reading past the NUL
+# terminator. Guard execution on cluster_d_loader=1 so neither stock 3.29.0 nor
+# pre-Cluster-D fork 4443504 executes the unpatched OOB read, while still
+# printing counted cluster_d_only SKIPs.
+if [ "$cluster_d_loader" = 1 ]; then
+    python3 - "$work/data/host_specific.json" <<'PYEOF'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(b'{"vars":{"tendcf_interlock":{"a":"x\\')
+PYEOF
+    out="$work/strict-trailing-backslash.out"
+    tb_rc=0
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || tb_rc=$?
+    pout="$work/probe-strict-trailing-backslash.out"
+    tb_prc=0
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || tb_prc=$?
+else
+    out="$work/strict-trailing-backslash.out"
+    pout="$work/probe-strict-trailing-backslash.out"
+    tb_rc=0
+    tb_prc=0
+fi
+cluster_d_only "trailing-backslash: cf-agent did not crash on signal (rc < 128)" test "$tb_rc" -lt 128
+cluster_d_only "trailing-backslash: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+cluster_d_only "trailing-backslash: the loader refuses the truncated string" \
+    grep -q "Could not parse JSON file .*host_specific\\.json: Unable to parse json data as string, did not end with doublequote" "$out"
+cluster_d_only "trailing-backslash: the policy refuses and reports it" refusal_reported "$out"
+cluster_d_only "trailing-backslash: the policy reports it once" refusal_once "$out"
+cluster_d_only "trailing-backslash: nothing actuated" no_actuation "$out"
+cluster_d_only "trailing-backslash: probe cf-agent did not crash on signal (rc < 128)" test "$tb_prc" -lt 128
+cluster_d_only "trailing-backslash: no tendcf_interlock variable" \
+    grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+cluster_d_only "trailing-backslash: no tendcf_service variable" \
+    grep -q "cmdb-probe: tendcf_service absent" "$pout"
+
+# (i) Strict JSON non-JSON forms (issue #67): missing colon, unquoted key, and
+# \u0000 escapes in key or value positions are refused by JsonParseStrict() and
+# install nothing.
+for strict67_spec in \
+    "missing-colon:Unable to parse json data as object, ':' seen without having specified an l-value" \
+    "unquoted-key:Unable to parse json data as object, unrecognized token beginning entry" \
+    "null-escape-key:Unwilling to parse json string with a null character escape" \
+    "null-escape-val:Unwilling to parse json string with a null character escape"; do
+    name="${strict67_spec%%:*}"; expected="${strict67_spec#*:}"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$name" <<'PYEOF'
+import pathlib, sys
+base = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+mode = sys.argv[3]
+if mode == "missing-colon":
+    assert base.startswith('{"vars":')
+    payload = '{"vars" ' + base[len('{"vars":'):]
+elif mode == "unquoted-key":
+    assert base.startswith('{"vars":')
+    payload = '{vars:' + base[len('{"vars":'):]
+elif mode == "null-escape-key":
+    assert '"tendcf_service":' in base
+    payload = base.replace('"tendcf_service":', '"tendcf_service\\u0000":', 1)
+elif mode == "null-escape-val":
+    assert '"working_dir":"/"' in base
+    payload = base.replace('"working_dir":"/"', '"working_dir":"/\\u0000"', 1)
+else:
+    raise SystemExit(f"unknown mode: {mode}")
+pathlib.Path(sys.argv[2]).write_text(payload, encoding="utf-8")
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    cluster_d_only "$name: the policy refuses and reports it" refusal_reported "$out"
+    cluster_d_only "$name: the policy reports it once" refusal_once "$out"
+    cluster_d_only "$name: the loader refuses the non-JSON input" \
+        grep -q "Could not parse JSON file .*host_specific\\.json: $expected" "$out"
+    cluster_d_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    cluster_d_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    cluster_d_only "$name: nothing actuated" no_actuation "$out"
+    check "$name: nothing rendered, nothing started" no_render_start "$out"
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || true
+    cluster_d_only "$name: no tendcf_interlock variable" \
+        grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+    cluster_d_only "$name: no tendcf_service variable" \
+        grep -q "cmdb-probe: tendcf_service absent" "$pout"
+done
+
+# Positive control for escaped-backslash `\u0000` (PR #117 R1 Codex #1 / B-14):
+# JSON `"\\u0000"` encodes an escaped backslash followed by `u0000` (the 6-byte
+# literal `\u0000`, NOT a NUL escape). Proves end-to-end on both the pinned fork
+# (`vm` legs) and the applied overlay (`overlay-build`) that JsonParseStrict()
+# accepts it and decodes backslash escapes once (no double-decode into NUL).
+cat > "$work/inputs/lit-probe.cf" <<'EOF'
+body common control
+{
+      bundlesequence => { "lit_probe" };
+}
+
+bundle agent lit_probe
+{
+  vars:
+      "val" string => "$(data:variables.tendcf_lit[val])";
+      "len" int => string_length("$(val)");
+
+  classes:
+      "defined" expression => isvariable("data:variables.tendcf_lit");
+      "len_is_6" expression => strcmp("$(len)", "6");
+      "exact_bs_u0000" expression => strcmp("$(val)", "\\u0000");
+
+  reports:
+      "lit-probe: val=[$(val)] len=$(len)";
+    defined::
+      "lit-probe: defined";
+    len_is_6::
+      "lit-probe: len_is_6";
+    exact_bs_u0000::
+      "lit-probe: exact_bs_u0000";
+}
+EOF
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(b'{"vars":{"tendcf_lit":{"val":"\\\\u0000"}}}')
+PYEOF
+pout="$work/probe-strict-escaped-backslash-u0000.out"
+"$cf_agent" -K -f "$work/inputs/lit-probe.cf" >"$pout" 2>&1 || true
+check "escaped-backslash-u0000: data:variables.tendcf_lit is defined" \
+    grep -qF "lit-probe: defined" "$pout"
+fork_only "escaped-backslash-u0000: decoded value has exact length 6 (no double-decode)" \
+    grep -qF "lit-probe: len_is_6" "$pout"
+fork_only "escaped-backslash-u0000: decoded value equals literal \\u0000" \
+    grep -qF "lit-probe: exact_bs_u0000" "$pout"
+
+# (j) Unknown metadata keys inside CMDB `classes` and `variables` objects
+# (issue #68): a misspelled metadata key (such as singular `class_expression` or
+# `tag`) refuses the whole file and installs neither the class/variable nor any
+# sibling `vars` containers. Unqualified CMDB classes live in namespace `data`
+# (`data:maint`).
+cat > "$work/inputs/meta-probe.cf" <<'EOF'
+body common control
+{
+      bundlesequence => { "meta_probe" };
+}
+
+bundle agent meta_probe
+{
+  classes:
+      "interlock_present" expression => isvariable("data:variables.tendcf_interlock");
+      "service_present" expression => isvariable("data:variables.tendcf_service");
+      "var_x_present" expression => isvariable("data:variables.x");
+
+  reports:
+    interlock_present::
+      "meta-probe: tendcf_interlock present";
+    !interlock_present::
+      "meta-probe: tendcf_interlock absent";
+    service_present::
+      "meta-probe: tendcf_service present";
+    !service_present::
+      "meta-probe: tendcf_service absent";
+    var_x_present::
+      "meta-probe: var x present";
+    !var_x_present::
+      "meta-probe: var x absent";
+    data:maint::
+      "meta-probe: class maint present";
+    !data:maint::
+      "meta-probe: class maint absent";
+}
+EOF
+# Positive control: prove meta-probe.cf genuinely detects both `data:maint` and
+# `data:variables.x` when a valid `host_specific.json` defines them.
+printf '%s\n' '{"classes":{"maint":"any::"},"variables":{"x":{"value":"1"}}}' > "$work/data/host_specific.json"
+pout="$work/probe-strict-meta-control.out"
+"$cf_agent" -K -f "$work/inputs/meta-probe.cf" >"$pout" 2>&1 || true
+check "meta-probe positive control: valid CMDB class defines data:maint" \
+    grep -qF "meta-probe: class maint present" "$pout"
+check "meta-probe positive control: valid CMDB variable defines data:variables.x" \
+    grep -qF "meta-probe: var x present" "$pout"
+for meta_spec in \
+    "meta-class-unknown|classes|Invalid key 'class_expression' in CMDB class specification 'maint' (only 'class_expressions', 'regular_expressions', 'tags' and 'comment' are allowed)|meta-probe: class maint absent" \
+    "meta-var-unknown|variables|Invalid key 'tag' in CMDB variable specification 'x' (only 'value', 'tags' and 'comment' are allowed)|meta-probe: var x absent"; do
+    IFS='|' read -r name section loader_err probe_expect <<< "$meta_spec"
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$name" <<'PYEOF'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if sys.argv[3] == "meta-class-unknown":
+    doc["classes"] = {"maint": {"class_expression": ["!prod::"]}}
+elif sys.argv[3] == "meta-var-unknown":
+    doc["variables"] = {"x": {"value": "1", "tag": ["a"]}}
+else:
+    raise SystemExit(f"unknown meta case: {sys.argv[3]}")
+pathlib.Path(sys.argv[2]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/strict-$name.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "$name: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+    check "$name: the policy refuses and reports it" refusal_reported "$out"
+    check "$name: the policy reports it once" refusal_once "$out"
+    check "$name: the $section section is named by the policy" \
+        grep -q "has top-level section '$section' besides 'vars'" "$out"
+    check "$name: nothing actuated" no_actuation "$out"
+    cluster_d_only "$name: the loader refuses the unknown metadata key" \
+        grep -qF "$loader_err" "$out"
+    cluster_d_only "$name: the loader installs none of the file" \
+        grep -q "installing none of its contents" "$out"
+    cluster_d_only "$name: tendcf_interlock reported not installed" key_not_loaded "$out" tendcf_interlock
+    cluster_d_only "$name: tendcf_service reported not installed" key_not_loaded "$out" tendcf_service
+    pout="$work/probe-strict-$name.out"
+    "$cf_agent" -K -f "$work/inputs/meta-probe.cf" >"$pout" 2>&1 || true
+    cluster_d_only "$name: target entity not defined ($probe_expect)" \
+        grep -qF "$probe_expect" "$pout"
+    cluster_d_only "$name: no tendcf_interlock variable" \
+        grep -q "meta-probe: tendcf_interlock absent" "$pout"
+    cluster_d_only "$name: no tendcf_service variable" \
+        grep -q "meta-probe: tendcf_service absent" "$pout"
 done
 
 echo "# 10. CMDB cross-check, a loader that skips one container (tests/policy/sim-loader.cf)"
@@ -4962,9 +5244,15 @@ if [ "$fail" != 0 ]; then
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-no-augments xc-ctrl-keysec xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \
-             malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
+             malformed-unresolved malformed-index-key probe-control probe-capability probe-cluster-d probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \
+             strict-nul-trailing strict-nul-eof probe-strict-nul-trailing probe-strict-nul-eof \
+             strict-trailing-backslash probe-strict-trailing-backslash \
+             strict-missing-colon strict-unquoted-key strict-null-escape-key strict-null-escape-val \
+             probe-strict-missing-colon probe-strict-unquoted-key probe-strict-null-escape-key probe-strict-null-escape-val \
+             probe-strict-escaped-backslash-u0000 probe-strict-meta-control \
+             strict-meta-class-unknown strict-meta-var-unknown probe-strict-meta-class-unknown probe-strict-meta-var-unknown \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-ctrl-unloaded xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \
              reserved-systemd-nosuffix-present reserved-systemd-nosuffix-absent reserved-systemd-timer-present reserved-dry-launchd reserved-dry-systemd \

@@ -399,8 +399,17 @@ merged upstream on `2026-11-24T09:01:49Z` in
 [cfengine/core#6507](https://github.com/cfengine/core/pull/6507) with
 skip-and-continue semantics, so `overlay/core/0002` and its pin remain
 unchanged to preserve whole-file refusal) and B-7 (the dotted-key warning, `ee1f9d60c`, a passenger), as the
-fork's final `cmdb.c` contains both. The strict parse comes from two libntech
-patches, B-24 (`dc3fba2`, `8a57e55`, fork PR 11). The one change from `4443504`
+fork's final `cmdb.c` contains both. The strict parse comes from libntech
+patches B-24 (`dc3fba2`, `8a57e55`, fork PR [djbclark/libntech#11](https://github.com/djbclark/libntech/pull/11)),
+extended in Cluster D (2026-11-25, fork pin `75dee108`, libntech `638510a`)
+with `overlay/libntech/0007` (`78ec2002`, [djbclark/libntech#12](https://github.com/djbclark/libntech/pull/12),
+#66 trailing-backslash OOB guard), `overlay/libntech/0008` (`40c83ea8`,
+[djbclark/libntech#13](https://github.com/djbclark/libntech/pull/13), #67
+strict JSON hardening; residual non-RFC-8259 parser inheritances tracked in
+[frdminc/tendcf#118](https://github.com/frdminc/tendcf/issues/118)), and
+`overlay/core/0003`–`0004` (`70670fc0`, `e61d6893`,
+[djbclark/core#100](https://github.com/djbclark/core/pull/100), #68 unknown
+CMDB metadata key refusal and #69 loader-level NUL fixture). The one change from `4443504`
 is the secrets-tracking accessor spelled `EvalContextVariableGet()` at three
 call sites because the base has no `EvalContextVariableGetPlaintext()`
 ([`upstream-overlay.md`](upstream-overlay.md) sections 5 and 7, risk R1).

@@ -291,6 +291,29 @@ change (2026-11-02 to 2026-11-14) the manifest's B-5b reproduced the per-entry
 skip, which is history ([`upstream-register.md`](upstream-register.md), B-5b
 note and "Operator rulings of 2026-11-14 on the queue and the fork", item 2).
 
+**Errata (2026-11-25, Cluster D, issues #66–#69).** The fork pin in
+`overlay/fork.json` moved from `4443504` to `75dee108` (libntech submodule
+`638510a`), and the overlay grew from 2/6 to 4/8 patches on the same pinned
+bases: `overlay/libntech/0007` (`78ec2002`, #66 trailing-backslash OOB guard,
+fork PR 12) and `0008` (`40c83ea8`, #67 strict JSON hardening, fork PR 13;
+`libntech` 8 patches -> tree `b91be8ffee2f`), plus `overlay/core/0003`
+(`70670fc0`, #68 unknown CMDB metadata key refusal, fork PR 100) and `0004`
+(`e61d6893`, #69 loader-level embedded-NUL fixture in `cmdb_test`, fork PR 100,
+carried as a deliberate test-coverage companion for `overlay-build`'s
+ASan/UBSan `cmdb_test` pass; `core` 4 patches -> tree `82ee0ecaf99d`).
+`JsonParseStrict()` now closes the three non-JSON forms named in #67 (unquoted
+object keys, missing object colons, `\u0000` escapes), replaces quadratic
+duplicate checks with O(n) `StringSet` tracking, and enforces a 128-level
+nesting depth cap; residual non-RFC-8259 lenient inheritances (trailing/leading
+commas, missing array commas, raw `0x01`–`0x1f` controls in strings,
+unrecognized escapes, malformed `\u`/unpaired surrogates, `-01`, and unkeyed
+Jenkins hash) remain tracked in
+[#118](https://github.com/frdminc/tendcf/issues/118) (not a risk for
+root-owned JCS-projected `host_specific.json`). `overlay-build` in
+`.github/workflows/linux.yml` now also builds and runs `json_test` and
+`cmdb_test` under ASan/UBSan/LSan (`-fsanitize=address,undefined
+-fno-sanitize-recover=all`) and asserts `libasan` / `__ubsan_` binary linkage.
+
 **What is verified and what is not.** The tree equalities above and the
 `apply`/`check` runs are mechanical and were run. The patched tree builds and
 the loader's tests pass in the `overlay-build` job (`cmdb_test`, `json_test`,

@@ -221,6 +221,70 @@ class StdlibJcsFallbackTests(unittest.TestCase):
         finally:
             self.proj._rfc8785 = orig
 
+    def test_nul_escape_rejected_in_key_and_value_positions(self) -> None:
+        """Issue #67/#69: bin/projector.py rejects \\u0000 in both key and value positions."""
+        # 1. Key position (in both check_projection and project)
+        nul_key_raw = (
+            b'{"vars":{"tendcf_service":{"demo\\u0000svc":{"bundle":"demo",'
+            b'"command":["/usr/bin/sleep","1"],"run_as":"nobody","state":"present",'
+            b'"unit":{"runit":{"enabled":true}},"working_dir":"/"}}}}'
+        )
+        key_findings = self.proj.check_projection(nul_key_raw)
+        self.assertTrue(
+            any(
+                f.rule == self.proj.RULE_PROJECTION
+                and "(key)" in f.msg
+                and "forbidden control character" in f.msg
+                for f in key_findings
+            ),
+            f"expected key-position control-char finding, got {key_findings!r}",
+        )
+
+        # 2. Value position (in check_projection)
+        nul_val_raw = (
+            b'{"vars":{"tendcf_service":{"demo-svc":{"bundle":"demo",'
+            b'"command":["/usr/bin/sleep","1"],"run_as":"nobody","state":"present",'
+            b'"unit":{"runit":{"enabled":true}},"working_dir":"/srv\\u0000bad"}}}}'
+        )
+        val_findings = self.proj.check_projection(nul_val_raw)
+        self.assertTrue(
+            any(
+                f.rule == self.proj.RULE_PROJECTION
+                and "working_dir" in f.msg
+                and "forbidden control character" in f.msg
+                for f in val_findings
+            ),
+            f"expected value-position control-char finding, got {val_findings!r}",
+        )
+
+        # 3. project() refuses goal files carrying NUL in either key or value
+        for label, svc_id, wdir in (
+            ("key", "demo\x00svc", "/"),
+            ("value", "demo-svc", "/srv\x00bad"),
+        ):
+            with self.subTest(position=label):
+                goal = {
+                    "domains": {
+                        "supervision": {
+                            "entries": {
+                                "service": {
+                                    svc_id: {
+                                        "bundle": "demo",
+                                        "command": ["/usr/bin/sleep", "1"],
+                                        "run_as": "nobody",
+                                        "state": "present",
+                                        "unit": {"runit": {"enabled": True}},
+                                        "working_dir": wdir,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                with self.assertRaises(self.proj.ProjectionRefused) as ctx:
+                    self.proj.project(goal)
+                self.assertIn("forbidden control character", str(ctx.exception))
+
     def test_iterative_walk_and_oversized_early_return(self) -> None:
         # 1. Exact pre-order traversal parity with a reference recursive walk
         def _ref_walk(node: object, path: str = ""):

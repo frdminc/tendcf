@@ -1,7 +1,7 @@
 {
   "components": {
     "core": {
-      "applied_tree": "5c9f3ce18a6b290903b6610b58cb535638453822",
+      "applied_tree": "82ee0ecaf99d41c96e7cdbe1a758a7ddd99bc824",
       "base": "a0bca6aaf310515f69fef60e6c56b3e60bd337ac",
       "base_described": "upstream master as of 2026-08-15 (merge of #6276)",
       "fork": "https://github.com/djbclark/core",
@@ -47,15 +47,49 @@
           ],
           "upstream_pr": "none: B-5b's per-entry skip was cfengine/core#6320 (closed unmerged 2026-08-19); the all-or-nothing loader has no upstream PR yet",
           "why": "replaces 8f0076b81 (B-5b's per-entry skip) per the 2026-11-14 operator ruling Replace; a squash of the fork's tendcf-integration loader (djbclark/core 4443504) onto the overlay base plus B-5a, with EvalContextVariableGetPlaintext() spelled EvalContextVariableGet() because the base has no secrets tracking (upstream-overlay.md section 7, risk R1)"
+        },
+        {
+          "commit": "70670fc045f578548bde57f25c0b701fbeb030ab",
+          "file": "0003-Refused-unknown-keys-inside-CMDB-class-and-variable-.patch",
+          "fork_pr": "https://github.com/djbclark/core/pull/100",
+          "fork_ref": "fix/cmdb-cluster-d",
+          "load_bearing_for": [
+            "CMDB loader (overlay/core 0002) rejects unknown top-level keys; refusing unknown keys inside class and variable metadata objects prevents typos like 'class_expression' or 'tag' from silently defining classes unconditionally or dropping metadata (frdminc/tendcf#68)"
+          ],
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Refused unknown keys inside CMDB class and variable metadata objects",
+          "tests": [
+            "tests/unit/cmdb_test.c"
+          ],
+          "upstream_pr": "none: fork PR https://github.com/djbclark/core/pull/100 only; upstream requires operator approval",
+          "why": "closes frdminc/tendcf#68: PrepareCMDBClasses() and PrepareCMDBVariables() previously ignored unknown keys inside metadata objects; CheckCMDBMetadataKeys() now rejects any member outside the allowed metadata keys and installs nothing from the file"
+        },
+        {
+          "commit": "e61d689391d1e5ff2a34299598ea8a9a643f2140",
+          "file": "0004-Added-loader-level-embedded-NUL-fixture-to-cmdb_test.patch",
+          "fork_pr": "https://github.com/djbclark/core/pull/100",
+          "fork_ref": "fix/cmdb-cluster-d",
+          "load_bearing_for": [
+            "proves directly through LoadCMDBData() in cmdb_test that host_specific.json files containing an embedded NUL byte (after a valid object or inside a string) are refused and install nothing (frdminc/tendcf#69)"
+          ],
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Added loader-level embedded NUL fixture to cmdb_test",
+          "tests": [
+            "tests/unit/cmdb_test.c"
+          ],
+          "upstream_pr": "none: fork PR https://github.com/djbclark/core/pull/100 only; upstream requires operator approval",
+          "why": "closes frdminc/tendcf#69 part B: adds test_embedded_nul_byte_installs_nothing to tests/unit/cmdb_test.c verifying LoadCMDBData() fails closed on embedded NUL bytes; carried in the overlay as a deliberate test-coverage companion for overlay-build's ASan/UBSan cmdb_test pass"
         }
       ],
       "upstream": "https://github.com/cfengine/core"
     },
     "libntech": {
-      "applied_tree": "8d5fda1f9938c6b69bb9bb4d8a6e3be6c174f9e0",
+      "applied_tree": "b91be8ffee2f535ff48330b3a309837e6d2aaf03",
       "base": "0c0620d6c5f8f8d1cae212f084b021cff0b86ce6",
       "base_described": "upstream master as of 2026-08-15 (merge of #289); exactly the libntech submodule pin of core's base a0bca6aaf, so the two components are one coherent tree",
-      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 8d5fda1f9938 with all six patches; 0001-0004 alone give 5cbd6f7425fa, identical to the local merge 45c816c)",
+      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree b91be8ffee2f with all eight patches; 0001-0006 gave 8d5fda1f9938; 0001-0004 alone gave 5cbd6f7425fa, identical to the local merge 45c816c)",
       "fork": "https://github.com/djbclark/libntech",
       "patches": [
         {
@@ -140,6 +174,40 @@
           "role": "load-bearing",
           "subject": "Fixed JsonParseFileStrict() missing a null byte in the file",
           "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/11 only"
+        },
+        {
+          "commit": "78ec200227627808b2db8367cc6046bcd26de6ba",
+          "file": "0007-Fixed-JsonParseAsString-reading-past-NUL-on-a-traili.patch",
+          "fork_pr": "https://github.com/djbclark/libntech/pull/12",
+          "fork_ref": "fix/json-trailing-backslash-oob",
+          "load_bearing_for": [
+            "prevents out-of-bounds read past the NUL terminator in JsonParseAsString() on a truncated string ending in a trailing backslash, which JsonParseFileStrict() reaches when loading host_specific.json (frdminc/tendcf#66)"
+          ],
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Fixed JsonParseAsString() reading past NUL on a trailing backslash",
+          "tests": [
+            "tests/unit/json_test.c"
+          ],
+          "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/12 only; upstream requires operator approval",
+          "why": "closes frdminc/tendcf#66: guards **data == '\\0' after '\\' in JsonParseAsString() to return JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END immediately, and destroys array on string-parse failure in JsonParseAsArray() so error paths do not leak under ASan"
+        },
+        {
+          "commit": "40c83ea8adf8a1c17a73116ec45e944498029584",
+          "file": "0008-Hardened-JsonParseStrict-against-non-JSON-forms-quad.patch",
+          "fork_pr": "https://github.com/djbclark/libntech/pull/13",
+          "fork_ref": "fix/json-strict-parse-hardening",
+          "load_bearing_for": [
+            "hardens JsonParseStrict() and JsonParseFileStrict() (0005/0006), which core's CMDB loader calls on host_specific.json: refuses unquoted keys, missing colons, \\u0000 escapes, and nesting deeper than 128 levels, and eliminates O(n^2) duplicate-key checks (frdminc/tendcf#67)"
+          ],
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Hardened JsonParseStrict() against non-JSON forms, quadratic keys and deep nesting",
+          "tests": [
+            "tests/unit/json_test.c"
+          ],
+          "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/13 only; upstream requires operator approval",
+          "why": "closes frdminc/tendcf#67: refuses unquoted object keys, missing colons, \\u0000 escapes, and nesting deeper than 128 levels under JsonParseStrict()/JsonParseFileStrict(), and replaces O(n^2) duplicate-key scans with a StringSet while leaving lenient JsonParse*() unchanged"
         }
       ],
       "upstream": "https://github.com/NorthernTechHQ/libntech"
