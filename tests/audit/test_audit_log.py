@@ -1040,6 +1040,131 @@ class TestR1AdversaryRegressions(unittest.TestCase):
         with self.assertRaises(audit.AuditRedactionError):
             audit.validate_event_data("promise_outcome", {**_promise_data(), "env": None})
 
+    def test_pr123_bot_extra_key_names_never_echoed_in_errors(self) -> None:
+        # Macroscope #4712891391: rejected extra JSON keys must not echo attacker-controlled names.
+        secret_key = "password=hunter2_do_not_leak"
+        with self.assertRaises(audit.AuditRedactionError) as ctx1:
+            audit.validate_event_data("promise_outcome", {**_promise_data(), secret_key: "x"})
+        self.assertNotIn(secret_key, str(ctx1.exception))
+
+        env = audit.build_envelope(
+            host="pastebin", boot_id="boot-1", seq=1, prev=audit.GENESIS_PREV,
+            event_type="heartbeat", data=_hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=1,
+        )
+        env[secret_key] = "x"
+        with self.assertRaises(audit.AuditRedactionError) as ctx2:
+            audit.validate_envelope(env)
+        self.assertNotIn(secret_key, str(ctx2.exception))
+
+    def test_pr123_bot_non_ascii_hash_in_local_and_sink_state_does_not_crash(self) -> None:
+        # Macroscope #4712891399 & Codex #4712897474: non-ASCII h must yield findings, never TypeError.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            sink_root = root / "sink"
+            env = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=1)
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=spool.log_path.read_bytes(),
+                receive_ts="2026-11-26T12:00:02Z",
+            )
+            stream_dir = sink_root / "pastebin" / "tendcf"
+
+            # Corrupt local record with non-ASCII 'h'.
+            bad_local = dict(env)
+            bad_local["h"] = "é"
+            spool.log_path.write_bytes(json.dumps(bad_local, ensure_ascii=False).encode("utf-8") + b"\n")
+            rep1 = audit.verify_local_against_sink(spool.log_path, stream_dir, expected_host="pastebin")
+            self.assertFalse(rep1.ok)
+            codes1 = {f.code for f in rep1.findings}
+            self.assertIn("LOCAL_EDITED", codes1)
+
+            # Corrupt sink state.json last_h with non-ASCII 'é'.
+            st = json.loads((stream_dir / "state.json").read_text(encoding="utf-8"))
+            st["last_h"] = "é"
+            (stream_dir / "state.json").write_text(json.dumps(st, ensure_ascii=False) + "\n", encoding="utf-8")
+            rep2 = audit.verify_local_against_sink(spool.log_path, stream_dir, expected_host="pastebin")
+            self.assertFalse(rep2.ok)
+            self.assertIn("SINK_STATE_MISMATCH", {f.code for f in rep2.findings})
+
+    def test_pr123_bot_spool_o1_append_does_not_rescan_full_history(self) -> None:
+        # Codex #4712897460: append() uses cursor byte offsets (O(1)) instead of scanning seq 1..N.
+        with tempfile.TemporaryDirectory() as td:
+            spool = audit.AuditSpool(Path(td) / "spool", host="pastebin", boot_id="boot-1")
+            for i in range(1, 25):
+                spool.append("heartbeat", _hb_data(), ts=f"2026-11-26T12:00:{i:02d}Z", mono_ms=i)
+
+            orig_iter = audit._iter_regular_lines_in_dir
+            calls = []
+
+            def spy_iter(*args, **kwargs):
+                calls.append((args, kwargs))
+                return orig_iter(*args, **kwargs)
+
+            audit._iter_regular_lines_in_dir = spy_iter
+            try:
+                spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:30Z", mono_ms=30)
+                # Steady-state append must NOT invoke full-file line iteration at all.
+                self.assertEqual(calls, [])
+            finally:
+                audit._iter_regular_lines_in_dir = orig_iter
+
+            cur = json.loads(spool.cursor_path.read_text(encoding="utf-8"))
+            self.assertEqual(cur["local_seq"], 25)
+            self.assertEqual(cur["local_offset"], spool.log_path.stat().st_size)
+
+    def test_pr123_bot_sink_recovers_incomplete_partial_write_before_retry(self) -> None:
+        # Codex #4712897466: unterminated 100-byte partial write on daily file must recover
+        # append-only (chattr +a compatible) so subsequent batch retries succeed cleanly.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            sink_root = root / "sink"
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            e1_bytes = audit.jcs_dumps(e1) + b"\n"
+            e2_bytes = audit.jcs_dumps(e2) + b"\n"
+
+            # Commit e1 normally, then simulate interrupted partial write of 100 bytes of e2.
+            ack1 = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e1_bytes,
+                receive_ts="2026-11-26T12:00:05Z",
+            )
+            self.assertEqual(ack1["last_seq"], 1)
+            day_file = sink_root / "pastebin" / "tendcf" / "2026-11-26.jsonl"
+            with open(day_file, "ab") as fh:
+                fh.write(e2_bytes[:100])
+
+            # Retry full batch [e1, e2]: sink must seal torn fragment append-only, dedup e1,
+            # commit e2 cleanly, and record recovery witness in quarantine.jsonl & state.json.
+            ack2 = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e1_bytes + e2_bytes,
+                receive_ts="2026-11-26T12:00:10Z",
+            )
+            self.assertTrue(ack2["ok"])
+            self.assertEqual(ack2["duplicates"], 1)
+            self.assertEqual(ack2["accepted"], 1)
+            self.assertEqual(ack2["last_seq"], 2)
+            self.assertEqual(ack2["last_h"], e2["h"])
+
+            # Subsequent verification sees both committed records (no SINK_CORRUPT) plus quarantine witness.
+            ver = audit.verify_local_against_sink(
+                spool.log_path, sink_root / "pastebin" / "tendcf", expected_host="pastebin"
+            )
+            self.assertEqual(ver.sink_count, 2)
+            codes = {f.code for f in ver.findings}
+            self.assertNotIn("SINK_CORRUPT", codes)
+            self.assertNotIn("LOCAL_EDITED", codes)
+            self.assertIn("SINK_QUARANTINE_PRESENT", codes)
+
     def test_cli_end_to_end_via_isolated_python(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
