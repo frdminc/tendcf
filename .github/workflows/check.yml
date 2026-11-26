@@ -25,7 +25,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Schema lint
-        run: bin/schema_lint.py
+        run: |
+          bin/schema_lint.py
+          bin/recompute_goal_hashes.py --check
+          python3 -I -m unittest discover -s tests/schema -v
 
       # Runs the projector too: schema_lint imports bin/projector.py and gates
       # project(goal-file.json) against examples/host_specific.json, which is

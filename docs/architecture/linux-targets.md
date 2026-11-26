@@ -56,6 +56,7 @@ is a derivation kept in the host flake, not in this repo.
    device-side component, a Python command (`bin/projector.py` promoted)
    that validates the approved goal file and writes `host_specific.json`
    before cf-agent reads it; no daemon. It is built after schema v5 lands
+   (erratum: v5 has landed; the schema is currently at v9)
    and before any further host is enforced. pastebin's canary is the only
    enforced host today; its CMDB data is a projection made in this repo
    and installed by `deploy/linux/tendcf-install.sh install --data`.

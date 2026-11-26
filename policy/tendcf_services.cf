@@ -205,11 +205,17 @@
 #     variable twice) and a `classes` section (which can define `interlock_ok_*`);
 #     the projector emits neither (N-2, bin/projector.py check_projection), so
 #     any other top-level key is refused rather than compared;
-#   - every key under `vars` must be a plain identifier ([A-Za-z0-9_]+). The
-#     loader reads a key as a variable reference (cmdb.c GetCMDBVariableRef,
-#     VarRefParse): `a.b` lands in scope a, `ns:b.c` in another namespace,
-#     `a[i]` is an array element. Such a key can preset a variable of THIS
-#     policy (`default:tendcf_services_apply.service_ids`), so it is refused;
+#   - every key under `vars` must be a plain identifier of 1-64 characters
+#     ([A-Za-z0-9_]{1,64}). The loader reads a key as a variable reference
+#     (cmdb.c GetCMDBVariableRef, VarRefParse): `a.b` lands in scope a,
+#     `ns:b.c` in another namespace, `a[i]` is an array element. Such a key can
+#     preset a variable of THIS policy (`default:tendcf_services_apply.service_ids`),
+#     so it is refused. The 64-character upper bound keeps every per-key class
+#     name (`tendcf_cmdb_problem_uncomparable_<k>`, `..._noverdict_<k>`,
+#     `..._differs_<k>`, `..._partial_<k>`, `tendcf_cmdb_json_same_<k>`) at
+#     most 97 characters (98 bytes with NUL), well below CFEngine's
+#     1024-character limit in
+#     `EvalContextClassPutTagsSet` (issue #60 I1 / I1 extended);
 #   - for every key under `vars`, `data:variables.<key>` must exist;
 #   - per key, the set of entry ids in the file must equal the set of
 #     indices of the loaded container (a half-loaded container is caught);
@@ -228,7 +234,8 @@
 #     nor a difference could be evaluated), not the absence of a difference;
 #   - every `data:variables.*` the loader installed must be a key of `vars`
 #     in the file;
-#   - nothing the loader installed may lie outside `data:variables.<identifier>`:
+#   - nothing the loader installed may lie outside `data:variables.<identifier>`
+#     (1-64 characters, `[A-Za-z0-9_]{1,64}`):
 #     no CMDB-installed variable of any other name, and no CMDB-installed class.
 #     This is read from the loaded state (the variable table and the class
 #     table, by the tag the loader puts on everything it installs,
@@ -316,21 +323,32 @@
 # One file on purpose: the fork resolves each file's bundles when it is loaded
 # and the whole policy again afterwards (libpromises/loading.c), so `tendcf_cmdb`
 # decides in the file it shares with the gated bundles, before their ids are
-# first read. Were it split off, the literal empty `*_ids` lists under the
-# refusal would still redefine the ids, so it would fail closed, but this is why
-# the bundles live together.
+# first read. While the literal empty `*_ids` lists under the refusal are
+# intended to redefine the ids if split off, that "would still fail closed if
+# split" claim has NOT been traced through `loading.c` and must be re-tested
+# against a real build if `tendcf_cmdb` is ever moved into a separate file.
 #
 # What is NOT guaranteed: the check compares the file with the loader's state at
 # the evaluation. A file replaced after the last evaluation, or by a promise
 # that changes `data:variables.*` afterwards, is not seen; and nothing here makes
 # a publication atomic (`tendcf-install.sh data` installs by atomic rename, but
-# the agent can still start between the loader's read and ours). Not a sandbox
-# either: it is a consistency check between the file and what the loader
-# installed. A CMDB author (root) already chooses each pre_action executable,
-# `/bin/sh -c ...` included, and the unit commands, so it does not stop a hostile
-# but self-consistent file; it stops a file and a loader that disagree, and the
-# sections, keys, variables and classes through which a file could change what
-# the policy reads without showing up as a `vars` difference.
+# the agent can still start between the loader's read and ours). A CMDB key in
+# the `match` scope (e.g. `match.0`) lands in `ctx->match_variables`, which
+# `variablesmatching()` does not walk, so `tendcf_cmdb_problem_foreign_var`
+# cannot see it (caught by the file-side `tendcf_cmdb_problem_badkey` outside a
+# file-swap race; issue #60 I2). Not a sandbox either: it is a consistency check
+# between the file and what the loader installed. Root-only channels the check
+# does not model include `cf-agent -N tendcf_cmdb_refused`,
+# `-D interlock_ok_<id>`, `-D tendcf_cmdb_json_same_<k>` (which keeps
+# `tendcf_cmdb_problem_noverdict_<k>` unset), persistent classes
+# (`source=persistent`) of those names, and other policy files that write
+# `data:variables.*` or define `interlock_ok_*` or `tendcf_cmdb_json_same_*`
+# (issue #60 I4 / I4 extended). A CMDB author (root) already chooses each
+# pre_action executable, `/bin/sh -c ...` included, and the unit commands, so it
+# does not stop a hostile but self-consistent file; it stops a file and a loader
+# that disagree, and the sections, keys, variables and classes through which a
+# file could change what the policy reads without showing up as a `vars`
+# difference.
 
 bundle common tendcf_cmdb
 {
@@ -375,12 +393,15 @@ bundle common tendcf_cmdb
       "extra_sections"
         slist => difference("doc_sections", "allowed_sections");
 
-      # Only a plain identifier is a `vars` key this policy will look up. The
-      # grep() pattern is anchored by CFEngine. Every other key is refused as a
-      # whole (`..._problem_badkey`) and is never used to build a variable name
-      # below.
+      # Only a plain identifier of 1-64 characters is a `vars` key this policy
+      # will look up. The grep() pattern is anchored by CFEngine. Bounding the
+      # length to 64 keeps every per-key class name at most 97 characters
+      # (98 bytes with NUL), well below EvalContextClassPutTagsSet's 1024-char
+      # limit (issue #60 I1). Every
+      # other key is refused as a whole (`..._problem_badkey`) and is never used
+      # to build a variable name below.
       "safe_keys"
-        slist => grep("[A-Za-z0-9_]+", "file_keys");
+        slist => grep("[A-Za-z0-9_]{1,64}", "file_keys");
 
       "bad_keys"
         slist => difference("file_keys", "safe_keys");
@@ -435,9 +456,8 @@ bundle common tendcf_cmdb
       "key_canon[$(safe_keys)]"
         string => canonify("$(safe_keys)");
 
-      # The key as a report shows it: at most 64 characters (a safe key is a plain
-      # identifier, so no character replacement is needed, but its length is not
-      # bounded). Lookups and class names keep using the full `safe_keys`.
+      # The key as a report shows it: at most 64 characters (safe_keys is
+      # bounded to [A-Za-z0-9_]{1,64}; string_head is kept as defense in depth).
       "key_clean[$(safe_keys)]"
         string => string_head("$(safe_keys)", 64);
 
@@ -513,11 +533,12 @@ bundle common tendcf_cmdb
       # Read from the loaded state, with the calls inline: no variable here for
       # a CMDB key to preset. Every variable tagged by the CMDB loader or by the
       # augments loader is counted, and so is every one of them that is exactly
-      # data:variables.<identifier> AND tagged by the CMDB loader; any excess is
-      # a variable of another name (or from augments), which is a problem.
+      # data:variables.<identifier> (1-64 chars) AND tagged by the CMDB loader;
+      # any excess is a variable of another name (or >64 chars, or from augments),
+      # which is a problem.
       "tendcf_cmdb_problem_foreign_var"
         expression => isgreaterthan(length(variablesmatching(".*", "source=cmdb", "source=augments_file")),
-                                    length(variablesmatching("data:variables\.[A-Za-z0-9_]+", "source=cmdb")));
+                                    length(variablesmatching("data:variables\.[A-Za-z0-9_]{1,64}", "source=cmdb")));
 
       "tendcf_cmdb_problem_foreign_class"
         expression => classmatch(".*", "source=cmdb", "source=augments_file");
@@ -601,80 +622,150 @@ bundle agent tendcf_interlocks
         slist => { },
         ifvarclass => "tendcf_cmdb_refused";
 
-      "interlock_canon[$(interlock_ids)]"
-        string => canonify("$(interlock_ids)");
+      # Filter out any interlock id that is empty, >128 chars, or contains `[`
+      # or `]` before indexing into data:variables.tendcf_interlock[$(id)] or
+      # calling tendcf_interlock_run: an unmatched bracket (such as an ANSI CSI
+      # `\x1b[31m` in a schema-skipped file) breaks CFEngine's array-index
+      # parser, and an unbounded id would risk overflowing CFEngine's 1024-char
+      # class limit (`interlock_ok_<canon>`). Any unsafe id sets
+      # `tendcf_interlock_malformed_id` -> `tendcf_interlock_gate_refused`
+      # (namespace) to fail closed on all service actuation and reports a
+      # sanitized id (issue #56 items 1-2, R1 C1/C2).
+      "interlock_safe_ids"
+        slist => grep("(?s)^[^\[\]]{1,128}$", "interlock_ids");
 
-      # commands: promise runs <promiser> <arglist...>, and non-scalar
-      # attributes (arglist, template_data below) can't take an indexed
-      # data-container element directly -- CFEngine rejects "container
-      # assigned to an indexed variable name" for that, and neither `@()`
-      # nor bare `$()` accept a bracket path as a full non-scalar rvalue
-      # (confirmed against a real build; both give parse errors, not just
-      # a hunch). join() over the container path (a proven idiom: pass
-      # the path as a plain string, CFEngine resolves it) sidesteps that.
+      "interlock_unsafe_ids"
+        slist => difference("interlock_ids", "interlock_safe_ids");
+
+      "interlock_unsafe_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "interlock_unsafe_ids");
+
+      "interlock_unsafe_clean"
+        slist => maplist(string_head("$(this)", 64), "interlock_unsafe_san");
+
+      "interlock_safe_canon[$(interlock_safe_ids)]"
+        string => canonify("$(interlock_safe_ids)");
+
+      "interlock_safe_san[$(interlock_safe_ids)]"
+        string => regex_replace("$(interlock_safe_ids)", "[^A-Za-z0-9._:@/-]", "?", "g");
+
+      "interlock_safe_clean[$(interlock_safe_ids)]"
+        string => string_head("$(interlock_safe_san[$(interlock_safe_ids)])", 64);
+
+      # Collision detection across interlock_safe_ids (R1 C1 / Codex #1):
+      # canonify() maps '.', '-', '_', '@' etc. to '_', so two distinct ids
+      # (e.g. 'a-b' and 'a.b') would share `interlock_ok_a_b` and let a passing
+      # sibling satisfy a failing one. Detect canonify collisions and fail closed.
+      "interlock_canon_list"
+        slist => maplist(canonify("$(this)"), "interlock_safe_ids"),
+        ifvarclass => isgreaterthan(length("interlock_safe_ids"), 0);
+
+      "interlock_canon_list"
+        slist => { },
+        ifvarclass => not(isgreaterthan(length("interlock_safe_ids"), 0));
+
+      "interlock_canon_unique"
+        slist => unique("interlock_canon_list"),
+        ifvarclass => isgreaterthan(length("interlock_safe_ids"), 0);
+
+      "interlock_canon_unique"
+        slist => { },
+        ifvarclass => not(isgreaterthan(length("interlock_safe_ids"), 0));
+
+      # Validate every interlock's `bundle` before execution or class creation
+      # (R1 C2 / Codex #1): `interlock_blocked_` is 18 chars and CFEngine
+      # silently drops classes >= 1024 chars (`EvalContextClassPutTagsSet`), so
+      # an unbounded (>= 1006 chars), missing, or non-string `bundle` would fail
+      # OPEN. Require a top-level JSON string matching [A-Za-z0-9._:@/-]{1,128}.
+      "interlock_entry_json[$(interlock_safe_ids)]"
+        string => storejson("data:variables.tendcf_interlock[$(interlock_safe_ids)]");
+
+      "interlock_bundle_json[$(interlock_safe_ids)]"
+        string => storejson("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]");
+
+      "interlock_bundle_val[$(interlock_safe_ids)]"
+        string => "$(data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle])",
+        ifvarclass => and(isvariable("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]"),
+                          not(isvariable("interlock_bundle_json[$(interlock_safe_ids)]")));
+
+  classes:
+      "tendcf_interlock_malformed_id"
+        expression => isgreaterthan(length("interlock_unsafe_ids"), 0),
+        scope => "namespace";
+
+      "tendcf_interlock_id_collision"
+        expression => and(isgreaterthan(length("interlock_safe_ids"), 0),
+                          isgreaterthan(length("interlock_safe_ids"),
+                                        length("interlock_canon_unique"))),
+        scope => "namespace";
+
+      "tendcf_ilk_bad_bundle_shape_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => or(
+          not(isvariable("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]")),
+          isvariable("interlock_bundle_json[$(interlock_safe_ids)]"),
+          not(isvariable("interlock_entry_json[$(interlock_safe_ids)]")));
+
+      "tendcf_ilk_bad_bundle_json_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => not(regcmp('(?s).*\n  "bundle": "[A-Za-z0-9._:@/-]{1,128}",?\n.*',
+                                 "$(interlock_entry_json[$(interlock_safe_ids)])")),
+        ifvarclass => isvariable("interlock_entry_json[$(interlock_safe_ids)]");
+
+      "tendcf_ilk_bad_bundle_val_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => not(regcmp("^[A-Za-z0-9._:@/-]{1,128}$",
+                                 "$(interlock_bundle_val[$(interlock_safe_ids)])")),
+        ifvarclass => isvariable("interlock_bundle_val[$(interlock_safe_ids)]");
+
+      "tendcf_interlock_malformed_bundle"
+        expression => classmatch("tendcf_ilk_bad_bundle_.*"),
+        scope => "namespace";
+
+      "tendcf_interlock_gate_refused"
+        expression => "tendcf_interlock_malformed_id|tendcf_interlock_id_collision|tendcf_interlock_malformed_bundle",
+        scope => "namespace";
+
+  methods:
+      # Step 2 (issue #56 item 1, C-policy-01): execute each interlock in its
+      # own parameterized helper bundle `tendcf_interlock_run(id)` using
+      # `getvalues(...)` and `commands:` `arglist => { @(cmd_args[$(id)]) }`
+      # under `useshell => "noshell"`.
       #
-      # Guarantee, stated exactly: CFEngine starts no shell of its own for
-      # this promise. tendcf_interlock_contain sets useshell => "noshell",
-      # so cf-agent splits the joined string itself
-      # (libpromises/exec_tools.c ArgSplitCommand: on whitespace, and an
-      # argument that BEGINS with " ' or ` runs to the matching quote) and
-      # execv()s the result: argv[0] is the program, the rest reach it
-      # unchanged. `;`, `|`, `&&`, redirection and backticks mid-word are
-      # plain arguments, never operators, and there is no PATH search.
-      # That is NOT a sandbox: an author who declares ["/bin/sh", "-c", ...]
+      # Guarantee, stated exactly: CFEngine starts no shell of its own AND
+      # never joins or re-splits arguments (command[1..N-1]) through
+      # `ArgSplitCommand`. Under `useshell => "noshell"`, `cf-agent` splits
+      # only `promiser` (`command[0]`) with `ArgSplitCommand` and appends every
+      # `arglist` element verbatim to `execv()` (`libpromises/exec_tools.c`
+      # ArgSplitCommand, `cf-agent/verify_exec.c` RepairExec; whitespace
+      # preserved in `arglist` under `noshell` since CFEngine 3.24, CFE-2724 /
+      # CFE-4294). Because `command[0]` is still passed through
+      # `ArgSplitCommand`, `tendcf_interlock_run` strictly requires `command[0]`
+      # to be a normalized printable-ASCII absolute non-directory path with no
+      # whitespace, quote delimiters (`"`, `'`, `` ` ``), backslashes (`\`), or
+      # `.`/`..` path segments before invoking `commands:`.
+      #
+      # This is NOT a sandbox: an author who declares ["/bin/sh", "-c", ...]
       # (schema-valid) still gets that shell, because the chosen program
-      # interprets its own arguments. What is removed is the implicit
-      # root shell over a joined string.
+      # interprets its own arguments. What is removed is both the implicit root
+      # shell (Step 1, PR #52) and `join(" ", ...)` / `ArgSplitCommand`
+      # argv-shifting on hand-installed/schema-skipped files (Step 2).
       #
-      # The join is lossy for an element with whitespace, a leading quote or
-      # an empty string, so the schema holds pre_action.command to an
-      # alphabet with none of them (common.schema.json $defs/interlock_argv:
-      # absolute command[0], then [A-Za-z0-9._+@:=,/-] only), pinned by
-      # examples/broken/156-159, 161-174 and 176 (the services
-      # contract_version by 160 and 175) and by tests/policy/run.sh check 8,
-      # which records the argv a program receives. Remaining limit: nothing on
-      # the device re-checks the schema (the projector now also enforces
-      # interlock_argv and forbids control characters/noncharacters, though
-      # `tendcf-install.sh data` installs without running the projector), so a
-      # hand-installed file can still carry a space or leading quote, which
-      # shifts argv, or a relative command[0], which the guard on the commands
-      # promise below refuses. Removing the join altogether (an slist per
-      # interlock from getvalues(), passed as arglist) is deliberately not done
-      # until proven against a real build.
-      "pre_action_cmd[$(interlock_ids)]"
-        string => join(" ",
-          "data:variables.tendcf_interlock[$(interlock_ids)][pre_action][command]");
-
-  commands:
-      # pre_action: run the interlock's check under its own timeout, and
-      # classify strictly by the entry's own expect_exit -- not bare
-      # zero, since the schema allows any code 0-255.
-      #
-      # `if` fails closed on a relative command[0]: cf-agent would stat it
-      # and execv() it against its own working directory (it is not a PATH
-      # lookup), so the schema's absolute-path rule is re-enforced here for
-      # a projection that skipped the schema (so a quoted absolute command[0],
-      # "/bin/x", is refused too: the guard wants a leading `/`). A skipped promise leaves
-      # interlock_ok_* undefined and the bundle blocked and reported.
-      "$(pre_action_cmd[$(interlock_ids)])"
-        if => regcmp("/.*", "$(pre_action_cmd[$(interlock_ids)])"),
-        contain => tendcf_interlock_contain(
-          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][timeout_seconds])"),
-        classes => tendcf_interlock_result(
-          "interlock_ok_$(interlock_canon[$(interlock_ids)])",
-          "$(data:variables.tendcf_interlock[$(interlock_ids)][pre_action][expect_exit])");
+      # Schema v9's strict `common.schema.json#/$defs/interlock_argv` alphabet
+      # and `bin/projector.py`'s matching check are intentionally kept intact
+      # (no schema version bump; operator ruling 2026-11-25).
+      "tendcf_interlock_$(interlock_safe_ids)"
+        usebundle => tendcf_interlock_run("$(interlock_safe_ids)"),
+        action => tendcf_probe_always,
+        ifvarclass => "!tendcf_cmdb_refused.!tendcf_interlock_gate_refused";
 
   reports:
-      # Why the promise above was skipped, so the blocked bundle's report
-      # (tendcf_services, "not satisfied ... refused") has a cause beside it.
-      # Best effort: inside the reports promise's ifelapsed window a second
-      # agent run can suppress the line, while the refusal itself still holds
-      # (it comes from interlock_ok_* staying undefined). The line is also
-      # not printed when `command` is not an array or pre_action is missing
-      # (the join then has no first element to test); the bare refusal line
-      # still is.
-      "tendcf: interlock '$(interlock_ids)' pre_action command[0] is not an absolute path; refused"
-        if => not(regcmp("/.*", "$(pre_action_cmd[$(interlock_ids)])"));
+      "tendcf_interlock_malformed_id.!tendcf_cmdb_refused"::
+        "tendcf: interlock '$(interlock_unsafe_clean)' id is empty, too long (>128 chars), or contains bracket characters; refusing all service actuation";
+
+      "tendcf_interlock_id_collision.!tendcf_cmdb_refused"::
+        "tendcf: interlock actuation refused: two or more interlock ids collide under canonify(); refusing all service actuation until ids are canonically unique";
+
+      "tendcf_interlock_malformed_bundle.!tendcf_cmdb_refused.(tendcf_ilk_bad_bundle_shape_$(interlock_safe_canon[$(interlock_safe_ids)])|tendcf_ilk_bad_bundle_json_$(interlock_safe_canon[$(interlock_safe_ids)])|tendcf_ilk_bad_bundle_val_$(interlock_safe_canon[$(interlock_safe_ids)]))"::
+        "tendcf: interlock '$(interlock_safe_clean[$(interlock_safe_ids)])' bundle is missing, non-string, or invalid ([A-Za-z0-9._:@/-]{1,128}); refusing all service actuation";
 
       # The one report of a CMDB mismatch (tendcf_cmdb decides, this says).
       # First bundle of the sequence, so it comes before anything else.
@@ -717,7 +808,167 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: the CMDB or an augments file defined a class; no class from either is accepted";
 
       "tendcf_cmdb_problem_badkey"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]+); the loader would read it as a variable reference";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]{1,64}, 1-64 chars); the loader would read it as a variable reference or exceed the per-key class length bound";
+}
+
+# Parameterized per-interlock executor (issue #56 items 1-2).
+#
+# Caller (`tendcf_interlocks`) passes only bracket-free ids so array indexing by
+# `[$(id)]` isolates every invocation's `cmd_json`, `cmd_vals`, `cmd0`,
+# `cmd_args`, `cmd_timeout`, and `cmd_expect` with zero cross-interlock bleed
+# (CFEngine retains bundle-scope variables across calls to the same bundle,
+# whereas bundle-scope classes are cleared per call).
+#
+# Validation before execution (all fail closed, leaving `interlock_ok_*`
+# undefined):
+#   - `command` must serialize via `storejson()` as a non-empty JSON array of
+#     strings only (rejects missing `command`, empty `[]`, scalar string, JSON
+#     object, and non-string elements such as nested objects/arrays/numbers/null
+#     that `getvalues()` would otherwise flatten or stringify);
+#   - `command[0]` must be a normalized printable-ASCII absolute non-directory
+#     path with no ASCII control chars, non-ASCII bytes, whitespace, quote
+#     delimiters (`"`, `'`, `` ` ``), backslashes (`\`), or `.`/`..` path
+#     segments because CFEngine still runs `ArgSplitCommand` over `promiser`
+#     (`command[0]`) even when `arglist` is passed;
+#   - `timeout_seconds` must be a JSON integer in `1..3600` (matching
+#     schema/goal-file.schema.json and preventing 32-bit exec_timeout wraparound
+#     or `StringToLongExitOnError` aborts) and `expect_exit` a JSON integer in
+#     `0..255`, verified by anchored pure regex against both the scalar value
+#     and top-level `storejson(pre_action)` members (never `islessthan`, which
+#     aborts cf-agent on >64-bit numbers because CFEngine `and()` does not
+#     short-circuit).
+#
+# Execution splits 1-element `[cmd0]` (no `arglist` attribute, avoiding any
+# empty-slist skip) from multi-element `[cmd0, arg1, ...]` (`arglist => {
+# @(cmd_args[$(id)]) }`), both under `useshell => "noshell"` and
+# `action => tendcf_probe_always` (so two interlocks sharing the same command
+# both run even without `-K`).
+bundle agent tendcf_interlock_run(id)
+{
+  vars:
+      "id_canon[$(id)]"
+        string => canonify("$(id)");
+
+      "id_san[$(id)]"
+        string => regex_replace("$(id)", "[^A-Za-z0-9._:@/-]", "?", "g");
+
+      "id_clean[$(id)]"
+        string => string_head("$(id_san[$(id)])", 64);
+
+      "pa_json[$(id)]"
+        string => storejson("data:variables.tendcf_interlock[$(id)][pre_action]");
+
+      "cmd_json[$(id)]"
+        string => storejson("data:variables.tendcf_interlock[$(id)][pre_action][command]");
+
+      "cmd_vals[$(id)]"
+        slist => getvalues("data:variables.tendcf_interlock[$(id)][pre_action][command]");
+
+      "cmd_len[$(id)]"
+        int => length("cmd_vals[$(id)]");
+
+      "cmd0[$(id)]"
+        string => nth("cmd_vals[$(id)]", 0),
+        ifvarclass => isgreaterthan("$(cmd_len[$(id)])", 0);
+
+      "cmd_rest_len[$(id)]"
+        string => format("%d", eval("$(cmd_len[$(id)]) - 1", "math", "infix")),
+        ifvarclass => isgreaterthan("$(cmd_len[$(id)])", 1);
+
+      "cmd_args[$(id)]"
+        slist => sublist("cmd_vals[$(id)]", "tail", "$(cmd_rest_len[$(id)])"),
+        ifvarclass => isgreaterthan("$(cmd_len[$(id)])", 1);
+
+      "cmd_timeout_json[$(id)]"
+        string => storejson("data:variables.tendcf_interlock[$(id)][pre_action][timeout_seconds]");
+
+      "cmd_expect_json[$(id)]"
+        string => storejson("data:variables.tendcf_interlock[$(id)][pre_action][expect_exit]");
+
+      "cmd_timeout[$(id)]"
+        string => "$(data:variables.tendcf_interlock[$(id)][pre_action][timeout_seconds])",
+        ifvarclass => and(isvariable("data:variables.tendcf_interlock[$(id)][pre_action][timeout_seconds]"),
+                          not(isvariable("cmd_timeout_json[$(id)]")));
+
+      "cmd_expect[$(id)]"
+        string => "$(data:variables.tendcf_interlock[$(id)][pre_action][expect_exit])",
+        ifvarclass => and(isvariable("data:variables.tendcf_interlock[$(id)][pre_action][expect_exit]"),
+                          not(isvariable("cmd_expect_json[$(id)]")));
+
+  classes:
+      "tendcf_ilk_cmd_is_string_array"
+        expression => and(
+          isvariable("cmd_json[$(id)]"),
+          regcmp('(?s)^\[\s*"(?:[^"\\\\]|\\\\.)*"(?:\s*,\s*"(?:[^"\\\\]|\\\\.)*")*\s*\]$',
+                 "$(cmd_json[$(id)])"));
+
+      "tendcf_ilk_cmd_len_ok"
+        expression => isgreaterthan("$(cmd_len[$(id)])", 0);
+
+      "tendcf_ilk_cmd0_ok"
+        expression => and(
+          isvariable("cmd0[$(id)]"),
+          regcmp("^/[^\x00-\x20\x7f-\xff\"'`\x5c]+$", "$(cmd0[$(id)])"),
+          not(regcmp(".*/", "$(cmd0[$(id)])")),
+          not(regcmp("(^|.*/)\\.\\.?(/.*|$)", "$(cmd0[$(id)])")));
+
+      # Strict JSON integer + range checks (R1 H1 / Codex #3):
+      # libntech's JsonWrite escapes `\n` inside JSON strings and indents
+      # nested containers >=4 spaces, so `\n  "key": <int>,?\n` matches ONLY
+      # top-level integer members of `pre_action` (rejecting `"5"`, `[5]`,
+      # floats, out-of-range values, and spoofed command strings).
+      "tendcf_ilk_meta_ok"
+        expression => and(
+          isvariable("pa_json[$(id)]"),
+          isvariable("cmd_timeout[$(id)]"),
+          not(isvariable("cmd_timeout_json[$(id)]")),
+          regcmp("^(?:[1-9][0-9]{0,2}|[12][0-9]{3}|3[0-5][0-9]{2}|3600)$",
+                 "$(cmd_timeout[$(id)])"),
+          regcmp('(?s).*\n  "timeout_seconds": (?:[1-9][0-9]{0,2}|[12][0-9]{3}|3[0-5][0-9]{2}|3600),?\n.*',
+                 "$(pa_json[$(id)])"),
+          isvariable("cmd_expect[$(id)]"),
+          not(isvariable("cmd_expect_json[$(id)]")),
+          regcmp("^(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$",
+                 "$(cmd_expect[$(id)])"),
+          regcmp('(?s).*\n  "expect_exit": (?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5]),?\n.*',
+                 "$(pa_json[$(id)])"));
+
+      "tendcf_ilk_cmd_valid"
+        expression => "!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.tendcf_ilk_cmd_is_string_array.tendcf_ilk_cmd_len_ok.tendcf_ilk_cmd0_ok.tendcf_ilk_meta_ok";
+
+      "tendcf_ilk_has_args"
+        expression => and("tendcf_ilk_cmd_valid",
+                          isgreaterthan("$(cmd_len[$(id)])", 1));
+
+      "tendcf_ilk_no_args"
+        expression => and("tendcf_ilk_cmd_valid",
+                          strcmp("$(cmd_len[$(id)])", "1"));
+
+  commands:
+      "$(cmd0[$(id)])"
+        arglist => { @(cmd_args[$(id)]) },
+        action => tendcf_probe_always,
+        contain => tendcf_interlock_contain("$(cmd_timeout[$(id)])"),
+        classes => tendcf_interlock_result("interlock_ok_$(id_canon[$(id)])",
+                                           "$(cmd_expect[$(id)])"),
+        ifvarclass => "tendcf_ilk_has_args";
+
+      "$(cmd0[$(id)])"
+        action => tendcf_probe_always,
+        contain => tendcf_interlock_contain("$(cmd_timeout[$(id)])"),
+        classes => tendcf_interlock_result("interlock_ok_$(id_canon[$(id)])",
+                                           "$(cmd_expect[$(id)])"),
+        ifvarclass => "tendcf_ilk_no_args";
+
+  reports:
+      "!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.!(tendcf_ilk_cmd_is_string_array.tendcf_ilk_cmd_len_ok)"::
+        "tendcf: interlock '$(id_clean[$(id)])' pre_action command is missing or not a non-empty array of strings; refused";
+
+      "!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.tendcf_ilk_cmd_is_string_array.tendcf_ilk_cmd_len_ok.!tendcf_ilk_cmd0_ok"::
+        "tendcf: interlock '$(id_clean[$(id)])' pre_action command[0] is not a normalized printable-ASCII absolute path without whitespace, quotes, or backslashes; refused";
+
+      "!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.tendcf_ilk_cmd_is_string_array.tendcf_ilk_cmd_len_ok.tendcf_ilk_cmd0_ok.!tendcf_ilk_meta_ok"::
+        "tendcf: interlock '$(id_clean[$(id)])' pre_action timeout_seconds (integer 1..3600) or expect_exit (integer 0..255) is missing or invalid; refused";
 }
 
 bundle agent tendcf_ensure_user_launchagents(home_dir, owner)
@@ -749,12 +1000,31 @@ bundle agent tendcf_ensure_user_launchagents(home_dir, owner)
       "$(home_dir)/Library/LaunchAgents/."
         create => "true",
         perms => tendcf_user_dir_perms("$(owner)"),
-        ifvarclass => "darwin.!tendcf_cmdb_refused.tendcf_user_home_ok.tendcf_user_owner_ok.tendcf_user_library_dir_ok.tendcf_user_launchagents_missing";
+        ifvarclass => "darwin.!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.!tendcf_service_id_malformed.tendcf_user_home_ok.tendcf_user_owner_ok.tendcf_user_library_dir_ok.tendcf_user_launchagents_missing";
 }
 
 bundle agent tendcf_services
 {
+  vars:
+      "service_raw_ids"
+        slist => getindices("data:variables.tendcf_service"),
+        ifvarclass => "!tendcf_cmdb_refused";
+
+      "service_raw_ids"
+        slist => { },
+        ifvarclass => "tendcf_cmdb_refused";
+
+      "service_safe_ids"
+        slist => grep("(?s)^[^\[\]]+$", "service_raw_ids");
+
+      "service_unsafe_ids"
+        slist => difference("service_raw_ids", "service_safe_ids");
+
   classes:
+      "tendcf_service_id_malformed"
+        expression => isgreaterthan(length("service_unsafe_ids"), 0),
+        scope => "namespace";
+
       # Fail-closed root/user privilege split (issue #94, operator ruling
       # 2026-11-23): `sys.user_data[uid|username|gid|home_dir]` comes from
       # getpwuid(getuid()), never from $HOME/$USER. Root actuates `system` only;
@@ -800,7 +1070,7 @@ bundle agent tendcf_services
         usebundle => tendcf_ensure_user_launchagents("$(sys.user_data[home_dir])",
                                                      "$(sys.user_data[username])"),
         action => tendcf_probe_always,
-        ifvarclass => "darwin.!tendcf_cmdb_refused.tendcf_running_as_nonroot.!tendcf_running_as_root.tendcf_user_home_valid";
+        ifvarclass => "darwin.!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.!tendcf_service_id_malformed.tendcf_running_as_nonroot.!tendcf_running_as_root.tendcf_user_home_valid";
 
       "services_user_darwin"
         usebundle => tendcf_services_apply("user",
@@ -841,33 +1111,141 @@ bundle agent tendcf_services
 bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, launchd_owner, launchd_group, launchd_run_user, launchd_uid)
 {
   vars:
-      # Empty under a CMDB mismatch, see tendcf_interlocks and `tendcf_cmdb`
-      # (set explicitly for the same reason as there, so even a direct call to
-      # tendcf_services_apply fails closed under tendcf_cmdb_refused).
-      "service_ids"
-        slist => getindices("data:variables.tendcf_service"),
-        ifvarclass => "!tendcf_cmdb_refused";
-
-      "service_ids"
-        slist => { },
-        ifvarclass => "tendcf_cmdb_refused";
-
-      "interlock_ids"
+      # Empty under a CMDB mismatch, malformed/colliding interlock id, malformed
+      # interlock bundle, or malformed/bracketed service id (set explicitly so
+      # even a direct call to tendcf_services_apply fails closed).
+      "interlock_raw_ids"
         slist => getindices("data:variables.tendcf_interlock"),
         ifvarclass => "!tendcf_cmdb_refused";
 
-      "interlock_ids"
+      "interlock_raw_ids"
         slist => { },
         ifvarclass => "tendcf_cmdb_refused";
 
+      "interlock_safe_ids"
+        slist => grep("(?s)^[^\[\]]{1,128}$", "interlock_raw_ids");
+
+      "interlock_unsafe_ids"
+        slist => difference("interlock_raw_ids", "interlock_safe_ids");
+
+      "interlock_unsafe_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "interlock_unsafe_ids");
+
+      "interlock_unsafe_clean"
+        slist => maplist(string_head("$(this)", 64), "interlock_unsafe_san");
+
+      "interlock_safe_canon[$(interlock_safe_ids)]"
+        string => canonify("$(interlock_safe_ids)");
+
+      "interlock_canon_list"
+        slist => maplist(canonify("$(this)"), "interlock_safe_ids"),
+        ifvarclass => isgreaterthan(length("interlock_safe_ids"), 0);
+
+      "interlock_canon_list"
+        slist => { },
+        ifvarclass => not(isgreaterthan(length("interlock_safe_ids"), 0));
+
+      "interlock_canon_unique"
+        slist => unique("interlock_canon_list"),
+        ifvarclass => isgreaterthan(length("interlock_safe_ids"), 0);
+
+      "interlock_canon_unique"
+        slist => { },
+        ifvarclass => not(isgreaterthan(length("interlock_safe_ids"), 0));
+
+      "interlock_entry_json[$(interlock_safe_ids)]"
+        string => storejson("data:variables.tendcf_interlock[$(interlock_safe_ids)]");
+
+      "interlock_bundle_json[$(interlock_safe_ids)]"
+        string => storejson("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]");
+
+      "interlock_bundle_val[$(interlock_safe_ids)]"
+        string => "$(data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle])",
+        ifvarclass => and(isvariable("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]"),
+                          not(isvariable("interlock_bundle_json[$(interlock_safe_ids)]")));
+
+      "interlock_ids"
+        slist => { @(interlock_safe_ids) },
+        ifvarclass => and("!tendcf_cmdb_refused",
+                          "!tendcf_interlock_gate_refused",
+                          not(isgreaterthan(length("interlock_unsafe_ids"), 0)),
+                          not(isgreaterthan(length("interlock_safe_ids"),
+                                            length("interlock_canon_unique"))));
+
+      "interlock_ids"
+        slist => { },
+        ifvarclass => or("tendcf_cmdb_refused",
+                         "tendcf_interlock_gate_refused",
+                         isgreaterthan(length("interlock_unsafe_ids"), 0),
+                         isgreaterthan(length("interlock_safe_ids"),
+                                       length("interlock_canon_unique")));
+
+      # Filter out empty or bracketed service ids symmetrically to interlocks
+      # before any [$(service_ids)] array indexing (R1 M1): prevents CFEngine
+      # `Broken variable expression` floods on `\x1b[31m` and fails closed on
+      # all service actuation.
+      "service_raw_ids"
+        slist => getindices("data:variables.tendcf_service"),
+        ifvarclass => "!tendcf_cmdb_refused";
+
+      "service_raw_ids"
+        slist => { },
+        ifvarclass => "tendcf_cmdb_refused";
+
+      "service_safe_ids"
+        slist => grep("(?s)^[^\[\]]+$", "service_raw_ids");
+
+      "service_unsafe_ids"
+        slist => difference("service_raw_ids", "service_safe_ids");
+
+      "service_unsafe_san"
+        slist => maplist(regex_replace("$(this)", "[^A-Za-z0-9._:@/-]", "?", "g"),
+                         "service_unsafe_ids");
+
+      "service_unsafe_clean"
+        slist => maplist(string_head("$(this)", 64), "service_unsafe_san");
+
+      "service_ids"
+        slist => { @(service_safe_ids) },
+        ifvarclass => and("!tendcf_cmdb_refused",
+                          "!tendcf_interlock_gate_refused",
+                          "!tendcf_service_id_malformed",
+                          not(isgreaterthan(length("interlock_unsafe_ids"), 0)),
+                          not(isgreaterthan(length("interlock_safe_ids"),
+                                            length("interlock_canon_unique"))),
+                          not(isgreaterthan(length("service_unsafe_ids"), 0)));
+
+      "service_ids"
+        slist => { },
+        ifvarclass => or("tendcf_cmdb_refused",
+                         "tendcf_interlock_gate_refused",
+                         "tendcf_service_id_malformed",
+                         isgreaterthan(length("interlock_unsafe_ids"), 0),
+                         isgreaterthan(length("interlock_safe_ids"),
+                                       length("interlock_canon_unique")),
+                         isgreaterthan(length("service_unsafe_ids"), 0));
+
       "service_canon[$(service_ids)]"
         string => canonify("$(service_ids)");
+
+      "service_id_san[$(service_ids)]"
+        string => regex_replace("$(service_ids)", "[^A-Za-z0-9._:@/-]", "?", "g");
+
+      "service_id_clean[$(service_ids)]"
+        string => string_head("$(service_id_san[$(service_ids)])", 64);
 
       "service_lower[$(service_ids)]"
         string => string_downcase("$(service_ids)");
 
       "interlock_canon[$(interlock_ids)]"
         string => canonify("$(interlock_ids)");
+
+      "interlock_san[$(interlock_ids)]"
+        string => regex_replace("$(interlock_ids)", "[^A-Za-z0-9._:@/-]", "?", "g");
+
+      "interlock_clean[$(interlock_ids)]"
+        string => string_head("$(interlock_san[$(interlock_ids)])", 64);
 
       "service_bundle_canon[$(service_ids)]"
         string => canonify(
@@ -876,6 +1254,16 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "interlock_bundle_canon[$(interlock_ids)]"
         string => canonify(
           "$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])");
+
+      "interlock_bundle_san[$(interlock_ids)]"
+        string => regex_replace(
+          "$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])",
+          "[^A-Za-z0-9._:@/-]", "?", "g"),
+        ifvarclass => isvariable("data:variables.tendcf_interlock[$(interlock_ids)][bundle]");
+
+      "interlock_bundle_clean[$(interlock_ids)]"
+        string => string_head("$(interlock_bundle_san[$(interlock_ids)])", 64),
+        ifvarclass => isvariable("interlock_bundle_san[$(interlock_ids)]");
 
       # The goal file's `unit` carries exactly one flavour key (goal-file
       # schema $defs/unit, oneOf launchd/systemd/runit); a tombstone
@@ -886,9 +1274,23 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       "unit_flavour[$(service_ids)]"
         string => join(",", "unit_flavours[$(service_ids)]");
 
+      "unit_flavour_san[$(service_ids)]"
+        string => regex_replace("$(unit_flavour[$(service_ids)])", "[^A-Za-z0-9._:@/,-]", "?", "g");
+
+      "unit_flavour_clean[$(service_ids)]"
+        string => string_head("$(unit_flavour_san[$(service_ids)])", 64);
+
       "service_launchd_domain[$(service_ids)]"
         string => "$(data:variables.tendcf_service[$(service_ids)][unit][launchd][domain])",
         ifvarclass => isvariable("data:variables.tendcf_service[$(service_ids)][unit][launchd][domain]");
+
+      "service_launchd_domain_san[$(service_ids)]"
+        string => regex_replace("$(service_launchd_domain[$(service_ids)])", "[^A-Za-z0-9._:@/-]", "?", "g"),
+        ifvarclass => isvariable("service_launchd_domain[$(service_ids)]");
+
+      "service_launchd_domain_clean[$(service_ids)]"
+        string => string_head("$(service_launchd_domain_san[$(service_ids)])", 64),
+        ifvarclass => isvariable("service_launchd_domain_san[$(service_ids)]");
 
       # Per-service launchctl target domain, peer domain (user mode anti-dual-load),
       # and effective-domain reload-pending key. Resolved in pass 1 from literal
@@ -961,17 +1363,29 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
                           isvariable("service_launchd_domain[$(service_ids)]"),
                           strcmp("$(service_launchd_domain[$(service_ids)])", "user-background"));
 
+      "service_run_as_json[$(service_ids)]"
+        string => storejson("data:variables.tendcf_service[$(service_ids)][run_as]");
+
       "service_run_as[$(service_ids)]"
         string => "$(data:variables.tendcf_service[$(service_ids)][run_as])",
-        ifvarclass => isvariable("data:variables.tendcf_service[$(service_ids)][run_as]");
+        ifvarclass => and(isvariable("data:variables.tendcf_service[$(service_ids)][run_as]"),
+                          not(isvariable("service_run_as_json[$(service_ids)]")));
 
-      "service_run_as_display[$(service_ids)]"
-        string => "$(service_run_as[$(service_ids)])",
+      "service_run_as_san[$(service_ids)]"
+        string => regex_replace("$(service_run_as[$(service_ids)])", "[^A-Za-z0-9._:@/-]", "?", "g"),
         ifvarclass => isvariable("service_run_as[$(service_ids)]");
 
-      "service_run_as_display[$(service_ids)]"
+      "service_run_as_clean[$(service_ids)]"
+        string => string_head("$(service_run_as_san[$(service_ids)])", 64),
+        ifvarclass => isvariable("service_run_as_san[$(service_ids)]");
+
+      "service_run_as_clean[$(service_ids)]"
         string => "<missing>",
         ifvarclass => not(isvariable("data:variables.tendcf_service[$(service_ids)][run_as]"));
+
+      "service_run_as_clean[$(service_ids)]"
+        string => "<non-scalar>",
+        ifvarclass => isvariable("service_run_as_json[$(service_ids)]");
 
       "service_cmd0[$(service_ids)]"
         string => "$(data:variables.tendcf_service[$(service_ids)][command][0])",
@@ -1035,8 +1449,45 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         string => concat("^", escape("$(service_ids).plist"), "$");
 
   classes:
+      # Self-contained interlock and service-id structural guards (R1 C1/C2/M1):
+      # recomputed here as well as in tendcf_interlocks / tendcf_services so a
+      # direct call to tendcf_services_apply(...) still fails closed.
+      "tendcf_local_ilk_malformed_id"
+        expression => isgreaterthan(length("interlock_unsafe_ids"), 0);
+
+      "tendcf_local_ilk_id_collision"
+        expression => and(isgreaterthan(length("interlock_safe_ids"), 0),
+                          isgreaterthan(length("interlock_safe_ids"),
+                                        length("interlock_canon_unique")));
+
+      "tendcf_local_ilk_bad_bundle_shape_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => or(
+          not(isvariable("data:variables.tendcf_interlock[$(interlock_safe_ids)][bundle]")),
+          isvariable("interlock_bundle_json[$(interlock_safe_ids)]"),
+          not(isvariable("interlock_entry_json[$(interlock_safe_ids)]")));
+
+      "tendcf_local_ilk_bad_bundle_json_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => not(regcmp('(?s).*\n  "bundle": "[A-Za-z0-9._:@/-]{1,128}",?\n.*',
+                                 "$(interlock_entry_json[$(interlock_safe_ids)])")),
+        ifvarclass => isvariable("interlock_entry_json[$(interlock_safe_ids)]");
+
+      "tendcf_local_ilk_bad_bundle_val_$(interlock_safe_canon[$(interlock_safe_ids)])"
+        expression => not(regcmp("^[A-Za-z0-9._:@/-]{1,128}$",
+                                 "$(interlock_bundle_val[$(interlock_safe_ids)])")),
+        ifvarclass => isvariable("interlock_bundle_val[$(interlock_safe_ids)]");
+
+      "tendcf_local_ilk_malformed_bundle"
+        expression => classmatch("tendcf_local_ilk_bad_bundle_.*");
+
+      "tendcf_local_service_id_malformed"
+        expression => isgreaterthan(length("service_unsafe_ids"), 0);
+
       # Fail-closed service-id collision guards (must precede every actuation
-      # and probe class below).
+      # and probe class below). `tendcf_service_id_collision` is the bundle-wide
+      # fail-closed actuation gate checked by every probe/actuation/reload
+      # promise below, so it also incorporates any local or namespace gate
+      # refusal (CMDB, interlock id/collision/bundle, or malformed service id);
+      # the canon/case collision reports check their specific classes below.
       "tendcf_service_id_canon_collision"
         expression => and(isgreaterthan(length("service_ids"), 0),
                           isgreaterthan(length("service_ids"), length("service_canon_unique")));
@@ -1047,7 +1498,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
                           isgreaterthan(length("service_ids"), length("service_lower_unique")));
 
       "tendcf_service_id_collision"
-        expression => "tendcf_service_id_canon_collision|tendcf_service_id_case_collision";
+        expression => "tendcf_service_id_canon_collision|tendcf_service_id_case_collision|tendcf_cmdb_refused|tendcf_interlock_gate_refused|tendcf_service_id_malformed|tendcf_local_ilk_malformed_id|tendcf_local_ilk_id_collision|tendcf_local_ilk_malformed_bundle|tendcf_local_service_id_malformed";
 
       # state dispatch -- the one place this bundle inspects an entry's
       # value to pick a promise, which C-1 says belongs here and nowhere
@@ -1089,7 +1540,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # interlock_ok_* is final here: tendcf_interlocks ran to completion
       # before this bundle started (see the header).
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"
-        expression => "!interlock_ok_$(interlock_canon[$(interlock_ids)])";
+        expression => "!tendcf_service_id_collision.!interlock_ok_$(interlock_canon[$(interlock_ids)])";
 
       # Fail-closed flavour/host guard (linux-targets.md step 3). Two
       # adapters exist, each tied to the host that can run it: launchd on
@@ -1770,7 +2221,7 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # unit is on disk before the manager is told about it.
       "/usr/bin/systemctl"
         arglist => { "daemon-reload" },
-        ifvarclass => "tendcf_systemd_reload.!tendcf_cmdb_refused.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_systemd_reload.!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.!tendcf_service_id_malformed.!tendcf_service_id_collision";
 
       "/usr/bin/systemctl"
         arglist => { "enable", "$(service_ids)" },
@@ -1798,9 +2249,21 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
       # so a run that already reloaded for a render still reloads again.
       "/usr/bin/systemctl"
         arglist => { "--quiet", "daemon-reload" },
-        ifvarclass => "tendcf_systemd_unit_removed.!tendcf_cmdb_refused.!tendcf_service_id_collision";
+        ifvarclass => "tendcf_systemd_unit_removed.!tendcf_cmdb_refused.!tendcf_interlock_gate_refused.!tendcf_service_id_malformed.!tendcf_service_id_collision";
 
   reports:
+      "!tendcf_cmdb_refused.!tendcf_interlock_malformed_id.tendcf_local_ilk_malformed_id"::
+        "tendcf: interlock '$(interlock_unsafe_clean)' id is empty, too long (>128 chars), or contains bracket characters; refusing all service actuation";
+
+      "!tendcf_cmdb_refused.!tendcf_interlock_id_collision.tendcf_local_ilk_id_collision"::
+        "tendcf: interlock actuation refused: two or more interlock ids collide under canonify(); refusing all service actuation until ids are canonically unique";
+
+      "!tendcf_cmdb_refused.!tendcf_interlock_malformed_bundle.tendcf_local_ilk_malformed_bundle"::
+        "tendcf: interlock bundle is missing, non-string, or invalid ([A-Za-z0-9._:@/-]{1,128}); refusing all service actuation";
+
+      "!tendcf_cmdb_refused.(tendcf_service_id_malformed|tendcf_local_service_id_malformed)"::
+        "tendcf: service '$(service_unsafe_clean)' id is empty or contains bracket characters; refusing all service actuation";
+
       "tendcf_service_id_canon_collision"::
         "tendcf: service actuation refused: two or more service ids collide under canonify(); refusing all service actuation until ids are canonically unique";
 
@@ -1808,118 +2271,118 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         "tendcf: service actuation refused: two or more service ids collide case-insensitively on darwin (APFS); refusing all service actuation until ids are case-insensitively unique";
 
       "interlock_blocked_$(interlock_bundle_canon[$(interlock_ids)])"::
-        "tendcf: interlock '$(interlock_ids)' not satisfied, bundle '$(data:variables.tendcf_interlock[$(interlock_ids)][bundle])' refused";
+        "tendcf: interlock '$(interlock_clean[$(interlock_ids)])' not satisfied, bundle '$(interlock_bundle_clean[$(interlock_ids)])' refused";
 
       "tendcf_svc_reserved__$(service_canon[$(service_ids)]).tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_service_id_collision"::
-        "tendcf: service '$(service_ids)' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine";
 
       "tendcf_svc_reserved__$(service_canon[$(service_ids)]).tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_service_id_collision"::
-        "tendcf: service '$(service_ids)' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine";
 
       "tendcf_svc_reserved__$(service_canon[$(service_ids)]).!tendcf_svc_present__$(service_canon[$(service_ids)]).!tendcf_svc_absent__$(service_canon[$(service_ids)]).!tendcf_service_id_collision"::
-        "tendcf: service '$(service_ids)' refused: installer-owned unit (tendcf-install) cannot be managed by cfengine";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: installer-owned unit (tendcf-install) cannot be managed by cfengine";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])"::
         "tendcf: launchd service refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host"::
-        "tendcf: service '$(service_ids)' refused: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.!tendcf_svc_launchd_domain_valid__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: missing or invalid unit.launchd.domain (expected 'system', 'user-gui', or 'user-background')";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: missing or invalid unit.launchd.domain (expected 'system', 'user-gui', or 'user-background')";
 
       "tendcf_launchd_mode_system.tendcf_svc_launchd_domain_skipped__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' skipped: belongs to launchd '$(service_launchd_domain[$(service_ids)])' domain (this agent runs 'system')";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' skipped: belongs to launchd '$(service_launchd_domain_clean[$(service_ids)])' domain (this agent runs 'system')";
 
       "tendcf_launchd_mode_user.tendcf_svc_launchd_domain_skipped__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' skipped: belongs to launchd 'system' domain (this agent runs 'user-gui' and 'user-background')";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' skipped: belongs to launchd 'system' domain (this agent runs 'user-gui' and 'user-background')";
 
       "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)]).tendcf_svc_launchd_dom_user_gui__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' deferred: launchd 'gui/$(launchd_uid)' domain is unavailable (no active Aqua GUI login session); user-gui convergence skipped";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' deferred: launchd 'gui/$(launchd_uid)' domain is unavailable (no active Aqua GUI login session); user-gui convergence skipped";
 
       "tendcf_svc_launchd_deferred__$(service_canon[$(service_ids)]).tendcf_svc_launchd_dom_user_bg__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' deferred: launchd domain 'user/$(launchd_uid)' unavailable (no user domain)";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' deferred: launchd domain 'user/$(launchd_uid)' unavailable (no user domain)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_launchd_mode_system.!tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: system-domain service run_as '$(service_run_as_display[$(service_ids)])' is missing or invalid ([a-z_][a-z0-9_-]*, <=32 chars)";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: system-domain service run_as '$(service_run_as_clean[$(service_ids)])' is missing or invalid ([a-z_][a-z0-9_-]*, <=32 chars)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host.tendcf_svc_launchd_domain_match__$(service_canon[$(service_ids)]).tendcf_launchd_mode_user.!tendcf_svc_launchd_run_as_ok__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: user-domain service run_as '$(service_run_as_display[$(service_ids)])' does not match running user '$(launchd_run_user)'";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: user-domain service run_as '$(service_run_as_clean[$(service_ids)])' does not match running user '$(launchd_run_user)'";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)])"::
         "tendcf: systemd service refused: id is not a valid systemd service unit name ([A-Za-z0-9][A-Za-z0-9@._-]*.service, <=128 chars)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: systemd command[0] is missing or not a safe absolute non-directory path (must start with '/' and not end with '/')";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: systemd command[0] is missing or not a safe absolute non-directory path (must start with '/' and not end with '/')";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).!tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).!tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)])).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).darwin.!tendcf_launchd_host).!(tendcf_svc_launchd__$(service_canon[$(service_ids)]).tendcf_svc_launchd_id_valid__$(service_canon[$(service_ids)]).darwin.tendcf_launchd_host).!(tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere)"::
-        "tendcf: service '$(service_ids)' refused: unit flavour '$(unit_flavour[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: unit flavour '$(unit_flavour_clean[$(service_ids)])' is not implemented on this host ($(sys.flavour); adapters: launchd on darwin, systemd on a Linux host booted by systemd)";
 
       "tendcf_svc_refused__$(service_canon[$(service_ids)]).tendcf_svc_systemd__$(service_canon[$(service_ids)]).tendcf_svc_systemd_id_valid__$(service_canon[$(service_ids)]).tendcf_svc_systemd_cmd0_valid__$(service_canon[$(service_ids)]).tendcf_systemd_units_elsewhere"::
-        "tendcf: service '$(service_ids)' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are written by the system configuration (supervisor nixos), not by cfengine";
 
       "tendcf_svc_launchd_present_nonregular__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter writes only a regular plist";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: $(launchd_dir)/$(service_id_clean[$(service_ids)]).plist is not a regular file (a symlink, dangling link or directory); this adapter writes only a regular plist";
 
       "tendcf_svc_launchd_present_case_mismatch__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' refused: no exact-case entry '$(service_ids).plist' in $(launchd_dir) (case-insensitive filesystem mismatch); this adapter writes only an exact-case plist";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' refused: no exact-case entry '$(service_id_clean[$(service_ids)]).plist' in $(launchd_dir) (case-insensitive filesystem mismatch); this adapter writes only an exact-case plist";
 
       "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_gui_probe_failed"::
-        "tendcf: service '$(service_ids)' failed: launchctl print gui/$(launchd_uid) exited with unexpected error; user-domain convergence skipped";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl print gui/$(launchd_uid) exited with unexpected error; user-domain convergence skipped";
 
       "tendcf_launchd_mode_user.tendcf_svc_launchd_go__$(service_canon[$(service_ids)]).tendcf_launchd_user_probe_failed"::
-        "tendcf: service '$(service_ids)' failed: launchctl print user/$(launchd_uid) exited with unexpected error; user-domain convergence skipped";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl print user/$(launchd_uid) exited with unexpected error; user-domain convergence skipped";
 
       "tendcf_svc_launchd_peer_probe_failed__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' failed: launchctl print $(service_launchd_peer[$(service_ids)])/$(service_ids) exited with unexpected error; bootstrap not run";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl print $(service_launchd_peer[$(service_ids)])/$(service_id_clean[$(service_ids)]) exited with unexpected error; bootstrap not run";
 
       "tendcf_svc_launchd_peer_bootout_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' failed: launchctl bootout $(service_launchd_peer[$(service_ids)])/$(service_ids) exited non-zero; bootstrap not run";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl bootout $(service_launchd_peer[$(service_ids)])/$(service_id_clean[$(service_ids)]) exited non-zero; bootstrap not run";
 
       "tendcf_svc_plist_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' failed: could not render or set permissions on $(launchd_dir)/$(service_ids).plist; launchctl not run";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: could not render or set permissions on $(launchd_dir)/$(service_id_clean[$(service_ids)]).plist; launchctl not run";
 
       "tendcf_svc_launchd_bootout_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' failed: launchctl bootout $(service_launchd_target[$(service_ids)])/$(service_ids) exited non-zero; bootstrap not run";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl bootout $(service_launchd_target[$(service_ids)])/$(service_id_clean[$(service_ids)]) exited non-zero; bootstrap not run";
 
       "tendcf_svc_launchd_bootstrap_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' failed: launchctl bootstrap $(service_launchd_target[$(service_ids)]) $(launchd_dir)/$(service_ids).plist exited non-zero";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' failed: launchctl bootstrap $(service_launchd_target[$(service_ids)]) $(launchd_dir)/$(service_id_clean[$(service_ids)]).plist exited non-zero";
 
       "tendcf_svc_launchd_teardown_refused__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: $(launchd_dir)/$(service_ids).plist is not a regular file (a symlink, dangling link or directory); this adapter removes only a file it could have rendered";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone not actuated: $(launchd_dir)/$(service_id_clean[$(service_ids)]).plist is not a regular file (a symlink, dangling link or directory); this adapter removes only a file it could have rendered";
 
       "tendcf_svc_launchd_tombstone_case_mismatch__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: no exact-case entry '$(service_ids).plist' in $(launchd_dir) (case-insensitive filesystem mismatch)";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone not actuated: no exact-case entry '$(service_id_clean[$(service_ids)]).plist' in $(launchd_dir) (case-insensitive filesystem mismatch)";
 
       "tendcf_svc_launchd_tombstone_host_refused__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone not actuated: launchd domain/identity invalid, $(launchd_dir) is not a real directory, or $(launchctl_bin) is not executable on this host ($(sys.flavour))";
 
       "tendcf_launchd_mode_user.tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)]).tendcf_launchd_gui_probe_failed"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl print gui/$(launchd_uid) exited with unexpected error; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl print gui/$(launchd_uid) exited with unexpected error; plist left in place";
 
       "tendcf_launchd_mode_user.tendcf_svc_launchd_teardown__$(service_canon[$(service_ids)]).tendcf_launchd_user_probe_failed"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl print user/$(launchd_uid) exited with unexpected error; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl print user/$(launchd_uid) exited with unexpected error; plist left in place";
 
       "tendcf_svc_tombstone_probe_failed__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl print system/$(service_ids) exited with unexpected error; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl print system/$(service_id_clean[$(service_ids)]) exited with unexpected error; plist left in place";
 
       "tendcf_svc_launchd_teardown_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl bootout system/$(service_ids) exited non-zero; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl bootout system/$(service_id_clean[$(service_ids)]) exited non-zero; plist left in place";
 
       "tendcf_svc_tomb_gui_probe_failed__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl print gui/$(launchd_uid)/$(service_ids) exited with unexpected error; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl print gui/$(launchd_uid)/$(service_id_clean[$(service_ids)]) exited with unexpected error; plist left in place";
 
       "tendcf_svc_tomb_gui_bootout_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl bootout gui/$(launchd_uid)/$(service_ids) exited non-zero; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl bootout gui/$(launchd_uid)/$(service_id_clean[$(service_ids)]) exited non-zero; plist left in place";
 
       "tendcf_svc_tomb_user_probe_failed__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl print user/$(launchd_uid)/$(service_ids) exited with unexpected error; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl print user/$(launchd_uid)/$(service_id_clean[$(service_ids)]) exited with unexpected error; plist left in place";
 
       "tendcf_svc_tomb_user_bootout_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' tombstone failed: launchctl bootout user/$(launchd_uid)/$(service_ids) exited non-zero; plist left in place";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: launchctl bootout user/$(launchd_uid)/$(service_id_clean[$(service_ids)]) exited non-zero; plist left in place";
 
       "tendcf_svc_launchd_delete_failed__$(service_canon[$(service_ids)]).!opt_dry_run"::
-        "tendcf: service '$(service_ids)' tombstone failed: could not delete $(launchd_dir)/$(service_ids).plist";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone failed: could not delete $(launchd_dir)/$(service_id_clean[$(service_ids)]).plist";
 
       "tendcf_svc_launchd_tombstone_bad_id__$(service_canon[$(service_ids)])"::
         "tendcf: launchd tombstone refused: id is not a valid launchd label ([A-Za-z0-9][A-Za-z0-9@._-]*, <=128 chars)";
@@ -1928,10 +2391,10 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         "tendcf: systemd tombstone refused: id is not a valid systemd unit name ([A-Za-z0-9][A-Za-z0-9@._-]*.(service|socket|timer|path), <=128 chars)";
 
       "tendcf_svc_tombstone_elsewhere__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone not actuated: /etc/systemd/system is not a writable directory on this host ($(sys.flavour)); its units are the system configuration's (supervisor nixos)";
 
       "tendcf_svc_teardown_refused__$(service_canon[$(service_ids)])"::
-        "tendcf: service '$(service_ids)' tombstone not actuated: /etc/systemd/system/$(service_ids) is not a regular file (an alias, mask, dangling link or directory); this adapter removes only a file it could have rendered";
+        "tendcf: service '$(service_id_clean[$(service_ids)])' tombstone not actuated: /etc/systemd/system/$(service_id_clean[$(service_ids)]) is not a regular file (an alias, mask, dangling link or directory); this adapter removes only a file it could have rendered";
 }
 
 body contain tendcf_noshell
@@ -1954,9 +2417,9 @@ body contain tendcf_noshell_readonly
 
 body contain tendcf_interlock_contain(timeout)
 {
-      # noshell: cf-agent splits the joined pre_action string itself and
-      # execv()s it (see the comment on pre_action_cmd). Never "useshell":
-      # it would run the joined string through /bin/sh as root.
+      # noshell: cf-agent execv()s command[0] with arglist elements passed
+      # verbatim without a shell (see tendcf_interlocks / tendcf_interlock_run).
+      # Never "useshell": it would run the command through /bin/sh as root.
       useshell     => "noshell";
       exec_timeout => "$(timeout)";
 }

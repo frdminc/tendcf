@@ -58,8 +58,9 @@ live `host_specific.json` (running `python3 -I -S projector.py --check` and
 and refuse `tendcf_cmdb_refused` / `tendcf_cmdb_problem_*`, serialized with
 `flock` and atomic rollback on any post-publish failure or catchable
 interruption (`SIGTERM`/`SIGINT`; uncatchable `SIGKILL`/power loss does not run
-traps)). `run-once` is `cf-agent -K -I` over the
-installed `promises.cf`; run it again and it prints no repairs.
+traps)). `run-once` is `cf-agent --no-augments -K -I` over the
+installed `promises.cf` (and `cf-execd`'s `exec_command` passes
+`--no-augments` too); run it again and it prints no repairs.
 
 ## Stage B: let cf-execd run it
 

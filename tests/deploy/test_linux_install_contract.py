@@ -30,10 +30,32 @@ OK_CF_SCRIPT = (
 
 
 def _extract_func(src: str, name: str) -> str:
-    m = re.search(rf"^{re.escape(name)}\(\) \{{[^\n]*\n(.*?)^\}}", src, re.MULTILINE | re.DOTALL)
-    if m is None:
+    lines = src.splitlines(keepends=True)
+    header_re = re.compile(rf"^{re.escape(name)}\(\) \{{")
+    heredoc_re = re.compile(r"(?<!<)<<(?!<)-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+    start = None
+    for idx, line in enumerate(lines):
+        if header_re.match(line):
+            start = idx
+            break
+    if start is None:
         raise AssertionError(f"function {name}() not found in {INSTALLER}")
-    return m.group(0)
+    out: list[str] = []
+    heredoc_end: str | None = None
+    for line in lines[start:]:
+        out.append(line)
+        if heredoc_end is not None:
+            if line.rstrip("\r\n") == heredoc_end:
+                heredoc_end = None
+            continue
+        if not line.lstrip().startswith("#"):
+            hm = heredoc_re.search(line)
+            if hm is not None:
+                heredoc_end = hm.group(1)
+                continue
+        if line.rstrip("\r\n") == "}":
+            return "".join(out).rstrip("\r\n")
+    raise AssertionError(f"unterminated function {name}() in {INSTALLER}")
 
 
 def _make_linux_shims(shim_dir: Path, *, real_uid: bool = False) -> None:
@@ -1366,6 +1388,51 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             self.assertIn(str(paths["data"]), err)
             self.assertNotIn("removed unverified first-time data", err)
             self.assertTrue(paths["data"].exists())
+
+    def test_no_augments_on_cf_agent_entrypoints_only(self) -> None:
+        """Issue #59: cf-agent invocations pass --no-augments; cf-promises does not."""
+        place_fn = _extract_func(self.src, "place_policy")
+        self.assertIn(
+            'exec_command => "$(sys.cf_agent) --no-augments -f $(sys.inputdir)/promises.cf";',
+            place_fn,
+        )
+        run_once_fn = _extract_func(self.src, "cmd_run_once")
+        self.assertIn('"$cf_agent" --no-augments -K -I -f "$entry"', run_once_fn)
+
+        # cf-promises does not support --no-augments; confirm none of its calls pass it.
+        validate_fn = _extract_func(self.src, "validate_cmdb_workdir")
+        self.assertNotIn("--no-augments", validate_fn)
+        init_fn = _extract_func(self.src, "init_paths")
+        self.assertNotIn("--no-augments", init_fn)
+
+        # Hermetic behavioral check: cmd_run_once passes --no-augments to $cf_agent.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            args_log = root / "cf-agent.args"
+            fake_agent = root / "cf-agent"
+            fake_agent.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{args_log}\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            fake_agent.chmod(0o755)
+            entry = root / "promises.cf"
+            entry.write_text("bundle agent main {}\n", encoding="utf-8")
+            data = root / "host_specific.json"
+            data.write_text('{"vars":{}}\n', encoding="utf-8")
+            script = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                f'cf_lib_path="{root}"\n'
+                f'cf_agent="{fake_agent}"\n'
+                f'entry="{entry}"\n'
+                f'data="{data}"\n'
+                f"{run_once_fn}\n"
+                "cmd_run_once\n"
+            )
+            r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = args_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(argv, ["--no-augments", "-K", "-I", "-f", str(entry)])
 
 
 if __name__ == "__main__":

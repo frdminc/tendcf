@@ -194,7 +194,7 @@ signed release and runs CFEngine with `tendcf-validate` or tendcf-agent
 (map D45), never the compiler. (On Linux and macOS the
 validation is `tendcf-validate`, which is planned: it does not exist as a
 command yet, it has no directory in this tree (§2) and map D45 (3) builds
-it after schema v5. Any sentence below that relies on a Linux or macOS
+it after schema v5 (erratum: v5 has landed; the schema is currently at v9). Any sentence below that relies on a Linux or macOS
 device validating a goal file describes that planned design; the Android
 agent's state was not checked for this amendment.)
 

@@ -201,6 +201,99 @@ def test_projects_through_tendcf_projector(schemas: Schemas, projector) -> None:
     assert vars_["tendcf_service"]["com.tendcf.example.tailscaled"]["unit"]["launchd"]["domain"] == "system"
 
 
+def test_multi_interlock_argv_passthrough_and_projection(
+    schemas: Schemas, projector, lint
+) -> None:
+    """Issue #56 item 5: multi-interlock argv pass-through (shared + distinct bundles)."""
+    model = _model(SITE)
+    bundles = model.services.data["bundles"]
+    # Add a second interlock on the same bundle (`fleet-vpn`) with distinct argv,
+    # non-zero expect_exit, and custom timeout_seconds, plus a third interlock on
+    # a distinct active bundle (`edge-http`) using the full interlock_argv alphabet.
+    bundles["fleet-vpn"]["interlocks"].append(
+        {
+            "id": "tailscale-route-probe",
+            "description": "Verify route table check returns expected sentinel exit code.",
+            "pre_action": {
+                "command": ["/usr/local/bin/tailscale", "netcheck", "--format=json", "--verbose=1"],
+                "expect_exit": 2,
+                "timeout_seconds": 7,
+            },
+            "defines_class": "tailscale_route_ok",
+            "blocks": "enclosing-bundle",
+            "report": True,
+        }
+    )
+    bundles["edge-http"]["interlocks"] = [
+        {
+            "id": "edge-cert-fresh",
+            "description": "Verify TLS certificate file is readable before starting edge-http.",
+            "pre_action": {
+                "command": ["/usr/bin/test", "-r", "/etc/caddy/cert_v1.pem", "a+b:c=d,e@f-g"],
+                "expect_exit": 0,
+                "timeout_seconds": 5,
+            },
+            "defines_class": "edge_cert_ready",
+            "blocks": "enclosing-bundle",
+            "report": True,
+        }
+    ]
+    assert validate_site_model(model, schemas) == []
+
+    result = compile_host(model, _host(SITE), schemas)
+    doc = result.goal_file
+    assert schemas.errors("goal-file.schema.json", doc) == []
+    assert _cross_file_findings(lint, doc) == []
+
+    ilks = doc["domains"]["supervision"]["entries"]["interlock"]
+    assert set(ilks) == {
+        "tailscale-authenticated-before-lockdown",
+        "tailscale-route-probe",
+        "edge-cert-fresh",
+    }
+    assert ilks["tailscale-authenticated-before-lockdown"] == {
+        "state": "present",
+        "bundle": "fleet-vpn",
+        "pre_action": {
+            "command": ["/usr/local/bin/tailscale", "status", "--json"],
+            "expect_exit": 0,
+            "timeout_seconds": 15,
+        },
+        "defines_class": "tailscale_authenticated",
+        "blocks": "enclosing-bundle",
+        "report": True,
+    }
+    assert ilks["tailscale-route-probe"] == {
+        "state": "present",
+        "bundle": "fleet-vpn",
+        "pre_action": {
+            "command": ["/usr/local/bin/tailscale", "netcheck", "--format=json", "--verbose=1"],
+            "expect_exit": 2,
+            "timeout_seconds": 7,
+        },
+        "defines_class": "tailscale_route_ok",
+        "blocks": "enclosing-bundle",
+        "report": True,
+    }
+    assert ilks["edge-cert-fresh"] == {
+        "state": "present",
+        "bundle": "edge-http",
+        "pre_action": {
+            "command": ["/usr/bin/test", "-r", "/etc/caddy/cert_v1.pem", "a+b:c=d,e@f-g"],
+            "expect_exit": 0,
+            "timeout_seconds": 5,
+        },
+        "defines_class": "edge_cert_ready",
+        "blocks": "enclosing-bundle",
+        "report": True,
+    }
+
+    projected_raw = projector.project(json.loads(result.canonical))
+    assert projector.validate_projection(projected_raw) == []
+    projected_ilks = json.loads(projected_raw)["vars"]["tendcf_interlock"]
+    assert projected_ilks == ilks
+
+
 def test_pure_and_order_independent(schemas: Schemas) -> None:
     a = compile_host(_model(SITE), _host(SITE), schemas).canonical
     model = _model(SITE)

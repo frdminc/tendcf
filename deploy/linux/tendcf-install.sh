@@ -24,7 +24,7 @@
 #                    with atomic rollback on post-publish failure or catchable
 #                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss does
 #                    not run traps)
-#   run-once         one `cf-agent -K -I` pass over the installed policy
+#   run-once         one `cf-agent --no-augments -K -I` pass over the installed policy
 #   enable           install and start tendcf-execd.service (root cf-execd)
 #   disable          stop and remove it
 #   status           what is installed and running
@@ -490,7 +490,7 @@ body common control
 
 body executor control
 {
-      exec_command => "$(sys.cf_agent) -f $(sys.inputdir)/promises.cf";
+      exec_command => "$(sys.cf_agent) --no-augments -f $(sys.inputdir)/promises.cf";
 }
 EOF
     chmod 0644 "$entry.new"
@@ -916,7 +916,7 @@ cmd_install() {
 cmd_run_once() {
     [ -f "$entry" ] || die "not installed: run install first"
     [ -f "$data" ] || die "no CMDB data: run install --data FILE or data FILE first"
-    LD_LIBRARY_PATH="$cf_lib_path" "$cf_agent" -K -I -f "$entry"
+    LD_LIBRARY_PATH="$cf_lib_path" "$cf_agent" --no-augments -K -I -f "$entry"
 }
 
 cmd_enable() {
