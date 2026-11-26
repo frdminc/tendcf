@@ -1166,8 +1166,8 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertIn("SINK_QUARANTINE_PRESENT", codes)
 
     def test_r3_h1_write_ahead_partial_recovery_survives_crash_before_newline_seal(self) -> None:
-        # H1-R3 + Macroscope 4712973914: recovered_partials.jsonl pins (file, line, sha, len)
-        # BEFORE sealing '\n' on the daily file, without growing state.json.
+        # H1-R3 + Macroscope 4712973914/4713174933: atomic per-pin files in recovered_partials/
+        # are persisted BEFORE sealing '\n' on the daily file, without growing state.json.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
@@ -1188,9 +1188,14 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             with open(day_file, "ab") as fh:
                 fh.write(e2_bytes[:100])
 
-            # Simulate crash right after recovered_partials.jsonl pin write, BEFORE '\n' seal on daily file.
+            # Simulate crash right after atomic pin write, BEFORE '\n' seal on daily file.
             orig_append = audit._append_bytes_durable_in_dir
+            orig_write_json = audit._write_json_atomic_in_dir
             call_order: list[str] = []
+
+            def spy_write_json(dfd, name, payload, mode=0o600):
+                call_order.append(f"atomic:{name}")
+                return orig_write_json(dfd, name, payload, mode=mode)
 
             def crash_on_newline_seal(dfd, name, payload, mode=0o600):
                 call_order.append(f"append:{name}:{len(payload)}")
@@ -1198,6 +1203,7 @@ class TestR1AdversaryRegressions(unittest.TestCase):
                     raise OSError("simulated power loss before newline seal")
                 return orig_append(dfd, name, payload, mode=mode)
 
+            audit._write_json_atomic_in_dir = spy_write_json
             audit._append_bytes_durable_in_dir = crash_on_newline_seal
             try:
                 with self.assertRaises(OSError):
@@ -1208,13 +1214,12 @@ class TestR1AdversaryRegressions(unittest.TestCase):
                         stdin_bytes=e1_bytes + e2_bytes,
                         receive_ts="2026-11-26T12:00:10Z",
                     )
-                # Confirm quarantine witness and recovered_partials.jsonl pin were persisted BEFORE '\n' seal.
-                pin_idx = next(
-                    i for i, entry in enumerate(call_order) if entry.startswith("append:recovered_partials.jsonl:")
-                )
+                # Confirm atomic pin file was persisted BEFORE attempting '\n' seal.
+                pin_idx = call_order.index("atomic:2026-11-26.jsonl.2.json")
                 seal_idx = call_order.index("append:2026-11-26.jsonl:1")
                 self.assertLess(pin_idx, seal_idx)
             finally:
+                audit._write_json_atomic_in_dir = orig_write_json
                 audit._append_bytes_durable_in_dir = orig_append
 
             # Next retry completes the '\n' seal without duplicating pin/witness and commits e2.
@@ -1230,8 +1235,9 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertEqual(ack["accepted"], 1)
             q_lines = (sink_root / "pastebin" / "tendcf" / "quarantine.jsonl").read_text().splitlines()
             self.assertEqual(len(q_lines), 1)
-            rp_lines = (sink_root / "pastebin" / "tendcf" / "recovered_partials.jsonl").read_text().splitlines()
-            self.assertEqual(len(rp_lines), 1)
+            pin_dir = sink_root / "pastebin" / "tendcf" / "recovered_partials"
+            pin_files = sorted(p.name for p in pin_dir.iterdir())
+            self.assertEqual(pin_files, ["2026-11-26.jsonl.2.json"])
             st = json.loads((sink_root / "pastebin" / "tendcf" / "state.json").read_text())
             self.assertNotIn("recovered_partials", st)
 
@@ -1296,59 +1302,108 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertEqual(res_cap.remaining, 3)
             self.assertEqual(unbounded_calls, 0)
 
-    def test_recovered_partials_log_scales_past_state_json_cap(self) -> None:
-        # Macroscope 4712973914: recovered_partials.jsonl streams beyond MAX_LINE_BYTES (64 KiB)
-        # while keeping state.json small and verify_local_against_sink intact.
+    def test_recovered_partials_dir_scales_and_survives_interrupted_multi_pin_crash(self) -> None:
+        # Macroscope 4712973914 + 4713174933:
+        # 1. Atomic per-pin files scale past 64 KiB total without growing state.json.
+        # 2. A crash midway through writing multiple pins (leaving a torn .tmp file and only
+        #    a subset of pins renamed) recovers cleanly on the next ingest without wedging.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
             sink_root = root / "sink"
-            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-25T12:00:01Z", mono_ms=10)
             e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            e3 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:03Z", mono_ms=30)
             e1_bytes = audit.jcs_dumps(e1) + b"\n"
             e2_bytes = audit.jcs_dumps(e2) + b"\n"
+            e3_bytes = audit.jcs_dumps(e3) + b"\n"
 
             audit.run_forced_command(
                 sink_root=sink_root,
                 expected_host="pastebin",
                 expected_src="tendcf",
                 stdin_bytes=e1_bytes,
-                receive_ts="2026-11-26T12:00:05Z",
+                receive_ts="2026-11-25T12:00:05Z",
             )
-            sink_dir = sink_root / "pastebin" / "tendcf"
-            rp_path = sink_dir / "recovered_partials.jsonl"
-            # Pre-populate recovered_partials.jsonl with >70 KiB of historical partial pins (> MAX_LINE_BYTES).
-            dummy_sha = "sha256:" + ("a" * 64)
-            lines = [
-                audit.jcs_dumps(
-                    {
-                        "file": "2026-11-25.jsonl",
-                        "line": i,
-                        "raw_sha256": dummy_sha,
-                        "raw_len": 42,
-                    }
-                )
-                + b"\n"
-                for i in range(1, 650)
-            ]
-            rp_blob = b"".join(lines)
-            self.assertGreater(len(rp_blob), audit.MAX_LINE_BYTES)
-            rp_path.write_bytes(rp_blob)
-            os.chmod(rp_path, 0o600)
-
-            # Next sink append and local-vs-sink verify both succeed cleanly.
-            ack = audit.run_forced_command(
+            audit.run_forced_command(
                 sink_root=sink_root,
                 expected_host="pastebin",
                 expected_src="tendcf",
                 stdin_bytes=e2_bytes,
-                receive_ts="2026-11-26T12:00:10Z",
+                receive_ts="2026-11-26T12:00:05Z",
+            )
+            sink_dir = sink_root / "pastebin" / "tendcf"
+            # Leave unterminated partial tails on BOTH daily files simultaneously.
+            with open(sink_dir / "2026-11-25.jsonl", "ab") as fh:
+                fh.write(e3_bytes[:80])
+            with open(sink_dir / "2026-11-26.jsonl", "ab") as fh:
+                fh.write(e3_bytes[:90])
+
+            # Pre-populate >64 KiB worth of historical atomic pins + a leftover torn .tmp file.
+            rp_dir = sink_dir / "recovered_partials"
+            rp_dir.mkdir(mode=0o700)
+            dummy_sha = "sha256:" + ("a" * 64)
+            total_pin_bytes = 0
+            for i in range(1, 650):
+                p = rp_dir / f"2026-11-24.jsonl.{i}.json"
+                blob = audit.jcs_dumps(
+                    {
+                        "file": "2026-11-24.jsonl",
+                        "line": i,
+                        "raw_sha256": dummy_sha,
+                        "raw_len": 42,
+                    }
+                ) + b"\n"
+                p.write_bytes(blob)
+                os.chmod(p, 0o600)
+                total_pin_bytes += len(blob)
+            self.assertGreater(total_pin_bytes, audit.MAX_LINE_BYTES)
+            # Simulate a torn pre-rename temp file left by an earlier power loss.
+            torn_tmp = rp_dir / ".2026-11-26.jsonl.2.json.tmp.99999.0123456789abcdef"
+            torn_tmp.write_bytes(b'{"file":"2026-11-26.jsonl","line":2')
+            os.chmod(torn_tmp, 0o600)
+
+            # Simulate crash AFTER writing the first pin (2026-11-25) and BEFORE writing the second (2026-11-26).
+            orig_write_json = audit._write_json_atomic_in_dir
+
+            def crash_on_second_pin(dfd, name, payload, mode=0o600):
+                if name == "2026-11-26.jsonl.2.json":
+                    raise OSError("simulated power loss between multi-pin writes")
+                return orig_write_json(dfd, name, payload, mode=mode)
+
+            audit._write_json_atomic_in_dir = crash_on_second_pin
+            try:
+                with self.assertRaises(OSError):
+                    audit.run_forced_command(
+                        sink_root=sink_root,
+                        expected_host="pastebin",
+                        expected_src="tendcf",
+                        stdin_bytes=e3_bytes,
+                        receive_ts="2026-11-26T12:00:10Z",
+                    )
+                self.assertTrue((rp_dir / "2026-11-25.jsonl.2.json").exists())
+                self.assertFalse((rp_dir / "2026-11-26.jsonl.2.json").exists())
+            finally:
+                audit._write_json_atomic_in_dir = orig_write_json
+
+            # Next retry tolerates the leftover torn .tmp file, reuses the first pin idempotently,
+            # persists the second pin, seals both daily files, and commits e3 cleanly.
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e3_bytes,
+                receive_ts="2026-11-26T12:00:15Z",
             )
             self.assertTrue(ack["ok"])
-            self.assertEqual(ack["last_seq"], 2)
+            self.assertEqual(ack["last_seq"], 3)
+            self.assertTrue((rp_dir / "2026-11-26.jsonl.2.json").exists())
             self.assertLess((sink_dir / "state.json").stat().st_size, 512)
             ver = audit.verify_local_against_sink(spool.log_path, sink_dir, expected_host="pastebin")
-            self.assertTrue(ver.ok, f"unexpected findings: {ver.findings}")
+            codes = {f.code for f in ver.findings}
+            self.assertNotIn("SINK_CORRUPT", codes)
+            self.assertNotIn("SINK_STATE_MISMATCH", codes)
+            self.assertIn("SINK_QUARANTINE_PRESENT", codes)
 
     def test_r3_m1_cursor_zero_seq_nonzero_offset_and_advance_ack_chain_check(self) -> None:
         # M1-R3 (1): acked_seq == 0 with nonzero acked_offset must raise ChainTamperError.

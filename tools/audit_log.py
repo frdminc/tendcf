@@ -1982,7 +1982,53 @@ def _iter_sink_day_names(dir_fd: int) -> list[str]:
     return [name for _, name in entries]
 
 
-RECOVERED_PARTIALS_NAME = "recovered_partials.jsonl"
+RECOVERED_PARTIALS_DIR = "recovered_partials"
+RECOVERED_PARTIAL_FILE_RE = re.compile(
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl)\.([1-9][0-9]*)\.json$"
+)
+RECOVERED_PARTIAL_TMP_RE = re.compile(
+    r"^\.[0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl\.[1-9][0-9]*\.json\.tmp\.[0-9]+\.[0-9a-f]{16}$"
+)
+
+
+def _open_child_dir_fd(
+    parent_fd: int, name: str, *, create: bool = False, require_private: bool = False
+) -> int | None:
+    """Open (optionally create) a direct child directory inside `parent_fd` without following symlinks."""
+    if not name or "/" in name or name in (".", "..") or "\x00" in name:
+        raise AuditFileSecurityError(f"unsafe child directory name: {name!r}")
+    created = False
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            return None
+        raise
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise AuditFileSecurityError(f"refusing symlink or non-directory: {name}") from exc
+        raise
+    try:
+        st_fd = os.fstat(child_fd)
+        if not stat.S_ISDIR(st_fd.st_mode):
+            raise AuditFileSecurityError(f"opened descriptor is not a directory: {name}")
+        if created:
+            os.fchmod(child_fd, 0o700)
+            _fsync_dir_fd(parent_fd)
+            st_fd = os.fstat(child_fd)
+        if require_private:
+            _verify_private_dir_mode(st_fd, Path(name))
+        return child_fd
+    except BaseException:
+        os.close(child_fd)
+        raise
 
 
 def _parse_recovered_partial_item(item: Any) -> tuple[tuple[str, int], tuple[str, int]]:
@@ -2009,9 +2055,12 @@ def _parse_recovered_partial_item(item: Any) -> tuple[tuple[str, int], tuple[str
 
 
 def _load_recovered_partials_in_dir(
-    dir_fd: int, legacy_state_obj: dict[str, Any] | None = None
+    dir_fd: int,
+    legacy_state_obj: dict[str, Any] | None = None,
+    *,
+    require_private: bool = False,
 ) -> dict[tuple[str, int], tuple[str, int]]:
-    """Stream recovered partial-write pins from `recovered_partials.jsonl` (unbounded, no 64 KiB cap)."""
+    """Load atomic per-pin files from `recovered_partials/` (unbounded, crash-safe, no 64 KiB cap)."""
     out: dict[tuple[str, int], tuple[str, int]] = {}
     if legacy_state_obj is not None and legacy_state_obj.get("recovered_partials") is not None:
         raw_list = legacy_state_obj["recovered_partials"]
@@ -2022,16 +2071,39 @@ def _load_recovered_partials_in_dir(
             if key in out and out[key] != val:
                 raise ChainTamperError(f"conflicting recovered_partials pin for {key[0]}:{key[1]}")
             out[key] = val
+    rp_dfd = _open_child_dir_fd(
+        dir_fd, RECOVERED_PARTIALS_DIR, create=False, require_private=require_private
+    )
+    if rp_dfd is None:
+        return out
     try:
-        for _, line, _, _ in _iter_regular_lines_in_dir(dir_fd, RECOVERED_PARTIALS_NAME):
-            key, val = _parse_recovered_partial_item(strict_json_loads(line))
+        for name in sorted(os.listdir(rp_dfd)):
+            st = os.lstat(name, dir_fd=rp_dfd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise AuditFileSecurityError(
+                    f"{RECOVERED_PARTIALS_DIR}/{name} is symlink or non-regular"
+                )
+            if RECOVERED_PARTIAL_TMP_RE.match(name):
+                # Interrupted pre-rename temp file from _write_json_atomic_in_dir; safe to ignore.
+                continue
+            m = RECOVERED_PARTIAL_FILE_RE.match(name)
+            if not m:
+                raise ChainTamperError(f"unexpected file in {RECOVERED_PARTIALS_DIR}: {name}")
+            expected_key = (m.group(1), int(m.group(2)))
+            try:
+                raw = _read_small_regular_in_dir(rp_dfd, name, max_bytes=4096)
+                key, val = _parse_recovered_partial_item(strict_json_loads(raw.rstrip(b"\n")))
+            except AuditValidationError as exc:
+                raise ChainTamperError(f"{RECOVERED_PARTIALS_DIR}/{name} corrupt: {exc}") from exc
+            if key != expected_key:
+                raise ChainTamperError(
+                    f"{RECOVERED_PARTIALS_DIR}/{name} disagrees with payload key {key[0]}:{key[1]}"
+                )
             if key in out and out[key] != val:
                 raise ChainTamperError(f"conflicting recovered_partials pin for {key[0]}:{key[1]}")
             out[key] = val
-    except FileNotFoundError:
-        return out
-    except AuditValidationError as exc:
-        raise ChainTamperError(f"{RECOVERED_PARTIALS_NAME} corrupt: {exc}") from exc
+    finally:
+        os.close(rp_dfd)
     return out
 
 
@@ -2138,7 +2210,9 @@ class AuditSink:
                 or raw_state["last_seq"] > MAX_SAFE_INT
             ):
                 raise ChainTamperError("sink state.json invalid last_seq")
-        recovered_partials = _load_recovered_partials_in_dir(dir_fd, raw_state)
+        recovered_partials = _load_recovered_partials_in_dir(
+            dir_fd, raw_state, require_private=True
+        )
 
         committed_list, unterminated = _load_sink_committed_records_in_dir(
             dir_fd,
@@ -2199,16 +2273,17 @@ class AuditSink:
                         break
                 state_dirty = True
 
-        # Write-ahead append-only recovery for any interrupted partial trailing write on a
-        # daily file (crash-safe at every syscall boundary, chattr +a compatible, and
-        # scalable without growing state.json beyond MAX_LINE_BYTES):
-        # 1. Verify against existing pin or build new pin + quarantine witness.
-        # 2. Durably append witness to `quarantine.jsonl` and pin to `recovered_partials.jsonl`
-        #    (and persist state.json if dirty) BEFORE sealing `day_name` with '\n'.
+        # Write-ahead atomic per-pin recovery for any interrupted partial trailing write on
+        # daily files (crash-safe at every syscall boundary, chattr +a compatible on daily
+        # logs, and scalable without growing state.json beyond MAX_LINE_BYTES):
+        # 1. Verify against existing pin or build new atomic pin + quarantine witness.
+        # 2. Durably append witness to `quarantine.jsonl`, atomically persist each pin file
+        #    `recovered_partials/<day>.<lineno>.json` (temp + fsync + os.replace + dir fsync),
+        #    and persist state.json if dirty — all BEFORE sealing `day_name` with '\n'.
         # 3. Append '\n' to seal each unterminated daily file.
         if unterminated:
             partials_map = dict(recovered_partials)
-            new_pin_lines: list[bytes] = []
+            new_pins: list[tuple[str, dict[str, Any]]] = []
             new_witnesses: list[bytes] = []
             for day_name, lineno, tail_bytes in unterminated:
                 tail_sha = f"sha256:{hashlib.sha256(tail_bytes).hexdigest()}"
@@ -2227,7 +2302,7 @@ class AuditSink:
                     "raw_sha256": tail_sha,
                     "raw_len": tail_len,
                 }
-                new_pin_lines.append(jcs_dumps(pin_entry) + b"\n")
+                new_pins.append((f"{day_name}.{lineno}.json", pin_entry))
                 partials_map[(day_name, lineno)] = (tail_sha, tail_len)
                 new_witnesses.append(
                     self._build_quarantine_line(
@@ -2242,10 +2317,16 @@ class AuditSink:
                 _append_bytes_durable_in_dir(
                     dir_fd, self.quarantine_name, b"".join(new_witnesses), mode=0o600
                 )
-            if new_pin_lines:
-                _append_bytes_durable_in_dir(
-                    dir_fd, RECOVERED_PARTIALS_NAME, b"".join(new_pin_lines), mode=0o600
+            if new_pins:
+                rp_dfd = _open_child_dir_fd(
+                    dir_fd, RECOVERED_PARTIALS_DIR, create=True, require_private=True
                 )
+                assert rp_dfd is not None
+                try:
+                    for pin_name, pin_entry in new_pins:
+                        _write_json_atomic_in_dir(rp_dfd, pin_name, pin_entry, mode=0o600)
+                finally:
+                    os.close(rp_dfd)
             if state_dirty:
                 _write_json_atomic_in_dir(dir_fd, self.state_name, obj, mode=0o600)
                 state_dirty = False
