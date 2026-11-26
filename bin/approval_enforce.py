@@ -110,6 +110,7 @@ KEY_ID_RE = re.compile(r"^ed25519:[0-9a-f]{64}\Z")
 ED25519_SIG_RE = re.compile(r"^ed25519-sig:[0-9a-f]{128}\Z")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
 RAW_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
+ACTUATION_ID_RE = re.compile(r"^[0-9a-f]{32}\Z")
 GRANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 NONCE_RE = re.compile(r"^[!-~]{22,128}\Z")
 UTC_TS_RE = re.compile(
@@ -1071,7 +1072,7 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
             not isinstance(pa, dict)
             or set(pa) != {"actuation_id", "proposed_sha256", "proposed_goal", "baseline_sha256"}
             or not isinstance(pa["actuation_id"], str)
-            or not pa["actuation_id"]
+            or not ACTUATION_ID_RE.match(pa["actuation_id"])
             or not isinstance(pa["proposed_sha256"], str)
             or not SHA256_RE.match(pa["proposed_sha256"])
             or not isinstance(pa["proposed_goal"], dict)
@@ -1129,6 +1130,7 @@ class ReplayStore:
         self._lock_depth: int = 0
         self._lock_fd: int | None = None
         self._in_actuation_tx: bool = False
+        self._pending_actuation_observed_utc: datetime.datetime | None = None
         self.write_count: int = 0
         self.nonce_consume_count: int = 0
         self._seen_nonces_memory: set[str] = set()
@@ -2011,6 +2013,16 @@ def check_standing_migration_invariants(
             "migration_mutated_device_trust",
             "migration alters device-trust content (including defaults/types); requires per-change owner record",
         )
+    # schema/goal-diff.schema.json:29: a standalone version_bump is valid ONLY when the baseline
+    # rendered at `new` differs from the baseline in `schema_version` only; any added/changed
+    # content (even outside device-trust) requires a per-change re-adoption!
+    base_without_ver = {k: v for k, v in baseline_goal.items() if k != "schema_version"}
+    migrated_without_ver = {k: v for k, v in migrated.items() if k != "schema_version"}
+    if not jcs_equal(base_without_ver, migrated_without_ver):
+        raise ScopeError(
+            "migration_adds_or_changes_content",
+            "standing migration may only change schema_version; content additions/changes require re-adoption",
+        )
     if not hmac.compare_digest(canonical_sha256(migrated), canonical_sha256(proposed_goal)):
         raise ScopeError(
             "migration_content_mismatch",
@@ -2204,14 +2216,23 @@ class ApprovalEnforcer:
             before_apply_hook()
 
         self.store._in_actuation_tx = True
+        self.store._pending_actuation_observed_utc = None
         try:
             if self._apply_callback is not None:
                 self._apply_callback(copy.deepcopy(proposed_goal))
+            stashed_utc = self.store._pending_actuation_observed_utc
         finally:
             self.store._in_actuation_tx = False
+            self.store._pending_actuation_observed_utc = None
 
-        # Reload fresh state after callback, publish confirmed baseline, clear pending_actuation.
+        # Reload fresh state after callback, publish confirmed baseline, flush stashed UTC, clear pending_actuation.
         fresh = self.store.load_verified_unlocked()
+        if stashed_utc is not None:
+            fresh_last = fresh.get("last_seen_utc")
+            if fresh_last is None or stashed_utc > _parse_internal_utc_timestamp(
+                fresh_last, field="last_seen_utc"
+            ):
+                self._advance_utc_clock(fresh, stashed_utc)
         fresh["applied_baseline_goal"] = copy.deepcopy(proposed_goal)
         fresh["applied_baseline_sha256"] = proposed_sha256
         fresh["pending_actuation"] = None
@@ -2223,9 +2244,9 @@ class ApprovalEnforcer:
         self, actuation_id: str, *, applied_on_device: bool
     ) -> dict[str, Any]:
         """Reconcile a specific crash/error-interrupted actuation intent against real device state (Codex R2 #1, R3 #3)."""
-        if not isinstance(actuation_id, str) or not actuation_id:
+        if not isinstance(actuation_id, str) or not ACTUATION_ID_RE.match(actuation_id):
             raise MalformedRecordError(
-                "invalid_actuation_id", "actuation_id must be a non-empty string"
+                "invalid_actuation_id", "actuation_id must be a 32-char lowercase hex string"
             )
         if not _is_exact_bool(applied_on_device):
             raise MalformedRecordError(
@@ -2395,6 +2416,22 @@ class ApprovalEnforcer:
             if state["voided"]:
                 return False
             self._check_utc_clock_monotonic(state, now_dt)
+            prev_last_str = state.get("last_seen_utc")
+            prev_last_dt = (
+                _parse_internal_utc_timestamp(prev_last_str, field="last_seen_utc")
+                if prev_last_str is not None
+                else None
+            )
+            if (
+                self.store._in_actuation_tx
+                and self.store._pending_actuation_observed_utc is not None
+                and now_dt < self.store._pending_actuation_observed_utc
+            ):
+                raise ClockRollbackError(
+                    "utc_clock_rollback",
+                    f"UTC clock moved backward during actuation: now {format_utc_timestamp(now_dt)} < "
+                    f"observed {format_utc_timestamp(self.store._pending_actuation_observed_utc)}",
+                )
             indicator_on = False
             observed_expired = False
             for grant in state["grants"].values():
@@ -2407,12 +2444,18 @@ class ApprovalEnforcer:
                     continue
                 if scope.get("developer_mode") is True:
                     indicator_on = True
-            if observed_expired:
-                if self.store._in_actuation_tx:
-                    raise ReplayError(
-                        "expiry_observation_during_actuation",
-                        "cannot expose observed grant expiry during an actuation callback without persisting watermark",
-                    )
+            if observed_expired and self.store._in_actuation_tx:
+                raise ReplayError(
+                    "expiry_observation_during_actuation",
+                    "cannot expose observed grant expiry during an actuation callback without persisting watermark",
+                )
+            should_advance = prev_last_dt is None or now_dt > prev_last_dt
+            if self.store._in_actuation_tx:
+                if should_advance:
+                    stashed = self.store._pending_actuation_observed_utc
+                    if stashed is None or now_dt > stashed:
+                        self.store._pending_actuation_observed_utc = now_dt
+            elif observed_expired or should_advance:
                 self._record_observed_expiry_unlocked(state, now_dt)
             return indicator_on
 

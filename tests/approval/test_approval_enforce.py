@@ -3522,6 +3522,12 @@ class TestSectionGR3ReconciliationAndEvidence(_EnforcerTestBase):
         act_id_2 = self.store.snapshot()["pending_actuation"]["actuation_id"]
         self.assertNotEqual(act_id_1, act_id_2)
 
+        # Non-ASCII / malformed actuation_id raises MalformedRecordError (never TypeError from hmac.compare_digest)!
+        for bad_aid in ("not-hex", "caf\u00e9" + "0" * 28, "A" * 32, "0" * 31):
+            with self.assertRaises(AE.MalformedRecordError) as ctx_bad_aid:
+                enf.reconcile_pending_actuation(bad_aid, applied_on_device=True)
+            self.assertEqual(ctx_bad_aid.exception.code, "invalid_actuation_id")
+
         # Delayed Worker A sends stale act_id_1 -> REFUSED with actuation_id_mismatch; act_id_2 remains pending!
         writes_before = self.store.write_count
         with self.assertRaises(AE.ReplayError) as ctx_stale:
@@ -3613,6 +3619,112 @@ class TestSectionGR3ReconciliationAndEvidence(_EnforcerTestBase):
                     raw, proposed_goal=prop_up, diff=diff_up, is_readoption=True, now_utc=T0
                 )
                 self.assertEqual(res.decision, "rejected" if verdict == "reject" else "withdrawn")
+
+    def test_r4_bot_p1_standing_migration_adding_service_content_refused(self) -> None:
+        # P1 (4709811340): per schema/goal-diff.schema.json:29, a standalone version_bump
+        # migration is valid ONLY when migrated baseline differs in schema_version only.
+        # Even if migrate_fn preserves device-trust identically, adding a service requires re-adoption!
+        _, base_nonce, _ = self.enroll_active(grant_id="mig-add-g", grant_class="baseline")
+
+        def migrate_adding_service(doc: dict[str, Any], target_ver: int) -> dict[str, Any]:
+            out = copy.deepcopy(doc)
+            out["schema_version"] = target_ver
+            out["domains"]["supervision"] = {
+                "coverage": "comprehensive",
+                "entries": {
+                    "service": {
+                        "com.tendcf.smuggled.svc": {
+                            "bundle": "demo",
+                            "command": ["/usr/bin/true"],
+                            "run_as": "nobody",
+                            "state": "present",
+                            "unit": {"launchd": {"domain": "system", "keep_alive": False, "run_at_load": True}},
+                            "working_dir": "/",
+                        }
+                    }
+                },
+            }
+            return out
+
+        prop_smug = migrate_adding_service(self.baseline, 10)
+        diff_smug = AE.compute_authoritative_diff(self.baseline, prop_smug, KEY_HOST)
+        app_smug = self.make_app_bytes(
+            grant_id="mig-add-g",
+            generation=1,
+            application_seq=1,
+            enrollment_nonce=base_nonce,
+            proposed=prop_smug,
+            ceremony_class="baseline",
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_add:
+            self.enforcer.process_standing_application(
+                app_smug,
+                proposed_goal=prop_smug,
+                diff=diff_smug,
+                now_utc=T0,
+                migrate_fn=migrate_adding_service,
+                device_trust_comparable=True,
+            )
+        self.assertEqual(ctx_add.exception.code, "migration_adds_or_changes_content")
+        self.assertEqual(self.store.snapshot()["grants"]["mig-add-g"]["application_seq_mark"], 0)
+
+    def test_r4_bot_p2_indicator_advances_utc_watermark_before_expiry_and_flushes_from_callback(self) -> None:
+        # P2 (4709811350): Enrolling at 12:00 (expiry 12:10), reading indicator at 12:09
+        # (still live!), then rolling clock back to 12:01 MUST fail closed with utc_clock_rollback!
+        t_1200 = datetime.datetime(2026, 11, 26, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        t_1201 = datetime.datetime(2026, 11, 26, 12, 1, 0, tzinfo=datetime.timezone.utc)
+        t_1209 = datetime.datetime(2026, 11, 26, 12, 9, 0, tzinfo=datetime.timezone.utc)
+        t_1210_str = "2026-11-26T12:10:00Z"
+
+        raw_dev, dev_nonce, _ = self.enroll_active(
+            grant_id="dev-wm",
+            covered_signers=[KEY_DEV],
+            developer_mode=True,
+            not_after=t_1210_str,
+            now_utc=t_1200,
+        )
+        # Option B identical redelivery remains strictly zero-write!
+        w_optb = self.store.write_count
+        self.enforcer.process_enrollment(raw_dev, now_utc=t_1200)
+        self.assertEqual(self.store.write_count, w_optb)
+
+        # Read indicator at 12:09 (before 12:10 expiry): still True AND durably advances last_seen_utc to 12:09!
+        self.assertTrue(self.enforcer.developer_mode_indicator_active(t_1209))
+        self.assertEqual(self.store.snapshot()["last_seen_utc"], "2026-11-26T12:09:00Z")
+
+        # Rolling clock back to 12:01 (even though > 12:00 enroll and < 12:10 expiry) MUST fail closed!
+        prop1, diff1 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.wm1")
+        app1 = self.make_app_bytes(
+            grant_id="dev-wm",
+            generation=1,
+            application_seq=1,
+            enrollment_nonce=dev_nonce,
+            proposed=prop1,
+            signer_seed=SEED_DEV,
+            signer_key=KEY_DEV,
+        )
+        with self.assertRaises(AE.ClockRollbackError) as ctx_rb:
+            self.enforcer.process_standing_application(
+                app1, proposed_goal=prop1, diff=diff1, now_utc=t_1201
+            )
+        self.assertEqual(ctx_rb.exception.code, "utc_clock_rollback")
+
+        # Also verify non-expired indicator read inside _apply_callback stashes forward UTC
+        # and flushes it into the baseline publication commit!
+        t_120930 = datetime.datetime(2026, 11, 26, 12, 9, 30, tzinfo=datetime.timezone.utc)
+        t_120915 = datetime.datetime(2026, 11, 26, 12, 9, 15, tzinfo=datetime.timezone.utc)
+        cb_seen: list[bool] = []
+
+        def forward_ind_cb(_goal: dict[str, Any]) -> None:
+            cb_seen.append(self.enforcer.developer_mode_indicator_active(t_120930))
+
+        enf_cb = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=forward_ind_cb)
+        res = enf_cb.process_standing_application(app1, proposed_goal=prop1, diff=diff1, now_utc=t_1209)
+        self.assertEqual(res.decision, "applied")
+        self.assertEqual(cb_seen, [True])
+        self.assertEqual(self.store.snapshot()["last_seen_utc"], "2026-11-26T12:09:30Z")
+        with self.assertRaises(AE.ClockRollbackError):
+            enf_cb.developer_mode_indicator_active(t_120915)
 
 
 if __name__ == "__main__":
