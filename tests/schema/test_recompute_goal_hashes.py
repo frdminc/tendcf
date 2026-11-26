@@ -329,12 +329,13 @@ class RecomputeGoalHashesTests(unittest.TestCase):
                 self.assertTrue(flags & os.O_DIRECTORY)
                 self.assertTrue(flags & os.O_NOFOLLOW)
 
-            # 2. Regular-file reads use dir_fd + O_NOFOLLOW with bare names.
+            # 2. Regular-file reads use dir_fd + O_NOFOLLOW | O_NONBLOCK with bare names.
             self.assertTrue(read_opens)
             for name, flags, dfd in read_opens:
                 self.assertNotIn("/", name)
                 self.assertIsNotNone(dfd)
                 self.assertTrue(flags & os.O_NOFOLLOW)
+                self.assertTrue(flags & os.O_NONBLOCK)
 
             # 3. Exclusive sibling temp creation uses O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, mode 0o600, dir_fd.
             self.assertEqual(len(tmp_opens), len(changes))
@@ -485,6 +486,30 @@ class RecomputeGoalHashesTests(unittest.TestCase):
             self.assertEqual(mod.recompute_hashes(tmp_root, write=False), [])
             leftovers = list((tmp_root / "examples").rglob("*.tmp"))
             self.assertEqual(leftovers, [], f"leftover temp files found: {leftovers}")
+
+    def test_rejects_fifo_without_blocking(self) -> None:
+        mod = _load_module()
+        with tempfile.TemporaryDirectory(prefix="tendcf-recompute-fifo-") as td:
+            tmp_root = Path(td)
+            shutil.copytree(REPO_ROOT / "examples", tmp_root / "examples")
+            fifo_path = tmp_root / "examples" / "goal-diff.json"
+            fifo_path.unlink()
+            os.mkfifo(fifo_path, 0o600)
+
+            # Bounded CLI check proves immediate fail-closed rejection with no writer.
+            r = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), "--root", str(tmp_root), "--check"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("non-regular file", r.stderr.lower())
+
+            # Direct API call also rejects immediately with ValueError.
+            with self.assertRaisesRegex(ValueError, "non-regular file"):
+                mod.recompute_hashes(tmp_root, write=False)
 
     def test_malformed_top_level_fixture_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tendcf-recompute-badtop-") as td:

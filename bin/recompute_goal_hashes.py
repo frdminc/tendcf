@@ -71,6 +71,7 @@ HASH_FIELDS = ("baseline_sha256", "proposed_sha256")
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 def _load_bundled_jcs_dumps():
@@ -148,7 +149,7 @@ def _read_regular_file_at(dfd: int, name: str, display: Path) -> tuple[bytes, in
     """
     if "/" in name or name in ("", ".", ".."):
         raise ValueError(f"invalid filename {name!r} at {display}")
-    flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
     try:
         fd = os.open(name, flags, dir_fd=dfd)
     except OSError as exc:
