@@ -315,19 +315,22 @@ root-owned JCS-projected `host_specific.json`). `overlay-build` in
 -fno-sanitize-recover=all`) and asserts `libasan` / `__ubsan_` binary linkage.
 
 **Errata (2026-11-26, issue #118, RFC-8259 strict-JSON tightening).** The fork
-pin in `overlay/fork.json` moved from `75dee108` to `f3f27dc04` (`libntech`
-submodule `638510a` -> `015bb0e6`), and the `libntech` overlay grew from 8 to 9
-patches on the same pinned base: `overlay/libntech/0009` (`4fd5cf42`, fork PR
+pin in `overlay/fork.json` moved from `75dee108` to `aee51485` (`libntech`
+submodule `638510a` -> `7bab503a`), and the `libntech` overlay grew from 8 to 9
+patches on the same pinned base: `overlay/libntech/0009` (`641f8120`, fork PR
 [djbclark/libntech#14](https://github.com/djbclark/libntech/pull/14), branch
-`fix/json-strict-parse-rfc8259`; `libntech` 9 patches -> tree `0abcc6fe6a7e`).
+`fix/json-strict-parse-rfc8259`; `libntech` 9 patches -> tree `e29ed2037175`).
 This closes all six residual non-RFC-8259 lenient inheritances tracked in
 [#118](https://github.com/frdminc/tendcf/issues/118) (leading/trailing commas,
 missing array commas, raw `0x01`–`0x1f` controls in strings, unrecognized
 escapes and malformed `\u`/unpaired UTF-16 surrogates, leading zeros after unary
 minus `-00`/`-01`, and unkeyed Jenkins OAAT hashing via a `/dev/urandom`-salted
-seed plus a 65,536-member object cap), along with decimal points after exponents
-(`1e2.3`) and `O(1)` `strncmp` replacing `StringStartsWith()` for
-`true`/`false`/`null`, while preserving lenient `JsonParse*()`.
+seed plus a 65,536-member object cap), adds strict-mode RFC 3629 UTF-8
+validation (`JSON_PARSE_ERROR_STRING_INVALID_UTF8`) for raw bytes in strings,
+rejects decimal points after exponents (`1e2.3`) unconditionally in both strict
+and lenient modes (preventing `StringToDouble` `SIGABRT`), and uses `O(1)`
+`strncmp` replacing `StringStartsWith()` for `true`/`false`/`null`, while
+otherwise preserving lenient `JsonParse*()`.
 
 **What is verified and what is not.** The tree equalities above and the
 `apply`/`check` runs are mechanical and were run. The patched tree builds and

@@ -82,7 +82,7 @@ jobs:
   # Upstream cfengine/core and libntech at the overlay bases plus the overlay
   # (docs/architecture/upstream-overlay.md §4, §7), not the pinned fork. It is
   # the proof that the overlay's all-or-nothing loader (overlay/core/0002..0004)
-  # and the strict JSON parse (overlay/libntech/0005..0008) build (both plain
+  # and the strict JSON parse (overlay/libntech/0005..0009) build (both plain
   # debug and ASan/UBSan/LSan for json_test and cmdb_test, issue #69), and that
   # the loader's unit and acceptance tests and run.sh (TENDCF_REQUIRE_FORK_LOADER=1;
   # its check 4b probes the loader and fails on any build that kept a

@@ -143,7 +143,7 @@
 #      container that is a list of strings is the positive control: accepted,
 #      actuates. A plain-identifier key longer than 64 characters is refused and
 #      its report line shows only the first 64. Every file of checks 2-8 and 6 is also a no-report control.
-#      NB: the fork at the pin (overlay/fork.json, core f3f27dc04; previously 75dee108 / 4443504) loads
+#      NB: the fork at the pin (overlay/fork.json, core aee51485; previously 75dee108 / 4443504) loads
 #      all-or-nothing (PR #41, operator ruling R13): a file in which an entry is
 #      invalid, a class cannot be inserted, a `vars` member or section is
 #      repeated, or non-whitespace follows the document, installs none of its
@@ -158,7 +158,7 @@
 #      tests/policy/fixtures/loader-*.json plus inline Cluster D fixtures (g)-(j)
 #      for fork 75dee108 (overlay libntech 0007-0008, core 0003-0004; issues
 #      #66, #67, #68, #69) and inline RFC-8259 strict-JSON fixtures (k) for fork
-#      f3f27dc04 (overlay libntech 0009; issue #118), each beside a valid
+#      aee51485 (overlay libntech 0009; issue #118), each beside a valid
 #      interlock and a present service:
 #      (a)-(f) a repeated member of `vars` (dup-member), a repeated
 #      top-level `vars` whose later section drops the interlock (dup-vars),
@@ -173,8 +173,9 @@
 #      (j) unknown metadata keys in `classes`/`variables` objects with a
 #      `data:maint` + `data:variables.x` positive control (#68); and (k) the
 #      remaining non-RFC-8259 strict-JSON forms (trailing/leading commas,
-#      missing array commas, raw control characters, unrecognized escapes,
-#      unpaired surrogates, `-01`, and `1e2.3`) plus a valid RFC-8259 surrogate
+#      missing array commas, raw control characters, raw invalid UTF-8
+#      surrogate bytes, unrecognized escapes, unpaired surrogates, `-01`, and
+#      capability-guarded `1e2.3`) plus a valid RFC-8259 surrogate
 #      pair and numeric positive control (#118). Each must be
 #      refused and reported once by PR 42's cross-check and actuate nothing
 #      (fork_only for the first three, the integration assertions above;
@@ -468,14 +469,14 @@ fi
 # RFC-8259 strict-JSON capability probe (issue #118): an inert trailing-comma
 # payload `{"vars":{},"trailing":1,}` is accepted at the JSON parser by stock
 # CFEngine AND pre-#118 Cluster D fork 75dee108 (failing only later as an
-# unknown CMDB key), whereas #118 builds (fork f3f27dc04 / overlay libntech
+# unknown CMDB key), whereas #118 builds (fork aee51485 / overlay libntech
 # 0009) refuse it at JsonParseStrict() with JSON_PARSE_ERROR_OBJECT_COMMA.
 printf '%s\n' '{"vars":{},"trailing":1,}' > "$work/data/host_specific.json"
 "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$work/probe-rfc8259.out" 2>&1 || true
 if [ "$cluster_d_loader" = 1 ] &&
    grep -q "Could not parse JSON file .*host_specific\\.json: Unable to parse json data as object, ',' seen without having specified an r-value" "$work/probe-rfc8259.out"; then
     rfc8259_strict_loader=1
-    echo "# loader capability: #118 RFC-8259 strict-JSON hardening present (fork f3f27dc04 / overlay 0009)"
+    echo "# loader capability: #118 RFC-8259 strict-JSON hardening present (fork aee51485 / overlay 0009)"
 else
     rfc8259_strict_loader=0
     echo "# loader capability: #118 RFC-8259 strict-JSON hardening NOT present; #118 assertions print SKIP"
@@ -4633,7 +4634,7 @@ check "list of strings in vars: no cross-check report" no_crosscheck "$out"
 check "list of strings in vars: actuates normally (the pre_action ran)" \
     grep -q "Executing .*'/usr/bin/true'" "$out"
 
-echo "# 9b. the real loader's strict parse and class handling (fork 4443504 / Cluster D 75dee108 / #118 f3f27dc04), policy level"
+echo "# 9b. the real loader's strict parse and class handling (fork 4443504 / Cluster D 75dee108 / #118 aee51485), policy level"
 # What the pinned loader does with each file is read from libpromises/cmdb.c at
 # 4443504 (line numbers there), and each case asserts it. The cross-check's
 # refusal and the absence of actuation are asserted unconditionally only where
@@ -5037,23 +5038,23 @@ PYEOF
         grep -q "meta-probe: tendcf_service absent" "$pout"
 done
 
-# (k) RFC-8259 strict-JSON tightening (fork f3f27dc04 / overlay libntech 0009;
+# (k) RFC-8259 strict-JSON tightening (fork aee51485 / overlay libntech 0009;
 # issue #118): remaining non-RFC-8259 lenient inheritances (trailing/leading
-# commas, missing array commas, raw control chars, unrecognized escapes,
-# unpaired UTF-16 surrogates, leading zero after unary minus `-01`, and
-# exponent decimal `1e2.3`) are refused by JsonParseStrict() and install
-# nothing, while valid RFC-8259 surrogate pairs and numeric forms inside a
-# `vars` data container still load cleanly.
+# commas, missing array commas, raw control chars, raw invalid UTF-8 bytes,
+# unrecognized escapes, unpaired UTF-16 surrogates, leading zero after unary
+# minus `-01`, and capability-guarded exponent decimal `1e2.3`) are refused by
+# JsonParseStrict() and install nothing, while valid RFC-8259 surrogate pairs
+# and numeric forms inside a `vars` data container still load cleanly.
 for rfc8259_spec in \
     "trailing-comma-obj|Unable to parse json data as object, ',' seen without having specified an r-value" \
     "leading-comma-obj|Unable to parse json data as object, ',' seen without having specified an r-value" \
     "trailing-comma-arr|Unable to parse json data as array, extraneous commas" \
     "missing-array-comma|Unable to parse json data as array, extraneous commas" \
     "raw-control-char|Unwilling to parse json string with an unescaped control character" \
+    "raw-invalid-utf8|Unwilling to parse json string with invalid UTF-8" \
     "invalid-escape|Unwilling to parse json string with an invalid escape sequence" \
     "unpaired-surrogate|Unwilling to parse json string with an invalid escape sequence" \
-    "neg-leading-zero|Unable to parse json data as number, dot or exponent must follow leading 0" \
-    "exp-decimal|Unable to parse json data as number, invalid symbol"; do
+    "neg-leading-zero|Unable to parse json data as number, dot or exponent must follow leading 0"; do
     IFS='|' read -r name expected <<< "$rfc8259_spec"
     python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" "$name" <<'PYEOF'
 import pathlib, sys
@@ -5074,6 +5075,9 @@ elif mode == "missing-array-comma":
 elif mode == "raw-control-char":
     assert '"working_dir":"/"' in base
     payload = base.encode("utf-8").replace(b'"working_dir":"/"', b'"working_dir":"/\x01"', 1)
+elif mode == "raw-invalid-utf8":
+    assert '"working_dir":"/"' in base
+    payload = base.encode("utf-8").replace(b'"working_dir":"/"', b'"working_dir":"/\xed\xa0\x80"', 1)
 elif mode == "invalid-escape":
     assert '"working_dir":"/"' in base
     payload = base.replace('"working_dir":"/"', '"working_dir":"/\\a"', 1).encode("utf-8")
@@ -5083,9 +5087,6 @@ elif mode == "unpaired-surrogate":
 elif mode == "neg-leading-zero":
     assert '"working_dir":"/"' in base
     payload = base.replace('"working_dir":"/"', '"working_dir":"/","bad_num":-01', 1).encode("utf-8")
-elif mode == "exp-decimal":
-    assert '"working_dir":"/"' in base
-    payload = base.replace('"working_dir":"/"', '"working_dir":"/","bad_num":1e2.3', 1).encode("utf-8")
 else:
     raise SystemExit(f"unknown #118 mode: {mode}")
 pathlib.Path(sys.argv[2]).write_bytes(payload)
@@ -5108,6 +5109,46 @@ PYEOF
     rfc8259_only "$name: no tendcf_service variable" \
         grep -q "cmdb-probe: tendcf_service absent" "$pout"
 done
+
+# Exponent-decimal (`1e2.3`, H1/B1): guard execution on rfc8259_strict_loader=1
+# (matching 9b (h) trailing-backslash) so stock/unpatched CFEngine 3.29.0 never
+# executes StringToDouble SIGABRT, while still emitting counted rfc8259_only
+# SKIPs. Patch 0009 rejects `1e2.3` unconditionally in both strict and lenient
+# modes, so readjson() also rejects it (tendcf_cmdb_problem_unreadable rather
+# than key_not_loaded).
+if [ "$rfc8259_strict_loader" = 1 ]; then
+    python3 - "$repo/tests/policy/fixtures/interlock-refused.json" "$work/data/host_specific.json" <<'PYEOF'
+import pathlib, sys
+base = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+assert '"working_dir":"/"' in base
+payload = base.replace('"working_dir":"/"', '"working_dir":"/","bad_num":1e2.3', 1).encode("utf-8")
+pathlib.Path(sys.argv[2]).write_bytes(payload)
+PYEOF
+    out="$work/strict-exp-decimal.out"
+    ed_rc=0
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || ed_rc=$?
+    pout="$work/probe-strict-exp-decimal.out"
+    ed_prc=0
+    "$cf_agent" -K -f "$work/inputs/cmdb-probe.cf" >"$pout" 2>&1 || ed_prc=$?
+else
+    out="$work/strict-exp-decimal.out"
+    pout="$work/probe-strict-exp-decimal.out"
+    ed_rc=0
+    ed_prc=0
+fi
+rfc8259_only "exp-decimal: cf-agent did not crash on signal (rc < 128)" test "$ed_rc" -lt 128
+rfc8259_only "exp-decimal: this run evaluated the policy to the end (test-only marker)" policy_completed "$out"
+rfc8259_only "exp-decimal: the loader refuses the exponent-decimal input" \
+    grep -q "Could not parse JSON file .*host_specific\\.json: Unable to parse json data as number, invalid symbol" "$out"
+rfc8259_only "exp-decimal: the policy refuses and reports it" refusal_reported "$out"
+rfc8259_only "exp-decimal: the policy reports it once" refusal_once "$out"
+rfc8259_only "exp-decimal: nothing actuated" no_actuation "$out"
+rfc8259_only "exp-decimal: nothing rendered, nothing started" no_render_start "$out"
+rfc8259_only "exp-decimal: probe cf-agent did not crash on signal (rc < 128)" test "$ed_prc" -lt 128
+rfc8259_only "exp-decimal: no tendcf_interlock variable" \
+    grep -q "cmdb-probe: tendcf_interlock absent" "$pout"
+rfc8259_only "exp-decimal: no tendcf_service variable" \
+    grep -q "cmdb-probe: tendcf_service absent" "$pout"
 
 # Positive control (issue #118): prove valid RFC-8259 constructs still load
 # cleanly through JsonParseFileStrict() into data:variables.tendcf_rfc8259:
@@ -5161,8 +5202,11 @@ check "rfc8259-positive-control: data:variables.tendcf_rfc8259 is defined" \
     grep -qF "rfc8259-probe: defined" "$pout"
 check "rfc8259-positive-control: all RFC-8259 keys (emoji, neg_zero, neg_half, small_exp) loaded" \
     grep -qF "rfc8259-probe: keys_ok" "$pout"
+check "rfc8259-positive-control: numeric values decoded positively" \
+    grep -Eq 'rfc8259-probe: .* nums=\[-?0,-0\.50?,(0\.00|1\.0e-05|0\.00001)\] keys=emoji,neg_half,neg_zero,small_exp' "$pout"
+no_rfc8259_error() { ! grep -Eq 'Could not parse JSON file|\$\(data:variables\.tendcf_rfc8259' "$1"; }
 check "rfc8259-positive-control: numeric values expanded without parse error" \
-    bash -c "! grep -Eq 'Could not parse JSON file|\\\$\(data:variables\.tendcf_rfc8259' '$pout'"
+    no_rfc8259_error "$pout"
 rfc8259_only "rfc8259-positive-control: surrogate pair \\uD83D\\uDE00 decoded to 4-byte UTF-8 U+1F600" \
     python3 -c 'import pathlib, sys; raw = pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(0 if b"rfc8259-probe: emoji=[\xf0\x9f\x98\x80] len=4 " in raw else 1)' "$pout"
 
@@ -5411,8 +5455,8 @@ if [ "$fail" != 0 ]; then
              probe-strict-missing-colon probe-strict-unquoted-key probe-strict-null-escape-key probe-strict-null-escape-val \
              probe-strict-escaped-backslash-u0000 probe-strict-meta-control \
              strict-meta-class-unknown strict-meta-var-unknown probe-strict-meta-class-unknown probe-strict-meta-var-unknown \
-             strict-trailing-comma-obj strict-leading-comma-obj strict-trailing-comma-arr strict-missing-array-comma strict-raw-control-char strict-invalid-escape strict-unpaired-surrogate strict-neg-leading-zero strict-exp-decimal \
-             probe-strict-trailing-comma-obj probe-strict-leading-comma-obj probe-strict-trailing-comma-arr probe-strict-missing-array-comma probe-strict-raw-control-char probe-strict-invalid-escape probe-strict-unpaired-surrogate probe-strict-neg-leading-zero probe-strict-exp-decimal \
+             strict-trailing-comma-obj strict-leading-comma-obj strict-trailing-comma-arr strict-missing-array-comma strict-raw-control-char strict-raw-invalid-utf8 strict-invalid-escape strict-unpaired-surrogate strict-neg-leading-zero strict-exp-decimal \
+             probe-strict-trailing-comma-obj probe-strict-leading-comma-obj probe-strict-trailing-comma-arr probe-strict-missing-array-comma probe-strict-raw-control-char probe-strict-raw-invalid-utf8 probe-strict-invalid-escape probe-strict-unpaired-surrogate probe-strict-neg-leading-zero probe-strict-exp-decimal \
              probe-strict-rfc8259-positive-control \
              xc-sim-control xc-sim-nointerlock xc-sim-noservice xc-sim-partial xc-sim-ctrl-unloaded xc-sim-stray xc-sim-nofile xc-sim-changed-service xc-sim-changed-interlock \
              reserved-launchd-present reserved-launchd-case-present reserved-systemd-present reserved-launchd-absent reserved-launchd-case-absent reserved-systemd-absent reserved-malformed-state \

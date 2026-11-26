@@ -1,29 +1,30 @@
-From 4fd5cf42270419ca89039e392bba479aecf85145 Mon Sep 17 00:00:00 2001
+From 641f8120c7ec02e951a1a9e5d4a2eefbb124825e Mon Sep 17 00:00:00 2001
 From: Daniel JB Clark <djbclark@gmail.com>
-Date: Thu, 26 Nov 2026 06:27:24 -0500
+Date: Thu, 26 Nov 2026 07:15:23 -0500
 Subject: [PATCH] Tightened JsonParseStrict to reject remaining non-RFC-8259
  forms
 
 Reject leading/trailing commas, missing array commas, raw control
-characters (0x01-0x1f), unrecognized or malformed escapes and unpaired
-UTF-16 surrogates, leading zeros after unary minus (-00/-01), decimal
-points after exponents (1e2.3), and objects exceeding 65536 members in
-JsonParseStrict(). Salt the strict duplicate-key hash set seed and make
-boolean/null literal prefix matching O(1) via strncmp() instead of
-StringStartsWith() to avoid quadratic strlen scans, while preserving
-lenient JsonParse().
+characters (0x01-0x1f), invalid UTF-8 byte sequences (RFC 3629),
+unrecognized or malformed escapes and unpaired UTF-16 surrogates,
+leading zeros after unary minus (-00/-01), and objects exceeding 65536
+members in JsonParseStrict(). Also reject decimal points after
+exponents (1e2.3) in both strict and lenient modes so JsonParse() never
+produces a malformed REAL token, salt the strict duplicate-key hash set
+seed, and make boolean/null prefix matching O(1) via strncmp() while
+preserving lenient JsonParse() compatibility.
 
 Changelog: Title
 Ticket: none
 Signed-off-by: Daniel JB Clark <djbclark@gmail.com>
 ---
- libutils/json.c        | 280 +++++++++++++++++++++++++++++++++++------
- libutils/json.h        |  22 +++-
- tests/unit/json_test.c | 265 +++++++++++++++++++++++++++++++++++++-
- 3 files changed, 519 insertions(+), 48 deletions(-)
+ libutils/json.c        | 373 +++++++++++++++++++++++++++++++++++-----
+ libutils/json.h        |  24 ++-
+ tests/unit/json_test.c | 379 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 728 insertions(+), 48 deletions(-)
 
 diff --git a/libutils/json.c b/libutils/json.c
-index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce2069593a8d 100644
+index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..5f3b0b991a6da9a7b8751e3455d076cf3fdaf7f0 100644
 --- a/libutils/json.c
 +++ b/libutils/json.c
 @@ -40,10 +40,55 @@
@@ -109,7 +110,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
      {
          char next = *(*data + 4);
          if (IsSeparator(next) || next == '\0')
-@@ -2190,11 +2235,102 @@ const char *JsonParseErrorToString(const JsonParseError error)
+@@ -2190,11 +2235,181 @@ const char *JsonParseErrorToString(const JsonParseError error)
          [JSON_PARSE_ERROR_STRING_NULL_ESCAPE] =
              "Unwilling to parse json string with a null character escape",
          [JSON_PARSE_ERROR_MAX_DEPTH] =
@@ -120,7 +121,9 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
 +        [JSON_PARSE_ERROR_STRING_INVALID_ESCAPE] =
 +            "Unwilling to parse json string with an invalid escape sequence",
 +        [JSON_PARSE_ERROR_MAX_MEMBERS] =
-+            "Unwilling to parse json object exceeding maximum member count"};
++            "Unwilling to parse json object exceeding maximum member count",
++        [JSON_PARSE_ERROR_STRING_INVALID_UTF8] =
++            "Unwilling to parse json string with invalid UTF-8"};
  
      return parse_errors[error];
  }
@@ -210,10 +213,87 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
 +    }
 +}
 +
++static size_t JsonValidateStrictUtf8Char(const unsigned char *const s)
++{
++    const unsigned char b0 = s[0];
++    if (b0 >= 0xc2 && b0 <= 0xdf)
++    {
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x80 && b1 <= 0xbf)
++        {
++            return 2;
++        }
++        return 0;
++    }
++    if (b0 == 0xe0)
++    {
++        const unsigned char b1 = s[1];
++        if (b1 >= 0xa0 && b1 <= 0xbf && s[2] >= 0x80 && s[2] <= 0xbf)
++        {
++            return 3;
++        }
++        return 0;
++    }
++    if ((b0 >= 0xe1 && b0 <= 0xec) || (b0 >= 0xee && b0 <= 0xef))
++    {
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x80 && b1 <= 0xbf && s[2] >= 0x80 && s[2] <= 0xbf)
++        {
++            return 3;
++        }
++        return 0;
++    }
++    if (b0 == 0xed)
++    {
++        /* Reject UTF-16 surrogates (U+D800..U+DFFF: 0xED 0xA0..0xBF). */
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x80 && b1 <= 0x9f && s[2] >= 0x80 && s[2] <= 0xbf)
++        {
++            return 3;
++        }
++        return 0;
++    }
++    if (b0 == 0xf0)
++    {
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x90 && b1 <= 0xbf &&
++            s[2] >= 0x80 && s[2] <= 0xbf &&
++            s[3] >= 0x80 && s[3] <= 0xbf)
++        {
++            return 4;
++        }
++        return 0;
++    }
++    if (b0 >= 0xf1 && b0 <= 0xf3)
++    {
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x80 && b1 <= 0xbf &&
++            s[2] >= 0x80 && s[2] <= 0xbf &&
++            s[3] >= 0x80 && s[3] <= 0xbf)
++        {
++            return 4;
++        }
++        return 0;
++    }
++    if (b0 == 0xf4)
++    {
++        /* Reject code points > U+10FFFF (0xF4 0x90..0xBF). */
++        const unsigned char b1 = s[1];
++        if (b1 >= 0x80 && b1 <= 0x8f &&
++            s[2] >= 0x80 && s[2] <= 0xbf &&
++            s[3] >= 0x80 && s[3] <= 0xbf)
++        {
++            return 4;
++        }
++        return 0;
++    }
++    return 0;
++}
++
  static JsonParseError JsonParseAsString(
      const char **const data, char **const str_out, const bool strict)
  {
-@@ -2211,9 +2347,16 @@ static JsonParseError JsonParseAsString(
+@@ -2211,9 +2426,30 @@ static JsonParseError JsonParseAsString(
      }
  
      Writer *writer = StringWriter();
@@ -227,10 +307,24 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
 +            *str_out = NULL;
 +            return JSON_PARSE_ERROR_STRING_CONTROL_CHAR;
 +        }
++        if (strict && (unsigned char) **data >= 0x80)
++        {
++            const size_t seq_len =
++                JsonValidateStrictUtf8Char((const unsigned char *) *data);
++            if (seq_len == 0)
++            {
++                WriterClose(writer);
++                *str_out = NULL;
++                return JSON_PARSE_ERROR_STRING_INVALID_UTF8;
++            }
++            WriterWriteLen(writer, *data, seq_len);
++            *data += seq_len - 1;
++            continue;
++        }
          switch (**data)
          {
          case '"':
-@@ -2228,13 +2371,16 @@ static JsonParseError JsonParseAsString(
+@@ -2228,13 +2464,16 @@ static JsonParseError JsonParseAsString(
                  *str_out = NULL;
                  return JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END;
              }
@@ -253,7 +347,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              }
              switch (**data)
              {
-@@ -2286,8 +2432,8 @@ static JsonParseError JsonParseAsString(
+@@ -2286,8 +2525,8 @@ static JsonParseError JsonParseAsString(
      return JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END;
  }
  
@@ -264,7 +358,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
  {
      assert(data != NULL);
      assert(*data != NULL);
-@@ -2331,13 +2477,19 @@ JsonParseError JsonParseAsNumber(
+@@ -2331,13 +2570,19 @@ JsonParseError JsonParseAsNumber(
                  WriterClose(writer);
                  return JSON_PARSE_ERROR_NUMBER_DUPLICATE_ZERO;
              }
@@ -276,7 +370,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              break;
  
          case '.':
-+            if (strict && seen_exponent)
++            if (seen_exponent)
 +            {
 +                *json_out = NULL;
 +                WriterClose(writer);
@@ -285,7 +379,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              if (seen_dot)
              {
                  *json_out = NULL;
-@@ -2414,6 +2566,12 @@ JsonParseError JsonParseAsNumber(
+@@ -2414,6 +2659,12 @@ JsonParseError JsonParseAsNumber(
      }
  }
  
@@ -298,7 +392,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
  static JsonParseError JsonParseAsPrimitive(
      const char **const data,
      JsonElement **const json_out,
-@@ -2440,7 +2598,8 @@ static JsonParseError JsonParseAsPrimitive(
+@@ -2440,7 +2691,8 @@ static JsonParseError JsonParseAsPrimitive(
      {
          if (**data == '-' || **data == '0' || IsDigit(**data))
          {
@@ -308,7 +402,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              if (err != JSON_PARSE_OK)
              {
                  return err;
-@@ -2505,6 +2664,12 @@ static JsonParseError JsonParseAsArray(
+@@ -2505,6 +2757,12 @@ static JsonParseError JsonParseAsArray(
          {
          case '"':
          {
@@ -321,7 +415,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              char *value = NULL;
              JsonParseError err = JsonParseAsString(data, &value, strict);
              if (err != JSON_PARSE_OK)
-@@ -2576,20 +2741,34 @@ static JsonParseError JsonParseAsArray(
+@@ -2576,20 +2834,34 @@ static JsonParseError JsonParseAsArray(
          case ',':
              if (prev_char == ',' || prev_char == '[')
              {
@@ -357,7 +451,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                  if (err != JSON_PARSE_OK)
                  {
                      JsonDestroy(array);
-@@ -2693,7 +2872,12 @@ static JsonParseError JsonParseAsObject(
+@@ -2693,7 +2965,12 @@ static JsonParseError JsonParseAsObject(
      }
  
      JsonElement *object = JsonObjectCreate(DEFAULT_CONTAINER_CAPACITY);
@@ -371,7 +465,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
      object->container.skip_dup_scan = strict;
      char *property_name = NULL;
      char prev_char = '{';
-@@ -2714,7 +2898,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2714,7 +2991,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -380,7 +474,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return JSON_PARSE_ERROR_OBJECT_COLON;
                  }
-@@ -2725,7 +2909,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2725,7 +3002,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -389,7 +483,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return err;
                  }
-@@ -2746,7 +2930,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2746,7 +3023,7 @@ static JsonParseError JsonParseAsObject(
                  if (prev_char != '{' && prev_char != ',')
                  {
                      *json_out = NULL;
@@ -398,7 +492,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return JSON_PARSE_ERROR_OBJECT_COMMA_MISSING;
                  }
-@@ -2756,22 +2940,30 @@ static JsonParseError JsonParseAsObject(
+@@ -2756,22 +3033,30 @@ static JsonParseError JsonParseAsObject(
                  if (err != JSON_PARSE_OK)
                  {
                      *json_out = NULL;
@@ -433,7 +527,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                  }
              }
              break;
-@@ -2781,18 +2973,19 @@ static JsonParseError JsonParseAsObject(
+@@ -2781,18 +3066,19 @@ static JsonParseError JsonParseAsObject(
              {
                  *json_out = NULL;
                  free(property_name);
@@ -456,7 +550,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                  JsonDestroy(object);
                  return JSON_PARSE_ERROR_OBJECT_COMMA;
              }
-@@ -2805,7 +2998,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2805,7 +3091,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -465,7 +559,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return JSON_PARSE_ERROR_OBJECT_COLON;
                  }
-@@ -2821,7 +3014,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2821,7 +3107,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -474,7 +568,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return err;
                  }
-@@ -2834,7 +3027,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2834,7 +3120,7 @@ static JsonParseError JsonParseAsObject(
              {
                  *json_out = NULL;
                  free(property_name);
@@ -483,7 +577,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                  JsonDestroy(object);
                  return JSON_PARSE_ERROR_OBJECT_ARRAY_LVAL;
              }
-@@ -2847,7 +3040,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2847,7 +3133,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -492,7 +586,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return JSON_PARSE_ERROR_OBJECT_COLON;
                  }
-@@ -2863,7 +3056,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2863,7 +3149,7 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -501,7 +595,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                      JsonDestroy(object);
                      return err;
                  }
-@@ -2876,7 +3069,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2876,7 +3162,7 @@ static JsonParseError JsonParseAsObject(
              {
                  *json_out = NULL;
                  free(property_name);
@@ -510,7 +604,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                  JsonDestroy(object);
                  return JSON_PARSE_ERROR_OBJECT_OBJECT_LVAL;
              }
-@@ -2887,12 +3080,20 @@ static JsonParseError JsonParseAsObject(
+@@ -2887,12 +3173,20 @@ static JsonParseError JsonParseAsObject(
              {
                  *json_out = NULL;
                  free(property_name);
@@ -533,7 +627,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              object->container.skip_dup_scan = false;
              *json_out = object;
              return JSON_PARSE_OK;
-@@ -2926,19 +3127,20 @@ static JsonParseError JsonParseAsObject(
+@@ -2926,19 +3220,20 @@ static JsonParseError JsonParseAsObject(
                  {
                      *json_out = NULL;
                      free(property_name);
@@ -557,7 +651,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
                          JsonDestroy(object);
                          return err;
                      }
-@@ -2983,7 +3185,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2983,7 +3278,7 @@ static JsonParseError JsonParseAsObject(
  
              *json_out = NULL;
              free(property_name);
@@ -566,7 +660,7 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
              JsonDestroy(object);
              return JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL;
          } // default
-@@ -2994,7 +3196,7 @@ static JsonParseError JsonParseAsObject(
+@@ -2994,7 +3289,7 @@ static JsonParseError JsonParseAsObject(
  
      *json_out = NULL;
      free(property_name);
@@ -576,20 +670,21 @@ index e2a7171d8ced1a47ca61363f6e5ccf8b16989c6f..403c7c4431e563b4c147b57ae8ecce20
      return JSON_PARSE_ERROR_OBJECT_END;
  }
 diff --git a/libutils/json.h b/libutils/json.h
-index 52084ee33acbee1ab79c29d9a806b08050d90611..f33bcaa06b25e33cddf28e8c03dd638af05dc389 100644
+index 52084ee33acbee1ab79c29d9a806b08050d90611..9f8772900b358b8bbef42210170317d257d98e0e 100644
 --- a/libutils/json.h
 +++ b/libutils/json.h
-@@ -121,6 +121,9 @@ typedef enum
+@@ -121,6 +121,10 @@ typedef enum
      JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
      JSON_PARSE_ERROR_STRING_NULL_ESCAPE,
      JSON_PARSE_ERROR_MAX_DEPTH,
 +    JSON_PARSE_ERROR_STRING_CONTROL_CHAR,
 +    JSON_PARSE_ERROR_STRING_INVALID_ESCAPE,
 +    JSON_PARSE_ERROR_MAX_MEMBERS,
++    JSON_PARSE_ERROR_STRING_INVALID_UTF8,
  
      JSON_PARSE_ERROR_MAX
  } JsonParseError;
-@@ -617,12 +620,19 @@ JsonParseError JsonParseAll(const char **data, JsonElement **json_out);
+@@ -617,12 +621,20 @@ JsonParseError JsonParseAll(const char **data, JsonElement **json_out);
          member is replaced, rather than silently keeping the last one.
          Unquoted object keys are refused with
          JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL, missing colons with
@@ -602,8 +697,9 @@ index 52084ee33acbee1ab79c29d9a806b08050d90611..f33bcaa06b25e33cddf28e8c03dd638a
 +        JSON_PARSE_ERROR_OBJECT_COLON, leading/trailing commas and missing
 +        array commas with JSON_PARSE_ERROR_OBJECT_COMMA /
 +        JSON_PARSE_ERROR_ARRAY_COMMA, raw control characters (0x01-0x1f)
-+        with JSON_PARSE_ERROR_STRING_CONTROL_CHAR, unrecognized escapes and
-+        malformed \u / unpaired surrogates with
++        with JSON_PARSE_ERROR_STRING_CONTROL_CHAR, invalid UTF-8 byte
++        sequences with JSON_PARSE_ERROR_STRING_INVALID_UTF8, unrecognized
++        escapes and malformed \u / unpaired surrogates with
 +        JSON_PARSE_ERROR_STRING_INVALID_ESCAPE, \u0000 escapes with
 +        JSON_PARSE_ERROR_STRING_NULL_ESCAPE, leading zeros after unary minus
 +        (-00, -01) with JSON_PARSE_ERROR_NUMBER_*, nesting deeper than 128
@@ -616,7 +712,7 @@ index 52084ee33acbee1ab79c29d9a806b08050d90611..f33bcaa06b25e33cddf28e8c03dd638a
    */
  JsonParseError JsonParseStrict(const char **data, JsonElement **json_out);
 diff --git a/tests/unit/json_test.c b/tests/unit/json_test.c
-index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..242765ebf2da2f8cc6fdc2c6a9acd5ba00b0c282 100644
+index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..6ace2662538af4e87dd1d4dd3ab61788c23eac70 100644
 --- a/tests/unit/json_test.c
 +++ b/tests/unit/json_test.c
 @@ -1772,9 +1772,9 @@ static void test_parse_strict_non_json_forms(void)
@@ -632,7 +728,7 @@ index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..242765ebf2da2f8cc6fdc2c6a9acd5ba
  
      /* Lenient JsonParse() still accepts unquoted keys. */
      data = "{plain: true}";
-@@ -1784,6 +1784,246 @@ static void test_parse_strict_non_json_forms(void)
+@@ -1784,6 +1784,354 @@ static void test_parse_strict_non_json_forms(void)
      JsonDestroy(json);
  }
  
@@ -804,8 +900,116 @@ index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..242765ebf2da2f8cc6fdc2c6a9acd5ba
 +        JsonDestroy(json);
 +    }
 +
-+    /* Lenient JsonParse() keeps accepting -01. */
++    /* Lenient JsonParse() keeps accepting -01, but still rejects decimal point
++     * after exponent (which would poison REAL -> StringToDouble assert). */
 +    const char *data = "-01";
++    JsonElement *json = NULL;
++    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
++    assert_true(json != NULL);
++    JsonDestroy(json);
++
++    const char *const bad_lenient_exp_dot[] = {
++        "1e2.3", "1E-2.5", "0e0.0", "[1e2.3]", NULL
++    };
++    for (size_t i = 0; bad_lenient_exp_dot[i] != NULL; i++)
++    {
++        data = bad_lenient_exp_dot[i];
++        json = NULL;
++        assert_int_equal(
++            JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL, JsonParse(&data, &json));
++        assert_true(json == NULL);
++    }
++}
++
++static void test_parse_strict_utf8(void)
++{
++    /* Valid 2-, 3-, and 4-byte RFC 3629 UTF-8 sequences in values and keys. */
++    const char *const valid_utf8[] = {
++        "\"\xc2\xa2\"",                   /* U+00A2 */
++        "\"\xc3\xa9\"",                   /* U+00E9 */
++        "\"\xdf\xbf\"",                   /* U+07FF */
++        "\"\xe0\xa0\x80\"",               /* U+0800 */
++        "\"\xe2\x82\xac\"",               /* U+20AC */
++        "\"\xed\x9f\xbf\"",               /* U+D7FF */
++        "\"\xee\x80\x80\"",               /* U+E000 */
++        "\"\xef\xbf\xbf\"",               /* U+FFFF */
++        "\"\xf0\x90\x80\x80\"",           /* U+10000 */
++        "\"\xf0\x9f\x98\x80\"",           /* U+1F600 */
++        "\"\xf4\x8f\xbf\xbf\"",           /* U+10FFFF */
++        "{\"caf\xc3\xa9\": \"\xf0\x9f\x98\x80\"}",
++        NULL
++    };
++    for (size_t i = 0; valid_utf8[i] != NULL; i++)
++    {
++        const char *data = valid_utf8[i];
++        JsonElement *json = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
++        assert_true(json != NULL);
++        JsonDestroy(json);
++    }
++
++    /* Verify decoded multi-byte UTF-8 bytes are preserved intact. */
++    {
++        const char *data = "{\"k\": \"caf\xc3\xa9 \xf0\x9f\x98\x80\"}";
++        JsonElement *json = NULL;
++        assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
++        assert_string_equal(
++            "caf\xc3\xa9 \xf0\x9f\x98\x80", JsonObjectGetAsString(json, "k"));
++        JsonDestroy(json);
++    }
++
++    /* Invalid UTF-8 sequences are refused in strict mode. */
++    const char *const invalid_utf8[] = {
++        "\"\x80\"",                       /* lone continuation */
++        "\"\xbf\"",                       /* lone continuation */
++        "\"\xc0\xaf\"",                   /* overlong '/' */
++        "\"\xc1\xbf\"",                   /* overlong 2-byte */
++        "\"\xe0\x9f\xbf\"",               /* overlong 3-byte */
++        "\"\xed\xa0\x80\"",               /* UTF-8 high surrogate U+D800 */
++        "\"\xed\xbf\xbf\"",               /* UTF-8 low surrogate U+DFFF */
++        "\"\xf0\x8f\xbf\xbf\"",           /* overlong 4-byte */
++        "\"\xf4\x90\x80\x80\"",           /* > U+10FFFF */
++        "\"\xf5\x80\x80\x80\"",           /* invalid lead byte */
++        "\"\xfe\"",                       /* invalid byte */
++        "\"\xff\"",                       /* invalid byte */
++        "\"\xc2\"",                       /* truncated 2-byte before '"' */
++        "\"\xe2\x82\"",                   /* truncated 3-byte before '"' */
++        "\"\xf0\x9f\x98\"",               /* truncated 4-byte before '"' */
++        "{\"\x80\": 1}",                  /* invalid UTF-8 in object key */
++        "[\"\xed\xa0\x80\"]",             /* invalid UTF-8 in array */
++        NULL
++    };
++    for (size_t i = 0; invalid_utf8[i] != NULL; i++)
++    {
++        assert_strict_refused(
++            invalid_utf8[i], JSON_PARSE_ERROR_STRING_INVALID_UTF8);
++    }
++
++    /* Exact-sized heap buffers truncated right at NUL (ASan OOB proof). */
++    const char *const trunc_utf8[] = {
++        "\"\xc2",
++        "\"\xe2",
++        "\"\xe2\x82",
++        "\"\xf0",
++        "\"\xf0\x9f",
++        "\"\xf0\x9f\x98",
++        NULL
++    };
++    for (size_t i = 0; trunc_utf8[i] != NULL; i++)
++    {
++        const size_t len = strlen(trunc_utf8[i]);
++        char *buf = xmalloc(len + 1);
++        memcpy(buf, trunc_utf8[i], len + 1);
++        const char *p = buf;
++        JsonElement *out = NULL;
++        assert_int_equal(
++            JSON_PARSE_ERROR_STRING_INVALID_UTF8, JsonParseStrict(&p, &out));
++        assert_true(out == NULL);
++        free(buf);
++    }
++
++    /* Lenient JsonParse() keeps accepting raw non-UTF-8 bytes. */
++    const char *data = "\"\x80\xff\"";
 +    JsonElement *json = NULL;
 +    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
 +    assert_true(json != NULL);
@@ -879,7 +1083,7 @@ index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..242765ebf2da2f8cc6fdc2c6a9acd5ba
  static void test_parse_strict_large_object_linear(void)
  {
      /* 10,000 unique keys: exercises O(n) hash-set duplicate tracking and
-@@ -2006,6 +2246,21 @@ static void test_parse_strict_error_string(void)
+@@ -2006,6 +2354,26 @@ static void test_parse_strict_error_string(void)
          JsonParseErrorToString(JSON_PARSE_ERROR_MAX_DEPTH);
      assert_true(depth_msg != NULL);
      assert_true(strstr(depth_msg, "depth") != NULL);
@@ -898,16 +1102,22 @@ index 6a85e67ac63f3d7bc86ae9ea66d7c9a432611b39..242765ebf2da2f8cc6fdc2c6a9acd5ba
 +        JsonParseErrorToString(JSON_PARSE_ERROR_MAX_MEMBERS);
 +    assert_true(mem_msg != NULL);
 +    assert_true(strstr(mem_msg, "member") != NULL);
++
++    const char *const utf8_msg =
++        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_INVALID_UTF8);
++    assert_true(utf8_msg != NULL);
++    assert_true(strstr(utf8_msg, "UTF-8") != NULL);
  }
  
  static void write_strict_test_file(
-@@ -2977,6 +3232,10 @@ int main()
+@@ -2977,6 +3345,11 @@ int main()
          unit_test(test_parse_strict_valid),
          unit_test(test_parse_strict_duplicate_member),
          unit_test(test_parse_strict_non_json_forms),
 +        unit_test(test_parse_strict_commas_and_array_separators),
 +        unit_test(test_parse_strict_control_chars_and_escapes),
 +        unit_test(test_parse_strict_negative_leading_zero),
++        unit_test(test_parse_strict_utf8),
 +        unit_test(test_parse_strict_max_members),
          unit_test(test_parse_strict_large_object_linear),
          unit_test(test_parse_strict_max_depth),

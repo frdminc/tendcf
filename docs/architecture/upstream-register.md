@@ -409,11 +409,13 @@ strict JSON hardening), and
 `overlay/core/0003`–`0004` (`70670fc0`, `e61d6893`,
 [djbclark/core#100](https://github.com/djbclark/core/pull/100), #68 unknown
 CMDB metadata key refusal and #69 loader-level NUL fixture), and further
-tightened on 2026-11-26 (fork pin `f3f27dc04`, libntech `015bb0e6`) with
-`overlay/libntech/0009` (`4fd5cf42`, [djbclark/libntech#14](https://github.com/djbclark/libntech/pull/14),
+tightened on 2026-11-26 (fork pin `aee51485`, libntech `7bab503a`) with
+`overlay/libntech/0009` (`641f8120`, [djbclark/libntech#14](https://github.com/djbclark/libntech/pull/14),
 closes [frdminc/tendcf#118](https://github.com/frdminc/tendcf/issues/118)
-residual non-RFC-8259 lenient inheritances, `1e2.3` exponent-decimal refusal,
-65,536-member cap, `/dev/urandom`-salted hash seed, and `O(1)` `strncmp`). The one change from `4443504`
+residual non-RFC-8259 lenient inheritances, strict-mode RFC 3629 UTF-8
+validation `JSON_PARSE_ERROR_STRING_INVALID_UTF8`, unconditional `1e2.3`
+exponent-decimal refusal, 65,536-member cap, `/dev/urandom`-salted hash seed,
+and `O(1)` `strncmp`). The one change from `4443504`
 is the secrets-tracking accessor spelled `EvalContextVariableGet()` at three
 call sites because the base has no `EvalContextVariableGetPlaintext()`
 ([`upstream-overlay.md`](upstream-overlay.md) sections 5 and 7, risk R1).
