@@ -636,6 +636,7 @@ def _validate_boot_epoch(boot_epoch: Any) -> str:
             "invalid_boot_epoch",
             "boot_epoch must be a non-empty single-line string",
         )
+    _check_nfc(boot_epoch, "boot_epoch")
     return boot_epoch
 
 
@@ -990,6 +991,7 @@ def _fresh_store_state(
         "last_seen_utc": None,
         "applied_baseline_goal": base_copy,
         "applied_baseline_sha256": base_sha,
+        "pending_actuation": None,
         "persisted_rejects": {},
         "outstanding_nonces": {},
         "grants": {},
@@ -1010,6 +1012,7 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
         "last_seen_utc",
         "applied_baseline_goal",
         "applied_baseline_sha256",
+        "pending_actuation",
         "persisted_rejects",
         "outstanding_nonces",
         "grants",
@@ -1061,6 +1064,24 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
             raise StoreRollbackError(
                 "store_corrupt", "applied_baseline_sha256 does not match applied_baseline_goal"
             )
+    pa = doc["pending_actuation"]
+    if pa is not None:
+        if (
+            not isinstance(pa, dict)
+            or set(pa) != {"proposed_sha256", "proposed_goal", "baseline_sha256"}
+            or not isinstance(pa["proposed_sha256"], str)
+            or not SHA256_RE.match(pa["proposed_sha256"])
+            or not isinstance(pa["proposed_goal"], dict)
+            or (
+                pa["baseline_sha256"] is not None
+                and (
+                    not isinstance(pa["baseline_sha256"], str)
+                    or not SHA256_RE.match(pa["baseline_sha256"])
+                )
+            )
+            or not hmac.compare_digest(canonical_sha256(pa["proposed_goal"]), pa["proposed_sha256"])
+        ):
+            raise StoreRollbackError("store_corrupt", "invalid pending_actuation record")
     for dict_key in ("persisted_rejects", "outstanding_nonces", "grants", "pending_holds"):
         if not isinstance(doc[dict_key], dict):
             raise StoreRollbackError("store_corrupt", f"store field {dict_key!r} is not an object")
@@ -1091,21 +1112,20 @@ class ReplayStore:
             )
         self.store_dir = Path(store_dir)
         if isinstance(anchor, FileRollbackAnchor):
-            try:
-                anchor_parent = anchor.path.resolve().parent
-                store_resolved = self.store_dir.resolve()
-                if anchor_parent == store_resolved:
-                    raise ValueError(
-                        "FileRollbackAnchor must live outside store_dir (separate rollback domain)"
-                    )
-            except OSError:
-                pass
+            # Fail closed on resolution failure and reject store_dir itself or any resolved descendant!
+            store_resolved = self.store_dir.resolve(strict=False)
+            anchor_resolved = anchor.path.resolve(strict=False)
+            if anchor_resolved == store_resolved or anchor_resolved.is_relative_to(store_resolved):
+                raise ValueError(
+                    "FileRollbackAnchor must live outside store_dir (cannot be store_dir or any descendant)"
+                )
         self.lock_path = self.store_dir / "replay-store.lock"
         self.host = host
         self.anchor = anchor
         self._thread_lock = threading.RLock()
         self._lock_depth: int = 0
         self._lock_fd: int | None = None
+        self._in_actuation_tx: bool = False
         self.write_count: int = 0
         self.nonce_consume_count: int = 0
         self._seen_nonces_memory: set[str] = set()
@@ -1120,9 +1140,10 @@ class ReplayStore:
         baseline_goal: dict[str, Any] | None = None,
     ) -> "ReplayStore":
         """Explicitly provision a brand-new replay store and anchor."""
+        baseline_snap = copy.deepcopy(baseline_goal) if baseline_goal is not None else None
         store = cls(store_dir, host, anchor=anchor)
-        if baseline_goal is not None:
-            validate_goal_file_basics(baseline_goal, host)
+        if baseline_snap is not None:
+            validate_goal_file_basics(baseline_snap, host)
         with store.locked():
             if store.anchor.read() is not None:
                 raise StoreRollbackError(
@@ -1135,7 +1156,7 @@ class ReplayStore:
                     "cannot provision store while versioned store files already exist",
                 )
             initial = _fresh_store_state(
-                host, store_generation=0, applied_baseline_goal=baseline_goal
+                host, store_generation=0, applied_baseline_goal=baseline_snap
             )
             store._two_phase_commit_unlocked(initial, count_write=False)
         return store
@@ -1331,7 +1352,20 @@ class ReplayStore:
         before_anchor_hook: Callable[[], None] | None = None,
         after_commit_hook: Callable[[], None] | None = None,
     ) -> None:
-        state["store_generation"] = state["store_generation"] + 1
+        if self._in_actuation_tx:
+            raise ReplayError(
+                "nested_mutation_during_actuation",
+                "nested store mutations are forbidden while an actuation callback is running",
+            )
+        expected_gen = state["store_generation"]
+        current_anchor = self.anchor.read()
+        if current_anchor is None or current_anchor.store_generation != expected_gen:
+            raise StoreRollbackError(
+                "anchor_generation_conflict",
+                f"anchor generation mismatch before commit (expected {expected_gen}, "
+                f"got {current_anchor.store_generation if current_anchor else None})",
+            )
+        state["store_generation"] = expected_gen + 1
         self._two_phase_commit_unlocked(
             state,
             before_replace_hook=before_replace_hook,
@@ -1356,20 +1390,22 @@ class ReplayStore:
         cleared, and restores the authoritative applied baseline supplied by the
         owner recovery ceremony (if provided).
         """
-        if baseline_goal is not None:
-            validate_goal_file_basics(baseline_goal, self.host)
+        baseline_snap = copy.deepcopy(baseline_goal) if baseline_goal is not None else None
+        if baseline_snap is not None:
+            validate_goal_file_basics(baseline_snap, self.host)
         with self.locked():
             state = self.load_verified_unlocked(allow_voided=True)
             state["voided"] = False
             state["void_reason"] = None
+            state["pending_actuation"] = None
             state["outstanding_nonces"] = {}
             state["pending_holds"] = {}
             state["grants"] = {
                 gid: g for gid, g in state["grants"].items() if g.get("tombstoned") is True
             }
-            if baseline_goal is not None:
-                state["applied_baseline_goal"] = copy.deepcopy(baseline_goal)
-                state["applied_baseline_sha256"] = canonical_sha256(baseline_goal)
+            if baseline_snap is not None:
+                state["applied_baseline_goal"] = copy.deepcopy(baseline_snap)
+                state["applied_baseline_sha256"] = canonical_sha256(baseline_snap)
             self.commit_unlocked(state)
 
 
@@ -1399,47 +1435,60 @@ def validate_trust_root_no_host_key(goal_file: dict[str, Any], host: str) -> Non
 
 
 def validate_goal_file_basics(goal_file: Any, host: str) -> None:
-    """Validate goal-file host, schema_version, domain coverages, and Item 10 trust-root ban."""
+    """Validate goal-file NFC, closed keys, host, schema_version, coverages, and Item 10 ban."""
     if not isinstance(goal_file, dict):
         raise MalformedRecordError("invalid_goal_file", "goal file must be a JSON object")
+    _check_nfc(goal_file)
     if goal_file.get("host") != host:
         raise ScopeError(
             "goal_host_mismatch",
             f"goal file host {goal_file.get('host')!r} != device host {host!r}",
         )
-    sv = goal_file.get("schema_version")
+    if set(goal_file) != {"schema_version", "host", "domains"}:
+        raise MalformedRecordError(
+            "unexpected_goal_fields",
+            f"goal file must have exact keys schema_version, host, domains; got {sorted(goal_file)}",
+        )
+    sv = goal_file["schema_version"]
     if not _is_exact_int(sv) or sv < 1 or sv > MAX_SAFE_INT:
         raise MalformedRecordError(
             "invalid_goal_schema_version", f"invalid goal schema_version {sv!r}"
         )
-    domains = goal_file.get("domains")
+    domains = goal_file["domains"]
     if not isinstance(domains, dict):
         raise MalformedRecordError("invalid_goal_domains", "goal file domains must be an object")
     for dom_name, dom_obj in domains.items():
         if not isinstance(dom_name, str) or not isinstance(dom_obj, dict):
             raise MalformedRecordError("invalid_goal_domain", f"domain {dom_name!r} must be an object")
+        extra_dom_keys = set(dom_obj) - {"coverage", "entries"}
+        if extra_dom_keys:
+            raise MalformedRecordError(
+                "unexpected_domain_fields",
+                f"domain {dom_name!r} has unexpected keys: {sorted(extra_dom_keys)}",
+            )
         cov = dom_obj.get("coverage")
         if not isinstance(cov, str) or cov not in GOAL_COVERAGE_VALUES:
             raise MalformedRecordError(
                 "invalid_coverage_value",
                 f"domain {dom_name!r} has invalid coverage {cov!r}",
             )
-        entries = dom_obj.get("entries")
-        if entries is not None:
-            if not isinstance(entries, dict):
-                raise MalformedRecordError(
-                    "invalid_domain_entries", f"domain {dom_name!r} entries must be an object"
-                )
-            if cov == "deliberately-unmanaged" and entries:
+        if "entries" in dom_obj:
+            entries = dom_obj["entries"]
+            if cov == "deliberately-unmanaged":
                 raise MalformedRecordError(
                     "entries_in_unmanaged_domain",
-                    f"deliberately-unmanaged domain {dom_name!r} must not contain entries",
+                    f"deliberately-unmanaged domain {dom_name!r} must not carry entries",
+                )
+            if not isinstance(entries, dict) or not entries:
+                raise MalformedRecordError(
+                    "invalid_domain_entries",
+                    f"domain {dom_name!r} entries must be a non-empty object",
                 )
             for kind_name, ids in entries.items():
-                if not isinstance(kind_name, str) or not isinstance(ids, dict):
+                if not isinstance(kind_name, str) or not isinstance(ids, dict) or not ids:
                     raise MalformedRecordError(
                         "invalid_kind_bucket",
-                        f"domain {dom_name!r} kind {kind_name!r} must be an object",
+                        f"domain {dom_name!r} kind {kind_name!r} must be a non-empty object",
                     )
                 for eid, body in ids.items():
                     if not isinstance(eid, str) or not isinstance(body, dict):
@@ -1598,6 +1647,12 @@ def compute_authoritative_diff(
         diff["hunks"] = hunks
     if not coverage_changes and not hunks:
         raise ScopeError("empty_diff", "no representable diff between baseline and proposed")
+    reconstructed = _apply_validated_diff_to_baseline(baseline_goal, diff)
+    if not hmac.compare_digest(canonical_sha256(reconstructed), prop_hash):
+        raise ScopeError(
+            "diff_reconstruct_mismatch",
+            "authoritative diff does not reproduce proposed goal file byte-for-byte",
+        )
     return diff
 
 
@@ -2085,33 +2140,92 @@ class ApprovalEnforcer:
             return max(base, CEREMONY_RANK["privileged"])
         return base
 
+    def _ensure_no_pending_actuation(self, state: dict[str, Any]) -> None:
+        if self.store._in_actuation_tx:
+            raise ReplayError(
+                "nested_mutation_during_actuation",
+                "nested enforcer mutation is forbidden inside an actuation callback",
+            )
+        if state.get("pending_actuation") is not None:
+            raise ReplayError(
+                "pending_actuation_unreconciled",
+                "unreconciled pending actuation exists; call reconcile_pending_actuation() first",
+            )
+
     def _actuate_and_publish_baseline_unlocked(
         self,
-        state: dict[str, Any],
         proposed_goal: dict[str, Any],
         proposed_sha256: str,
         *,
         before_apply_hook: Callable[[], None] | None = None,
+        before_publish_hook: Callable[[], None] | None = None,
     ) -> None:
-        """Actuate `proposed_goal` and publish baseline ONLY after callback confirmation (Codex #8).
+        """Actuate `proposed_goal` and publish baseline ONLY after callback confirmation (Codex #1, #2, #8; R2-H2).
 
         Caller has ALREADY durably committed the pre-actuation replay reservation
-        (consumed `application_seq` / `approval_seq` / nonce) before invoking
-        this method. If `before_apply_hook` or `_apply_callback` raises, the
-        replay mark stays consumed (fail-closed) while the authoritative applied
-        baseline remains the prior baseline.
+        together with `pending_actuation` intent before invoking this method.
+        - Nested mutations from inside `_apply_callback` are forbidden while
+          read-only calls (`store.snapshot()`, `developer_mode_indicator_active()`)
+          remain allowed.
+        - Confirmed `_apply_callback` exception clears `pending_actuation` while
+          preserving the prior baseline and consumed replay mark.
+        - Crash/failure during `before_apply_hook` or `before_publish_hook` leaves
+          `pending_actuation` persisted on disk so subsequent operations fail closed
+          until `reconcile_pending_actuation()` resolves the outcome.
         """
         if before_apply_hook is not None:
             before_apply_hook()
-        if self._apply_callback is not None:
-            self._apply_callback(copy.deepcopy(proposed_goal))
 
-        # Confirmed actuation: publish new authoritative baseline & prune any stale hold.
-        state["applied_baseline_goal"] = copy.deepcopy(proposed_goal)
-        state["applied_baseline_sha256"] = proposed_sha256
-        state["pending_holds"].pop(proposed_sha256, None)
-        self.store.commit_unlocked(state)
+        self.store._in_actuation_tx = True
+        try:
+            if self._apply_callback is not None:
+                self._apply_callback(copy.deepcopy(proposed_goal))
+        except BaseException:
+            self.store._in_actuation_tx = False
+            fresh_abort = self.store.load_verified_unlocked()
+            fresh_abort["pending_actuation"] = None
+            self.store.commit_unlocked(fresh_abort)
+            raise
+        finally:
+            self.store._in_actuation_tx = False
+
+        # Reload fresh state after callback, publish confirmed baseline, clear pending_actuation.
+        fresh = self.store.load_verified_unlocked()
+        fresh["applied_baseline_goal"] = copy.deepcopy(proposed_goal)
+        fresh["applied_baseline_sha256"] = proposed_sha256
+        fresh["pending_actuation"] = None
+        fresh["pending_holds"].pop(proposed_sha256, None)
+        self.store.commit_unlocked(fresh, before_replace_hook=before_publish_hook)
         self.actuation_count += 1
+
+    def reconcile_pending_actuation(self, *, applied_on_device: bool) -> dict[str, Any]:
+        """Reconcile an uncertain crash-interrupted actuation against the real device state (Codex R2 #1)."""
+        if not _is_exact_bool(applied_on_device):
+            raise MalformedRecordError(
+                "invalid_reconcile_flag", "applied_on_device must be an exact bool"
+            )
+        with self.store.locked():
+            state = self.store.load_verified_unlocked()
+            pa = state.get("pending_actuation")
+            if pa is None:
+                raise ReplayError("no_pending_actuation", "no pending actuation to reconcile")
+            if applied_on_device:
+                state["applied_baseline_goal"] = copy.deepcopy(pa["proposed_goal"])
+                state["applied_baseline_sha256"] = pa["proposed_sha256"]
+                state["pending_holds"].pop(pa["proposed_sha256"], None)
+                state["pending_actuation"] = None
+                self.store.commit_unlocked(state)
+                self.actuation_count += 1
+                return {
+                    "status": "promoted",
+                    "applied_baseline_sha256": state["applied_baseline_sha256"],
+                }
+            state["pending_actuation"] = None
+            self.store.commit_unlocked(state)
+            return {
+                "status": "aborted",
+                "applied_baseline_sha256": state["applied_baseline_sha256"],
+            }
 
     # ------------------------------------------------------------------
     # Ceremony nonce issuance (Items 2, 12, 22, PR #75 R4 #3 & #5)
@@ -2169,6 +2283,7 @@ class ApprovalEnforcer:
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             if now_utc is not None:
                 self._advance_utc_clock(state, _coerce_utc(now_utc))
             nonce = generate_device_nonce()
@@ -2205,6 +2320,7 @@ class ApprovalEnforcer:
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             if now_utc is not None:
                 self._advance_utc_clock(state, _coerce_utc(now_utc))
             nonce = generate_device_nonce()
@@ -2225,7 +2341,12 @@ class ApprovalEnforcer:
     # ------------------------------------------------------------------
 
     def developer_mode_indicator_active(self, now_utc: datetime.datetime | str) -> bool:
-        """True iff at least one active, unexpired developer-mode grant exists on this host."""
+        """True iff at least one active, unexpired developer-mode grant exists on this host.
+
+        Codex R2 #3: if any active grant is observed expired at `now_utc`,
+        durably advances `last_seen_utc` (unless running read-only inside an
+        actuation callback) so a backward clock cannot resurrect the grant.
+        """
         now_dt = _coerce_utc(now_utc)
         with self.store.locked():
             try:
@@ -2235,15 +2356,21 @@ class ApprovalEnforcer:
             if state["voided"]:
                 return False
             self._check_utc_clock_monotonic(state, now_dt)
+            indicator_on = False
+            observed_expired = False
             for grant in state["grants"].values():
                 if grant.get("grant_state") != "active" or grant.get("tombstoned"):
                     continue
                 scope = grant.get("scope") or {}
-                if scope.get("developer_mode") is not True:
+                expired = self._is_expired(scope.get("not_after"), now_dt)
+                if expired:
+                    observed_expired = True
                     continue
-                if not self._is_expired(scope.get("not_after"), now_dt):
-                    return True
-            return False
+                if scope.get("developer_mode") is True:
+                    indicator_on = True
+            if observed_expired and not self.store._in_actuation_tx:
+                self._record_observed_expiry_unlocked(state, now_dt)
+            return indicator_on
 
     # ------------------------------------------------------------------
     # Standing enrollment & terminal revocation (Items 1, 2, 6, 7, 8-11, 20, 22)
@@ -2282,6 +2409,7 @@ class ApprovalEnforcer:
         # Option B equality, nonce consumption) run strictly inside self.store.locked()!
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             self._check_utc_clock_monotonic(state, now_dt)
 
             baseline_goal = state["applied_baseline_goal"]
@@ -2516,19 +2644,26 @@ class ApprovalEnforcer:
         derived_class: str,
         now_dt: datetime.datetime,
         roles: dict[str, str],
-    ) -> tuple[str, int | None]:
-        """Evaluate every active, unexpired grant covering `(signer, derived_class)`."""
+    ) -> tuple[str, int | None, bool]:
+        """Evaluate every active, unexpired grant covering `(signer, derived_class)`.
+
+        Returns `(effective_mode, longest_hold, observed_expired)` where
+        `observed_expired` is True if ANY active grant on the host was observed
+        past its `not_after` at `now_dt` (Codex R2 #3).
+        """
         winning_mode: str | None = None
         winning_rank = 0
         longest_hold: int | None = None
+        observed_expired = False
 
         for grant in state["grants"].values():
             if grant.get("grant_state") != "active" or grant.get("tombstoned"):
                 continue
             scope = grant.get("scope") or {}
-            if scope.get("class") != derived_class:
-                continue
             if self._is_expired(scope.get("not_after"), now_dt):
+                observed_expired = True
+                continue
+            if scope.get("class") != derived_class:
                 continue
             if signer not in (scope.get("covered_signers") or []):
                 continue
@@ -2549,8 +2684,10 @@ class ApprovalEnforcer:
                     longest_hold = hs
 
         if winning_mode is None:
+            if observed_expired:
+                self._record_observed_expiry_unlocked(state, now_dt)
             raise ScopeError("no_covering_grant", "no active unexpired grant covers this application")
-        return winning_mode, longest_hold
+        return winning_mode, longest_hold, observed_expired
 
     # ------------------------------------------------------------------
     # Standing application intake, hold display confirm & hold completion
@@ -2573,13 +2710,18 @@ class ApprovalEnforcer:
         before_replace_hook: Callable[[], None] | None = None,
         before_anchor_hook: Callable[[], None] | None = None,
         before_apply_hook: Callable[[], None] | None = None,
+        before_publish_hook: Callable[[], None] | None = None,
     ) -> ApplicationResult:
         """Validate and execute/hold/park a `standing-application`.
 
         Item 26 + PR #75 R4 #2: EVERY check passes BEFORE `application_seq` is
-        persisted. All baseline/role/diff/store checks run strictly inside
+        persisted. Snapshots caller-owned `proposed_goal` and `diff` at entry
+        (Codex R2 #5). All baseline/role/diff/store checks run strictly inside
         `self.store.locked()` (zero TOCTOU).
         """
+        proposed_goal = copy.deepcopy(proposed_goal)
+        diff = copy.deepcopy(diff) if diff is not None else None
+
         now_dt = _coerce_utc(now_utc)
         if now_mono is not None:
             validated_mono: float | None = _coerce_mono(now_mono)
@@ -2631,6 +2773,7 @@ class ApprovalEnforcer:
         # ALL stateful checks run atomically inside self.store.locked().
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             self._check_utc_clock_monotonic(state, now_dt)
 
             baseline_goal = state["applied_baseline_goal"]
@@ -2745,7 +2888,7 @@ class ApprovalEnforcer:
                     f"signer {signer!r} is not a baseline covered-signer (non-developer grant)",
                 )
 
-            effective_mode, effective_hold_seconds = self._resolve_covering_precedence(
+            effective_mode, effective_hold_seconds, observed_expired = self._resolve_covering_precedence(
                 state,
                 signer=signer,
                 derived_class=derived_class,
@@ -2754,6 +2897,8 @@ class ApprovalEnforcer:
             )
 
             if effective_mode == "standing-refusal":
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 raise ScopeError(
                     "standing_refusal",
                     "a covering active standing-refusal grant refuses this change",
@@ -2761,6 +2906,8 @@ class ApprovalEnforcer:
 
             # Adversary M2: refuse overwriting an existing pending hold BEFORE burning mark!
             if effective_mode == "hold-window" and actual_proposed_hash in state["pending_holds"]:
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 raise ReplayError(
                     "duplicate_pending_hold",
                     "a pending hold already exists for this proposed_sha256",
@@ -2769,12 +2916,16 @@ class ApprovalEnforcer:
             # Item 5 & Item 26: check application_seq AFTER every other check!
             stored_mark = grant["application_seq_mark"]
             if app_seq <= stored_mark:
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 raise ReplayError(
                     "stale_application_seq",
                     f"application_seq {app_seq} <= stored mark {stored_mark}",
                 )
 
             if effective_mode == "wait-for-user":
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 return ApplicationResult(
                     decision="parked",
                     host=self.host,
@@ -2827,7 +2978,12 @@ class ApprovalEnforcer:
                 )
 
             # effective_mode == "standing-approval":
-            # Phase A: durably persist replay reservation BEFORE actuation.
+            # Phase A: durably persist replay reservation + pending_actuation intent BEFORE actuation.
+            state["pending_actuation"] = {
+                "proposed_sha256": actual_proposed_hash,
+                "proposed_goal": copy.deepcopy(proposed_goal),
+                "baseline_sha256": current_baseline_hash,
+            }
             self.store.commit_unlocked(
                 state,
                 before_replace_hook=before_replace_hook,
@@ -2835,10 +2991,10 @@ class ApprovalEnforcer:
             )
             # Phase B & C: invoke callback and publish new authoritative baseline ONLY on success.
             self._actuate_and_publish_baseline_unlocked(
-                state,
                 proposed_goal,
                 actual_proposed_hash,
                 before_apply_hook=before_apply_hook,
+                before_publish_hook=before_publish_hook,
             )
             return ApplicationResult(
                 decision="applied",
@@ -2862,16 +3018,18 @@ class ApprovalEnforcer:
         epoch = _validate_boot_epoch(boot_epoch)
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             hold = state["pending_holds"].get(proposed_sha256)
             if hold is None:
                 raise ReplayError(
                     "no_pending_hold",
                     f"no pending hold exists for {proposed_sha256!r}",
                 )
-            if hold.get("displayed") is True:
+            # Allow re-display after a reboot (boot_epoch change), refuse duplicate confirm on same epoch.
+            if hold.get("displayed") is True and hold.get("boot_epoch") == epoch:
                 raise ReplayError(
                     "hold_already_displayed",
-                    f"hold for {proposed_sha256!r} already confirmed displayed",
+                    f"hold for {proposed_sha256!r} already confirmed displayed in epoch {epoch!r}",
                 )
             hold["displayed"] = True
             hold["first_shown_mono"] = mono
@@ -2892,8 +3050,12 @@ class ApprovalEnforcer:
         migrate_fn: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
         device_trust_comparable: bool = False,
         before_apply_hook: Callable[[], None] | None = None,
+        before_publish_hook: Callable[[], None] | None = None,
     ) -> ApplicationResult:
         """Complete a confirmed hold window after monotonic elapsed time, re-evaluating EVERY check."""
+        proposed_goal = copy.deepcopy(proposed_goal)
+        diff = copy.deepcopy(diff) if diff is not None else None
+
         now_dt = _coerce_utc(now_utc)
         mono = _coerce_mono(now_mono)
         epoch = _validate_boot_epoch(boot_epoch)
@@ -2901,6 +3063,7 @@ class ApprovalEnforcer:
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             self._check_utc_clock_monotonic(state, now_dt)
 
             hold = state["pending_holds"].get(proposed_sha256)
@@ -2926,11 +3089,17 @@ class ApprovalEnforcer:
                     "hold window cannot complete before trusted UI display confirmation",
                 )
 
-            # Codex #6: monotonic clock MUST belong to the same boot/clock epoch!
+            # Codex #6 & Macroscope 4709254027: reset display state on reboot so UI can re-show cleanly!
             if hold["boot_epoch"] != epoch:
+                prev_epoch = hold["boot_epoch"]
+                hold["displayed"] = False
+                hold["first_shown_mono"] = None
+                hold["boot_epoch"] = None
+                self._advance_utc_clock(state, now_dt)
+                self.store.commit_unlocked(state)
                 raise ClockRollbackError(
                     "monotonic_boot_epoch_mismatch",
-                    f"boot_epoch changed during hold ({hold['boot_epoch']!r} -> {epoch!r}); re-show required",
+                    f"boot_epoch changed during hold ({prev_epoch!r} -> {epoch!r}); display reset, re-show required",
                 )
 
             first_shown = _coerce_mono(hold["first_shown_mono"])
@@ -3036,7 +3205,7 @@ class ApprovalEnforcer:
                     "signer lost baseline covered-signer role during hold",
                 )
 
-            effective_mode, effective_hold_seconds = self._resolve_covering_precedence(
+            effective_mode, effective_hold_seconds, observed_expired = self._resolve_covering_precedence(
                 state,
                 signer=signer,
                 derived_class=hold["ceremony_class"],
@@ -3050,6 +3219,8 @@ class ApprovalEnforcer:
                     "a covering standing-refusal grant now refuses this held change",
                 )
             if effective_mode == "wait-for-user":
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 return ApplicationResult(
                     decision="parked",
                     host=self.host,
@@ -3067,22 +3238,29 @@ class ApprovalEnforcer:
             elapsed = mono - first_shown
             # Defense in depth against NaN: require `elapsed >= required_hold` explicitly!
             if not (elapsed >= required_hold):
+                if observed_expired:
+                    self._record_observed_expiry_unlocked(state, now_dt)
                 raise ScopeError(
                     "hold_window_not_elapsed",
                     f"hold window elapsed {elapsed:.3f}s < required {required_hold}s",
                 )
 
-            # Phase A: remove pending hold & record UTC durably BEFORE actuating.
+            # Phase A: remove pending hold, record pending_actuation & UTC durably BEFORE actuating.
             del state["pending_holds"][proposed_sha256]
+            state["pending_actuation"] = {
+                "proposed_sha256": proposed_sha256,
+                "proposed_goal": copy.deepcopy(proposed_goal),
+                "baseline_sha256": current_baseline_hash,
+            }
             self._advance_utc_clock(state, now_dt)
             self.store.commit_unlocked(state)
 
             # Phase B & C: actuate & publish new baseline only on callback success.
             self._actuate_and_publish_baseline_unlocked(
-                state,
                 proposed_goal,
                 proposed_sha256,
                 before_apply_hook=before_apply_hook,
+                before_publish_hook=before_publish_hook,
             )
             return ApplicationResult(
                 decision="applied",
@@ -3112,10 +3290,12 @@ class ApprovalEnforcer:
         before_replace_hook: Callable[[], None] | None = None,
         before_anchor_hook: Callable[[], None] | None = None,
         before_apply_hook: Callable[[], None] | None = None,
+        before_publish_hook: Callable[[], None] | None = None,
     ) -> PerChangeResult:
         """Process an owner `per-change` approval/reject/withdraw record.
 
         Hardened invariants:
+          - Snapshots caller-owned `proposed_goal` and `diff` at entry (Codex R2 #5).
           - All baseline/role/diff/store checks run strictly inside `self.store.locked()`.
           - `verdict == "accept"` ALWAYS requires `proposed_goal is not None`.
           - First adoption (`baseline_goal is None`) requires an explicit non-empty
@@ -3124,12 +3304,16 @@ class ApprovalEnforcer:
             `validate_trust_root_no_host_key`, and anti-downgrade `new >= old`
             (and `new > old` on migrations, 2026-11-26 ruling Item 15).
           - Never falls back to `record["ceremony_class"]`; derives class
-            authoritatively from `(baseline_goal, proposed_goal)` or verified `diff`.
+            authoritatively from `(baseline_goal, proposed_goal)` or verified `diff`
+            (requiring `proposed_goal` for non-hold `version_bump` reject/withdraw).
           - Narrow hold-window override reject (Item 18): owner `per-change` `reject`
             naming `(host, proposed_sha256)` stops a pending hold immediately and
             persists as a DC-2 reject regardless of `ceremony_class`, `nonce`, or
             `approval_seq`.
         """
+        proposed_goal = copy.deepcopy(proposed_goal) if proposed_goal is not None else None
+        diff = copy.deepcopy(diff) if diff is not None else None
+
         now_dt = _coerce_utc(now_utc)
         # Pure stateless checks outside lock.
         doc = parse_strict_json(raw_record)
@@ -3158,6 +3342,7 @@ class ApprovalEnforcer:
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
+            self._ensure_no_pending_actuation(state)
             self._check_utc_clock_monotonic(state, now_dt)
 
             baseline_goal = state["applied_baseline_goal"]
@@ -3307,13 +3492,19 @@ class ApprovalEnforcer:
                         raise ReplayError("diff_baseline_hash_mismatch", "diff baseline_sha256 != baseline hash")
                     if not hmac.compare_digest(diff["proposed_sha256"], proposed_sha256):
                         raise ScopeError("diff_proposed_hash_mismatch", "diff proposed_sha256 != record proposed_sha256")
-                    if "version_bump" not in diff:
-                        applied = _apply_validated_diff_to_baseline(baseline_goal, diff)
-                        if not hmac.compare_digest(canonical_sha256(applied), proposed_sha256):
-                            raise ScopeError(
-                                "diff_apply_mismatch",
-                                "applying diff to baseline does not match record proposed_sha256",
-                            )
+                    if "version_bump" in diff:
+                        # Codex R2 #6 / Adversary R2-L1 #1: require proposed_goal for version_bump
+                        # reject/withdraw so migration content & hashes are verified authoritatively.
+                        raise MalformedRecordError(
+                            "version_bump_requires_proposal",
+                            "non-hold per-change reject/withdraw with version_bump requires proposed_goal",
+                        )
+                    applied = _apply_validated_diff_to_baseline(baseline_goal, diff)
+                    if not hmac.compare_digest(canonical_sha256(applied), proposed_sha256):
+                        raise ScopeError(
+                            "diff_apply_mismatch",
+                            "applying diff to baseline does not match record proposed_sha256",
+                        )
 
             # Item 23: asserted ceremony_class must equal derived class exactly.
             if record["ceremony_class"] != derived_class:
@@ -3402,8 +3593,13 @@ class ApprovalEnforcer:
             state["persisted_rejects"].pop(proposed_sha256, None)
             if proposed_sha256 in state["pending_holds"]:
                 cancelled_holds.append(state["pending_holds"].pop(proposed_sha256)["hold_id"])
+            state["pending_actuation"] = {
+                "proposed_sha256": proposed_sha256,
+                "proposed_goal": copy.deepcopy(proposed_goal),
+                "baseline_sha256": state["applied_baseline_sha256"],
+            }
             self._advance_utc_clock(state, now_dt)
-            # Phase A: commit replay reservation BEFORE actuation.
+            # Phase A: commit replay reservation + pending_actuation intent BEFORE actuation.
             self.store.commit_unlocked(
                 state,
                 before_replace_hook=before_replace_hook,
@@ -3413,10 +3609,10 @@ class ApprovalEnforcer:
 
             # Phase B & C: actuate & publish confirmed baseline only on callback success.
             self._actuate_and_publish_baseline_unlocked(
-                state,
                 proposed_goal,
                 proposed_sha256,
                 before_apply_hook=before_apply_hook,
+                before_publish_hook=before_publish_hook,
             )
             return PerChangeResult(
                 decision="applied",
