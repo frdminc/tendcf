@@ -13,11 +13,16 @@
 # nothing a non-root user can write is read by root.
 #
 #   install [--data FILE] [--policy-src DIR] [--projector-src FILE] [--projector-sha256 HEX]
+#           [--audit-log-src FILE] [--audit-log-sha256 HEX] [--lock-auditd]
 #                    make /opt/tendcf root-owned, lay out the work directory, put the
-#                    policy, promises.cf and projector.py in place (projector source
-#                    must either be root-owned and non-writable or match --projector-sha256),
-#                    optionally install the CMDB data (validated by python3 -I -S
-#                    projector.py and cf-promises --show-classes before publication)
+#                    policy, promises.cf, projector.py and audit_log.py in place
+#                    (projector and audit_log sources must either be root-owned and
+#                    non-writable or match --projector-sha256 / --audit-log-sha256),
+#                    create private audit spool/config directories and install
+#                    auditd + AIDE tripwire rules (pass --lock-auditd to include
+#                    immutable `-e 2` in auditd rules), and optionally install CMDB
+#                    data (validated by python3 -I -S projector.py and cf-promises
+#                    --show-classes before publication)
 #   data FILE        replace the CMDB data (serialized via flock, validated by
 #                    projector.py and cf-promises --show-classes requiring positive
 #                    tendcf_cmdb_evaluated source=promise and zero refusal classes,
@@ -25,8 +30,13 @@
 #                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss does
 #                    not run traps)
 #   run-once         one `cf-agent --no-augments -K -I` pass over the installed policy
-#   enable           install and start tendcf-execd.service (root cf-execd)
-#   disable          stop and remove it
+#   enable           install and start tendcf-execd.service (root cf-execd) and,
+#                    when audit_log.py is installed, tendcf-audit-shipper.{service,timer}
+#   disable          stop and remove tendcf-execd.service and tendcf-audit-shipper.{service,timer}
+#   uninstall [--purge-spool]
+#                    disable/remove scheduler + audit shipper units, remove installed
+#                    auditd/AIDE tripwire rules, shipper config and audit_log.py
+#                    (preserves /opt/tendcf/var/audit-spool unless --purge-spool)
 #   status           what is installed and running
 #
 # The tree at /opt/tendcf is a CI build made with --prefix=/opt/tendcf, so its
@@ -66,11 +76,28 @@ cf_lib_path="$prefix/lib"
 workdir=""   # set by init_paths
 unit=tendcf-execd.service
 unit_path=/etc/systemd/system/$unit
+shipper_service=tendcf-audit-shipper.service
+shipper_timer=tendcf-audit-shipper.timer
+shipper_service_path=/etc/systemd/system/$shipper_service
+shipper_timer_path=/etc/systemd/system/$shipper_timer
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 policy_src="$here/../../policy"
 projector_src=""
 projector_sha256=""
 installed_projector="$prefix/share/tendcf/bin/projector.py"
+audit_log_src=""
+audit_log_sha256=""
+audit_log_explicit=0
+installed_audit_log="$prefix/share/tendcf/bin/audit_log.py"
+audit_etc_dir="$prefix/etc"
+audit_shipper_cfg="$audit_etc_dir/audit-shipper.json"
+audit_spool_dir="$prefix/var/audit-spool"
+tripwire_share_dir="$prefix/share/tendcf/tripwire"
+auditd_rules_dir=/etc/audit/rules.d
+auditd_rules_path="$auditd_rules_dir/99-tendcf-tripwire.rules"
+aide_rules_dir=/etc/aide/aide.conf.d
+aide_rules_path="$aide_rules_dir/99-tendcf-tripwire"
+lock_auditd=0
 
 probe_tmp=""
 place_projector_stage=""
@@ -79,6 +106,11 @@ prepared_projector_stage=""
 prepared_projector_file=""
 projector_prepared=0
 installed_projector_originally_clean=0
+place_audit_log_tmp=""
+prepared_audit_log_stage=""
+prepared_audit_log_file=""
+audit_log_prepared=0
+installed_audit_log_originally_clean=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -138,6 +170,15 @@ cleanup_temp() {
         rm -rf "$prepared_projector_stage" || true
         prepared_projector_stage=""
         prepared_projector_file=""
+    fi
+    if [ -n "${place_audit_log_tmp:-}" ]; then
+        rm -f "$place_audit_log_tmp" || true
+        place_audit_log_tmp=""
+    fi
+    if [ -n "${prepared_audit_log_stage:-}" ] && [ -d "$prepared_audit_log_stage" ]; then
+        rm -rf "$prepared_audit_log_stage" || true
+        prepared_audit_log_stage=""
+        prepared_audit_log_file=""
     fi
     if [ -n "${probe_tmp:-}" ]; then
         rm -f "$probe_tmp" || true
@@ -649,6 +690,315 @@ place_projector() {
     verify_installed_projector
 }
 
+resolve_audit_log_src() {
+    if [ -z "$audit_log_src" ]; then
+        if [ -e "$here/bin/audit_log.py" ] || [ -L "$here/bin/audit_log.py" ]; then
+            audit_log_src="$here/bin/audit_log.py"
+        elif [ -e "$here/../../tools/audit_log.py" ] || [ -L "$here/../../tools/audit_log.py" ]; then
+            audit_log_src="$here/../../tools/audit_log.py"
+        elif [ -e "$here/../../bin/audit_log.py" ] || [ -L "$here/../../bin/audit_log.py" ]; then
+            audit_log_src="$here/../../bin/audit_log.py"
+        else
+            if [ "${audit_log_explicit:-0}" -eq 1 ] || [ -n "$audit_log_sha256" ]; then
+                die "audit_log.py not found (use --audit-log-src FILE)"
+            fi
+            return 1
+        fi
+    fi
+    [ -f "$audit_log_src" ] && [ ! -L "$audit_log_src" ] \
+        || die "audit-log-src must be a regular non-symlink file: $audit_log_src"
+    case "$audit_log_src" in
+        /*) ;;
+        *)
+            local cwd_l
+            cwd_l="$(pwd -L)"
+            if [ "$cwd_l" = "/" ]; then
+                audit_log_src="/${audit_log_src#./}"
+            else
+                audit_log_src="${cwd_l}/${audit_log_src#./}"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+verify_installed_audit_log() {
+    check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
+    check_dir_chain_strict_under_prefix "$prefix/share/tendcf/bin"
+    check_regular_file_root_unwritable "$installed_audit_log"
+}
+
+installed_audit_log_clean_ok() {
+    check_ancestors_ok "$prefix" || return 1
+    local d meta uid gid mode
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        [ ! -L "$d" ] && [ -d "$d" ] || return 1
+        meta="$(stat -c '%u %g %a' "$d" 2>/dev/null)" || return 1
+        read -r uid gid mode <<< "$meta"
+        [ "$uid" = 0 ] && [ "$gid" = 0 ] || return 1
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    done
+    [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ] || return 1
+    meta="$(stat -c '%u %g %a' "$installed_audit_log" 2>/dev/null)" || return 1
+    read -r uid gid mode <<< "$meta"
+    [ "$uid" = 0 ] && [ "$gid" = 0 ] && [ $((8#$mode)) -eq $((8#644)) ] || return 1
+    return 0
+}
+
+prepare_audit_log_source() {
+    audit_log_prepared=0
+    if ! resolve_audit_log_src; then
+        return 0
+    fi
+    if [ -n "$audit_log_sha256" ] && [[ ! "$audit_log_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --audit-log-sha256 must be 64 lowercase hex characters"
+    fi
+    local src_trusted=0
+    if source_file_root_trusted_ok "$audit_log_src"; then
+        src_trusted=1
+    fi
+    if [ -z "$audit_log_sha256" ] && [ "$src_trusted" -ne 1 ]; then
+        die "$audit_log_src is not a root-owned non-writable regular file with trusted ancestors (or pass --audit-log-sha256)"
+    fi
+
+    if [ -n "${prepared_audit_log_stage:-}" ] && [ -d "$prepared_audit_log_stage" ]; then
+        rm -rf "$prepared_audit_log_stage"
+        prepared_audit_log_stage=""
+        prepared_audit_log_file=""
+    fi
+    local old_umask stage_d staged_a actual_sha
+    old_umask="$(umask)"
+    umask 077
+    stage_d="$(mktemp -d /tmp/tendcf-audit-stage.XXXXXX)"
+    umask "$old_umask"
+    prepared_audit_log_stage="$stage_d"
+    chown root:root "$stage_d"
+    chmod 0700 "$stage_d"
+
+    staged_a="$stage_d/audit_log.py"
+    old_umask="$(umask)"
+    umask 077
+    cat "$audit_log_src" > "$staged_a"
+    umask "$old_umask"
+    chown root:root "$staged_a"
+    chmod 0600 "$staged_a"
+    prepared_audit_log_file="$staged_a"
+
+    if [ -n "$audit_log_sha256" ]; then
+        actual_sha="$(sha256sum "$staged_a" | awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$audit_log_sha256" ]; then
+            die "audit_log sha256 mismatch for $audit_log_src: expected $audit_log_sha256, got $actual_sha"
+        fi
+    fi
+    audit_log_prepared=1
+}
+
+detach_unsafe_installed_audit_log() {
+    installed_audit_log_originally_clean=0
+    if [ -e "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+        if installed_audit_log_clean_ok; then
+            installed_audit_log_originally_clean=1
+            return 0
+        fi
+        if [ -d "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ]; then
+            die "$installed_audit_log is a directory; refusing"
+        fi
+        rm -f "$installed_audit_log"
+        if [ -e "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+            die "could not remove untrusted $installed_audit_log"
+        fi
+    fi
+}
+
+place_audit_log() {
+    if [ "${audit_log_prepared:-0}" -ne 1 ]; then
+        return 0
+    fi
+    [ -n "${prepared_audit_log_file:-}" ] \
+        && [ -f "$prepared_audit_log_file" ] \
+        && [ ! -L "$prepared_audit_log_file" ] \
+        || die "audit_log source was not prepared or staged copy is missing"
+    check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
+    check_dir_chain_strict_under_prefix "$prefix/share/tendcf/bin"
+    if [ -L "$installed_audit_log" ] || [ -d "$installed_audit_log" ]; then
+        die "$installed_audit_log is not a regular file; refusing"
+    fi
+    if [ "${installed_audit_log_originally_clean:-0}" -eq 1 ] \
+        && [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ] \
+        && cmp -s "$prepared_audit_log_file" "$installed_audit_log" \
+        && installed_audit_log_clean_ok; then
+        :
+    else
+        local old_umask tmp
+        old_umask="$(umask)"
+        umask 022
+        tmp="$(mktemp "$prefix/share/tendcf/bin/.audit_log.py.new.XXXXXX")"
+        umask "$old_umask"
+        place_audit_log_tmp="$tmp"
+        cat "$prepared_audit_log_file" > "$tmp"
+        chown root:root "$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$installed_audit_log"
+        place_audit_log_tmp=""
+    fi
+    if [ -n "${prepared_audit_log_stage:-}" ] && [ -d "$prepared_audit_log_stage" ]; then
+        rm -rf "$prepared_audit_log_stage"
+        prepared_audit_log_stage=""
+        prepared_audit_log_file=""
+    fi
+    audit_log_prepared=0
+    verify_installed_audit_log
+}
+
+place_audit_shipper_state() {
+    check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
+    local d
+    for d in "$audit_etc_dir" "$prefix/var" "$audit_spool_dir"; do
+        [ ! -L "$d" ] || die "$d is a symlink; refusing"
+        if [ -e "$d" ] && [ ! -d "$d" ]; then
+            die "$d is not a directory; refusing"
+        fi
+    done
+    install -d -m 0700 -o root -g root "$audit_etc_dir"
+    check_dir_root_unwritable "$audit_etc_dir"
+    install -d -m 0755 -o root -g root "$prefix/var"
+    check_dir_root_unwritable "$prefix/var"
+    install -d -m 0700 -o root -g root "$audit_spool_dir"
+    check_dir_root_unwritable "$audit_spool_dir"
+    if [ -L "$audit_shipper_cfg" ] || [ -d "$audit_shipper_cfg" ]; then
+        die "$audit_shipper_cfg is not a regular file; refusing"
+    fi
+    if [ ! -f "$audit_shipper_cfg" ]; then
+        local host_name old_umask tmp_cfg
+        host_name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo localhost)"
+        if [[ ! "$host_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
+            host_name="localhost"
+        fi
+        old_umask="$(umask)"
+        umask 077
+        tmp_cfg="$(mktemp "$audit_etc_dir/.audit-shipper.json.new.XXXXXX")"
+        umask "$old_umask"
+        printf '{"enabled":false,"host":"%s","spool_dir":"%s","src":"tendcf"}\n' \
+            "$host_name" "$audit_spool_dir" > "$tmp_cfg"
+        chown root:root "$tmp_cfg"
+        chmod 0600 "$tmp_cfg"
+        mv -f "$tmp_cfg" "$audit_shipper_cfg"
+    fi
+}
+
+render_linux_tripwire_auditd() {  # render_linux_tripwire_auditd DEST
+    local dest="$1"
+    cat > "$dest" <<EOF
+# Managed by deploy/linux/tendcf-install.sh (issue #119 Slice 2).
+# Watches tendcf binaries, policy, CMDB data, shipper config, systemd units,
+# sudoers, and root authorized_keys for writes or attribute changes.
+-w $prefix/bin -p wa -k tendcf_tripwire
+-w $prefix/lib -p wa -k tendcf_tripwire
+-w $prefix/share/tendcf -p wa -k tendcf_tripwire
+-w $workdir/inputs -p wa -k tendcf_tripwire
+-w $workdir/data/host_specific.json -p wa -k tendcf_tripwire
+-w $audit_shipper_cfg -p wa -k tendcf_tripwire
+-w $unit_path -p wa -k tendcf_tripwire
+-w $shipper_service_path -p wa -k tendcf_tripwire
+-w $shipper_timer_path -p wa -k tendcf_tripwire
+-w /etc/sudoers -p wa -k tendcf_tripwire
+-w /etc/sudoers.d -p wa -k tendcf_tripwire
+-w /root/.ssh/authorized_keys -p wa -k tendcf_tripwire
+EOF
+    if [ "${lock_auditd:-0}" -eq 1 ]; then
+        printf '# Immutable auditd lock requested via --lock-auditd (requires reboot to change)\n-e 2\n' >> "$dest"
+    else
+        printf '# To lock kernel audit rules until reboot, re-run install with --lock-auditd (adds -e 2)\n' >> "$dest"
+    fi
+}
+
+render_linux_tripwire_aide() {  # render_linux_tripwire_aide DEST
+    local dest="$1"
+    cat > "$dest" <<EOF
+# Managed by deploy/linux/tendcf-install.sh (issue #119 Slice 2).
+# AIDE integrity rules for tendcf binaries, policy, CMDB data, units, sudoers, authorized_keys.
+$prefix/bin p+i+n+u+g+s+m+c+sha256
+$prefix/lib p+i+n+u+g+s+m+c+sha256
+$prefix/share/tendcf p+i+n+u+g+s+m+c+sha256
+$workdir/inputs p+i+n+u+g+s+m+c+sha256
+$workdir/data/host_specific.json p+i+n+u+g+s+m+c+sha256
+$audit_shipper_cfg p+i+n+u+g+s+m+c+sha256
+$unit_path p+i+n+u+g+s+m+c+sha256
+$shipper_service_path p+i+n+u+g+s+m+c+sha256
+$shipper_timer_path p+i+n+u+g+s+m+c+sha256
+/etc/sudoers p+i+n+u+g+s+m+c+sha256
+/etc/sudoers.d p+i+n+u+g+s+m+c+sha256
+/root/.ssh/authorized_keys p+i+n+u+g+s+m+c+sha256
+EOF
+}
+
+place_tripwire_rules() {
+    check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
+    check_dir_chain_strict_under_prefix "$prefix/share/tendcf"
+    [ ! -L "$tripwire_share_dir" ] || die "$tripwire_share_dir is a symlink; refusing"
+    if [ -e "$tripwire_share_dir" ] && [ ! -d "$tripwire_share_dir" ]; then
+        die "$tripwire_share_dir is not a directory; refusing"
+    fi
+    install -d -m 0755 -o root -g root "$tripwire_share_dir"
+    check_dir_root_unwritable "$tripwire_share_dir"
+
+    local old_umask tmp_audit tmp_aide
+    old_umask="$(umask)"
+    umask 022
+    tmp_audit="$(mktemp "$tripwire_share_dir/.auditd.new.XXXXXX")"
+    tmp_aide="$(mktemp "$tripwire_share_dir/.aide.new.XXXXXX")"
+    umask "$old_umask"
+    render_linux_tripwire_auditd "$tmp_audit"
+    chown root:root "$tmp_audit"
+    chmod 0640 "$tmp_audit"
+    mv -f "$tmp_audit" "$tripwire_share_dir/99-tendcf-tripwire.rules"
+
+    render_linux_tripwire_aide "$tmp_aide"
+    chown root:root "$tmp_aide"
+    chmod 0644 "$tmp_aide"
+    mv -f "$tmp_aide" "$tripwire_share_dir/99-tendcf-tripwire.aide"
+
+    # Install system-level auditd and AIDE drop-in rules into trusted /etc trees.
+    check_dir_chain_ok /etc || die "/etc is not a trusted root-owned non-writable directory"
+    local d
+    for d in /etc/audit "$auditd_rules_dir"; do
+        [ ! -L "$d" ] || die "$d is a symlink; refusing"
+        if [ -e "$d" ] && [ ! -d "$d" ]; then
+            die "$d is not a directory; refusing"
+        fi
+        install -d -m 0750 -o root -g root "$d"
+        check_dir_root_unwritable "$d"
+    done
+    [ ! -L "$auditd_rules_path" ] && [ ! -d "$auditd_rules_path" ] \
+        || die "$auditd_rules_path is not a regular file; refusing"
+    tmp_audit="$(mktemp "$auditd_rules_dir/.99-tendcf-tripwire.rules.new.XXXXXX")"
+    cp -p "$tripwire_share_dir/99-tendcf-tripwire.rules" "$tmp_audit"
+    chown root:root "$tmp_audit"
+    chmod 0640 "$tmp_audit"
+    mv -f "$tmp_audit" "$auditd_rules_path"
+
+    for d in /etc/aide "$aide_rules_dir"; do
+        [ ! -L "$d" ] || die "$d is a symlink; refusing"
+        if [ -e "$d" ] && [ ! -d "$d" ]; then
+            die "$d is not a directory; refusing"
+        fi
+        install -d -m 0755 -o root -g root "$d"
+        check_dir_root_unwritable "$d"
+    done
+    [ ! -L "$aide_rules_path" ] && [ ! -d "$aide_rules_path" ] \
+        || die "$aide_rules_path is not a regular file; refusing"
+    tmp_aide="$(mktemp "$aide_rules_dir/.99-tendcf-tripwire.new.XXXXXX")"
+    cp -p "$tripwire_share_dir/99-tendcf-tripwire.aide" "$tmp_aide"
+    chown root:root "$tmp_aide"
+    chmod 0644 "$tmp_aide"
+    mv -f "$tmp_aide" "$aide_rules_path"
+
+    if [ -x /sbin/augenrules ] && [ -d /run/systemd/system ] \
+        && systemctl is-active --quiet auditd 2>/dev/null; then
+        /sbin/augenrules --load >/dev/null 2>&1 || say "warning: augenrules --load returned non-zero (audit rules may be locked with -e 2)"
+    fi
+}
+
 # Validate CMDB data in WD using cf-promises --show-classes (issue #57).
 # Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly),
 # closes FD 9 in the child, and runs a single status-checked awk scanner that:
@@ -886,6 +1236,12 @@ prevalidate_install_inputs() {
     if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
         die "install: --projector-sha256 must be 64 lowercase hex characters"
     fi
+    if [ -n "${audit_log_sha256:-}" ] && [[ ! "$audit_log_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --audit-log-sha256 must be 64 lowercase hex characters"
+    fi
+    if [ "${audit_log_explicit:-0}" -eq 1 ] || [ -n "${audit_log_sha256:-}" ]; then
+        resolve_audit_log_src || die "audit_log.py not found (use --audit-log-src FILE)"
+    fi
     if [ -n "$datafile" ]; then
         [ ! -L "$datafile" ] && [ -f "$datafile" ] \
             || die "data file must be a regular non-symlink file: $datafile"
@@ -900,17 +1256,25 @@ cmd_install() {
             --policy-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --policy-src needs a non-empty path"; policy_src="$2"; shift 2 ;;
             --projector-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-src needs a non-empty path"; projector_src="$2"; shift 2 ;;
             --projector-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-sha256 needs a 64-hex sha256"; projector_sha256="$2"; shift 2 ;;
+            --audit-log-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --audit-log-src needs a non-empty path"; audit_log_src="$2"; audit_log_explicit=1; shift 2 ;;
+            --audit-log-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --audit-log-sha256 needs a 64-hex sha256"; audit_log_sha256="$2"; audit_log_explicit=1; shift 2 ;;
+            --lock-auditd) lock_auditd=1; shift ;;
             *) die "install: unknown argument $1" ;;
         esac
     done
     prevalidate_install_inputs "$datafile"
     prepare_projector_source
+    prepare_audit_log_source
     detach_unsafe_installed_projector
+    detach_unsafe_installed_audit_log
     check_tree
     init_paths
     lay_out
     place_policy
     place_projector
+    place_audit_log
+    place_audit_shipper_state
+    place_tripwire_rules
     if [ -n "$datafile" ]; then put_data "$datafile"; fi
     say "installed: $(LD_LIBRARY_PATH="$cf_lib_path" "$cf_agent" --version | head -1)"
 }
@@ -921,9 +1285,68 @@ cmd_run_once() {
     LD_LIBRARY_PATH="$cf_lib_path" "$cf_agent" --no-augments -K -I -f "$entry"
 }
 
+enable_audit_shipper() {
+    if [ ! -f "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+        return 0
+    fi
+    verify_installed_projector
+    verify_installed_audit_log
+    place_audit_shipper_state
+    local py
+    py="$(find_trusted_python)" || die "cannot enable audit shipper: no trusted root-owned python3 found"
+    check_dir_root_unwritable /etc/systemd/system
+    [ ! -L "$shipper_service_path" ] && [ ! -d "$shipper_service_path" ] \
+        || die "$shipper_service_path is not a regular file; refusing"
+    [ ! -L "$shipper_timer_path" ] && [ ! -d "$shipper_timer_path" ] \
+        || die "$shipper_timer_path is not a regular file; refusing"
+    cat > "$shipper_service_path.new" <<EOF
+# Written by deploy/linux/tendcf-install.sh (issue #119 Slice 2)
+[Unit]
+Description=tendcf tamper-evident audit log shipper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=$py -I -S $installed_audit_log ship --config $audit_shipper_cfg
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=$audit_spool_dir
+EOF
+    chown root:root "$shipper_service_path.new"
+    chmod 0644 "$shipper_service_path.new"
+    mv -f "$shipper_service_path.new" "$shipper_service_path"
+
+    cat > "$shipper_timer_path.new" <<EOF
+# Written by deploy/linux/tendcf-install.sh (issue #119 Slice 2)
+[Unit]
+Description=Periodic tendcf audit log shipper timer
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=5m
+RandomizedDelaySec=15s
+Persistent=true
+Unit=$shipper_service
+
+[Install]
+WantedBy=timers.target
+EOF
+    chown root:root "$shipper_timer_path.new"
+    chmod 0644 "$shipper_timer_path.new"
+    mv -f "$shipper_timer_path.new" "$shipper_timer_path"
+}
+
 cmd_enable() {
     need_systemd
     [ -f "$entry" ] || die "not installed: run install first"
+    check_dir_root_unwritable /etc/systemd/system
+    [ ! -L "$unit_path" ] && [ ! -d "$unit_path" ] \
+        || die "$unit_path is not a regular file; refusing"
     cat > "$unit_path.new" <<EOF
 # Written by deploy/linux/tendcf-install.sh
 [Unit]
@@ -940,19 +1363,85 @@ KillMode=process
 [Install]
 WantedBy=multi-user.target
 EOF
+    chown root:root "$unit_path.new"
     chmod 0644 "$unit_path.new"
     mv -f "$unit_path.new" "$unit_path"
+    enable_audit_shipper
     systemctl daemon-reload
     systemctl enable --now "$unit"
-    say "enabled: $unit"
+    if [ -f "$shipper_timer_path" ]; then
+        systemctl enable --now "$shipper_timer"
+        say "enabled: $unit and $shipper_timer"
+    else
+        say "enabled: $unit"
+    fi
+}
+
+disable_units() {
+    if [ -d /run/systemd/system ]; then
+        systemctl disable --now "$shipper_timer" 2>/dev/null || true
+        systemctl stop "$shipper_service" 2>/dev/null || true
+        systemctl disable --now "$unit" 2>/dev/null || true
+    fi
+    local u
+    for u in "$shipper_timer_path" "$shipper_service_path" "$unit_path"; do
+        if [ -e "$u" ] || [ -L "$u" ]; then
+            check_ancestors_ok "$u" || die "unsafe ancestor for $u; refusing removal"
+            [ ! -L "$u" ] && [ -f "$u" ] || die "$u is not a regular file; refusing removal"
+            rm -f "$u"
+        fi
+    done
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
 }
 
 cmd_disable() {
     need_systemd
-    systemctl disable --now "$unit" 2>/dev/null || true
-    rm -f "$unit_path"
-    systemctl daemon-reload
-    say "disabled: $unit"
+    disable_units
+    say "disabled: $unit and $shipper_timer"
+}
+
+remove_managed_file_safe() {  # remove_managed_file_safe PATH
+    local target="$1"
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        return 0
+    fi
+    check_ancestors_ok "$target" || die "unsafe ancestor for $target; refusing removal"
+    [ ! -L "$target" ] && [ -f "$target" ] || die "$target is not a regular file; refusing removal"
+    rm -f "$target"
+}
+
+cmd_uninstall() {
+    local purge_spool=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --purge-spool) purge_spool=1; shift ;;
+            *) die "uninstall: unknown argument $1" ;;
+        esac
+    done
+    disable_units
+    remove_managed_file_safe "$auditd_rules_path"
+    remove_managed_file_safe "$aide_rules_path"
+    if [ -x /sbin/augenrules ] && [ -d /run/systemd/system ] \
+        && systemctl is-active --quiet auditd 2>/dev/null; then
+        /sbin/augenrules --load >/dev/null 2>&1 || say "warning: augenrules --load returned non-zero (audit rules may be locked with -e 2)"
+    fi
+    remove_managed_file_safe "$installed_audit_log"
+    remove_managed_file_safe "$audit_shipper_cfg"
+    if [ -e "$tripwire_share_dir" ] || [ -L "$tripwire_share_dir" ]; then
+        check_ancestors_ok "$tripwire_share_dir" || die "unsafe ancestor for $tripwire_share_dir; refusing removal"
+        [ ! -L "$tripwire_share_dir" ] && [ -d "$tripwire_share_dir" ] \
+            || die "$tripwire_share_dir is not a real directory; refusing removal"
+        rm -rf "$tripwire_share_dir"
+    fi
+    if [ "$purge_spool" -eq 1 ] && { [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; }; then
+        check_ancestors_ok "$audit_spool_dir" || die "unsafe ancestor for $audit_spool_dir; refusing removal"
+        [ ! -L "$audit_spool_dir" ] && [ -d "$audit_spool_dir" ] \
+            || die "$audit_spool_dir is not a real directory; refusing removal"
+        rm -rf "$audit_spool_dir"
+    fi
+    say "uninstalled: scheduler, audit shipper, and tripwire rules removed"
 }
 
 cmd_status() {
@@ -960,13 +1449,18 @@ cmd_status() {
     echo "entry:    $([ -f "$entry" ] && echo present || echo missing)"
     echo "data:     $([ -f "$data" ] && stat -c '%U:%G %a %s bytes' "$data" || echo missing)"
     echo "$unit: $(systemctl is-enabled "$unit" 2>&1 || true) / $(systemctl is-active "$unit" 2>&1 || true)"
+    echo "$shipper_timer: $(systemctl is-enabled "$shipper_timer" 2>&1 || true) / $(systemctl is-active "$shipper_timer" 2>&1 || true)"
+    echo "audit-config: $([ -f "$audit_shipper_cfg" ] && stat -c '%U:%G %a' "$audit_shipper_cfg" || echo missing)"
+    echo "auditd-tripwire: $([ -f "$auditd_rules_path" ] && stat -c '%U:%G %a' "$auditd_rules_path" || echo missing)"
+    echo "aide-tripwire: $([ -f "$aide_rules_path" ] && stat -c '%U:%G %a' "$aide_rules_path" || echo missing)"
 }
 
-[ $# -ge 1 ] || die "usage: $0 install|data|run-once|enable|disable|status ..."
+[ $# -ge 1 ] || die "usage: $0 install|data|run-once|enable|disable|uninstall|status|workdir ..."
 sub="$1"; shift
 case "$sub" in
     install) cmd_install "$@" ;;
     disable) cmd_disable ;;
+    uninstall) cmd_uninstall "$@" ;;
     workdir) init_paths; echo "$workdir" ;;
     data) init_paths; [ $# -eq 1 ] && [ -n "$1" ] || die "usage: $0 data FILE"; put_data "$1" ;;
     run-once) init_paths; cmd_run_once ;;

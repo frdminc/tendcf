@@ -26,6 +26,9 @@ record of every CFEngine/libntech defect and contribution.
 [`plugin-layout.md`](plugin-layout.md) is the repository layout and the
 compiler's plugin kinds, decided 2026-11-13 together with moving the
 compiler into tendcf (map D46).
+[`audit-android-push.md`](audit-android-push.md) specifies (and explicitly
+defers implementation of) the Android tamper-evident audit push path for
+issue #119.
 
 Site Model contract (JSON Schema, fixtures, lint):
 [`../../schema/`](../../schema/), [`../../examples/`](../../examples/),

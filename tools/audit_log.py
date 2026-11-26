@@ -1984,10 +1984,10 @@ def _iter_sink_day_names(dir_fd: int) -> list[str]:
 
 RECOVERED_PARTIALS_DIR = "recovered_partials"
 RECOVERED_PARTIAL_FILE_RE = re.compile(
-    r"^([0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl)\.([1-9][0-9]*)\.json$"
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl)\.([1-9][0-9]*)\.json\Z"
 )
 RECOVERED_PARTIAL_TMP_RE = re.compile(
-    r"^\.[0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl\.[1-9][0-9]*\.json\.tmp\.[0-9]+\.[0-9a-f]{16}$"
+    r"^\.[0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl\.[1-9][0-9]*\.json\.tmp\.[0-9]+\.[0-9a-f]{16}\Z"
 )
 
 
@@ -2949,6 +2949,107 @@ def check_host_liveness(
 
 
 # ---------------------------------------------------------------------------
+# Shipper config loader (for systemd timer / launchd LaunchDaemon, #119 Slice 2)
+# ---------------------------------------------------------------------------
+
+SHIPPER_CONFIG_KEYS = frozenset(
+    {
+        "enabled",
+        "spool_dir",
+        "host",
+        "src",
+        "target",
+        "identity",
+        "known_hosts",
+        "ssh_bin",
+        "port",
+        "batch_size",
+    }
+)
+
+
+def load_shipper_config(config_path: Path) -> dict[str, Any]:
+    """Load and validate a private (`0600` inside `0700` dir) shipper JSON config."""
+    abs_cfg = config_path if config_path.is_absolute() else (Path.cwd() / config_path)
+    _check_ancestors_no_symlinks(abs_cfg)
+    with _open_dir_fd(abs_cfg.parent, require_private=True) as dfd:
+        fd, _ = _open_regular_in_dir(dfd, abs_cfg.name, os.O_RDONLY)
+        try:
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid():
+                raise AuditFileSecurityError(
+                    f"shipper config {abs_cfg} owned by uid {st.st_uid}, expected euid {os.geteuid()}"
+                )
+            mode = stat.S_IMODE(st.st_mode)
+            if mode & 0o6077:
+                raise AuditFileSecurityError(
+                    f"shipper config {abs_cfg} mode {oct(mode)} must be private (0600, no SUID/SGID)"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, 8192)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 16384:
+                    raise AuditValidationError("shipper config exceeds 16384 bytes")
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+    obj = strict_json_loads(b"".join(chunks).rstrip(b"\n"))
+    if not isinstance(obj, dict):
+        raise AuditValidationError("shipper config must be a JSON object")
+    extra = set(obj.keys()) - SHIPPER_CONFIG_KEYS
+    if extra:
+        raise AuditValidationError("shipper config contains unexpected key(s)")
+    enabled = obj.get("enabled")
+    if not isinstance(enabled, bool):
+        raise AuditValidationError("shipper config 'enabled' must be a boolean")
+    if not enabled:
+        return {"enabled": False}
+
+    spool_dir = obj.get("spool_dir")
+    host = obj.get("host")
+    src = obj.get("src", DEFAULT_SRC)
+    target = obj.get("target")
+    identity = obj.get("identity")
+    known_hosts = obj.get("known_hosts")
+    ssh_bin = obj.get("ssh_bin", "/usr/bin/ssh")
+    port = obj.get("port")
+    batch_size = obj.get("batch_size", 100)
+
+    for label, val in (
+        ("spool_dir", spool_dir),
+        ("identity", identity),
+        ("known_hosts", known_hosts),
+        ("ssh_bin", ssh_bin),
+    ):
+        if not isinstance(val, str) or not ABS_PATH_RE.match(val):
+            raise AuditValidationError(f"shipper config '{label}' must be an absolute path")
+    _require_regex(host, HOST_NAME_RE, "host")
+    _require_regex(src, SRC_RE, "src")
+    if not isinstance(target, str) or not target or target.startswith("-"):
+        raise AuditValidationError("shipper config 'target' must be a non-empty SSH destination")
+    if port is not None and (not _is_exact_int(port) or port < 1 or port > 65535):
+        raise AuditValidationError("shipper config 'port' must be an integer 1..65535")
+    if not _is_exact_int(batch_size) or batch_size < 1 or batch_size > MAX_BATCH_LINES:
+        raise AuditValidationError(f"shipper config 'batch_size' must be 1..{MAX_BATCH_LINES}")
+    return {
+        "enabled": True,
+        "spool_dir": Path(spool_dir),
+        "host": host,
+        "src": src,
+        "target": target,
+        "identity": Path(identity),
+        "known_hosts": Path(known_hosts),
+        "ssh_bin": ssh_bin,
+        "port": port,
+        "batch_size": batch_size,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 
@@ -2965,12 +3066,13 @@ def main(argv: list[str] | None = None) -> int:
     p_emit.add_argument("--data-json", required=True, help="JSON object for event data")
 
     p_ship = sub.add_parser("ship", help="ship unshipped spool events over hardened SSH")
-    p_ship.add_argument("--spool-dir", type=Path, required=True)
-    p_ship.add_argument("--host", required=True)
+    p_ship.add_argument("--config", type=Path, help="private 0600 JSON shipper config file")
+    p_ship.add_argument("--spool-dir", type=Path)
+    p_ship.add_argument("--host")
     p_ship.add_argument("--src", default=DEFAULT_SRC)
-    p_ship.add_argument("--target", required=True)
-    p_ship.add_argument("--identity", type=Path, required=True)
-    p_ship.add_argument("--known-hosts", type=Path, required=True)
+    p_ship.add_argument("--target")
+    p_ship.add_argument("--identity", type=Path)
+    p_ship.add_argument("--known-hosts", type=Path)
     p_ship.add_argument("--ssh-bin", default="/usr/bin/ssh")
     p_ship.add_argument("--port", type=int)
     p_ship.add_argument("--batch-size", type=int, default=100)
@@ -3002,16 +3104,67 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "ship":
-            spool = AuditSpool(args.spool_dir, host=args.host, src=args.src)
+            if args.config is not None:
+                if any(
+                    v is not None
+                    for v in (args.spool_dir, args.host, args.target, args.identity, args.known_hosts, args.port)
+                ):
+                    raise AuditValidationError("--config cannot be combined with explicit ship target flags")
+                cfg = load_shipper_config(args.config)
+                if not cfg["enabled"]:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "skipped": True,
+                                "reason": "audit shipper disabled (sink not enrolled)",
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return 0
+                spool_dir = cfg["spool_dir"]
+                host = cfg["host"]
+                src = cfg["src"]
+                target = cfg["target"]
+                identity = cfg["identity"]
+                known_hosts = cfg["known_hosts"]
+                ssh_bin = cfg["ssh_bin"]
+                port = cfg["port"]
+                batch_size = cfg["batch_size"]
+            else:
+                missing = [
+                    flag
+                    for flag, val in (
+                        ("--spool-dir", args.spool_dir),
+                        ("--host", args.host),
+                        ("--target", args.target),
+                        ("--identity", args.identity),
+                        ("--known-hosts", args.known_hosts),
+                    )
+                    if val is None
+                ]
+                if missing:
+                    raise AuditValidationError(f"ship requires --config or {', '.join(missing)}")
+                spool_dir = args.spool_dir
+                host = args.host
+                src = args.src
+                target = args.target
+                identity = args.identity
+                known_hosts = args.known_hosts
+                ssh_bin = args.ssh_bin
+                port = args.port
+                batch_size = args.batch_size
+            spool = AuditSpool(spool_dir, host=host, src=src)
             transport = make_ssh_append_transport(
-                target=args.target,
-                identity_file=args.identity,
-                known_hosts_file=args.known_hosts,
-                src=args.src,
-                ssh_bin=args.ssh_bin,
-                port=args.port,
+                target=target,
+                identity_file=identity,
+                known_hosts_file=known_hosts,
+                src=src,
+                ssh_bin=ssh_bin,
+                port=port,
             )
-            res = AuditShipper(spool, transport, batch_size=args.batch_size).ship()
+            res = AuditShipper(spool, transport, batch_size=batch_size).ship()
             print(json.dumps(dataclasses.asdict(res), sort_keys=True))
             return 0 if res.ok else 1
 

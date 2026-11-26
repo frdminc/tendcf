@@ -1552,6 +1552,91 @@ class TestR1AdversaryRegressions(unittest.TestCase):
         findings = audit.verify_chain_records(records, expected_host="pastebin", expected_src="tendcf")
         self.assertEqual(findings, [], f"example chain findings: {findings}")
 
+    def test_ship_config_disabled_exits_zero_and_enforces_private_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            etc = root / "etc"
+            etc.mkdir(mode=0o700)
+            cfg = etc / "audit-shipper.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "enabled": False,
+                        "host": "pastebin",
+                        "spool_dir": str(root / "spool"),
+                        "src": "tendcf",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(cfg, 0o600)
+
+            p = subprocess.run(
+                [sys.executable, "-I", "-S", str(AUDIT_TOOL), "ship", "--config", str(cfg)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            out = json.loads(p.stdout)
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["skipped"])
+
+            # Mixing --config with explicit target flags fails closed.
+            p_mix = subprocess.run(
+                [
+                    sys.executable, "-I", "-S", str(AUDIT_TOOL),
+                    "ship", "--config", str(cfg), "--host", "pastebin",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(p_mix.returncode, 0)
+            self.assertIn("--config cannot be combined", p_mix.stderr)
+
+            # Group-readable config file rejected.
+            os.chmod(cfg, 0o640)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit.load_shipper_config(cfg)
+
+            # Unknown key rejected even when 0600.
+            os.chmod(cfg, 0o600)
+            cfg.write_text(json.dumps({"enabled": False, "rogue": 1}) + "\n", encoding="utf-8")
+            with self.assertRaises(audit.AuditValidationError):
+                audit.load_shipper_config(cfg)
+
+            # Enabled config validates required paths & host/target cleanly.
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "host": "pastebin",
+                        "spool_dir": str(root / "spool"),
+                        "src": "tendcf",
+                        "target": "audit@nixncus.internal",
+                        "identity": str(root / "id_ed25519"),
+                        "known_hosts": str(root / "known_hosts"),
+                        "port": 2222,
+                        "batch_size": 50,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            loaded = audit.load_shipper_config(cfg)
+            self.assertTrue(loaded["enabled"])
+            self.assertEqual(loaded["port"], 2222)
+            self.assertEqual(loaded["batch_size"], 50)
+
+    def test_recovered_partials_regex_rejects_trailing_newline(self) -> None:
+        # N1-R6: \Z anchor rejects trailing newline filenames inside recovered_partials/.
+        self.assertIsNone(audit.RECOVERED_PARTIAL_FILE_RE.match("2026-11-26.jsonl.1.json\n"))
+        self.assertIsNone(
+            audit.RECOVERED_PARTIAL_TMP_RE.match(".2026-11-26.jsonl.1.json.tmp.123.0123456789abcdef\n")
+        )
+
 
 def _parse_yaml_scalar(val: str):
     if val.startswith('"') and val.endswith('"'):

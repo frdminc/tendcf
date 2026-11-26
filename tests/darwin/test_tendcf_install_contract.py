@@ -1956,6 +1956,12 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "verify_macho_tree() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
+                    "prepare_audit_log_source() { return 0; }\n"
+                    "detach_unsafe_installed_audit_log() { return 0; }\n"
+                    "place_audit_log() { return 0; }\n"
+                    "place_audit_shipper_state() { return 0; }\n"
+                    "place_tripwire_rules() { return 0; }\n"
+                    "enable_audit_shipper() { return 0; }\n"
                     f"place_policy() {{ {place_pol_body}; }}\n"
                     f'prefix="{prefix}"\n'
                     f'stage_dir="{paths["stage_dir"]}"\n'
@@ -2146,6 +2152,12 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                         "verify_macho_tree() { return 0; }\n"
                         "init_paths() { return 0; }\n"
                         "lay_out() { return 0; }\n"
+                        "prepare_audit_log_source() { return 0; }\n"
+                        "detach_unsafe_installed_audit_log() { return 0; }\n"
+                        "place_audit_log() { return 0; }\n"
+                        "place_audit_shipper_state() { return 0; }\n"
+                        "place_tripwire_rules() { return 0; }\n"
+                        "enable_audit_shipper() { return 0; }\n"
                         "place_policy() { return 0; }\n"
                         f'prefix="{prefix}"\n'
                         f'stage_dir="{paths["stage_dir"]}"\n'
@@ -2332,6 +2344,12 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "check_tree() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
+                    "prepare_audit_log_source() { return 0; }\n"
+                    "detach_unsafe_installed_audit_log() { return 0; }\n"
+                    "place_audit_log() { return 0; }\n"
+                    "place_audit_shipper_state() { return 0; }\n"
+                    "place_tripwire_rules() { return 0; }\n"
+                    "enable_audit_shipper() { return 0; }\n"
                     "place_policy() { return 0; }\n"
                     f'prefix="{prefix}"\n'
                     f'stage_dir="{paths["stage_dir"]}"\n'
@@ -2826,6 +2844,225 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             argv = args_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(argv, ["--no-augments", "-K", "-I", "-f", str(entry)])
+
+
+class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
+    """Issue #119 Slice 2: macOS audit shipper, osquery/eslogger tripwire rules, and uninstall."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = INSTALLER.read_text(encoding="utf-8")
+
+    def test_cmd_install_orders_audit_log_and_tripwire_securely(self) -> None:
+        cmd_fn = _extract_func(self.src, "cmd_install")
+        self.assertIn("--audit-log-src)", cmd_fn)
+        self.assertIn("--audit-log-sha256)", cmd_fn)
+        order = [
+            "prepare_audit_log_source",
+            "detach_unsafe_installed_audit_log",
+            "check_tree",
+            "place_audit_log",
+            "place_audit_shipper_state",
+            "place_tripwire_rules",
+        ]
+        idxs = [cmd_fn.find(name) for name in order]
+        for name, idx in zip(order, idxs):
+            self.assertNotEqual(idx, -1, f"missing {name} in cmd_install")
+        self.assertEqual(idxs, sorted(idxs))
+
+        pa_fn = _extract_func(self.src, "place_audit_log")
+        pa_code = "\n".join(l for l in pa_fn.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("$audit_log_src", pa_code)
+        self.assertNotIn("prepare_audit_log_source", pa_code)
+        self.assertIn("$prepared_audit_log_file", pa_code)
+
+        es_fn = _extract_func(self.src, "enable_audit_shipper")
+        self.assertIn("find_real_python", es_fn)
+        self.assertIn("render_shipper_plist", es_fn)
+        self.assertIn("launchctl enable", es_fn)
+
+    def test_hermetic_tripwire_plist_and_uninstall_lifecycle(self) -> None:
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "opt" / "tendcf"
+            workdir = prefix / "var" / "libntech"
+            launchd_dir = root / "LaunchDaemons"
+            osq_dir = root / "osquery" / "packs"
+            (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
+            (workdir / "inputs").mkdir(parents=True)
+            (workdir / "data").mkdir(parents=True)
+            (workdir / "outputs").mkdir(parents=True)
+            launchd_dir.mkdir(parents=True)
+            osq_dir.mkdir(parents=True)
+            shutil.copy2(PROJECTOR, prefix / "share" / "tendcf" / "bin" / "projector.py")
+            shutil.copy2(REPO / "tools" / "audit_log.py", prefix / "share" / "tendcf" / "bin" / "audit_log.py")
+
+            fns = "\n".join(
+                _extract_func(self.src, name)
+                for name in (
+                    "place_audit_shipper_state",
+                    "render_darwin_tripwire_osquery",
+                    "render_darwin_tripwire_eslogger",
+                    "install_managed_file_idempotent",
+                    "place_tripwire_rules",
+                    "render_shipper_plist",
+                    "disable_audit_shipper",
+                    "remove_managed_file_safe",
+                    "cmd_uninstall",
+                )
+            )
+            # Shim root-only ownership/stat/install/launchctl calls for unprivileged hermetic runs.
+            real_install = shutil.which("install") or "/usr/bin/install"
+            install_shim = root / "install-shim"
+            install_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                f"real = {real_install!r}\n"
+                "args = [real]\n"
+                "i = 1\n"
+                "while i < len(sys.argv):\n"
+                "    if sys.argv[i] in ('-o', '-g') and i + 1 < len(sys.argv):\n"
+                "        i += 2\n"
+                "    else:\n"
+                "        args.append(sys.argv[i])\n"
+                "        i += 1\n"
+                "os.execv(real, args)\n",
+                encoding="utf-8",
+            )
+            install_shim.chmod(0o755)
+            stat_shim = root / "stat-shim"
+            stat_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                "p = sys.argv[-1]\n"
+                "mode = stat.S_IMODE(os.lstat(p).st_mode)\n"
+                "print(f'root:wheel {mode:o}')\n",
+                encoding="utf-8",
+            )
+            stat_shim.chmod(0o755)
+            noop_shim = root / "noop-shim"
+            noop_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            noop_shim.chmod(0o755)
+            plutil_bin = "/usr/bin/plutil" if Path("/usr/bin/plutil").exists() else str(noop_shim)
+
+            fns_patched = (
+                fns.replace("/usr/sbin/chown", str(noop_shim))
+                .replace("/usr/bin/chflags", str(noop_shim))
+                .replace("/usr/bin/install", str(install_shim))
+                .replace("/usr/bin/stat", str(stat_shim))
+                .replace("/usr/bin/plutil", plutil_bin)
+                .replace("/bin/chmod -N", f"{noop_shim}")
+                .replace("/bin/launchctl", str(noop_shim))
+            )
+            audit_cfg = prefix / "etc" / "audit-shipper.json"
+            spool_dir = prefix / "var" / "audit-spool"
+            trip_dir = prefix / "share" / "tendcf" / "tripwire"
+            osq_pack = osq_dir / "tendcf-tripwire.conf"
+            execd_plist = launchd_dir / "org.tendcf.execd.plist"
+            shipper_plist = launchd_dir / "org.tendcf.audit-shipper.plist"
+            execd_plist.write_text("<plist/>", encoding="utf-8")
+
+            env_setup = (
+                "set -euo pipefail\n"
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                'say() { echo "tendcf-install: $*"; }\n'
+                f'stage_dir="{root}/stage"\n'
+                'mkdir -p "$stage_dir"\n'
+                "make_stage() { :; }\n"
+                "ensure_dir() { mkdir -p \"$2\"; chmod \"0$1\" \"$2\"; }\n"
+                "has_acl_path() { return 1; }\n"
+                "check_ancestors() { return 0; }\n"
+                "check_ancestors_ok() { return 0; }\n"
+                "check_ancestor_dir_ok() { return 0; }\n"
+                "check_launchd_dir() { return 0; }\n"
+                "acquire_publish_lock() { :; }\n"
+                "release_publish_lock() { :; }\n"
+                "execd_is_loaded() { return 1; }\n"
+                "shipper_is_loaded() { return 1; }\n"
+                "wait_execd_unloaded() { return 0; }\n"
+                "wait_shipper_unloaded() { return 0; }\n"
+                "changed=0\n"
+                f'prefix="{prefix}"\n'
+                f'workdir="{workdir}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'launchd_dir="{launchd_dir}"\n'
+                f'plist_path="{execd_plist}"\n'
+                f'shipper_plist_path="{shipper_plist}"\n'
+                f'installed_audit_log="{prefix}/share/tendcf/bin/audit_log.py"\n'
+                f'audit_etc_dir="{prefix}/etc"\n'
+                f'audit_shipper_cfg="{audit_cfg}"\n'
+                f'audit_spool_dir="{spool_dir}"\n'
+                f'tripwire_share_dir="{trip_dir}"\n'
+                f'osquery_packs_dir="{osq_dir}"\n'
+                f'osquery_pack_path="{osq_pack}"\n'
+                f"{fns_patched}\n"
+            )
+
+            r = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    env_setup
+                    + "place_audit_shipper_state\n"
+                    + "place_tripwire_rules\n"
+                    + f'render_shipper_plist "{shipper_plist}" "{sys.executable}"\n',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(audit_cfg.is_file())
+            self.assertEqual(stat.S_IMODE(audit_cfg.stat().st_mode), 0o600)
+            self.assertTrue(shipper_plist.is_file())
+            osq_obj = _json.loads((trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
+            self.assertIn("tendcf_file_events", osq_obj["queries"])
+            self.assertEqual(osq_pack.read_text(encoding="utf-8"), (trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
+            es_obj = _json.loads((trip_dir / "eslogger-events.json").read_text(encoding="utf-8"))
+            self.assertIn("unlink", es_obj["events"])
+            self.assertIn(str(shipper_plist), es_obj["watched_paths"])
+
+            # Verify idempotent re-run reports changed=0.
+            r_idem = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    env_setup + 'changed=0\nplace_audit_shipper_state\nplace_tripwire_rules\necho "CHANGED=$changed"\n',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_idem.returncode, 0, r_idem.stderr)
+            self.assertIn("CHANGED=0", r_idem.stdout)
+
+            # Verify uninstall preserves spool by default and removes all shipper/tripwire files.
+            spool_marker = spool_dir / "audit.jsonl"
+            spool_marker.write_text("witness\n", encoding="utf-8")
+            r_un = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_un.returncode, 0, r_un.stderr)
+            for gone in (execd_plist, shipper_plist, osq_pack, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py", trip_dir):
+                self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
+            self.assertTrue(spool_marker.is_file())
+
+            # Uninstall with --purge-spool removes spool and re-run reports no change.
+            r_purge = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\nchanged=0\ncmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_purge.returncode, 0, r_purge.stderr)
+            self.assertFalse(spool_dir.exists())
+            self.assertIn("no change (already uninstalled)", r_purge.stdout)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ unit=tendcf.canary.service
 fail=0
 
 cleanup() {
-    "$installer" disable >/dev/null 2>&1 || true
+    "$installer" uninstall --purge-spool >/dev/null 2>&1 || true
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$unit"
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -49,13 +49,25 @@ unit_prop() { systemctl show -p "$1" --value "$unit"; }
 
 echo "# 1. install"
 proj_sha="$(sha256sum "$repo/tools/projector.py" | awk '{print $1}')"
-"$installer" install --projector-src "$repo/tools/projector.py" --projector-sha256 "$proj_sha" --data "$canary/host_specific.json"
+audit_sha="$(sha256sum "$repo/tools/audit_log.py" | awk '{print $1}')"
+"$installer" install \
+    --projector-src "$repo/tools/projector.py" --projector-sha256 "$proj_sha" \
+    --audit-log-src "$repo/tools/audit_log.py" --audit-log-sha256 "$audit_sha" \
+    --data "$canary/host_specific.json"
 wd="$("$installer" workdir)"
 check "/opt/tendcf is root-owned and not group/other-writable" owned_by_root_unwritable /opt/tendcf
 check "installed policy is root-owned and not group/other-writable" \
     owned_by_root_unwritable "$wd/inputs"
 check "projector.py is installed root:root 0644 (non-symlink)" \
     bash -c "[ -f /opt/tendcf/share/tendcf/bin/projector.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/projector.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/projector.py)\" = 'root:root 644' ]"
+check "audit_log.py is installed root:root 0644 (non-symlink)" \
+    bash -c "[ -f /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/audit_log.py)\" = 'root:root 644' ]"
+check "audit-shipper.json is installed root:root 0600" \
+    bash -c "[ -f /opt/tendcf/etc/audit-shipper.json ] && [ ! -L /opt/tendcf/etc/audit-shipper.json ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/etc/audit-shipper.json)\" = 'root:root 600' ]"
+check "auditd tripwire rules installed root:root 0640" \
+    bash -c "[ -f /etc/audit/rules.d/99-tendcf-tripwire.rules ] && [ \"\$(stat -c '%U:%G %a' /etc/audit/rules.d/99-tendcf-tripwire.rules)\" = 'root:root 640' ]"
+check "AIDE tripwire rules installed root:root 0644" \
+    bash -c "[ -f /etc/aide/aide.conf.d/99-tendcf-tripwire ] && [ \"\$(stat -c '%U:%G %a' /etc/aide/aide.conf.d/99-tendcf-tripwire)\" = 'root:root 644' ]"
 check "CMDB data is root:root 0600" \
     bash -c "[ \"\$(stat -c '%U:%G %a' $wd/data/host_specific.json)\" = 'root:root 600' ]"
 
@@ -165,6 +177,19 @@ check "#58 final live data passes cf-promises --show-classes without tendcf_cmdb
     bash -c "out=\"\$(LD_LIBRARY_PATH=/opt/tendcf/lib /opt/tendcf/bin/cf-promises --workdir \"$wd\" -f \"$wd/inputs/promises.cf\" --show-classes)\" && [ -n \"\$out\" ] && ! printf '%s\n' \"\$out\" | awk '\$1 == \"tendcf_cmdb_refused\" || \$1 ~ /^tendcf_cmdb_problem_/ { found=1 } END { exit !found }'"
 check "#58 zero leftover staging/backup temp files in workdir/data" \
     bash -c "[ -z \"\$(find \"$wd/data\" -maxdepth 1 -mindepth 1 ! -name host_specific.json ! -name .publish.lock -print)\" ]"
+
+echo "# 6. audit shipper & uninstall (#119 Slice 2)"
+check "#119 tendcf-audit-shipper.timer enabled and active" \
+    bash -c "systemctl is-enabled --quiet tendcf-audit-shipper.timer && systemctl is-active --quiet tendcf-audit-shipper.timer"
+check "#119 tendcf-audit-shipper.service runs cleanly with disabled default config" \
+    systemctl start tendcf-audit-shipper.service
+"$installer" uninstall --purge-spool
+check "#119 uninstall removes tendcf-execd.service and shipper units" \
+    bash -c "[ ! -e /etc/systemd/system/tendcf-execd.service ] && [ ! -e /etc/systemd/system/tendcf-audit-shipper.service ] && [ ! -e /etc/systemd/system/tendcf-audit-shipper.timer ]"
+check "#119 uninstall removes auditd and AIDE tripwire rules" \
+    bash -c "[ ! -e /etc/audit/rules.d/99-tendcf-tripwire.rules ] && [ ! -e /etc/aide/aide.conf.d/99-tendcf-tripwire ]"
+check "#119 uninstall removes audit_log.py, shipper config, tripwire templates, and purged spool" \
+    bash -c "[ ! -e /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -e /opt/tendcf/etc/audit-shipper.json ] && [ ! -e /opt/tendcf/share/tendcf/tripwire ] && [ ! -e /opt/tendcf/var/audit-spool ]"
 
 if [ "$fail" != 0 ]; then exit 1; fi
 echo; echo "all install tests passed"

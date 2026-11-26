@@ -21,16 +21,22 @@
 # under `writer: "tendcf-install"` (`deploy/darwin/canary/goal-file*.json`,
 # `examples/launchd-writers.yml`, issue #99).
 #
-#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR] [--projector-src FILE] [--projector-sha256 HEX] [--enable]
+#   install [--tarball FILE] [--sha256 FILE] [--data FILE] [--policy-src DIR]
+#           [--projector-src FILE] [--projector-sha256 HEX]
+#           [--audit-log-src FILE] [--audit-log-sha256 HEX] [--enable]
 #                    verify and extract the PR 95 macOS fork tarball (clearing
 #                    com.apple.quarantine, ACLs, flags, SUID/SGID), enforce
 #                    root:wheel and go-w on /opt/tendcf and verify ancestors up
 #                    to /, verify Mach-O dependencies and code signatures, lay
-#                    out the work directory, place the policy, promises.cf and
-#                    projector.py (requiring root-owned non-writable source or
-#                    --projector-sha256), optionally install CMDB data (validated
+#                    out the work directory, place the policy, promises.cf,
+#                    projector.py and audit_log.py (requiring root-owned
+#                    non-writable source or --projector-sha256 /
+#                    --audit-log-sha256), create private audit spool/config
+#                    directories and install macOS osquery FIM + eslogger
+#                    tripwire rules, optionally install CMDB data (validated
 #                    by python3 -I -S projector.py and cf-promises --show-classes
-#                    before publication) and optionally enable org.tendcf.execd.
+#                    before publication) and optionally enable org.tendcf.execd
+#                    (and org.tendcf.audit-shipper when audit_log.py is present).
 #                    Re-running when converged is a no-op that reports `no change`.
 #   data FILE        replace the CMDB data (serialized via lockf, validated by
 #                    projector.py and cf-promises --show-classes requiring
@@ -39,10 +45,14 @@
 #                    SIGTERM/SIGINT interruption; uncatchable SIGKILL/power loss
 #                    does not run traps)
 #   run-once         one `cf-agent --no-augments -K -I` pass over the installed policy
-#   enable           write /Library/LaunchDaemons/org.tendcf.execd.plist
-#                    (root:wheel 0644, plutil -lint) and bootstrap it
-#                    idempotently (launchctl print exit-code probe)
-#   disable          bootout and remove org.tendcf.execd
+#   enable           write /Library/LaunchDaemons/org.tendcf.execd.plist (and
+#                    org.tendcf.audit-shipper.plist when audit_log.py is installed;
+#                    root:wheel 0644, plutil -lint) and bootstrap idempotently
+#   disable          bootout and remove org.tendcf.execd and org.tendcf.audit-shipper
+#   uninstall [--purge-spool]
+#                    bootout/remove scheduler + audit shipper LaunchDaemons, remove
+#                    installed tripwire rules, shipper config and audit_log.py
+#                    (preserves /opt/tendcf/var/audit-spool unless --purge-spool)
 #   status           what is installed and loaded (works on fresh/partial hosts)
 #   workdir          print the compiled-in work directory
 set -euo pipefail
@@ -78,14 +88,26 @@ umask 022
 prefix=/opt/tendcf
 workdir=""   # set by init_paths
 label=org.tendcf.execd
+shipper_label=org.tendcf.audit-shipper
 launchd_dir=/Library/LaunchDaemons
 plist_path="$launchd_dir/$label.plist"
+shipper_plist_path="$launchd_dir/$shipper_label.plist"
 installed_sha_file="$prefix/share/tendcf/INSTALLED_TARBALL.sha256"
 here="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 policy_src="$here/../../policy"
 projector_src=""
 projector_sha256=""
 installed_projector="$prefix/share/tendcf/bin/projector.py"
+audit_log_src=""
+audit_log_sha256=""
+audit_log_explicit=0
+installed_audit_log="$prefix/share/tendcf/bin/audit_log.py"
+audit_etc_dir="$prefix/etc"
+audit_shipper_cfg="$audit_etc_dir/audit-shipper.json"
+audit_spool_dir="$prefix/var/audit-spool"
+tripwire_share_dir="$prefix/share/tendcf/tripwire"
+osquery_packs_dir=/var/osquery/packs
+osquery_pack_path="$osquery_packs_dir/tendcf-tripwire.conf"
 
 cf_agent="$prefix/bin/cf-agent"
 cf_promises="$prefix/bin/cf-promises"
@@ -99,6 +121,10 @@ place_projector_tmp=""
 prepared_projector_file=""
 projector_prepared=0
 installed_projector_originally_clean=0
+place_audit_log_tmp=""
+prepared_audit_log_file=""
+audit_log_prepared=0
+installed_audit_log_originally_clean=0
 upgrade_prefix_swapped=0
 put_data_stage_wd=""
 put_data_tmp=""
@@ -230,6 +256,10 @@ cleanup_stage() {
     if [ -n "${place_projector_tmp:-}" ]; then
         /bin/rm -f "$place_projector_tmp" || true
         place_projector_tmp=""
+    fi
+    if [ -n "${place_audit_log_tmp:-}" ]; then
+        /bin/rm -f "$place_audit_log_tmp" || true
+        place_audit_log_tmp=""
     fi
     if [ "${publish_lock_held:-0}" -eq 1 ]; then
         exec 9>&-
@@ -882,6 +912,22 @@ wait_execd_unloaded() {
     local i=0
     while [ "$i" -lt 20 ]; do
         if ! execd_is_loaded; then
+            return 0
+        fi
+        /bin/sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+shipper_is_loaded() {
+    /bin/launchctl print "system/$shipper_label" >/dev/null 2>&1 9>&-
+}
+
+wait_shipper_unloaded() {
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        if ! shipper_is_loaded; then
             return 0
         fi
         /bin/sleep 0.5
@@ -1611,6 +1657,340 @@ place_projector() {
     verify_installed_projector
 }
 
+resolve_audit_log_src() {
+    if [ -z "$audit_log_src" ]; then
+        if [ -e "$here/bin/audit_log.py" ] || [ -L "$here/bin/audit_log.py" ]; then
+            audit_log_src="$here/bin/audit_log.py"
+        elif [ -e "$here/../../tools/audit_log.py" ] || [ -L "$here/../../tools/audit_log.py" ]; then
+            audit_log_src="$here/../../tools/audit_log.py"
+        elif [ -e "$here/../../bin/audit_log.py" ] || [ -L "$here/../../bin/audit_log.py" ]; then
+            audit_log_src="$here/../../bin/audit_log.py"
+        else
+            if [ "${audit_log_explicit:-0}" -eq 1 ] || [ -n "$audit_log_sha256" ]; then
+                die "audit_log.py not found (use --audit-log-src FILE)"
+            fi
+            return 1
+        fi
+    fi
+    [ -f "$audit_log_src" ] && [ ! -L "$audit_log_src" ] \
+        || die "audit-log-src must be a regular non-symlink file: $audit_log_src"
+    case "$audit_log_src" in
+        /*) ;;
+        *)
+            local cwd_l
+            cwd_l="$(pwd -L)"
+            if [ "$cwd_l" = "/" ]; then
+                audit_log_src="/${audit_log_src#./}"
+            else
+                audit_log_src="${cwd_l}/${audit_log_src#./}"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+verify_installed_audit_log() {
+    check_ancestors "$installed_audit_log"
+    local d meta owner group mode mode_oct
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        check_dir_root_unwritable "$d"
+    done
+    [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ] \
+        || die "installed audit_log missing or symlink: $installed_audit_log (run install first)"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$installed_audit_log")" || die "cannot stat $installed_audit_log"
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] || die "$installed_audit_log owned by $owner, expected root"
+    [ "$group" = wheel ] || die "$installed_audit_log group is $group, expected wheel"
+    mode_oct=$((8#$mode))
+    if [ $((mode_oct & 8#6022)) -ne 0 ]; then
+        die "$installed_audit_log mode $mode is group/world-writable or SUID/SGID"
+    fi
+    if has_acl_path "$installed_audit_log"; then
+        die "$installed_audit_log has an extended ACL; refusing"
+    fi
+    if /usr/bin/xattr -p com.apple.quarantine "$installed_audit_log" >/dev/null 2>&1; then
+        die "$installed_audit_log has com.apple.quarantine; refusing"
+    fi
+}
+
+installed_audit_log_clean_ok() {
+    check_ancestors_ok "$prefix" || return 1
+    local d meta owner group mode
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        [ ! -L "$d" ] && [ -d "$d" ] || return 1
+        meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$d" 2>/dev/null)" || return 1
+        read -r owner group mode <<< "$meta"
+        [ "$owner" = root ] && [ "$group" = wheel ] || return 1
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+        if has_acl_path "$d"; then
+            return 1
+        fi
+    done
+    [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ] || return 1
+    [ "$(/usr/bin/stat -f '%f' "$installed_audit_log" 2>/dev/null)" = "0" ] || return 1
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$installed_audit_log" 2>/dev/null)" || return 1
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] && [ "$group" = wheel ] && [ $((8#$mode)) -eq $((8#644)) ] || return 1
+    if has_acl_path "$installed_audit_log"; then
+        return 1
+    fi
+    if /usr/bin/xattr -p com.apple.quarantine "$installed_audit_log" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+prepare_audit_log_source() {
+    audit_log_prepared=0
+    if ! resolve_audit_log_src; then
+        return 0
+    fi
+    if [ -n "$audit_log_sha256" ] && [[ ! "$audit_log_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --audit-log-sha256 must be 64 lowercase hex characters"
+    fi
+    local src_trusted=0
+    if source_file_root_trusted_ok "$audit_log_src"; then
+        src_trusted=1
+    fi
+    if [ -z "$audit_log_sha256" ] && [ "$src_trusted" -ne 1 ]; then
+        die "$audit_log_src is not a root:wheel non-writable ACL-free regular file with trusted ancestors (or pass --audit-log-sha256)"
+    fi
+
+    make_stage
+    local staged_a="$stage_dir/prepared-audit_log.py"
+    local old_umask actual_sha
+    old_umask="$(umask)"
+    umask 077
+    /bin/cat "$audit_log_src" > "$staged_a"
+    umask "$old_umask"
+    /usr/sbin/chown root:wheel "$staged_a"
+    /bin/chmod 0600 "$staged_a"
+    prepared_audit_log_file="$staged_a"
+
+    if [ -n "$audit_log_sha256" ]; then
+        actual_sha="$(/usr/bin/shasum -a 256 "$staged_a" | /usr/bin/awk '{ print tolower($1) }')"
+        if [ "$actual_sha" != "$audit_log_sha256" ]; then
+            /bin/rm -f "$staged_a"
+            prepared_audit_log_file=""
+            die "audit_log sha256 mismatch for $audit_log_src: expected $audit_log_sha256, got $actual_sha"
+        fi
+    fi
+    audit_log_prepared=1
+}
+
+detach_unsafe_installed_audit_log() {
+    installed_audit_log_originally_clean=0
+    if [ -e "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+        if installed_audit_log_clean_ok; then
+            installed_audit_log_originally_clean=1
+            return 0
+        fi
+        if [ -d "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ]; then
+            die "$installed_audit_log is a directory; refusing"
+        fi
+        if [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ]; then
+            /usr/bin/chflags 0 "$installed_audit_log"
+        fi
+        /bin/rm -f "$installed_audit_log"
+        if [ -e "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+            die "could not remove untrusted $installed_audit_log"
+        fi
+    fi
+}
+
+place_audit_log() {
+    if [ "${audit_log_prepared:-0}" -ne 1 ]; then
+        return 0
+    fi
+    [ -n "${prepared_audit_log_file:-}" ] \
+        && [ -f "$prepared_audit_log_file" ] \
+        && [ ! -L "$prepared_audit_log_file" ] \
+        || die "audit_log source was not prepared or staged copy is missing"
+    ensure_dir 755 "$prefix/share"
+    ensure_dir 755 "$prefix/share/tendcf"
+    ensure_dir 755 "$prefix/share/tendcf/bin"
+
+    if [ -L "$installed_audit_log" ] || [ -d "$installed_audit_log" ]; then
+        die "$installed_audit_log is not a regular file; refusing"
+    fi
+
+    local audit_differs=1 dst_flags=0
+    if [ "${upgrade_prefix_swapped:-0}" -eq 0 ] \
+        && [ "${installed_audit_log_originally_clean:-0}" -eq 1 ] \
+        && [ -f "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ] \
+        && /usr/bin/cmp -s "$prepared_audit_log_file" "$installed_audit_log" \
+        && installed_audit_log_clean_ok; then
+        audit_differs=0
+    elif [ -e "$installed_audit_log" ] && [ ! -L "$installed_audit_log" ]; then
+        dst_flags="$(/usr/bin/stat -f '%f' "$installed_audit_log")"
+    fi
+
+    if [ "$audit_differs" -eq 1 ]; then
+        local old_umask tmp_a
+        old_umask="$(umask)"
+        umask 022
+        tmp_a="$(/usr/bin/mktemp "$prefix/share/tendcf/bin/.audit_log.py.new.XXXXXX")"
+        umask "$old_umask"
+        place_audit_log_tmp="$tmp_a"
+        /bin/cat "$prepared_audit_log_file" > "$tmp_a"
+        /usr/bin/chflags 0 "$tmp_a"
+        if /usr/bin/xattr -p com.apple.quarantine "$tmp_a" >/dev/null 2>&1; then
+            /usr/bin/xattr -d com.apple.quarantine "$tmp_a"
+        fi
+        /bin/chmod -N "$tmp_a" 2>/dev/null || true
+        /usr/sbin/chown root:wheel "$tmp_a"
+        /bin/chmod 0644 "$tmp_a"
+        if [ -e "$installed_audit_log" ] && [ "$dst_flags" != "0" ]; then
+            /usr/bin/chflags 0 "$installed_audit_log"
+        fi
+        /bin/mv -f "$tmp_a" "$installed_audit_log"
+        place_audit_log_tmp=""
+        changed=1
+    fi
+    /bin/rm -f "$prepared_audit_log_file"
+    prepared_audit_log_file=""
+    audit_log_prepared=0
+    verify_installed_audit_log
+}
+
+place_audit_shipper_state() {
+    ensure_dir 700 "$audit_etc_dir"
+    ensure_dir 755 "$prefix/var"
+    ensure_dir 700 "$audit_spool_dir"
+    if [ -L "$audit_shipper_cfg" ] || [ -d "$audit_shipper_cfg" ]; then
+        die "$audit_shipper_cfg is not a regular file; refusing"
+    fi
+    if [ ! -f "$audit_shipper_cfg" ]; then
+        local host_name old_umask tmp_cfg
+        host_name="$(/bin/hostname -s 2>/dev/null || /bin/hostname 2>/dev/null || echo localhost)"
+        if [[ ! "$host_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
+            host_name="localhost"
+        fi
+        old_umask="$(umask)"
+        umask 077
+        tmp_cfg="$(/usr/bin/mktemp "$audit_etc_dir/.audit-shipper.json.new.XXXXXX")"
+        umask "$old_umask"
+        printf '{"enabled":false,"host":"%s","spool_dir":"%s","src":"tendcf"}\n' \
+            "$host_name" "$audit_spool_dir" > "$tmp_cfg"
+        /bin/chmod -N "$tmp_cfg" 2>/dev/null || true
+        /usr/sbin/chown root:wheel "$tmp_cfg"
+        /bin/chmod 0600 "$tmp_cfg"
+        /bin/mv -f "$tmp_cfg" "$audit_shipper_cfg"
+        changed=1
+    fi
+}
+
+render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
+    local dest="$1"
+    /bin/cat > "$dest" <<EOF
+{
+  "file_paths": {
+    "tendcf_binaries": [
+      "$prefix/bin/%%",
+      "$prefix/lib/%%",
+      "$prefix/share/tendcf/%%"
+    ],
+    "tendcf_policy_and_data": [
+      "$workdir/inputs/%%",
+      "$workdir/data/host_specific.json",
+      "$audit_shipper_cfg"
+    ],
+    "tendcf_launchd_and_trust": [
+      "$plist_path",
+      "$shipper_plist_path",
+      "/etc/sudoers",
+      "/etc/sudoers.d/%%",
+      "/var/root/.ssh/authorized_keys"
+    ]
+  },
+  "queries": {
+    "tendcf_file_events": {
+      "query": "SELECT target_path, action, uid, gid, mode, sha256, time FROM file_events WHERE category IN ('tendcf_binaries','tendcf_policy_and_data','tendcf_launchd_and_trust');",
+      "interval": 60,
+      "description": "Monitor tendcf binaries, policy, CMDB data, launchd plists, sudoers, and root authorized_keys (issue #119)"
+    }
+  }
+}
+EOF
+}
+
+render_darwin_tripwire_eslogger() {  # render_darwin_tripwire_eslogger DEST
+    local dest="$1"
+    /bin/cat > "$dest" <<EOF
+{
+  "schema": "tendcf-darwin-eslogger-tripwire-v1",
+  "note": "Requires macOS Full Disk Access for eslogger; watch list mirrors osquery-fim.conf (issue #119).",
+  "events": [
+    "rename",
+    "unlink",
+    "truncate",
+    "setmode",
+    "setowner",
+    "setflags",
+    "setacl",
+    "write"
+  ],
+  "watched_paths": [
+    "$prefix/bin",
+    "$prefix/lib",
+    "$prefix/share/tendcf",
+    "$workdir/inputs",
+    "$workdir/data/host_specific.json",
+    "$audit_shipper_cfg",
+    "$plist_path",
+    "$shipper_plist_path",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/var/root/.ssh/authorized_keys"
+  ]
+}
+EOF
+}
+
+install_managed_file_idempotent() {  # install_managed_file_idempotent SRC DEST MODE
+    local src="$1" dest="$2" mode="$3"
+    if [ -L "$dest" ] || [ -d "$dest" ]; then
+        die "$dest is not a regular file; refusing"
+    fi
+    local differs=1
+    if [ -f "$dest" ] \
+        && /usr/bin/cmp -s "$src" "$dest" \
+        && [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$dest")" = "root:wheel $mode" ] \
+        && ! has_acl_path "$dest"; then
+        differs=0
+    fi
+    if [ "$differs" -eq 1 ]; then
+        local tmp="$dest.new.$$"
+        if ! /usr/bin/install -m "0$mode" -o root -g wheel "$src" "$tmp"; then
+            /bin/rm -f "$tmp"
+            die "could not write $tmp"
+        fi
+        /bin/chmod -N "$tmp" 2>/dev/null || true
+        /bin/mv -f "$tmp" "$dest"
+        changed=1
+    fi
+}
+
+place_tripwire_rules() {
+    ensure_dir 755 "$prefix/share"
+    ensure_dir 755 "$prefix/share/tendcf"
+    ensure_dir 755 "$tripwire_share_dir"
+    make_stage
+    local staged_osq="$stage_dir/osquery-fim.conf"
+    local staged_es="$stage_dir/eslogger-events.json"
+    render_darwin_tripwire_osquery "$staged_osq"
+    render_darwin_tripwire_eslogger "$staged_es"
+    install_managed_file_idempotent "$staged_osq" "$tripwire_share_dir/osquery-fim.conf" 644
+    install_managed_file_idempotent "$staged_es" "$tripwire_share_dir/eslogger-events.json" 644
+
+    # If osquery packs directory exists and is a trusted root-owned directory,
+    # also drop the FIM pack into /var/osquery/packs/tendcf-tripwire.conf.
+    if [ -d "$osquery_packs_dir" ] && [ ! -L "$osquery_packs_dir" ] \
+        && check_ancestors_ok "$osquery_packs_dir" && check_ancestor_dir_ok "$osquery_packs_dir"; then
+        install_managed_file_idempotent "$staged_osq" "$osquery_pack_path" 644
+    fi
+}
+
 # Validate CMDB data in WD using cf-promises --show-classes (issue #57).
 # Captures stdout to a 0600 file in TMP_DIR (never pipes cf-promises directly),
 # closes FD 9 in the child, and runs a single status-checked awk scanner that:
@@ -1837,6 +2217,139 @@ check_launchd_dir() {
     if [ -L "$plist_path" ] || [ -d "$plist_path" ]; then
         die "$plist_path is not a regular file; refusing"
     fi
+    if [ -L "$shipper_plist_path" ] || [ -d "$shipper_plist_path" ]; then
+        die "$shipper_plist_path is not a regular file; refusing"
+    fi
+}
+
+render_shipper_plist() {  # render_shipper_plist DEST PYTHON_BIN
+    local dest="$1" py_bin="$2"
+    /bin/cat > "$dest" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$shipper_label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$py_bin</string>
+        <string>-I</string>
+        <string>-S</string>
+        <string>$installed_audit_log</string>
+        <string>ship</string>
+        <string>--config</string>
+        <string>$audit_shipper_cfg</string>
+    </array>
+    <key>UserName</key>
+    <string>root</string>
+    <key>WorkingDirectory</key>
+    <string>$prefix</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>$workdir/outputs/audit-shipper.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$workdir/outputs/audit-shipper.stderr.log</string>
+</dict>
+</plist>
+EOF
+    /usr/sbin/chown root:wheel "$dest"
+    /bin/chmod 0644 "$dest"
+    /usr/bin/plutil -lint "$dest" >/dev/null || die "plutil -lint rejected generated $shipper_label plist"
+}
+
+bootstrap_shipper_with_retry() {
+    if /bin/launchctl bootstrap system "$shipper_plist_path" 9>&-; then
+        return 0
+    fi
+    /bin/sleep 1
+    /bin/launchctl bootstrap system "$shipper_plist_path" 9>&-
+}
+
+enable_audit_shipper() {
+    if [ ! -f "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
+        return 0
+    fi
+    check_launchd_dir
+    verify_installed_projector
+    verify_installed_audit_log
+    place_audit_shipper_state
+
+    make_stage
+    local py
+    py="$(find_real_python)" || die "cannot enable audit shipper: no verified root-owned Python 3 found"
+    local staged_plist="$stage_dir/$shipper_label.plist"
+    local prev_plist="$stage_dir/$shipper_label.plist.prev"
+    local had_prev=0
+    render_shipper_plist "$staged_plist" "$py"
+
+    local plist_changed=0
+    if [ ! -f "$shipper_plist_path" ]; then
+        plist_changed=1
+    elif ! /usr/bin/cmp -s "$staged_plist" "$shipper_plist_path"; then
+        plist_changed=1
+    elif [ "$(/usr/bin/stat -f '%Su:%Sg %Lp' "$shipper_plist_path")" != "root:wheel 644" ] || has_acl_path "$shipper_plist_path"; then
+        plist_changed=1
+    fi
+
+    if [ "$plist_changed" -eq 1 ]; then
+        if [ -f "$shipper_plist_path" ]; then
+            /usr/bin/install -m 0644 -o root -g wheel "$shipper_plist_path" "$prev_plist"
+            had_prev=1
+        fi
+        local tmp="$shipper_plist_path.new.$$"
+        if ! /usr/bin/install -m 0644 -o root -g wheel "$staged_plist" "$tmp"; then
+            /bin/rm -f "$tmp"
+            die "could not write $tmp"
+        fi
+        /bin/mv -f "$tmp" "$shipper_plist_path"
+        changed=1
+    fi
+
+    /bin/launchctl enable "system/$shipper_label" 9>&- || die "launchctl enable system/$shipper_label failed"
+
+    if shipper_is_loaded; then
+        if [ "$plist_changed" -eq 1 ]; then
+            /bin/launchctl bootout "system/$shipper_label" 9>&- || die "launchctl bootout system/$shipper_label failed"
+            wait_shipper_unloaded || die "$shipper_label remained loaded after bootout"
+            if ! bootstrap_shipper_with_retry; then
+                if [ "$had_prev" -eq 1 ]; then
+                    /usr/bin/install -m 0644 -o root -g wheel "$prev_plist" "$shipper_plist_path.rollback.$$" \
+                        && /bin/mv -f "$shipper_plist_path.rollback.$$" "$shipper_plist_path"
+                    /bin/launchctl bootstrap system "$shipper_plist_path" >/dev/null 2>&1 9>&- || true
+                fi
+                die "launchctl bootstrap system $shipper_plist_path failed; previous plist restored"
+            fi
+        fi
+    else
+        if ! bootstrap_shipper_with_retry; then
+            if [ "$plist_changed" -eq 1 ]; then
+                if [ "$had_prev" -eq 1 ]; then
+                    /usr/bin/install -m 0644 -o root -g wheel "$prev_plist" "$shipper_plist_path.rollback.$$" \
+                        && /bin/mv -f "$shipper_plist_path.rollback.$$" "$shipper_plist_path"
+                else
+                    /bin/rm -f "$shipper_plist_path"
+                fi
+            fi
+            die "launchctl bootstrap system $shipper_plist_path failed"
+        fi
+        changed=1
+    fi
+}
+
+disable_audit_shipper() {
+    if shipper_is_loaded; then
+        /bin/launchctl bootout "system/$shipper_label" 9>&- || die "launchctl bootout system/$shipper_label failed"
+        wait_shipper_unloaded || die "$shipper_label remained loaded after bootout"
+        changed=1
+    fi
+    if [ -f "$shipper_plist_path" ]; then
+        /bin/rm -f "$shipper_plist_path"
+        changed=1
+    fi
 }
 
 render_execd_plist() {  # render_execd_plist DEST
@@ -1976,6 +2489,12 @@ prevalidate_install_inputs() {
     if [ -n "$projector_sha256" ] && [[ ! "$projector_sha256" =~ ^[0-9a-f]{64}$ ]]; then
         die "install: --projector-sha256 must be 64 lowercase hex characters"
     fi
+    if [ -n "${audit_log_sha256:-}" ] && [[ ! "$audit_log_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        die "install: --audit-log-sha256 must be 64 lowercase hex characters"
+    fi
+    if [ "${audit_log_explicit:-0}" -eq 1 ] || [ -n "${audit_log_sha256:-}" ]; then
+        resolve_audit_log_src || die "audit_log.py not found (use --audit-log-src FILE)"
+    fi
     if [ -n "$datafile" ]; then
         [ ! -L "$datafile" ] && [ -f "$datafile" ] \
             || die "data file must be a regular non-symlink file: $datafile"
@@ -1992,6 +2511,8 @@ cmd_install() {
             --policy-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --policy-src needs a non-empty path"; policy_src="$2"; shift 2 ;;
             --projector-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-src needs a non-empty path"; projector_src="$2"; shift 2 ;;
             --projector-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --projector-sha256 needs a 64-hex sha256"; projector_sha256="$2"; shift 2 ;;
+            --audit-log-src) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --audit-log-src needs a non-empty path"; audit_log_src="$2"; audit_log_explicit=1; shift 2 ;;
+            --audit-log-sha256) [ $# -ge 2 ] && [ -n "$2" ] || die "install: --audit-log-sha256 needs a 64-hex sha256"; audit_log_sha256="$2"; audit_log_explicit=1; shift 2 ;;
             --enable) do_enable=1; shift ;;
             *) die "install: unknown argument $1" ;;
         esac
@@ -1999,13 +2520,15 @@ cmd_install() {
     if [ -n "$sha256_file" ] && [ -z "$tarball" ]; then
         die "install: --sha256 requires --tarball"
     fi
-    # Fail fast on bad --policy-src, --projector-src, --projector-sha256 or --data,
-    # then serialize the entire install/upgrade/rollback transaction under the
-    # shared lock outside $prefix BEFORE checking stale dirs or booting out execd.
+    # Fail fast on bad --policy-src, --projector-src, --projector-sha256,
+    # --audit-log-src, --audit-log-sha256 or --data, then serialize the entire
+    # install/upgrade/rollback transaction under the shared lock outside $prefix
+    # BEFORE checking stale dirs or booting out execd.
     prevalidate_install_inputs "$datafile"
     acquire_publish_lock
     check_no_stale_upgrade_dirs
     prepare_projector_source
+    prepare_audit_log_source
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
             sha256_file="${tarball}.sha256"
@@ -2013,6 +2536,7 @@ cmd_install() {
         install_tarball "$tarball" "$sha256_file"
     fi
     detach_unsafe_installed_projector
+    detach_unsafe_installed_audit_log
     check_tree
     init_paths
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
@@ -2036,11 +2560,15 @@ cmd_install() {
     lay_out
     place_policy
     place_projector
+    place_audit_log
+    place_audit_shipper_state
+    place_tripwire_rules
     if [ -n "$datafile" ]; then
         put_data "$datafile"
     fi
     if [ "$do_enable" -eq 1 ] || [ "$upgrade_needs_execd_restart" -eq 1 ]; then
         enable_execd
+        enable_audit_shipper
         if [ "$upgrade_needs_execd_restart" -eq 1 ]; then
             say "restarted: $label after upgrade"
         fi
@@ -2077,6 +2605,7 @@ cmd_run_once() {
 
 cmd_enable() {
     enable_execd
+    enable_audit_shipper
     if [ "$changed" -eq 0 ]; then
         say "no change ($label already loaded)"
     else
@@ -2086,8 +2615,9 @@ cmd_enable() {
 
 cmd_disable() {
     check_launchd_dir
+    disable_audit_shipper
     if execd_is_loaded; then
-        /bin/launchctl bootout "system/$label" || die "launchctl bootout system/$label failed"
+        /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed"
         wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout"
         changed=1
     fi
@@ -2102,8 +2632,68 @@ cmd_disable() {
     fi
 }
 
+remove_managed_file_safe() {  # remove_managed_file_safe PATH
+    local target="$1"
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        return 0
+    fi
+    check_ancestors "$target"
+    [ ! -L "$target" ] && [ -f "$target" ] || die "$target is not a regular file; refusing removal"
+    /usr/bin/chflags 0 "$target" 2>/dev/null || true
+    /bin/rm -f "$target"
+    changed=1
+}
+
+cmd_uninstall() {
+    local purge_spool=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --purge-spool) purge_spool=1; shift ;;
+            *) die "uninstall: unknown argument $1" ;;
+        esac
+    done
+    acquire_publish_lock
+    check_launchd_dir
+    disable_audit_shipper
+    if execd_is_loaded; then
+        /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed"
+        wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout"
+        changed=1
+    fi
+    if [ -f "$plist_path" ]; then
+        /bin/rm -f "$plist_path"
+        changed=1
+    fi
+    remove_managed_file_safe "$osquery_pack_path"
+    remove_managed_file_safe "$installed_audit_log"
+    remove_managed_file_safe "$audit_shipper_cfg"
+    if [ -e "$tripwire_share_dir" ] || [ -L "$tripwire_share_dir" ]; then
+        check_ancestors "$tripwire_share_dir"
+        [ ! -L "$tripwire_share_dir" ] && [ -d "$tripwire_share_dir" ] \
+            || die "$tripwire_share_dir is not a real directory; refusing removal"
+        /usr/bin/chflags -R 0 "$tripwire_share_dir" 2>/dev/null || true
+        /bin/rm -rf "$tripwire_share_dir"
+        changed=1
+    fi
+    if [ "$purge_spool" -eq 1 ] && { [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; }; then
+        check_ancestors "$audit_spool_dir"
+        [ ! -L "$audit_spool_dir" ] && [ -d "$audit_spool_dir" ] \
+            || die "$audit_spool_dir is not a real directory; refusing removal"
+        /usr/bin/chflags -R 0 "$audit_spool_dir" 2>/dev/null || true
+        /bin/rm -rf "$audit_spool_dir"
+        changed=1
+    fi
+    release_publish_lock
+    if [ "$changed" -eq 0 ]; then
+        say "no change (already uninstalled)"
+    else
+        say "uninstalled: scheduler, audit shipper, and tripwire rules removed"
+    fi
+}
+
 cmd_status() {
     local tree_str entry_str data_str plist_str loaded_state="not loaded"
+    local shipper_plist_str shipper_loaded_state="not loaded"
     if [ -L "$prefix" ]; then
         tree_str="symlink (refused)"
     elif [ ! -e "$prefix" ]; then
@@ -2133,6 +2723,16 @@ cmd_status() {
     if execd_is_loaded; then
         loaded_state="loaded"
     fi
+    if [ -L "$shipper_plist_path" ]; then
+        shipper_plist_str="symlink (refused)"
+    elif [ -f "$shipper_plist_path" ]; then
+        shipper_plist_str="$(/usr/bin/stat -f '%Su:%Sg %Lp' "$shipper_plist_path")"
+    else
+        shipper_plist_str="missing"
+    fi
+    if shipper_is_loaded; then
+        shipper_loaded_state="loaded"
+    fi
     local had_nullglob=0 stale=() p
     shopt -q nullglob && had_nullglob=1
     shopt -s nullglob
@@ -2146,16 +2746,20 @@ cmd_status() {
     echo "entry:    $entry_str"
     echo "data:     $data_str"
     echo "$label: $plist_str / $loaded_state"
+    echo "$shipper_label: $shipper_plist_str / $shipper_loaded_state"
+    echo "audit-config: $([ -f "$audit_shipper_cfg" ] && /usr/bin/stat -f '%Su:%Sg %Lp' "$audit_shipper_cfg" || echo missing)"
+    echo "tripwire: $([ -f "$tripwire_share_dir/osquery-fim.conf" ] && echo present || echo missing)"
     if [ "${#stale[@]}" -gt 0 ]; then
         echo "stale:    ${stale[*]} (interrupted upgrade artifact; inspect before installing)"
     fi
 }
 
-[ $# -ge 1 ] || die "usage: $0 install|data|run-once|enable|disable|status|workdir ..."
+[ $# -ge 1 ] || die "usage: $0 install|data|run-once|enable|disable|uninstall|status|workdir ..."
 sub="$1"; shift
 case "$sub" in
     install) cmd_install "$@" ;;
     disable) cmd_disable ;;
+    uninstall) cmd_uninstall "$@" ;;
     workdir) init_paths; echo "$workdir" ;;
     data)
         [ $# -eq 1 ] && [ -n "$1" ] || die "usage: $0 data FILE"

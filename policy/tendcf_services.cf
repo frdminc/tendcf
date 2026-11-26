@@ -1518,21 +1518,27 @@ bundle agent tendcf_services_apply(launchd_domain, launchd_dir, launchctl_bin, l
         expression => strcmp("$(data:variables.tendcf_service[$(service_ids)][state])",
                               "absent");
 
-      # Defence-in-depth guard (issue #102): refuse and report any attempt to
-      # actuate or tombstone tendcf's own installer-owned scheduler unit even
-      # if a projection bypassed lint/compiler. Matched case-insensitively for
-      # launchd (`org.tendcf.execd`) to protect case-insensitive APFS, and
-      # exactly for systemd (`tendcf-execd.service`, suffixless `tendcf-execd`
-      # which systemctl implicitly resolves to `.service`, and same-stem
-      # companion units `.timer`/`.socket`/`.path`), unconditionally across
-      # all platforms and launchd domains.
+      # Defence-in-depth guard (issue #102, extended for #119 Slice 2): refuse
+      # and report any attempt to actuate or tombstone tendcf's own
+      # installer-owned scheduler or audit-shipper units even if a projection
+      # bypassed lint/compiler. Matched case-insensitively for launchd
+      # (`org.tendcf.execd`, `org.tendcf.audit-shipper`) to protect
+      # case-insensitive APFS, and exactly for systemd (`tendcf-execd*` and
+      # `tendcf-audit-shipper*` including suffixless and `.timer`/`.socket`/`.path`
+      # companions), unconditionally across all platforms and launchd domains.
       "tendcf_svc_reserved__$(service_canon[$(service_ids)])"
         expression => or(strcmp("$(service_lower[$(service_ids)])", "org.tendcf.execd"),
+                         strcmp("$(service_lower[$(service_ids)])", "org.tendcf.audit-shipper"),
                          strcmp("$(service_ids)", "tendcf-execd.service"),
                          strcmp("$(service_ids)", "tendcf-execd"),
                          strcmp("$(service_ids)", "tendcf-execd.timer"),
                          strcmp("$(service_ids)", "tendcf-execd.socket"),
-                         strcmp("$(service_ids)", "tendcf-execd.path"));
+                         strcmp("$(service_ids)", "tendcf-execd.path"),
+                         strcmp("$(service_ids)", "tendcf-audit-shipper.service"),
+                         strcmp("$(service_ids)", "tendcf-audit-shipper"),
+                         strcmp("$(service_ids)", "tendcf-audit-shipper.timer"),
+                         strcmp("$(service_ids)", "tendcf-audit-shipper.socket"),
+                         strcmp("$(service_ids)", "tendcf-audit-shipper.path"));
 
       # Bundle-scoped blast radius: named by the interlock's OWN bundle
       # tag, not by which service references it, so N interlocks sharing
