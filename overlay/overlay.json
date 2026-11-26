@@ -86,10 +86,10 @@
       "upstream": "https://github.com/cfengine/core"
     },
     "libntech": {
-      "applied_tree": "b91be8ffee2f535ff48330b3a309837e6d2aaf03",
+      "applied_tree": "0abcc6fe6a7e315990c778404057b7d8d8baaddb",
       "base": "0c0620d6c5f8f8d1cae212f084b021cff0b86ce6",
       "base_described": "upstream master as of 2026-08-15 (merge of #289); exactly the libntech submodule pin of core's base a0bca6aaf, so the two components are one coherent tree",
-      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree b91be8ffee2f with all eight patches; 0001-0006 gave 8d5fda1f9938; 0001-0004 alone gave 5cbd6f7425fa, identical to the local merge 45c816c)",
+      "build_note": "after `apply`, point the core checkout's libntech submodule at the applied libntech HEAD (tree 0abcc6fe6a7e with all nine patches; 0001-0008 gave b91be8ffee2f; 0001-0006 gave 8d5fda1f9938; 0001-0004 alone gave 5cbd6f7425fa, identical to the local merge 45c816c)",
       "fork": "https://github.com/djbclark/libntech",
       "patches": [
         {
@@ -208,6 +208,23 @@
           ],
           "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/13 only; upstream requires operator approval",
           "why": "closes frdminc/tendcf#67: refuses unquoted object keys, missing colons, \\u0000 escapes, and nesting deeper than 128 levels under JsonParseStrict()/JsonParseFileStrict(), and replaces O(n^2) duplicate-key scans with a StringSet while leaving lenient JsonParse*() unchanged"
+        },
+        {
+          "commit": "4fd5cf42270419ca89039e392bba479aecf85145",
+          "file": "0009-Tightened-JsonParseStrict-to-reject-remaining-non-RF.patch",
+          "fork_pr": "https://github.com/djbclark/libntech/pull/14",
+          "fork_ref": "fix/json-strict-parse-rfc8259",
+          "load_bearing_for": [
+            "tightens JsonParseStrict() and JsonParseFileStrict() (0005/0006/0008), which core's CMDB loader calls on host_specific.json: refuses leading/trailing commas, missing array commas, raw 0x01-0x1f control characters, unrecognized escapes, malformed \\u escapes and unpaired UTF-16 surrogates, leading zeros after unary minus (-00/-01), decimal points after exponents (1e2.3), and objects exceeding 65,536 members, while salting the strict duplicate-key hash seed and using O(1) strncmp for boolean/null literals (frdminc/tendcf#118)"
+          ],
+          "retire_when": "an upstream commit carries the same change (`bin/overlay.py retired` says RETIRE), or the code it protects is no longer shipped",
+          "role": "load-bearing",
+          "subject": "Tightened JsonParseStrict to reject remaining non-RFC-8259 forms",
+          "tests": [
+            "tests/unit/json_test.c"
+          ],
+          "upstream_pr": "none: fork PR https://github.com/djbclark/libntech/pull/14 only; upstream requires operator approval",
+          "why": "closes frdminc/tendcf#118: rejects all six residual non-RFC-8259 lenient inheritances (leading/trailing commas, missing array commas, raw 0x01-0x1f control chars, unrecognized escapes and malformed \\u/unpaired UTF-16 surrogates, leading zeros after unary minus -00/-01, and unkeyed hash set via /dev/urandom-salted Jenkins OAAT seed + 65,536-member cap), plus decimal points after exponents (1e2.3) and O(1) strncmp replacing StringStartsWith() for true/false/null while preserving lenient JsonParse*()"
         }
       ],
       "upstream": "https://github.com/NorthernTechHQ/libntech"
