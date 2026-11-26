@@ -3709,22 +3709,50 @@ class TestSectionGR3ReconciliationAndEvidence(_EnforcerTestBase):
             )
         self.assertEqual(ctx_rb.exception.code, "utc_clock_rollback")
 
-        # Also verify non-expired indicator read inside _apply_callback stashes forward UTC
-        # and flushes it into the baseline publication commit!
+        # (2) Inside _apply_callback at same UTC (12:09 == prev_last_dt, non-expired):
+        #     read-only indicator succeeds without mutating or deadlocking!
+        cb_same_seen: list[bool] = []
+
+        def same_utc_ind_cb(_goal: dict[str, Any]) -> None:
+            cb_same_seen.append(self.enforcer.developer_mode_indicator_active(t_1209))
+
+        enf_same = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=same_utc_ind_cb)
+        res_same = enf_same.process_standing_application(
+            app1, proposed_goal=prop1, diff=diff1, now_utc=t_1209
+        )
+        self.assertEqual(res_same.decision, "applied")
+        self.assertEqual(cb_same_seen, [True])
+
+        # (3) Codex R5 #1: Inside _apply_callback at forward UTC (12:09:30 > 12:09:00):
+        #     MUST refuse with ReplayError("time_advance_during_actuation") so an interrupted
+        #     callback + reopen + reconcile can NEVER lose an exposed forward UTC observation!
         t_120930 = datetime.datetime(2026, 11, 26, 12, 9, 30, tzinfo=datetime.timezone.utc)
-        t_120915 = datetime.datetime(2026, 11, 26, 12, 9, 15, tzinfo=datetime.timezone.utc)
-        cb_seen: list[bool] = []
+        prop2, diff2 = make_ordinary_service_change(prop1, service_id="com.tendcf.wm2")
+        app2 = self.make_app_bytes(
+            grant_id="dev-wm",
+            generation=1,
+            application_seq=2,
+            enrollment_nonce=dev_nonce,
+            baseline=prop1,
+            proposed=prop2,
+            signer_seed=SEED_DEV,
+            signer_key=KEY_DEV,
+        )
 
         def forward_ind_cb(_goal: dict[str, Any]) -> None:
-            cb_seen.append(self.enforcer.developer_mode_indicator_active(t_120930))
+            self.enforcer.developer_mode_indicator_active(t_120930)
 
-        enf_cb = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=forward_ind_cb)
-        res = enf_cb.process_standing_application(app1, proposed_goal=prop1, diff=diff1, now_utc=t_1209)
-        self.assertEqual(res.decision, "applied")
-        self.assertEqual(cb_seen, [True])
-        self.assertEqual(self.store.snapshot()["last_seen_utc"], "2026-11-26T12:09:30Z")
-        with self.assertRaises(AE.ClockRollbackError):
-            enf_cb.developer_mode_indicator_active(t_120915)
+        enf_fwd = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=forward_ind_cb)
+        with self.assertRaises(AE.ReplayError) as ctx_fwd:
+            enf_fwd.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=t_1209)
+        self.assertEqual(ctx_fwd.exception.code, "time_advance_during_actuation")
+        # Pending actuation stays persisted for reconciliation, and no unpersisted forward UTC was exposed!
+        snap_fwd = self.store.snapshot()
+        self.assertIsNotNone(snap_fwd["pending_actuation"])
+        self.assertEqual(snap_fwd["last_seen_utc"], "2026-11-26T12:09:00Z")
+        enf_fwd.reconcile_pending_actuation(
+            snap_fwd["pending_actuation"]["actuation_id"], applied_on_device=False
+        )
 
 
 if __name__ == "__main__":

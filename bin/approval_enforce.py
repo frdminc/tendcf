@@ -1130,7 +1130,6 @@ class ReplayStore:
         self._lock_depth: int = 0
         self._lock_fd: int | None = None
         self._in_actuation_tx: bool = False
-        self._pending_actuation_observed_utc: datetime.datetime | None = None
         self.write_count: int = 0
         self.nonce_consume_count: int = 0
         self._seen_nonces_memory: set[str] = set()
@@ -2216,23 +2215,14 @@ class ApprovalEnforcer:
             before_apply_hook()
 
         self.store._in_actuation_tx = True
-        self.store._pending_actuation_observed_utc = None
         try:
             if self._apply_callback is not None:
                 self._apply_callback(copy.deepcopy(proposed_goal))
-            stashed_utc = self.store._pending_actuation_observed_utc
         finally:
             self.store._in_actuation_tx = False
-            self.store._pending_actuation_observed_utc = None
 
-        # Reload fresh state after callback, publish confirmed baseline, flush stashed UTC, clear pending_actuation.
+        # Reload fresh state after callback, publish confirmed baseline, clear pending_actuation.
         fresh = self.store.load_verified_unlocked()
-        if stashed_utc is not None:
-            fresh_last = fresh.get("last_seen_utc")
-            if fresh_last is None or stashed_utc > _parse_internal_utc_timestamp(
-                fresh_last, field="last_seen_utc"
-            ):
-                self._advance_utc_clock(fresh, stashed_utc)
         fresh["applied_baseline_goal"] = copy.deepcopy(proposed_goal)
         fresh["applied_baseline_sha256"] = proposed_sha256
         fresh["pending_actuation"] = None
@@ -2422,16 +2412,6 @@ class ApprovalEnforcer:
                 if prev_last_str is not None
                 else None
             )
-            if (
-                self.store._in_actuation_tx
-                and self.store._pending_actuation_observed_utc is not None
-                and now_dt < self.store._pending_actuation_observed_utc
-            ):
-                raise ClockRollbackError(
-                    "utc_clock_rollback",
-                    f"UTC clock moved backward during actuation: now {format_utc_timestamp(now_dt)} < "
-                    f"observed {format_utc_timestamp(self.store._pending_actuation_observed_utc)}",
-                )
             indicator_on = False
             observed_expired = False
             for grant in state["grants"].values():
@@ -2452,9 +2432,10 @@ class ApprovalEnforcer:
             should_advance = prev_last_dt is None or now_dt > prev_last_dt
             if self.store._in_actuation_tx:
                 if should_advance:
-                    stashed = self.store._pending_actuation_observed_utc
-                    if stashed is None or now_dt > stashed:
-                        self.store._pending_actuation_observed_utc = now_dt
+                    raise ReplayError(
+                        "time_advance_during_actuation",
+                        "cannot expose unpersisted forward UTC observation during actuation callback",
+                    )
             elif observed_expired or should_advance:
                 self._record_observed_expiry_unlocked(state, now_dt)
             return indicator_on
