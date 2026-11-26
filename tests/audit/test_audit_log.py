@@ -679,6 +679,7 @@ class TestSilentHostLivenessAndSecurityEdges(unittest.TestCase):
             key = root / "id_ed25519"
             kh = root / "known_hosts"
             key.write_text("dummy", encoding="utf-8")
+            os.chmod(key, 0o600)
             kh.write_text("dummy", encoding="utf-8")
 
             argv = audit.build_ssh_append_argv(
@@ -687,20 +688,357 @@ class TestSilentHostLivenessAndSecurityEdges(unittest.TestCase):
                 known_hosts_file=kh,
                 src="tendcf",
             )
+            self.assertIn("-F", argv)
+            self.assertIn("/dev/null", argv)
             self.assertIn("BatchMode=yes", argv)
             self.assertIn("IdentitiesOnly=yes", argv)
             self.assertIn("StrictHostKeyChecking=yes", argv)
+            self.assertIn("GlobalKnownHostsFile=/dev/null", argv)
+            self.assertIn("ProxyCommand=none", argv)
+            self.assertIn("ProxyJump=none", argv)
+            self.assertIn("ControlPath=none", argv)
+            self.assertIn("KnownHostsCommand=none", argv)
             self.assertIn("ClearAllForwardings=yes", argv)
             self.assertIn("ForwardAgent=no", argv)
             self.assertEqual(argv[-3:], ["--", "audit@sink.example.org", "audit-append tendcf"])
 
-            # Option-injection target refused.
-            with self.assertRaises(audit.TransportError):
+            # Option-injection target and leading-dash host after @ refused (H5).
+            for bad_target in ("-oProxyCommand=evil", "audit@-oProxyCommand=evil", "audit@host:22"):
+                with self.subTest(bad_target=bad_target):
+                    with self.assertRaises(audit.TransportError):
+                        audit.build_ssh_append_argv(
+                            target=bad_target,
+                            identity_file=key,
+                            known_hosts_file=kh,
+                        )
+
+            # Group/world-readable key refused (H5).
+            os.chmod(key, 0o644)
+            with self.assertRaises(audit.AuditFileSecurityError):
                 audit.build_ssh_append_argv(
-                    target="-oProxyCommand=evil",
+                    target="audit@sink.example.org",
                     identity_file=key,
                     known_hosts_file=kh,
                 )
+            os.chmod(key, 0o600)
+
+            # Percent/whitespace injection in known_hosts path refused (H5).
+            bad_kh = root / "known %h hosts"
+            bad_kh.write_text("dummy", encoding="utf-8")
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit.build_ssh_append_argv(
+                    target="audit@sink.example.org",
+                    identity_file=key,
+                    known_hosts_file=bad_kh,
+                )
+
+            # Bad io_timeout_s refused (H5).
+            for bad_to in (0, -5, True, "10"):
+                with self.assertRaises(audit.TransportError):
+                    audit.make_ssh_append_transport(
+                        target="audit@sink.example.org",
+                        identity_file=key,
+                        known_hosts_file=kh,
+                        io_timeout_s=bad_to,  # type: ignore[arg-type]
+                    )
+
+
+class TestR1AdversaryRegressions(unittest.TestCase):
+    def test_h1_deeply_nested_json_does_not_crash_sink_or_verifier(self) -> None:
+        deep = (b'{"a":' * 1500) + b"1" + (b"}" * 1500)
+        with self.assertRaises(audit.AuditValidationError):
+            audit.strict_json_loads(deep)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sink_root = root / "sink"
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=deep + b"\n",
+                receive_ts="2026-11-26T15:00:00Z",
+            )
+            self.assertEqual(ack["quarantined"], 1)
+
+            local_log = root / "audit.jsonl"
+            local_log.write_bytes(deep + b"\n")
+            ver = audit.verify_local_against_sink(
+                local_log, sink_root / "pastebin" / "tendcf", expected_host="pastebin"
+            )
+            self.assertFalse(ver.ok)
+            self.assertIn("LOCAL_PARSE_ERROR", {f.code for f in ver.findings})
+
+    def test_h2_batch_line_cap_and_quarantine_cap_prevent_amplification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sink_root = Path(td) / "sink"
+            # Exceeding MAX_BATCH_LINES is rejected before looping.
+            too_many = b"x\n" * (audit.MAX_BATCH_LINES + 1)
+            with self.assertRaises(audit.AuditValidationError):
+                audit.run_forced_command(
+                    sink_root=sink_root,
+                    expected_host="pastebin",
+                    expected_src="tendcf",
+                    stdin_bytes=too_many,
+                    receive_ts="2026-11-26T15:00:00Z",
+                )
+
+            # 200 invalid lines within MAX_BATCH_LINES caps quarantine disk writes to MAX_QUARANTINE_PER_BATCH + 1 summary.
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=b"x\n" * 200,
+                receive_ts="2026-11-26T15:00:00Z",
+            )
+            self.assertEqual(ack["quarantined"], 200)
+            q_lines = (sink_root / "pastebin" / "tendcf" / "quarantine.jsonl").read_text().splitlines()
+            self.assertEqual(len(q_lines), audit.MAX_QUARANTINE_PER_BATCH + 1)
+            self.assertEqual(json.loads(q_lines[-1])["reason"], "quarantine_batch_cap_reached")
+            self.assertEqual(
+                json.loads(q_lines[-1])["suppressed_count"],
+                200 - audit.MAX_QUARANTINE_PER_BATCH,
+            )
+
+    def test_h3_shipper_unwedges_when_sink_ahead_of_batch_or_cursor_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            sink_root = root / "sink"
+            for i in range(1, 7):
+                spool.append(
+                    "heartbeat", _hb_data(), ts=f"2026-11-26T12:00:{i:02d}Z", mono_ms=i * 10
+                )
+
+            # Ship first 4 records to sink directly (simulating lost ack / rebuilt cursor.json).
+            pending_all, _ = spool.unshipped()
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=b"".join(raw + b"\n" for _, raw in pending_all[:4]),
+                receive_ts="2026-11-26T12:01:00Z",
+            )
+            # Delete cursor.json so spool recovers with acked_seq=0, then ship with batch_size=2.
+            spool.cursor_path.unlink()
+            shipper = audit.AuditShipper(
+                spool,
+                lambda b: audit.run_forced_command(
+                    sink_root=sink_root,
+                    expected_host="pastebin",
+                    expected_src="tendcf",
+                    stdin_bytes=b,
+                    receive_ts="2026-11-26T12:02:00Z",
+                ),
+                batch_size=2,
+            )
+            res = shipper.ship()
+            self.assertTrue(res.ok, f"shipper wedged: {res}")
+            self.assertEqual(res.last_acked_seq, 6)
+            self.assertEqual(res.remaining, 0)
+            self.assertEqual(res.shipped, 2)
+            self.assertEqual(res.duplicates, 2)
+
+    def test_h4_append_skips_redundant_fchmod_for_chattr_a_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "s"
+            d.mkdir(mode=0o700)
+            orig_fchmod = os.fchmod
+            calls = []
+
+            def spy_fchmod(fd: int, mode: int) -> None:
+                calls.append(mode)
+                return orig_fchmod(fd, mode)
+
+            os.fchmod = spy_fchmod  # type: ignore[assignment]
+            try:
+                with audit._open_dir_fd(d, require_private=True) as dfd:
+                    audit._append_bytes_durable_in_dir(dfd, "2026-11-26.jsonl", b'{"a":1}\n', mode=0o600)
+                    calls.clear()
+                    # Second append on an already-0600 file must NOT invoke fchmod (would EPERM on chattr +a).
+                    audit._append_bytes_durable_in_dir(dfd, "2026-11-26.jsonl", b'{"a":2}\n', mode=0o600)
+                    self.assertEqual(calls, [])
+            finally:
+                os.fchmod = orig_fchmod  # type: ignore[assignment]
+
+    def test_m1_verify_is_readonly_flags_missing_sink_and_enforces_0700_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_sink = root / "does-not-exist" / "tendcf"
+            local_log = root / "missing-local.jsonl"
+            rep = audit.verify_local_against_sink(local_log, missing_sink, expected_host="pastebin")
+            self.assertFalse(rep.ok)
+            self.assertIn("SINK_MISSING", {f.code for f in rep.findings})
+            # Must NEVER create the missing directory!
+            self.assertFalse(missing_sink.exists())
+            self.assertFalse((root / "does-not-exist").exists())
+
+            # Pre-existing 0755 spool dir rejected (M1).
+            wide_dir = root / "wide_spool"
+            wide_dir.mkdir(mode=0o755)
+            os.chmod(wide_dir, 0o755)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit.AuditSpool(wide_dir, host="pastebin", boot_id="boot-1")
+
+            # Symlinked ancestor directory rejected (M1).
+            real_base = root / "real_base"
+            real_base.mkdir(mode=0o700)
+            link_base = root / "link_base"
+            link_base.symlink_to(real_base)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit.AuditSpool(link_base / "spool", host="pastebin", boot_id="boot-1")
+
+    def test_m2_sink_crash_recovery_persists_state_without_fabricating_liveness(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sink_root = Path(td) / "sink"
+            hb = audit.build_envelope(
+                host="pastebin",
+                boot_id="boot-1",
+                seq=1,
+                prev=audit.GENESIS_PREV,
+                event_type="heartbeat",
+                data=_hb_data(),
+                ts="2026-11-26T10:00:00Z",
+                mono_ms=10,
+            )
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=audit.jcs_dumps(hb) + b"\n",
+                receive_ts="2026-11-26T10:00:01Z",
+            )
+            # Simulate crash where state.json was lost after daily file fsync.
+            state_file = sink_root / "pastebin" / "tendcf" / "state.json"
+            state_file.unlink()
+
+            # Retry 10 hours later (duplicate): must persist recovered state.json,
+            # but MUST NOT fabricate a fresh 20:00:00Z heartbeat receive timestamp!
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=audit.jcs_dumps(hb) + b"\n",
+                receive_ts="2026-11-26T20:00:00Z",
+            )
+            self.assertEqual(ack["duplicates"], 1)
+            self.assertTrue(state_file.is_file())
+            rep = audit.check_host_liveness(
+                sink_root / "pastebin" / "tendcf",
+                host="pastebin",
+                now_utc=datetime.datetime(2026, 11, 26, 20, 0, 5, tzinfo=datetime.timezone.utc),
+                max_silence_seconds=300,
+            )
+            self.assertEqual(rep.status, "unknown")
+
+    def test_m3_torn_transport_stream_does_not_poison_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sink_root = Path(td) / "sink"
+            env = audit.build_envelope(
+                host="pastebin",
+                boot_id="boot-1",
+                seq=1,
+                prev=audit.GENESIS_PREV,
+                event_type="heartbeat",
+                data=_hb_data(),
+                ts="2026-11-26T12:00:01Z",
+                mono_ms=10,
+            )
+            torn = audit.jcs_dumps(env)[:-10]  # missing tail & newline
+            with self.assertRaises(audit.AuditValidationError):
+                audit.run_forced_command(
+                    sink_root=sink_root,
+                    expected_host="pastebin",
+                    expected_src="tendcf",
+                    stdin_bytes=torn,
+                    receive_ts="2026-11-26T12:00:02Z",
+                )
+            self.assertFalse((sink_root / "pastebin" / "tendcf" / "quarantine.jsonl").exists())
+
+    def test_m4_path_and_akia_and_genesis_parity(self) -> None:
+        # Non-normalized paths rejected; /opt/AKIA/svc allowed while real AWS key blocked.
+        for bad_path in ("/etc/./passwd", "/etc/.", "/etc/systemd/", "/etc/foo/../bar"):
+            with self.assertRaises(audit.AuditValidationError):
+                audit.validate_event_data(
+                    "tripwire", {"tool": "aide", "event": "modified", "path": bad_path}
+                )
+        # Normal path containing AKIA passes; 20-char AWS key blocked.
+        audit.validate_event_data("tripwire", {"tool": "aide", "event": "modified", "path": "/opt/AKIA/svc"})
+        with self.assertRaises(audit.AuditRedactionError):
+            audit.validate_event_data(
+                "tripwire",
+                {"tool": "aide", "event": "modified", "path": "/opt/AKIAIOSFODNN7EXAMPLE/svc"},
+            )
+
+    def test_m5_l3_l4_cross_host_splice_liveness_mismatch_sink_truncation_and_quarantine(self) -> None:
+        # Cross-host chain splicing caught even when expected_host=None.
+        e1 = audit.build_envelope(
+            host="host-a", boot_id="b1", seq=1, prev=audit.GENESIS_PREV,
+            event_type="heartbeat", data=_hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=1,
+        )
+        e2 = audit.build_envelope(
+            host="host-b", boot_id="b2", seq=2, prev=e1["h"],
+            event_type="heartbeat", data=_hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=2,
+        )
+        findings = audit.verify_chain_records([e1, e2])
+        self.assertIn("CHAIN_HOST_MISMATCH", {f.code for f in findings})
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sink_root = root / "sink"
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="host-a",
+                expected_src="tendcf",
+                stdin_bytes=audit.jcs_dumps(e1) + b"\n",
+                receive_ts="2026-11-26T12:00:02Z",
+            )
+            stream_a = sink_root / "host-a" / "tendcf"
+            now = datetime.datetime(2026, 11, 26, 12, 0, 10, tzinfo=datetime.timezone.utc)
+            # Wrong host pointed at host-a's stream -> unknown (M5).
+            rep_wrong = audit.check_host_liveness(stream_a, host="host-b", now_utc=now)
+            self.assertEqual(rep_wrong.status, "unknown")
+            self.assertIn("mismatch", rep_wrong.reason)
+
+            # Quarantine present makes liveness "unknown" (L4).
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="host-a",
+                expected_src="tendcf",
+                stdin_bytes=b"bad\n",
+                receive_ts="2026-11-26T12:00:05Z",
+            )
+            rep_q = audit.check_host_liveness(stream_a, host="host-a", now_utc=now)
+            self.assertEqual(rep_q.status, "unknown")
+            self.assertEqual(rep_q.quarantine_count, 1)
+
+            # Deleting sink daily file while state.json survives -> SINK_TRUNCATED (M5).
+            (stream_a / "2026-11-26.jsonl").unlink()
+            local_log = root / "audit.jsonl"
+            local_log.write_bytes(b"")
+            ver_trunc = audit.verify_local_against_sink(local_log, stream_a, expected_host="host-a")
+            self.assertFalse(ver_trunc.ok)
+            self.assertIn("SINK_TRUNCATED", {f.code for f in ver_trunc.findings})
+
+            # Symlinked local log classified as LOCAL_UNSAFE_FILE (L3).
+            sym_local = root / "sym.jsonl"
+            sym_local.symlink_to(local_log)
+            ver_sym = audit.verify_local_against_sink(sym_local, stream_a, expected_host="host-a")
+            self.assertIn("LOCAL_UNSAFE_FILE", {f.code for f in ver_sym.findings})
+
+    def test_l1_redaction_errors_omit_raw_values_and_catch_forbidden_key_with_list(self) -> None:
+        secret = "my_secret_value_should_not_echo_12345"
+        with self.assertRaises(audit.AuditValidationError) as ctx:
+            audit.validate_event_data(
+                "promise_outcome", _promise_data(entry=f"bad {secret}")
+            )
+        self.assertNotIn(secret, str(ctx.exception))
+
+        # Forbidden key carrying a list/None must raise AuditRedactionError (not AuditValidationError).
+        with self.assertRaises(audit.AuditRedactionError):
+            audit.validate_event_data("promise_outcome", {**_promise_data(), "vars": ["secret"]})
+        with self.assertRaises(audit.AuditRedactionError):
+            audit.validate_event_data("promise_outcome", {**_promise_data(), "env": None})
 
     def test_cli_end_to_end_via_isolated_python(self) -> None:
         with tempfile.TemporaryDirectory() as td:

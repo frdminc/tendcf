@@ -15,27 +15,36 @@ Implements the shared envelope contract from `djbclark/djbclark-ade#1013` and
   - Redaction gate: closed allowlist of event types and per-type fields
     (`additionalProperties: false`) plus recursive key/value redaction guards
     so CMDB values, goal-file/config contents, command output, env vars,
-    secrets, key material, and consent free-text cannot enter the audit stream.
+    secrets, key material, and consent free-text cannot enter the audit stream
+    or leak into validation errors/stderr or `quarantine.jsonl`.
   - Local spool (`AuditSpool`): crash-safe append-only local capture + durable
-    cursor (`0700` dir, `0600` files, `O_NOFOLLOW` + `fstat` regular-file
-    checks, advisory `flock`, `fsync` before cursor advance). Never contacts
-    the network and never blocks `cf-agent`.
+    cursor (`0700` dir, `0600` files, ancestor symlink checks, `dir_fd` +
+    `O_NOFOLLOW` + `fstat` regular-file checks, advisory `flock`, `fsync`
+    before cursor advance). Never contacts the network and never blocks
+    `cf-agent`.
   - Offline shipper (`AuditShipper` + `make_ssh_append_transport`): ships
-    unshipped spool records in bounded batches over hardened non-interactive
-    SSH (`BatchMode=yes`, `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`,
-    dedicated write-only key, no forwarding/PTY). Survives unreachable sinks
-    without losing or skipping records and resumes cleanly on reconnect.
+    unshipped spool records in bounded batches (`MAX_BATCH_LINES` &
+    `MAX_BATCH_BYTES`) over hardened non-interactive SSH (`-F /dev/null`,
+    `BatchMode=yes`, `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`,
+    `GlobalKnownHostsFile=/dev/null`, `ProxyCommand=none`, `ProxyJump=none`,
+    `ControlPath=none`, `KnownHostsCommand=none`, dedicated write-only `0600`
+    key). Survives unreachable sinks without losing or skipping records and
+    resumes cleanly on reconnect (including when sink tip is ahead of batch).
   - Append-only sink receiver (`AuditSink` + `run_forced_command`): bound to
     pinned `(expected_host, expected_src)` from SSH `authorized_keys` forced
     command. Strictly refuses read/list/rename/truncate/delete commands,
     appends valid records to `<sink_root>/<host>/<src>/YYYY-MM-DD.jsonl` via
-    `O_APPEND | O_NOFOLLOW`, deduplicates idempotent retries, and quarantines
-    gaps, forks, hash mismatches, or invalid records into `quarantine.jsonl`
-    without storing unredacted raw secret material.
-  - Forensic verifier (`verify_local_against_sink`) and intermittent-host
-    liveness (`check_host_liveness`): flags deleted, truncated, edited, or
-    forked local logs against the off-device sink copy, and reports silent
-    hosts as `"unknown"`, never `"fine"`.
+    `O_APPEND | O_NOFOLLOW` (compatible with Linux `chattr +a` on `.jsonl`
+    files; `state.json` and `stream_dir` must remain mutable for atomic
+    `os.replace`), deduplicates idempotent retries, rejects torn transport
+    frames without poisoning `quarantine.jsonl`, and quarantines gaps, forks,
+    hash mismatches, or invalid records into `quarantine.jsonl` (bounded per
+    batch, without storing unredacted raw secret material).
+  - Forensic verifier (`verify_local_against_sink`, strictly read-only) and
+    intermittent-host liveness (`check_host_liveness`): flags deleted,
+    truncated, edited, or forked local logs (plus sink truncation/quarantine),
+    and reports silent, unseen, mismatched, or quarantined hosts as
+    `"unknown"`, never `"fine"`.
 """
 
 from __future__ import annotations
@@ -94,6 +103,8 @@ GENESIS_PREV = "sha256:" + ("0" * 64)
 MAX_SAFE_INT = 2**53 - 1
 MAX_LINE_BYTES = 65536
 MAX_BATCH_BYTES = 4 * 1024 * 1024
+MAX_BATCH_LINES = 2000
+MAX_QUARANTINE_PER_BATCH = 64
 MAX_STRING_LEN = 256
 
 ENVELOPE_REQUIRED_KEYS = frozenset(
@@ -110,12 +121,15 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
 KEY_ID_RE = re.compile(r"^ed25519:[0-9a-f]{64}\Z")
 GRANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 ENTRY_RE = re.compile(r"^[A-Za-z0-9/_.:@+-]{1,128}\Z")
-ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._+@:,/-]{1,255}\Z")
+ABS_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9._+@:,-]+/)*[A-Za-z0-9._+@:,-]+\Z")
+SSH_SAFE_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9._+@:/-]+)\Z")
 UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}\Z")
 PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.+:-]{0,127}\Z")
 VERSION_STR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}\Z")
 DAY_FILE_RE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl\Z")
-SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9._-]+(?:@[A-Za-z0-9._:-]+)?\Z")
+SSH_TARGET_RE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,63}@)?(?:[A-Za-z0-9][A-Za-z0-9._-]{0,252}|\[[0-9a-fA-F:]+\])\Z"
+)
 UTC_TS_RE = re.compile(
     r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
     r"T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])(?:\.([0-9]{1,9}))?Z\Z"
@@ -171,24 +185,29 @@ FORBIDDEN_KEY_NAMES = frozenset(
     }
 )
 
-# Belt-and-suspenders value-level secret/content leakage markers.
-FORBIDDEN_VALUE_SUBSTRINGS = (
-    "-----BEGIN ",
-    "PRIVATE KEY",
-    "ssh-rsa ",
-    "ssh-ed25519 ",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "AKIA",
-    "Bearer ",
-    "xoxb-",
-    "xoxp-",
-    '"vars":',
-    '"host_specific"',
-    '"goal-file"',
-    '"schema_version"',
+# Belt-and-suspenders value-level secret/content leakage patterns.
+FORBIDDEN_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN "),
+    re.compile(r"PRIVATE KEY"),
+    re.compile(r"ssh-rsa "),
+    re.compile(r"ssh-ed25519 "),
+    re.compile(r"gh[po]_[A-Za-z0-9]{10,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"Bearer "),
+    re.compile(r"xox[bp]-[A-Za-z0-9-]{8,}"),
+    re.compile(r'"vars":'),
+    re.compile(r'"host_specific"'),
+    re.compile(r'"goal-file"'),
+    re.compile(r'"schema_version"'),
 )
+
+# Immutable root OS symlinks on macOS (e.g. /var -> private/var).
+_DARWIN_OS_ROOT_SYMLINKS = {
+    "/var": "private/var",
+    "/tmp": "private/tmp",
+    "/etc": "private/etc",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +231,7 @@ class AuditFileSecurityError(AuditError):
 
 
 class ChainTamperError(AuditError):
-    """Local audit chain disagrees with persisted cursor or integrity checks."""
+    """Audit chain disagrees with persisted cursor/state or integrity checks."""
 
 
 class TransportError(AuditError):
@@ -293,14 +312,14 @@ class LivenessReport:
 # ---------------------------------------------------------------------------
 
 def _reject_nonfinite(token: str) -> Any:
-    raise AuditValidationError(f"non-finite JSON constant rejected: {token!r}")
+    raise AuditValidationError(f"non-finite JSON constant rejected: {token}")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in pairs:
         if k in out:
-            raise AuditValidationError(f"duplicate JSON object key: {k!r}")
+            raise AuditValidationError("duplicate JSON object key rejected")
         out[k] = v
     return out
 
@@ -322,7 +341,7 @@ def _check_json_tree(node: Any, *, depth: int = 0) -> None:
         return
     elif isinstance(node, int):
         if node < -MAX_SAFE_INT or node > MAX_SAFE_INT:
-            raise AuditValidationError(f"integer out of RFC 8785 safe range: {node}")
+            raise AuditValidationError("integer out of RFC 8785 safe range")
     elif isinstance(node, float):
         raise AuditValidationError("floating-point numbers are not permitted in audit envelopes")
     elif node is None:
@@ -344,8 +363,32 @@ def _check_safe_string(s: str, *, field: str) -> None:
         raise AuditValidationError(f"{field} is not Unicode NFC normalized")
 
 
+def _check_json_nesting_depth(text: str, *, max_depth: int = 16) -> None:
+    """Iterative O(N) nesting-depth pre-check before `json.loads` (zero recursion)."""
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                depth += 1
+                if depth > max_depth:
+                    raise AuditValidationError(f"JSON nesting depth exceeds limit ({max_depth})")
+            elif ch in "}]":
+                depth -= 1
+
+
 def strict_json_loads(raw: bytes | str) -> dict[str, Any]:
-    """Parse one canonical JSON object strictly (RFC 8259, no dup keys/NaN/BOM)."""
+    """Parse one canonical JSON object strictly (RFC 8259, no dup keys/NaN/BOM/deep recursion)."""
     if isinstance(raw, bytes):
         if len(raw) > MAX_LINE_BYTES:
             raise AuditValidationError(f"JSON line exceeds {MAX_LINE_BYTES} bytes")
@@ -356,13 +399,14 @@ def strict_json_loads(raw: bytes | str) -> dict[str, Any]:
         try:
             text = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
-            raise AuditValidationError(f"invalid UTF-8: {exc}") from exc
+            raise AuditValidationError("invalid UTF-8 in JSON line") from exc
     else:
         if len(raw.encode("utf-8", errors="surrogatepass")) > MAX_LINE_BYTES:
             raise AuditValidationError(f"JSON line exceeds {MAX_LINE_BYTES} bytes")
         if "\x00" in raw or "\r" in raw:
             raise AuditValidationError("JSON line contains NUL or CR")
         text = raw
+    _check_json_nesting_depth(text, max_depth=16)
     try:
         obj = json.loads(
             text,
@@ -371,8 +415,8 @@ def strict_json_loads(raw: bytes | str) -> dict[str, Any]:
         )
     except AuditValidationError:
         raise
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise AuditValidationError(f"malformed JSON: {exc}") from exc
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise AuditValidationError(f"malformed JSON ({type(exc).__name__})") from exc
     if not isinstance(obj, dict):
         raise AuditValidationError("JSON root must be an object")
     return obj
@@ -380,7 +424,10 @@ def strict_json_loads(raw: bytes | str) -> dict[str, Any]:
 
 def jcs_dumps(obj: Any) -> bytes:
     """Serialize `obj` to RFC 8785 JCS canonical UTF-8 bytes (pure stdlib via projector.py)."""
-    return bytes(_PROJECTOR._jcs_dumps(obj))
+    try:
+        return bytes(_PROJECTOR._jcs_dumps(obj))
+    except Exception as exc:
+        raise AuditValidationError(f"JCS canonicalization failed ({type(exc).__name__})") from exc
 
 
 def parse_utc_timestamp(ts: str) -> datetime.datetime:
@@ -389,7 +436,7 @@ def parse_utc_timestamp(ts: str) -> datetime.datetime:
         raise AuditValidationError("timestamp must be a string")
     m = UTC_TS_RE.match(ts)
     if not m:
-        raise AuditValidationError(f"invalid UTC RFC 3339 timestamp: {ts!r}")
+        raise AuditValidationError(f"invalid UTC RFC 3339 timestamp (len={len(ts)})")
     year, month, day, hour, minute, second = (int(m.group(i)) for i in range(1, 7))
     frac = m.group(7) or ""
     micro = int(frac.ljust(6, "0")[:6]) if frac else 0
@@ -398,7 +445,7 @@ def parse_utc_timestamp(ts: str) -> datetime.datetime:
             year, month, day, hour, minute, second, micro, tzinfo=datetime.timezone.utc
         )
     except ValueError as exc:
-        raise AuditValidationError(f"non-existent calendar date in timestamp {ts!r}: {exc}") from exc
+        raise AuditValidationError("non-existent calendar date in timestamp") from exc
 
 
 def utc_now_str() -> str:
@@ -428,7 +475,7 @@ def _detect_boot_id() -> str:
                 val = proc.stdout.strip()
                 if BOOT_ID_RE.match(val):
                     return val
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             pass
     return f"boot-{os.getpid()}-{secrets.token_hex(8)}"
 
@@ -443,31 +490,36 @@ def _is_exact_int(val: Any) -> bool:
 
 def _require_regex(val: Any, rx: re.Pattern[str], field: str) -> str:
     if not isinstance(val, str):
-        raise AuditValidationError(f"{field} must be a string")
+        raise AuditValidationError(f"{field} must be a string (got {type(val).__name__})")
     _check_redaction_value(val, field=field)
     if not rx.match(val):
-        raise AuditValidationError(f"{field} failed format validation: {val!r}")
+        raise AuditValidationError(f"{field} failed format validation (len={len(val)})")
     return val
 
 
 def _require_abs_path(val: Any, field: str) -> str:
     s = _require_regex(val, ABS_PATH_RE, field)
-    if ".." in s.split("/") or "//" in s:
-        raise AuditValidationError(f"{field} must be a normalized path without '..' or '//': {s!r}")
+    if len(s) > 256:
+        raise AuditValidationError(f"{field} exceeds maximum path length (256)")
+    parts = s.split("/")[1:]
+    if any(seg in ("", ".", "..") for seg in parts):
+        raise AuditValidationError(f"{field} must be a normalized absolute path without '.', '..', or '//'")
     return s
 
 
 def _require_enum(val: Any, allowed: frozenset[str], field: str) -> str:
     if not isinstance(val, str) or val not in allowed:
-        raise AuditValidationError(f"{field} must be one of {sorted(allowed)}, got {val!r}")
+        raise AuditValidationError(
+            f"{field} must be one of {sorted(allowed)} (got {type(val).__name__})"
+        )
     return val
 
 
 def _check_redaction_value(val: str, *, field: str) -> None:
     _check_safe_string(val, field=field)
-    for marker in FORBIDDEN_VALUE_SUBSTRINGS:
-        if marker in val:
-            raise AuditRedactionError(f"{field} contains forbidden secret/content marker {marker!r}")
+    for pat in FORBIDDEN_VALUE_PATTERNS:
+        if pat.search(val):
+            raise AuditRedactionError(f"{field} matched forbidden secret/content redaction rule")
 
 
 def _check_keys_allowed(
@@ -496,11 +548,12 @@ def _check_keys_allowed(
 def validate_event_data(event_type: str, data: Any) -> None:
     """Validate and enforce the strict redaction allowlist on event `data`."""
     if not isinstance(event_type, str) or event_type not in EVENT_TYPES:
-        raise AuditValidationError(f"unsupported audit event type: {event_type!r}")
+        raise AuditValidationError("unsupported audit event type")
     if not isinstance(data, dict):
         raise AuditValidationError(f"{event_type}: data must be a JSON object")
-    _check_json_tree(data)
 
+    # Enforce forbidden keys & closed allowlist BEFORE tree-type checks so
+    # e.g. `{"vars": ["secret"]}` or `{"env": None}` always raises AuditRedactionError.
     if event_type == "release_decision":
         _check_keys_allowed(
             data,
@@ -508,6 +561,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"validator_version"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_regex(data["release"], RELEASE_STAMP_RE, "data.release")
         _require_regex(data["release_sha256"], SHA256_RE, "data.release_sha256")
         _require_regex(data["goal_sha256"], SHA256_RE, "data.goal_sha256")
@@ -523,6 +577,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"grant_id"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_enum(data["verdict"], frozenset({"accept", "reject", "withdraw"}), "data.verdict")
         _require_regex(data["key_id"], KEY_ID_RE, "data.key_id")
         parse_utc_timestamp(data["decided_at"])
@@ -538,6 +593,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"blocked_by_interlock"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_regex(data["release"], RELEASE_STAMP_RE, "data.release")
         _require_regex(data["domain"], IDENTIFIER_RE, "data.domain")
         _require_regex(data["bundle"], IDENTIFIER_RE, "data.bundle")
@@ -557,6 +613,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"new_sha256", "prev_sha256"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         action = _require_enum(data["action"], frozenset({"install", "change", "remove"}), "data.action")
         _require_enum(data["supervisor"], frozenset({"launchd", "systemd", "runit"}), "data.supervisor")
         _require_regex(data["unit"], UNIT_NAME_RE, "data.unit")
@@ -578,6 +635,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"version", "prev_version"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_enum(data["action"], frozenset({"install", "upgrade", "remove"}), "data.action")
         _require_regex(data["package"], PACKAGE_NAME_RE, "data.package")
         if "version" in data:
@@ -592,6 +650,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"key_id", "new_sha256", "prev_sha256"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_enum(
             data["kind"],
             frozenset({"advisor_key", "peer_allowlist", "trust_policy", "emergency_revocation"}),
@@ -612,6 +671,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"prefix_sha256", "policy_sha256", "projector_sha256"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_enum(data["action"], frozenset({"install", "rollback", "uninstall"}), "data.action")
         _require_regex(data["release"], RELEASE_STAMP_RE, "data.release")
         for fld in ("prefix_sha256", "policy_sha256", "projector_sha256"):
@@ -625,6 +685,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"expected_sha256", "observed_sha256"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_enum(
             data["tool"],
             frozenset({"aide", "tripwire", "auditd", "eslogger", "osquery"}),
@@ -647,6 +708,7 @@ def validate_event_data(event_type: str, data: Any) -> None:
             optional=frozenset({"unshipped_count"}),
             event_type=event_type,
         )
+        _check_json_tree(data)
         _require_regex(data["running_release"], RELEASE_STAMP_RE, "data.running_release")
         _require_regex(data["goal_sha256"], SHA256_RE, "data.goal_sha256")
         _require_regex(data["projection_sha256"], SHA256_RE, "data.projection_sha256")
@@ -664,7 +726,7 @@ def compute_envelope_hash(entry_without_h: dict[str, Any]) -> str:
         raise AuditValidationError("entry_without_h must not contain 'h'")
     prev = entry_without_h.get("prev")
     if not isinstance(prev, str) or not SHA256_RE.match(prev):
-        raise AuditValidationError(f"invalid prev hash: {prev!r}")
+        raise AuditValidationError("invalid prev hash")
     canonical = jcs_dumps(entry_without_h)
     digest = hashlib.sha256(prev.encode("ascii") + canonical).hexdigest()
     return f"sha256:{digest}"
@@ -722,25 +784,25 @@ def _validate_envelope_fields(
         raise AuditValidationError(f"envelope missing required field(s): {sorted(missing)}")
 
     if not _is_exact_int(obj["v"]) or obj["v"] != ENVELOPE_VERSION:
-        raise AuditValidationError(f"unsupported envelope version: {obj['v']!r}")
+        raise AuditValidationError("unsupported envelope version")
     src = _require_regex(obj["src"], SRC_RE, "src")
     if expected_src is not None and src != expected_src:
-        raise AuditValidationError(f"envelope src {src!r} does not match expected {expected_src!r}")
+        raise AuditValidationError("envelope src does not match expected stream src")
     host = _require_regex(obj["host"], HOST_NAME_RE, "host")
     if expected_host is not None and host != expected_host:
-        raise AuditValidationError(f"envelope host {host!r} does not match expected {expected_host!r}")
+        raise AuditValidationError("envelope host does not match expected stream host")
     _require_regex(obj["boot_id"], BOOT_ID_RE, "boot_id")
 
     seq = obj["seq"]
     if not _is_exact_int(seq) or seq < 1 or seq > MAX_SAFE_INT:
-        raise AuditValidationError(f"invalid seq: {seq!r}")
+        raise AuditValidationError("invalid seq")
     parse_utc_timestamp(obj["ts"])
     mono_ms = obj["mono_ms"]
     if not _is_exact_int(mono_ms) or mono_ms < 0 or mono_ms > MAX_SAFE_INT:
-        raise AuditValidationError(f"invalid mono_ms: {mono_ms!r}")
+        raise AuditValidationError("invalid mono_ms")
     prev = _require_regex(obj["prev"], SHA256_RE, "prev")
     if seq == 1 and prev != GENESIS_PREV:
-        raise AuditValidationError(f"seq 1 must use genesis prev {GENESIS_PREV}, got {prev}")
+        raise AuditValidationError("seq 1 must use genesis prev")
     if seq > 1 and prev == GENESIS_PREV:
         raise AuditValidationError(f"seq {seq} cannot reuse genesis prev")
 
@@ -767,14 +829,12 @@ def validate_envelope(
         unsigned = {k: v for k, v in obj.items() if k != "h"}
         expected_h = compute_envelope_hash(unsigned)
         if not hmac.compare_digest(obj["h"], expected_h):
-            raise AuditValidationError(
-                f"envelope hash mismatch at seq {obj['seq']}: expected {expected_h}, got {obj['h']}"
-            )
+            raise AuditValidationError(f"envelope hash mismatch at seq {obj['seq']}")
     return obj
 
 
 # ---------------------------------------------------------------------------
-# Symlink-safe, crash-safe filesystem helpers (O_NOFOLLOW + fstat + flock)
+# Symlink-safe, dir_fd-pinned, crash-safe filesystem helpers
 # ---------------------------------------------------------------------------
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -787,32 +847,91 @@ def _write_all(fd: int, data: bytes) -> None:
         written += n
 
 
-def _fsync_dir(path: Path) -> None:
+def _fsync_dir_fd(dir_fd: int) -> None:
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.EBADF, errno.EROFS):
+            raise
+
+
+def _fsync_dir_path(path: Path) -> None:
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(str(path), flags)
     except OSError:
         return
     try:
-        os.fsync(fd)
-    except OSError as exc:
-        if exc.errno not in (errno.EINVAL, errno.EBADF, errno.EROFS):
-            raise
+        _fsync_dir_fd(fd)
     finally:
         os.close(fd)
 
 
-def _ensure_safe_dir_chain(root: Path, rel_components: tuple[str, ...] = (), *, mode: int = 0o700) -> Path:
-    """Verify `root` is a real non-symlink dir, then safely create/verify `rel_components` under it."""
-    try:
-        st_root = os.lstat(root)
-    except FileNotFoundError:
-        os.mkdir(root, mode)
-        st_root = os.lstat(root)
-    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
-        raise AuditFileSecurityError(f"root directory is missing or symlinked: {root}")
+def _check_ancestors_no_symlinks(path: Path) -> None:
+    """Verify every existing ancestor component of absolute `path` is a real directory.
 
-    cur = root
+    On macOS, allows only the immutable root OS symlinks (`/var -> private/var`,
+    `/tmp -> private/tmp`, `/etc -> private/etc`) and rejects all other symlinks.
+    """
+    abs_p = path if path.is_absolute() else (Path.cwd() / path)
+    parts = abs_p.parts
+    if not parts or parts[0] != "/":
+        raise AuditFileSecurityError(f"path must be absolute: {path}")
+    cur = Path("/")
+    for comp in parts[1:-1]:
+        if comp in ("", ".", ".."):
+            raise AuditFileSecurityError(f"unnormalized path component in {path}")
+        cur = cur / comp
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            raise AuditFileSecurityError(f"ancestor directory missing: {cur}") from None
+        if stat.S_ISLNK(st.st_mode):
+            if sys.platform == "darwin" and str(cur) in _DARWIN_OS_ROOT_SYMLINKS:
+                target = os.readlink(cur)
+                if target == _DARWIN_OS_ROOT_SYMLINKS[str(cur)]:
+                    continue
+            raise AuditFileSecurityError(f"refusing symlinked ancestor directory: {cur}")
+        if not stat.S_ISDIR(st.st_mode):
+            raise AuditFileSecurityError(f"ancestor is not a directory: {cur}")
+
+
+def _verify_private_dir_mode(st: os.stat_result, path: Path) -> None:
+    mode_bits = stat.S_IMODE(st.st_mode)
+    if mode_bits & 0o077:
+        raise AuditFileSecurityError(
+            f"directory {path} has unsafe group/world permissions ({oct(mode_bits)}; require 0700)"
+        )
+    if mode_bits & 0o6000:
+        raise AuditFileSecurityError(
+            f"directory {path} has SUID/SGID bit set ({oct(mode_bits)})"
+        )
+
+
+def _ensure_safe_dir_chain(root: Path, rel_components: tuple[str, ...] = (), *, mode: int = 0o700) -> Path:
+    """Verify ancestors and `root`, then safely create/verify `rel_components` with `0700`."""
+    abs_root = root if root.is_absolute() else (Path.cwd() / root)
+    _check_ancestors_no_symlinks(abs_root)
+
+    root_created = False
+    try:
+        st_root = os.lstat(abs_root)
+    except FileNotFoundError:
+        try:
+            os.mkdir(abs_root, mode)
+            root_created = True
+        except FileExistsError:
+            pass
+        st_root = os.lstat(abs_root)
+    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
+        raise AuditFileSecurityError(f"root directory is missing or symlinked: {abs_root}")
+    if root_created:
+        os.chmod(abs_root, mode)
+        _fsync_dir_path(abs_root.parent)
+        st_root = os.lstat(abs_root)
+    _verify_private_dir_mode(st_root, abs_root)
+
+    cur = abs_root
     for comp in rel_components:
         if not comp or comp in (".", "..") or "/" in comp or "\x00" in comp:
             raise AuditFileSecurityError(f"unsafe directory component: {comp!r}")
@@ -831,41 +950,78 @@ def _ensure_safe_dir_chain(root: Path, rel_components: tuple[str, ...] = (), *, 
             raise AuditFileSecurityError(f"directory component is symlink or non-directory: {cur}")
         if created:
             os.chmod(cur, mode)
-            _fsync_dir(cur.parent)
+            _fsync_dir_path(cur.parent)
+            st = os.lstat(cur)
+        _verify_private_dir_mode(st, cur)
     return cur
 
 
-def _open_regular_nofollow(path: Path, flags: int, *, mode: int = 0o600) -> int:
-    """Open a regular file safely, refusing symlinks, FIFOs, sockets, dirs, and devices."""
+@contextmanager
+def _open_dir_fd(path: Path, *, require_private: bool = False) -> Iterator[int]:
+    """Open an existing real directory without following symlinks and yield its `dir_fd`."""
+    abs_p = path if path.is_absolute() else (Path.cwd() / path)
+    _check_ancestors_no_symlinks(abs_p)
+    st_pre = os.lstat(abs_p)
+    if stat.S_ISLNK(st_pre.st_mode) or not stat.S_ISDIR(st_pre.st_mode):
+        raise AuditFileSecurityError(f"refusing symlink or non-directory: {abs_p}")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        st_pre = os.lstat(path)
+        dfd = os.open(str(abs_p), flags)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise AuditFileSecurityError(f"refusing symlink or non-directory: {abs_p}") from exc
+        raise
+    try:
+        st_fd = os.fstat(dfd)
+        if not stat.S_ISDIR(st_fd.st_mode):
+            raise AuditFileSecurityError(f"opened descriptor is not a directory: {abs_p}")
+        if st_fd.st_dev != st_pre.st_dev or st_fd.st_ino != st_pre.st_ino:
+            raise AuditFileSecurityError(f"directory identity changed during open (TOCTOU): {abs_p}")
+        if require_private:
+            _verify_private_dir_mode(st_fd, abs_p)
+        yield dfd
+    finally:
+        os.close(dfd)
+
+
+def _open_regular_in_dir(
+    dir_fd: int, name: str, flags: int, *, mode: int = 0o600
+) -> tuple[int, bool]:
+    """Open regular file `name` inside pinned `dir_fd`, refusing symlinks/FIFOs/devices.
+
+    Returns `(fd, existed_before)`.
+    """
+    if not name or "/" in name or name in (".", "..") or "\x00" in name:
+        raise AuditFileSecurityError(f"unsafe leaf filename: {name!r}")
+    try:
+        st_pre = os.lstat(name, dir_fd=dir_fd)
     except FileNotFoundError:
         st_pre = None
     if st_pre is not None:
         if stat.S_ISLNK(st_pre.st_mode) or not stat.S_ISREG(st_pre.st_mode):
-            raise AuditFileSecurityError(f"refusing non-regular or symlinked file: {path}")
+            raise AuditFileSecurityError(f"refusing non-regular or symlinked file: {name}")
 
     open_flags = flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(str(path), open_flags, mode)
+        fd = os.open(name, open_flags, mode, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise AuditFileSecurityError(f"refusing symlink: {path}") from exc
+            raise AuditFileSecurityError(f"refusing symlink: {name}") from exc
         raise
     try:
         st_fd = os.fstat(fd)
         if not stat.S_ISREG(st_fd.st_mode):
-            raise AuditFileSecurityError(f"opened descriptor is not a regular file: {path}")
+            raise AuditFileSecurityError(f"opened descriptor is not a regular file: {name}")
         if st_pre is not None and (st_fd.st_dev != st_pre.st_dev or st_fd.st_ino != st_pre.st_ino):
-            raise AuditFileSecurityError(f"file identity changed during open (TOCTOU): {path}")
-        return fd
+            raise AuditFileSecurityError(f"file identity changed during open (TOCTOU): {name}")
+        return fd, (st_pre is not None)
     except BaseException:
         os.close(fd)
         raise
 
 
-def _read_regular_file(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> bytes:
-    fd = _open_regular_nofollow(path, os.O_RDONLY)
+def _read_small_regular_in_dir(dir_fd: int, name: str, *, max_bytes: int = MAX_LINE_BYTES) -> bytes:
+    fd, _ = _open_regular_in_dir(dir_fd, name, os.O_RDONLY)
     try:
         chunks: list[bytes] = []
         total = 0
@@ -875,35 +1031,111 @@ def _read_regular_file(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> byte
                 break
             total += len(chunk)
             if total > max_bytes:
-                raise AuditValidationError(f"file exceeds maximum safe read size ({max_bytes} bytes): {path}")
+                raise AuditValidationError(f"file {name} exceeds maximum safe read size ({max_bytes} bytes)")
             chunks.append(chunk)
         return b"".join(chunks)
     finally:
         os.close(fd)
 
 
-def _append_line_durable(path: Path, line_bytes: bytes, *, mode: int = 0o600) -> None:
-    if not line_bytes.endswith(b"\n"):
-        raise ValueError("line_bytes must end with newline")
-    existed = path.exists()
-    fd = _open_regular_nofollow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode=mode)
+def _iter_regular_lines_in_dir(
+    dir_fd: int, name: str, *, max_line_bytes: int = MAX_LINE_BYTES
+) -> Iterator[bytes]:
+    """Stream lines from a regular JSONL file without loading the entire file into RAM."""
+    fd, _ = _open_regular_in_dir(dir_fd, name, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as fh:
+        lineno = 0
+        while True:
+            raw = fh.readline(max_line_bytes + 2)
+            if not raw:
+                break
+            lineno += 1
+            if len(raw) > max_line_bytes + 1:
+                raise AuditValidationError(f"{name}:{lineno} exceeds {max_line_bytes} bytes")
+            if not raw.endswith(b"\n"):
+                raise AuditValidationError(
+                    f"unterminated trailing line at {name}:{lineno} (possible partial write)"
+                )
+            line = raw[:-1]
+            if not line:
+                raise AuditValidationError(f"blank line at {name}:{lineno}")
+            yield line
+
+
+def _count_lines_streaming_in_dir(dir_fd: int, name: str) -> int:
+    """Count non-empty lines in a regular file using constant memory (no 64 MiB cliff)."""
     try:
-        os.fchmod(fd, mode)
-        _write_all(fd, line_bytes)
+        st = os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return 0
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise AuditFileSecurityError(f"refusing non-regular or symlinked file: {name}")
+    fd, _ = _open_regular_in_dir(dir_fd, name, os.O_RDONLY)
+    count = 0
+    saw_data_on_line = False
+    try:
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            for part in chunk.split(b"\n")[:-1]:
+                if part or saw_data_on_line:
+                    count += 1
+                saw_data_on_line = False
+            tail = chunk.rsplit(b"\n", 1)[-1]
+            if tail:
+                saw_data_on_line = True
+        if saw_data_on_line:
+            count += 1
+        return count
+    finally:
+        os.close(fd)
+
+
+def _append_bytes_durable_in_dir(
+    dir_fd: int, name: str, payload: bytes, *, mode: int = 0o600
+) -> None:
+    """Append `payload` durably via `O_APPEND | O_NOFOLLOW` + single `fsync`.
+
+    Compatible with Linux `chattr +a` (`S_APPEND`) files: only calls `os.fchmod`
+    when the existing mode differs from `mode`, avoiding unconditional `EPERM`.
+    """
+    if not payload:
+        return
+    if not payload.endswith(b"\n"):
+        raise ValueError("payload must end with newline")
+    fd, existed = _open_regular_in_dir(
+        dir_fd, name, os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode=mode
+    )
+    try:
+        st = os.fstat(fd)
+        cur_mode = stat.S_IMODE(st.st_mode)
+        if cur_mode != mode:
+            try:
+                os.fchmod(fd, mode)
+            except OSError as exc:
+                if exc.errno in (errno.EPERM, errno.EACCES) and (cur_mode & 0o077) == 0:
+                    # Existing private file protected by append-only inode flag (e.g. Linux chattr +a).
+                    pass
+                else:
+                    raise AuditFileSecurityError(
+                        f"cannot enforce private mode {oct(mode)} on {name} (current {oct(cur_mode)})"
+                    ) from exc
+        _write_all(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
     if not existed:
-        _fsync_dir(path.parent)
+        _fsync_dir_fd(dir_fd)
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any], *, mode: int = 0o600) -> None:
+def _write_json_atomic_in_dir(
+    dir_fd: int, name: str, payload: dict[str, Any], *, mode: int = 0o600
+) -> None:
     data = jcs_dumps(payload) + b"\n"
-    parent = path.parent
-    tmp_name = f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
-    tmp_path = parent / tmp_name
+    tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(str(tmp_path), flags, mode)
+    fd = os.open(tmp_name, flags, mode, dir_fd=dir_fd)
     try:
         os.fchmod(fd, mode)
         _write_all(fd, data)
@@ -911,29 +1143,49 @@ def _write_json_atomic(path: Path, payload: dict[str, Any], *, mode: int = 0o600
     except BaseException:
         os.close(fd)
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise
     else:
         os.close(fd)
     try:
-        os.replace(tmp_path, path)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise
-    _fsync_dir(parent)
+    _fsync_dir_fd(dir_fd)
 
 
 @contextmanager
-def _exclusive_lock(lock_path: Path) -> Iterator[None]:
-    fd = _open_regular_nofollow(lock_path, os.O_RDWR | os.O_CREAT, mode=0o600)
+def _exclusive_lock_in_dir(dir_fd: int, lock_name: str) -> Iterator[None]:
+    fd, _ = _open_regular_in_dir(dir_fd, lock_name, os.O_RDWR | os.O_CREAT, mode=0o600)
     try:
-        os.fchmod(fd, 0o600)
+        st = os.fstat(fd)
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _shared_lock_if_present(dir_fd: int, lock_name: str) -> Iterator[None]:
+    """Acquire shared `LOCK_SH` on `lock_name` if it exists (strictly read-only, never creates)."""
+    try:
+        fd, _ = _open_regular_in_dir(dir_fd, lock_name, os.O_RDONLY)
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
         try:
             yield
         finally:
@@ -946,26 +1198,20 @@ def _exclusive_lock(lock_path: Path) -> Iterator[None]:
 # Local hash-chained capture & offline spool
 # ---------------------------------------------------------------------------
 
-def _load_jsonl_records(
-    path: Path,
+def _load_jsonl_records_in_dir(
+    dir_fd: int,
+    name: str,
     *,
     expected_host: str | None = None,
     expected_src: str | None = None,
 ) -> list[tuple[dict[str, Any], bytes]]:
-    raw = _read_regular_file(path)
-    if not raw:
-        return []
-    if not raw.endswith(b"\n"):
-        raise AuditValidationError(f"JSONL file does not end with newline (possible partial write): {path}")
     records: list[tuple[dict[str, Any], bytes]] = []
-    for idx, line in enumerate(raw.split(b"\n")[:-1], start=1):
-        if not line:
-            raise AuditValidationError(f"blank line at {path}:{idx}")
+    for idx, line in enumerate(_iter_regular_lines_in_dir(dir_fd, name), start=1):
         obj = strict_json_loads(line)
         validate_envelope(obj, expected_host=expected_host, expected_src=expected_src, verify_hash=True)
         canonical = jcs_dumps(obj)
         if line != canonical:
-            raise AuditValidationError(f"non-canonical JCS bytes at {path}:{idx}")
+            raise AuditValidationError(f"non-canonical JCS bytes at {name}:{idx}")
         records.append((obj, line))
     return records
 
@@ -976,17 +1222,41 @@ def verify_chain_records(
     expected_host: str | None = None,
     expected_src: str | None = None,
 ) -> list[TamperFinding]:
-    """Verify a sequence of parsed envelopes forms a contiguous valid hash chain from seq=1."""
+    """Verify a sequence of parsed envelopes forms a contiguous valid single-stream hash chain."""
     findings: list[TamperFinding] = []
     expected_seq = 1
     expected_prev = GENESIS_PREV
+    pinned_host = expected_host
+    pinned_src = expected_src
+
     for rec in records:
         seq = rec.get("seq") if isinstance(rec, dict) else None
         try:
-            validate_envelope(rec, expected_host=expected_host, expected_src=expected_src, verify_hash=True)
+            validate_envelope(rec, verify_hash=True)
         except AuditError as exc:
             findings.append(TamperFinding("CHAIN_INVALID_RECORD", seq if _is_exact_int(seq) else None, str(exc)))
             continue
+
+        if pinned_host is None:
+            pinned_host = rec["host"]
+        elif rec["host"] != pinned_host:
+            findings.append(
+                TamperFinding(
+                    "CHAIN_HOST_MISMATCH",
+                    rec["seq"],
+                    f"expected host {pinned_host!r}, got {rec['host']!r}",
+                )
+            )
+        if pinned_src is None:
+            pinned_src = rec["src"]
+        elif rec["src"] != pinned_src:
+            findings.append(
+                TamperFinding(
+                    "CHAIN_SRC_MISMATCH",
+                    rec["seq"],
+                    f"expected src {pinned_src!r}, got {rec['src']!r}",
+                )
+            )
         if rec["seq"] != expected_seq:
             findings.append(
                 TamperFinding(
@@ -1029,27 +1299,50 @@ class AuditSpool:
         self.src = src
         self.boot_id = boot_id if boot_id is not None else _detect_boot_id()
         _require_regex(self.boot_id, BOOT_ID_RE, "boot_id")
-        self.log_path = self.spool_dir / "audit.jsonl"
-        self.cursor_path = self.spool_dir / "cursor.json"
-        self.lock_path = self.spool_dir / ".spool.lock"
+        self.log_name = "audit.jsonl"
+        self.cursor_name = "cursor.json"
+        self.lock_name = ".spool.lock"
+        self.log_path = self.spool_dir / self.log_name
+        self.cursor_path = self.spool_dir / self.cursor_name
+        self.lock_path = self.spool_dir / self.lock_name
 
-    def _read_cursor_unlocked(self) -> dict[str, Any] | None:
-        if not self.cursor_path.exists() and not self.cursor_path.is_symlink():
+    def _read_cursor_unlocked(self, dir_fd: int) -> dict[str, Any] | None:
+        try:
+            os.lstat(self.cursor_name, dir_fd=dir_fd)
+        except FileNotFoundError:
             return None
-        raw = _read_regular_file(self.cursor_path, max_bytes=MAX_LINE_BYTES)
-        obj = strict_json_loads(raw.rstrip(b"\n"))
+        try:
+            raw = _read_small_regular_in_dir(dir_fd, self.cursor_name, max_bytes=MAX_LINE_BYTES)
+            obj = strict_json_loads(raw.rstrip(b"\n"))
+        except AuditValidationError as exc:
+            raise ChainTamperError(f"cursor.json corrupt: {exc}") from exc
         if obj.get("host") != self.host or obj.get("src") != self.src:
             raise ChainTamperError("cursor.json host/src mismatch")
         for key in ("local_seq", "acked_seq"):
             if not _is_exact_int(obj.get(key)) or obj[key] < 0 or obj[key] > MAX_SAFE_INT:
                 raise ChainTamperError(f"cursor.json invalid {key}")
+        for key in ("local_h", "acked_h"):
+            val = obj.get(key)
+            if not isinstance(val, str) or not SHA256_RE.match(val):
+                raise ChainTamperError(f"cursor.json invalid {key}")
         if obj["acked_seq"] > obj["local_seq"]:
             raise ChainTamperError("cursor.json acked_seq exceeds local_seq")
+        if obj["local_seq"] == 0 and obj["local_h"] != GENESIS_PREV:
+            raise ChainTamperError("cursor.json local_seq 0 must use genesis hash")
+        if obj["acked_seq"] == 0 and obj["acked_h"] != GENESIS_PREV:
+            raise ChainTamperError("cursor.json acked_seq 0 must use genesis hash")
         return obj
 
-    def _load_and_verify_state_unlocked(self) -> tuple[list[tuple[dict[str, Any], bytes]], dict[str, Any]]:
-        cursor = self._read_cursor_unlocked()
-        has_log = self.log_path.exists() or self.log_path.is_symlink()
+    def _load_and_verify_state_unlocked(
+        self, dir_fd: int
+    ) -> tuple[list[tuple[dict[str, Any], bytes]], dict[str, Any]]:
+        cursor = self._read_cursor_unlocked(dir_fd)
+        try:
+            os.lstat(self.log_name, dir_fd=dir_fd)
+            has_log = True
+        except FileNotFoundError:
+            has_log = False
+
         if not has_log:
             if cursor is not None and cursor["local_seq"] > 0:
                 raise ChainTamperError(
@@ -1064,7 +1357,13 @@ class AuditSpool:
                 "acked_h": GENESIS_PREV,
             }
 
-        records = _load_jsonl_records(self.log_path, expected_host=self.host, expected_src=self.src)
+        try:
+            records = _load_jsonl_records_in_dir(
+                dir_fd, self.log_name, expected_host=self.host, expected_src=self.src
+            )
+        except AuditValidationError as exc:
+            raise ChainTamperError(f"local audit.jsonl unreadable or torn: {exc}") from exc
+
         chain_findings = verify_chain_records(
             [r for r, _ in records], expected_host=self.host, expected_src=self.src
         )
@@ -1101,8 +1400,6 @@ class AuditSpool:
                     f"local audit.jsonl hash mismatch at acked seq={cursor['acked_seq']}"
                 )
 
-        # If audit.jsonl has valid records past cursor.local_seq (e.g., crash after
-        # log fsync before cursor atomic replace), recover forward cleanly.
         recovered = dict(cursor)
         recovered["local_seq"] = actual_seq
         recovered["local_h"] = actual_h
@@ -1119,72 +1416,100 @@ class AuditSpool:
     ) -> dict[str, Any]:
         """Append one validated, redacted, hash-chained event to the local spool."""
         effective_boot = boot_id if boot_id is not None else self.boot_id
-        with _exclusive_lock(self.lock_path):
-            _, state = self._load_and_verify_state_unlocked()
-            next_seq = state["local_seq"] + 1
-            prev_h = state["local_h"] if state["local_seq"] > 0 else GENESIS_PREV
-            envelope = build_envelope(
-                host=self.host,
-                src=self.src,
-                boot_id=effective_boot,
-                seq=next_seq,
-                prev=prev_h,
-                event_type=event_type,
-                data=data,
-                ts=ts,
-                mono_ms=mono_ms,
-            )
-            line_bytes = jcs_dumps(envelope) + b"\n"
-            _append_line_durable(self.log_path, line_bytes, mode=0o600)
-            state["local_seq"] = next_seq
-            state["local_h"] = envelope["h"]
-            _write_json_atomic(self.cursor_path, state, mode=0o600)
-            return envelope
+        with _open_dir_fd(self.spool_dir, require_private=True) as dfd:
+            with _exclusive_lock_in_dir(dfd, self.lock_name):
+                _, state = self._load_and_verify_state_unlocked(dfd)
+                next_seq = state["local_seq"] + 1
+                prev_h = state["local_h"] if state["local_seq"] > 0 else GENESIS_PREV
+                envelope = build_envelope(
+                    host=self.host,
+                    src=self.src,
+                    boot_id=effective_boot,
+                    seq=next_seq,
+                    prev=prev_h,
+                    event_type=event_type,
+                    data=data,
+                    ts=ts,
+                    mono_ms=mono_ms,
+                )
+                line_bytes = jcs_dumps(envelope) + b"\n"
+                _append_bytes_durable_in_dir(dfd, self.log_name, line_bytes, mode=0o600)
+                state["local_seq"] = next_seq
+                state["local_h"] = envelope["h"]
+                _write_json_atomic_in_dir(dfd, self.cursor_name, state, mode=0o600)
+                return envelope
 
     def unshipped(self, *, limit: int | None = None) -> tuple[list[tuple[dict[str, Any], bytes]], dict[str, Any]]:
         """Return unshipped `(envelope, canonical_line)` pairs and a copy of current state."""
-        with _exclusive_lock(self.lock_path):
-            records, state = self._load_and_verify_state_unlocked()
-            acked = state["acked_seq"]
-            pending = [(rec, raw) for rec, raw in records if rec["seq"] > acked]
-            if limit is not None:
-                pending = pending[:limit]
-            return pending, dict(state)
+        with _open_dir_fd(self.spool_dir, require_private=True) as dfd:
+            with _exclusive_lock_in_dir(dfd, self.lock_name):
+                records, state = self._load_and_verify_state_unlocked(dfd)
+                acked = state["acked_seq"]
+                pending = [(rec, raw) for rec, raw in records if rec["seq"] > acked]
+                if limit is not None:
+                    pending = pending[:limit]
+                return pending, dict(state)
 
     def advance_ack(self, acked_seq: int, acked_h: str) -> dict[str, Any]:
         """Durably advance the shipped watermark after verifying exact hash agreement."""
         if not _is_exact_int(acked_seq) or acked_seq < 0 or acked_seq > MAX_SAFE_INT:
-            raise TransportError(f"invalid acked_seq: {acked_seq!r}")
+            raise TransportError("invalid acked_seq")
         _require_regex(acked_h, SHA256_RE, "acked_h")
-        with _exclusive_lock(self.lock_path):
-            records, state = self._load_and_verify_state_unlocked()
-            if acked_seq < state["acked_seq"]:
-                raise TransportError(
-                    f"sink ack regressed: {acked_seq} < current acked_seq {state['acked_seq']}"
-                )
-            if acked_seq > state["local_seq"]:
-                raise TransportError(
-                    f"sink ack exceeded local_seq: {acked_seq} > {state['local_seq']}"
-                )
-            if acked_seq == 0:
-                if acked_h != GENESIS_PREV:
-                    raise TransportError("acked_seq 0 must carry genesis hash")
-            else:
-                expected_rec = records[acked_seq - 1][0]
-                if not hmac.compare_digest(expected_rec["h"], acked_h):
+        with _open_dir_fd(self.spool_dir, require_private=True) as dfd:
+            with _exclusive_lock_in_dir(dfd, self.lock_name):
+                records, state = self._load_and_verify_state_unlocked(dfd)
+                if acked_seq < state["acked_seq"]:
                     raise TransportError(
-                        f"sink ack hash mismatch at seq {acked_seq}: "
-                        f"expected {expected_rec['h']}, got {acked_h}"
+                        f"sink ack regressed: {acked_seq} < current acked_seq {state['acked_seq']}"
                     )
-            state["acked_seq"] = acked_seq
-            state["acked_h"] = acked_h
-            _write_json_atomic(self.cursor_path, state, mode=0o600)
-            return dict(state)
+                if acked_seq > state["local_seq"]:
+                    raise TransportError(
+                        f"sink ack exceeded local_seq: {acked_seq} > {state['local_seq']}"
+                    )
+                if acked_seq == 0:
+                    if acked_h != GENESIS_PREV:
+                        raise TransportError("acked_seq 0 must carry genesis hash")
+                else:
+                    expected_rec = records[acked_seq - 1][0]
+                    if not hmac.compare_digest(expected_rec["h"], acked_h):
+                        raise TransportError(f"sink ack hash mismatch at seq {acked_seq}")
+                state["acked_seq"] = acked_seq
+                state["acked_h"] = acked_h
+                _write_json_atomic_in_dir(dfd, self.cursor_name, state, mode=0o600)
+                return dict(state)
 
 
 # ---------------------------------------------------------------------------
 # Hardened SSH append-only transport and offline-resilient shipper
 # ---------------------------------------------------------------------------
+
+def _validate_ssh_safe_file_path(
+    p: Path,
+    *,
+    label: str,
+    require_private_mode: bool = False,
+    require_exec: bool = False,
+) -> Path:
+    if not p.is_absolute():
+        raise AuditFileSecurityError(f"{label} must be an absolute path")
+    s = str(p)
+    if not SSH_SAFE_PATH_RE.match(s) or "//" in s:
+        raise AuditFileSecurityError(f"{label} contains unsafe characters for OpenSSH option/path")
+    parts = s.split("/")[1:]
+    if any(seg in ("", ".", "..") for seg in parts):
+        raise AuditFileSecurityError(f"{label} must be normalized without '.' or '..'")
+    _check_ancestors_no_symlinks(p)
+    st = os.lstat(p)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise AuditFileSecurityError(f"{label} must be a regular non-symlink file")
+    if require_private_mode and (stat.S_IMODE(st.st_mode) & 0o077) != 0:
+        raise AuditFileSecurityError(
+            f"{label} must not be group- or world-accessible (mode {oct(stat.S_IMODE(st.st_mode))})"
+        )
+    if require_exec and not os.access(p, os.X_OK):
+        raise AuditFileSecurityError(f"{label} is not executable")
+    return p
+
 
 def build_ssh_append_argv(
     *,
@@ -1199,36 +1524,41 @@ def build_ssh_append_argv(
     """Build a hardened, non-interactive argv list for SSH append-only shipping."""
     _require_regex(src, SRC_RE, "src")
     if not isinstance(target, str) or not SSH_TARGET_RE.match(target) or target.startswith("-"):
-        raise TransportError(f"unsafe SSH target: {target!r}")
-    if not isinstance(ssh_bin, str) or not ssh_bin.startswith("/") or "\x00" in ssh_bin:
-        raise TransportError(f"ssh_bin must be an absolute path: {ssh_bin!r}")
-    for label, p in (("identity_file", identity_file), ("known_hosts_file", known_hosts_file)):
-        if not p.is_absolute():
-            raise AuditFileSecurityError(f"{label} must be an absolute path: {p}")
-        st = os.lstat(p)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise AuditFileSecurityError(f"{label} must be a regular non-symlink file: {p}")
+        raise TransportError("unsafe SSH target")
+    ssh_path = _validate_ssh_safe_file_path(Path(ssh_bin), label="ssh_bin", require_exec=True)
+    id_path = _validate_ssh_safe_file_path(
+        identity_file, label="identity_file", require_private_mode=True
+    )
+    kh_path = _validate_ssh_safe_file_path(known_hosts_file, label="known_hosts_file")
     if not _is_exact_int(connect_timeout_s) or connect_timeout_s < 1 or connect_timeout_s > 120:
-        raise TransportError(f"invalid connect_timeout_s: {connect_timeout_s!r}")
+        raise TransportError("invalid connect_timeout_s")
 
     argv = [
-        ssh_bin,
+        str(ssh_path),
+        "-F", "/dev/null",
         "-o", "BatchMode=yes",
         "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={known_hosts_file}",
+        "-o", "CheckHostIP=yes",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", f"UserKnownHostsFile={kh_path}",
+        "-o", "KnownHostsCommand=none",
+        "-o", "ProxyCommand=none",
+        "-o", "ProxyJump=none",
         "-o", "ClearAllForwardings=yes",
         "-o", "ForwardAgent=no",
         "-o", "ForwardX11=no",
         "-o", "RequestTTY=no",
         "-o", "PermitLocalCommand=no",
         "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+        "-o", "ControlPersist=no",
         "-o", f"ConnectTimeout={connect_timeout_s}",
-        "-i", str(identity_file),
+        "-i", str(id_path),
     ]
     if port is not None:
         if not _is_exact_int(port) or port < 1 or port > 65535:
-            raise TransportError(f"invalid SSH port: {port!r}")
+            raise TransportError("invalid SSH port")
         argv.extend(["-p", str(port)])
     argv.extend(["--", target, f"audit-append {src}"])
     return argv
@@ -1246,6 +1576,8 @@ def make_ssh_append_transport(
     io_timeout_s: int = 30,
 ) -> Callable[[bytes], dict[str, Any]]:
     """Create a callable transport that pipes JSONL batches to the SSH forced command."""
+    if not _is_exact_int(io_timeout_s) or io_timeout_s < 1 or io_timeout_s > 600:
+        raise TransportError("invalid io_timeout_s")
     argv = build_ssh_append_argv(
         target=target,
         identity_file=identity_file,
@@ -1291,18 +1623,35 @@ class AuditShipper:
         *,
         batch_size: int = 100,
         max_batches: int = 100,
+        max_batch_bytes: int = MAX_BATCH_BYTES,
     ) -> None:
-        if not _is_exact_int(batch_size) or batch_size < 1 or batch_size > 10000:
-            raise ValueError("batch_size must be 1..10000")
+        if not _is_exact_int(batch_size) or batch_size < 1 or batch_size > MAX_BATCH_LINES:
+            raise ValueError(f"batch_size must be 1..{MAX_BATCH_LINES}")
         if not _is_exact_int(max_batches) or max_batches < 1 or max_batches > 10000:
             raise ValueError("max_batches must be 1..10000")
+        if not _is_exact_int(max_batch_bytes) or max_batch_bytes < MAX_LINE_BYTES or max_batch_bytes > MAX_BATCH_BYTES:
+            raise ValueError(f"max_batch_bytes must be {MAX_LINE_BYTES}..{MAX_BATCH_BYTES}")
         self.spool = spool
         self.transport = transport
         self.batch_size = batch_size
         self.max_batches = max_batches
+        self.max_batch_bytes = max_batch_bytes
+
+    def _slice_batch(
+        self, pending: list[tuple[dict[str, Any], bytes]]
+    ) -> list[tuple[dict[str, Any], bytes]]:
+        batch: list[tuple[dict[str, Any], bytes]] = []
+        total_bytes = 0
+        for item in pending:
+            line_len = len(item[1]) + 1
+            if batch and (len(batch) >= self.batch_size or total_bytes + line_len > self.max_batch_bytes):
+                break
+            batch.append(item)
+            total_bytes += line_len
+        return batch
 
     def ship(self) -> ShipResult:
-        """Drain unshipped records in batches. Never raises on unreachable sink."""
+        """Drain unshipped records in bounded batches. Never raises on unreachable sink."""
         total_shipped = 0
         total_dups = 0
         total_quarantined = 0
@@ -1322,31 +1671,37 @@ class AuditShipper:
                     last_acked_h=state["acked_h"] if state["acked_seq"] > 0 else None,
                 )
 
-            batch_bytes = b"".join(raw + b"\n" for _, raw in pending)
-            sent_by_seq = {rec["seq"]: rec["h"] for rec, _ in pending}
+            batch = self._slice_batch(pending)
+            batch_bytes = b"".join(raw + b"\n" for _, raw in batch)
+            sent_by_seq = {rec["seq"]: rec["h"] for rec, _ in batch}
             prev_acked = state["acked_seq"]
 
             try:
                 ack = self.transport(batch_bytes)
                 if not isinstance(ack, dict) or ack.get("ok") is not True:
-                    raise TransportError(f"sink rejected batch: {ack!r}")
+                    raise TransportError("sink rejected batch")
                 if ack.get("host") != self.spool.host or ack.get("src") != self.spool.src:
                     raise TransportError("sink ack host/src mismatch")
                 ack_seq = ack.get("last_seq")
                 ack_h = ack.get("last_h")
                 if not _is_exact_int(ack_seq) or ack_seq < prev_acked:
-                    raise TransportError(f"invalid or regressed sink ack last_seq: {ack_seq!r}")
-                if ack_seq > 0:
-                    if not isinstance(ack_h, str) or not SHA256_RE.match(ack_h):
-                        raise TransportError(f"invalid sink ack last_h: {ack_h!r}")
-                    if ack_seq in sent_by_seq:
-                        if not hmac.compare_digest(sent_by_seq[ack_seq], ack_h):
-                            raise TransportError("sink ack hash disagrees with sent record")
-                    elif ack_seq != prev_acked:
-                        raise TransportError(f"sink acked seq {ack_seq} not in current batch")
-                    last_state = self.spool.advance_ack(ack_seq, ack_h)
-                else:
+                    raise TransportError("invalid or regressed sink ack last_seq")
+                if ack_seq == 0:
                     raise TransportError("sink acked 0 records for non-empty batch")
+                if not isinstance(ack_h, str) or not SHA256_RE.match(ack_h):
+                    raise TransportError("invalid sink ack last_h")
+
+                if ack_seq == prev_acked:
+                    # No watermark progress (e.g. head record quarantined).
+                    last_state = state
+                else:
+                    # If ack_seq is within this batch, verify directly; if the sink is
+                    # ahead (e.g. batch_size shrank or cursor.json was rebuilt),
+                    # spool.advance_ack verifies ack_seq <= local_seq and exact hash
+                    # match against the local audit chain.
+                    if ack_seq in sent_by_seq and not hmac.compare_digest(sent_by_seq[ack_seq], ack_h):
+                        raise TransportError("sink ack hash disagrees with sent record")
+                    last_state = self.spool.advance_ack(ack_seq, ack_h)
             except (TransportError, AuditError, OSError) as exc:
                 rem_pending, cur_state = self.spool.unshipped()
                 return ShipResult(
@@ -1366,7 +1721,6 @@ class AuditShipper:
                 int(ack.get("quarantined", 0)) if _is_exact_int(ack.get("quarantined")) else 0
             )
 
-            # Stop if no progress was made to prevent infinite retry loops on quarantined head.
             if last_state["acked_seq"] == prev_acked:
                 rem_pending, cur_state = self.spool.unshipped()
                 return ShipResult(
@@ -1397,36 +1751,35 @@ class AuditShipper:
 # Append-only sink receiver & forced-command boundary (`audit-append`)
 # ---------------------------------------------------------------------------
 
-def _iter_sink_day_files(stream_dir: Path) -> list[Path]:
-    entries: list[tuple[str, Path]] = []
-    for entry in os.scandir(stream_dir):
-        m = DAY_FILE_RE.match(entry.name)
+def _iter_sink_day_names(dir_fd: int) -> list[str]:
+    entries: list[tuple[str, str]] = []
+    for name in os.listdir(dir_fd):
+        m = DAY_FILE_RE.match(name)
         if not m:
             continue
-        p = Path(entry.path)
-        st = os.lstat(p)
+        st = os.lstat(name, dir_fd=dir_fd)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise AuditFileSecurityError(f"sink daily log is symlink or non-regular: {p}")
-        entries.append((m.group(1), p))
+            raise AuditFileSecurityError(f"sink daily log is symlink or non-regular: {name}")
+        entries.append((m.group(1), name))
     entries.sort(key=lambda item: item[0])
-    return [p for _, p in entries]
+    return [name for _, name in entries]
 
 
-def _load_sink_committed_records(
-    stream_dir: Path,
+def _load_sink_committed_records_in_dir(
+    dir_fd: int,
     *,
     expected_host: str | None = None,
     expected_src: str | None = None,
 ) -> list[tuple[dict[str, Any], bytes]]:
     all_records: list[tuple[dict[str, Any], bytes]] = []
     seen_seqs: set[int] = set()
-    for day_path in _iter_sink_day_files(stream_dir):
-        for rec, raw in _load_jsonl_records(
-            day_path, expected_host=expected_host, expected_src=expected_src
+    for day_name in _iter_sink_day_names(dir_fd):
+        for rec, raw in _load_jsonl_records_in_dir(
+            dir_fd, day_name, expected_host=expected_host, expected_src=expected_src
         ):
             seq = rec["seq"]
             if seq in seen_seqs:
-                raise ChainTamperError(f"sink contains duplicate committed seq {seq} in {day_path}")
+                raise ChainTamperError(f"sink contains duplicate committed seq {seq} in {day_name}")
             seen_seqs.add(seq)
             all_records.append((rec, raw))
     all_records.sort(key=lambda pair: pair[0]["seq"])
@@ -1441,6 +1794,10 @@ class AuditSink:
     an untrusted client clock cannot proliferate arbitrary filenames) and
     quarantines gaps, forks, hash mismatches, or invalid/redaction-failing
     lines to `quarantine.jsonl`.
+
+    Deployment note for Linux `chattr +a`: apply `chattr +a` to the `.jsonl`
+    files (`YYYY-MM-DD.jsonl` and `quarantine.jsonl`), NOT to `state.json` or
+    `stream_dir` (which require atomic temp-file creation and `os.replace`).
     """
 
     def __init__(self, sink_root: Path, *, expected_host: str, expected_src: str = DEFAULT_SRC) -> None:
@@ -1452,13 +1809,18 @@ class AuditSink:
         self.stream_dir = _ensure_safe_dir_chain(
             self.sink_root, (expected_host, expected_src), mode=0o700
         )
-        self.state_path = self.stream_dir / "state.json"
-        self.quarantine_path = self.stream_dir / "quarantine.jsonl"
-        self.lock_path = self.stream_dir / ".sink.lock"
+        self.state_name = "state.json"
+        self.quarantine_name = "quarantine.jsonl"
+        self.lock_name = ".sink.lock"
+        self.state_path = self.stream_dir / self.state_name
+        self.quarantine_path = self.stream_dir / self.quarantine_name
+        self.lock_path = self.stream_dir / self.lock_name
 
-    def _read_state_unlocked(self, *, now_ts: str) -> tuple[dict[str, Any], dict[int, tuple[dict[str, Any], bytes]]]:
-        committed_list = _load_sink_committed_records(
-            self.stream_dir,
+    def _read_state_unlocked(
+        self, dir_fd: int
+    ) -> tuple[dict[str, Any], dict[int, tuple[dict[str, Any], bytes]], bool]:
+        committed_list = _load_sink_committed_records_in_dir(
+            dir_fd,
             expected_host=self.expected_host,
             expected_src=self.expected_src,
         )
@@ -1473,26 +1835,38 @@ class AuditSink:
         actual_seq = committed_list[-1][0]["seq"] if committed_list else 0
         actual_h = committed_list[-1][0]["h"] if committed_list else GENESIS_PREV
 
-        if not self.state_path.exists() and not self.state_path.is_symlink():
+        try:
+            os.lstat(self.state_name, dir_fd=dir_fd)
+            has_state = True
+        except FileNotFoundError:
+            has_state = False
+
+        if not has_state:
+            # Crash recovery when state.json is missing: NEVER fabricate
+            # `last_heartbeat_receive_ts` or `last_receive_ts` from current time
+            # for historical on-disk records, so liveness stays fail-closed ("unknown")
+            # until a live heartbeat is actually received.
             state = {
                 "host": self.expected_host,
                 "src": self.expected_src,
                 "last_seq": actual_seq,
                 "last_h": actual_h,
                 "last_ts": committed_list[-1][0]["ts"] if committed_list else "",
-                "last_receive_ts": now_ts if committed_list else "",
+                "last_receive_ts": "",
                 "last_heartbeat_ts": "",
                 "last_heartbeat_receive_ts": "",
             }
             for rec, _ in reversed(committed_list):
                 if rec["type"] == "heartbeat":
                     state["last_heartbeat_ts"] = rec["ts"]
-                    state["last_heartbeat_receive_ts"] = now_ts
                     break
-            return state, committed_index
+            return state, committed_index, (actual_seq > 0)
 
-        raw = _read_regular_file(self.state_path, max_bytes=MAX_LINE_BYTES)
-        obj = strict_json_loads(raw.rstrip(b"\n"))
+        try:
+            raw = _read_small_regular_in_dir(dir_fd, self.state_name, max_bytes=MAX_LINE_BYTES)
+            obj = strict_json_loads(raw.rstrip(b"\n"))
+        except AuditValidationError as exc:
+            raise ChainTamperError(f"sink state.json corrupt: {exc}") from exc
         if obj.get("host") != self.expected_host or obj.get("src") != self.expected_src:
             raise ChainTamperError("sink state.json host/src mismatch")
         if not _is_exact_int(obj.get("last_seq")) or obj["last_seq"] < 0 or obj["last_seq"] > MAX_SAFE_INT:
@@ -1503,22 +1877,25 @@ class AuditSink:
             )
         if obj["last_seq"] > 0:
             rec_at_state = committed_index.get(obj["last_seq"])
-            if rec_at_state is None or not hmac.compare_digest(rec_at_state[0]["h"], str(obj.get("last_h", ""))):
+            if rec_at_state is None or not hmac.compare_digest(
+                rec_at_state[0]["h"], str(obj.get("last_h", ""))
+            ):
                 raise ChainTamperError("sink state.json hash disagrees with committed log")
+        state_dirty = False
         if actual_seq > obj["last_seq"]:
             # Crash recovery: committed log fsynced ahead of state.json atomic swap.
+            # Preserve prior receive timestamps (never fabricate fresh ones).
             obj["last_seq"] = actual_seq
             obj["last_h"] = actual_h
             obj["last_ts"] = committed_list[-1][0]["ts"]
-            obj["last_receive_ts"] = obj.get("last_receive_ts") or now_ts
             for rec, _ in reversed(committed_list):
                 if rec["type"] == "heartbeat":
                     obj["last_heartbeat_ts"] = rec["ts"]
-                    obj["last_heartbeat_receive_ts"] = obj.get("last_heartbeat_receive_ts") or now_ts
                     break
-        return obj, committed_index
+            state_dirty = True
+        return obj, committed_index, state_dirty
 
-    def _append_quarantine_unlocked(
+    def _build_quarantine_line(
         self,
         *,
         received_at: str,
@@ -1527,7 +1904,7 @@ class AuditSink:
         expected_prev: str,
         raw_line: bytes,
         validated_envelope: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bytes:
         # Never persist unredacted raw bytes in quarantine; store only SHA-256 + length
         # unless the envelope already passed the full redaction allowlist.
         entry: dict[str, Any] = {
@@ -1545,123 +1922,149 @@ class AuditSink:
             entry["observed_prev"] = validated_envelope["prev"]
             entry["observed_h"] = validated_envelope["h"]
             entry["envelope"] = validated_envelope
-        _append_line_durable(self.quarantine_path, jcs_dumps(entry) + b"\n", mode=0o600)
+        return jcs_dumps(entry) + b"\n"
 
     def ingest_batch(self, stdin_bytes: bytes, *, receive_ts: str | None = None) -> SinkIngestResult:
-        """Ingest one newline-delimited JSONL batch from stdin."""
+        """Ingest one newline-terminated JSONL batch from stdin with single-fsync batching."""
         if not isinstance(stdin_bytes, bytes):
             raise AuditValidationError("stdin_bytes must be bytes")
         if len(stdin_bytes) > MAX_BATCH_BYTES:
             raise AuditValidationError(f"batch exceeds maximum size ({MAX_BATCH_BYTES} bytes)")
+        if stdin_bytes and not stdin_bytes.endswith(b"\n"):
+            # Reject torn mid-batch transport stream without poisoning quarantine.jsonl.
+            raise AuditValidationError("unterminated JSONL batch (truncated transport stream)")
+
         now_ts = receive_ts if receive_ts is not None else utc_now_str()
         parse_utc_timestamp(now_ts)
         receive_day = now_ts[:10]
 
-        with _exclusive_lock(self.lock_path):
-            state, committed_index = self._read_state_unlocked(now_ts=now_ts)
+        raw_lines = [ln for ln in stdin_bytes.split(b"\n")[:-1] if ln] if stdin_bytes else []
+        if len(raw_lines) > MAX_BATCH_LINES:
+            raise AuditValidationError(f"batch exceeds maximum line count ({MAX_BATCH_LINES})")
 
-            accepted = 0
-            duplicates = 0
-            quarantined = 0
+        with _open_dir_fd(self.stream_dir, require_private=True) as dfd:
+            with _exclusive_lock_in_dir(dfd, self.lock_name):
+                state, committed_index, state_dirty = self._read_state_unlocked(dfd)
 
-            raw_lines = stdin_bytes.split(b"\n")
-            if raw_lines and raw_lines[-1] == b"":
-                raw_lines = raw_lines[:-1]
+                accepted = 0
+                duplicates = 0
+                quarantined = 0
+                quarantine_suppressed = 0
+                accepted_buf: list[bytes] = []
+                quarantine_buf: list[bytes] = []
 
-            for raw_line in raw_lines:
-                if not raw_line:
-                    continue
-                if len(raw_line) > MAX_LINE_BYTES:
-                    self._append_quarantine_unlocked(
-                        received_at=now_ts,
-                        reason="line_too_large",
-                        expected_seq=state["last_seq"] + 1,
-                        expected_prev=state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV,
-                        raw_line=raw_line,
-                    )
+                def _queue_quarantine(
+                    *,
+                    reason: str,
+                    raw_line: bytes,
+                    validated_envelope: dict[str, Any] | None = None,
+                ) -> None:
+                    nonlocal quarantined, quarantine_suppressed
                     quarantined += 1
-                    continue
-
-                try:
-                    obj = strict_json_loads(raw_line)
-                    validate_envelope(
-                        obj,
-                        expected_host=self.expected_host,
-                        expected_src=self.expected_src,
-                        verify_hash=True,
-                    )
-                    canonical = jcs_dumps(obj)
-                    if raw_line != canonical:
-                        raise AuditValidationError("non-canonical JCS encoding")
-                except AuditError as exc:
-                    reason = "redaction_blocked" if isinstance(exc, AuditRedactionError) else "invalid_envelope"
-                    self._append_quarantine_unlocked(
-                        received_at=now_ts,
-                        reason=reason,
-                        expected_seq=state["last_seq"] + 1,
-                        expected_prev=state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV,
-                        raw_line=raw_line,
-                    )
-                    quarantined += 1
-                    continue
-
-                seq = obj["seq"]
-                expected_seq = state["last_seq"] + 1
-                expected_prev = state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV
-
-                if seq == expected_seq and hmac.compare_digest(obj["prev"], expected_prev):
-                    day_path = self.stream_dir / f"{receive_day}.jsonl"
-                    _append_line_durable(day_path, canonical + b"\n", mode=0o600)
-                    state["last_seq"] = seq
-                    state["last_h"] = obj["h"]
-                    state["last_ts"] = obj["ts"]
-                    state["last_receive_ts"] = now_ts
-                    if obj["type"] == "heartbeat":
-                        state["last_heartbeat_ts"] = obj["ts"]
-                        state["last_heartbeat_receive_ts"] = now_ts
-                    _write_json_atomic(self.state_path, state, mode=0o600)
-                    committed_index[seq] = (obj, canonical)
-                    accepted += 1
-                elif seq <= state["last_seq"]:
-                    existing = committed_index.get(seq)
-                    if (
-                        existing is not None
-                        and hmac.compare_digest(existing[0]["h"], obj["h"])
-                        and existing[1] == canonical
-                    ):
-                        duplicates += 1
-                    else:
-                        self._append_quarantine_unlocked(
-                            received_at=now_ts,
-                            reason="fork",
-                            expected_seq=expected_seq,
-                            expected_prev=expected_prev,
-                            raw_line=canonical,
-                            validated_envelope=obj,
+                    if len(quarantine_buf) < MAX_QUARANTINE_PER_BATCH:
+                        quarantine_buf.append(
+                            self._build_quarantine_line(
+                                received_at=now_ts,
+                                reason=reason,
+                                expected_seq=state["last_seq"] + 1,
+                                expected_prev=state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV,
+                                raw_line=raw_line,
+                                validated_envelope=validated_envelope,
+                            )
                         )
-                        quarantined += 1
-                else:
-                    reason = "gap" if seq > expected_seq else "prev_mismatch"
-                    self._append_quarantine_unlocked(
-                        received_at=now_ts,
-                        reason=reason,
-                        expected_seq=expected_seq,
-                        expected_prev=expected_prev,
-                        raw_line=canonical,
-                        validated_envelope=obj,
-                    )
-                    quarantined += 1
+                    else:
+                        quarantine_suppressed += 1
 
-            return SinkIngestResult(
-                ok=True,
-                host=self.expected_host,
-                src=self.expected_src,
-                last_seq=state["last_seq"],
-                last_h=state["last_h"] if state["last_seq"] > 0 else None,
-                accepted=accepted,
-                duplicates=duplicates,
-                quarantined=quarantined,
-            )
+                for raw_line in raw_lines:
+                    if len(raw_line) > MAX_LINE_BYTES:
+                        _queue_quarantine(reason="line_too_large", raw_line=raw_line)
+                        continue
+
+                    try:
+                        obj = strict_json_loads(raw_line)
+                        validate_envelope(
+                            obj,
+                            expected_host=self.expected_host,
+                            expected_src=self.expected_src,
+                            verify_hash=True,
+                        )
+                        canonical = jcs_dumps(obj)
+                        if raw_line != canonical:
+                            raise AuditValidationError("non-canonical JCS encoding")
+                    except AuditError as exc:
+                        reason = (
+                            "redaction_blocked"
+                            if isinstance(exc, AuditRedactionError)
+                            else "invalid_envelope"
+                        )
+                        _queue_quarantine(reason=reason, raw_line=raw_line)
+                        continue
+
+                    seq = obj["seq"]
+                    expected_seq = state["last_seq"] + 1
+                    expected_prev = state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV
+
+                    if seq == expected_seq and hmac.compare_digest(obj["prev"], expected_prev):
+                        accepted_buf.append(canonical + b"\n")
+                        state["last_seq"] = seq
+                        state["last_h"] = obj["h"]
+                        state["last_ts"] = obj["ts"]
+                        state["last_receive_ts"] = now_ts
+                        if obj["type"] == "heartbeat":
+                            state["last_heartbeat_ts"] = obj["ts"]
+                            state["last_heartbeat_receive_ts"] = now_ts
+                        committed_index[seq] = (obj, canonical)
+                        accepted += 1
+                    elif seq <= state["last_seq"]:
+                        existing = committed_index.get(seq)
+                        if (
+                            existing is not None
+                            and hmac.compare_digest(existing[0]["h"], obj["h"])
+                            and existing[1] == canonical
+                        ):
+                            duplicates += 1
+                        else:
+                            _queue_quarantine(
+                                reason="fork", raw_line=canonical, validated_envelope=obj
+                            )
+                    else:
+                        reason = "gap" if seq > expected_seq else "prev_mismatch"
+                        _queue_quarantine(
+                            reason=reason, raw_line=canonical, validated_envelope=obj
+                        )
+
+                if quarantine_suppressed > 0:
+                    summary = {
+                        "received_at": now_ts,
+                        "host": self.expected_host,
+                        "src": self.expected_src,
+                        "reason": "quarantine_batch_cap_reached",
+                        "suppressed_count": quarantine_suppressed,
+                    }
+                    quarantine_buf.append(jcs_dumps(summary) + b"\n")
+
+                # Single durable append + fsync per touched log file, then atomic state.json.
+                if accepted_buf:
+                    _append_bytes_durable_in_dir(
+                        dfd, f"{receive_day}.jsonl", b"".join(accepted_buf), mode=0o600
+                    )
+                if quarantine_buf:
+                    _append_bytes_durable_in_dir(
+                        dfd, self.quarantine_name, b"".join(quarantine_buf), mode=0o600
+                    )
+                if accepted_buf or state_dirty:
+                    _write_json_atomic_in_dir(dfd, self.state_name, state, mode=0o600)
+
+                return SinkIngestResult(
+                    ok=True,
+                    host=self.expected_host,
+                    src=self.expected_src,
+                    last_seq=state["last_seq"],
+                    last_h=state["last_h"] if state["last_seq"] > 0 else None,
+                    accepted=accepted,
+                    duplicates=duplicates,
+                    quarantined=quarantined,
+                )
 
 
 def run_forced_command(
@@ -1688,7 +2091,7 @@ def run_forced_command(
         f"audit-append --src {expected_src}",
     }
     if cmd not in allowed_cmds:
-        raise ForcedCommandError(f"disallowed sink command (append-only boundary): {cmd!r}")
+        raise ForcedCommandError("disallowed sink command (append-only boundary)")
 
     sink = AuditSink(sink_root, expected_host=expected_host, expected_src=expected_src)
     res = sink.ingest_batch(stdin_bytes, receive_ts=receive_ts)
@@ -1696,18 +2099,8 @@ def run_forced_command(
 
 
 # ---------------------------------------------------------------------------
-# Forensic cross-verifier & intermittent-host liveness
+# Forensic cross-verifier (strictly read-only) & intermittent-host liveness
 # ---------------------------------------------------------------------------
-
-def _count_quarantine_lines(stream_dir: Path) -> int:
-    q_path = stream_dir / "quarantine.jsonl"
-    if not q_path.exists() and not q_path.is_symlink():
-        return 0
-    raw = _read_regular_file(q_path)
-    if not raw:
-        return 0
-    return len([ln for ln in raw.split(b"\n") if ln])
-
 
 def verify_local_against_sink(
     local_jsonl_path: Path,
@@ -1718,33 +2111,109 @@ def verify_local_against_sink(
 ) -> VerifyReport:
     """Compare a host's local JSONL capture against the off-device sink witness.
 
-    Flags missing/deleted local log, tail truncation, mid-log deletion, edited
-    lines, chain breaks, and sink quarantine records (forks/gaps).
+    Strictly read-only (never calls `os.mkdir` or modifies disk). Flags missing
+    sink stream, sink state truncation/mismatch, sink quarantine entries,
+    missing/deleted/unsafe local log, tail truncation, mid-log deletion, edited
+    or re-chained local lines, and chain breaks.
     """
     findings: list[TamperFinding] = []
-    sink_dir = _ensure_safe_dir_chain(Path(sink_stream_dir), mode=0o700)
+    sink_dir = Path(sink_stream_dir)
+    if not sink_dir.exists() and not sink_dir.is_symlink():
+        return VerifyReport(
+            ok=False,
+            local_count=0,
+            sink_count=0,
+            quarantine_count=0,
+            findings=(
+                TamperFinding(
+                    "SINK_MISSING",
+                    None,
+                    f"sink stream directory does not exist: {sink_dir}",
+                ),
+            ),
+        )
 
     quarantine_count = 0
-    try:
-        quarantine_count = _count_quarantine_lines(sink_dir)
-    except AuditError as exc:
-        findings.append(TamperFinding("SINK_QUARANTINE_UNREADABLE", None, str(exc)))
-    if quarantine_count > 0:
-        findings.append(
-            TamperFinding(
-                "SINK_QUARANTINE_PRESENT",
-                None,
-                f"sink holds {quarantine_count} quarantined record(s) (gap, fork, or invalid submission)",
-            )
-        )
-
     sink_records: list[tuple[dict[str, Any], bytes]] = []
     try:
-        sink_records = _load_sink_committed_records(
-            sink_dir, expected_host=expected_host, expected_src=expected_src
+        with _open_dir_fd(sink_dir, require_private=False) as sdfd:
+            with _shared_lock_if_present(sdfd, ".sink.lock"):
+                try:
+                    quarantine_count = _count_lines_streaming_in_dir(sdfd, "quarantine.jsonl")
+                except AuditError as exc:
+                    findings.append(TamperFinding("SINK_QUARANTINE_UNREADABLE", None, str(exc)))
+                if quarantine_count > 0:
+                    findings.append(
+                        TamperFinding(
+                            "SINK_QUARANTINE_PRESENT",
+                            None,
+                            f"sink holds {quarantine_count} quarantined record(s) (gap, fork, or invalid submission)",
+                        )
+                    )
+
+                try:
+                    sink_records = _load_sink_committed_records_in_dir(
+                        sdfd, expected_host=expected_host, expected_src=expected_src
+                    )
+                except AuditError as exc:
+                    findings.append(TamperFinding("SINK_CORRUPT", None, str(exc)))
+
+                # Cross-check sink state.json against committed daily files so
+                # deleting a sink daily file while state.json survives is flagged.
+                try:
+                    os.lstat("state.json", dir_fd=sdfd)
+                    has_sink_state = True
+                except FileNotFoundError:
+                    has_sink_state = False
+                if has_sink_state:
+                    try:
+                        st_raw = _read_small_regular_in_dir(sdfd, "state.json", max_bytes=MAX_LINE_BYTES)
+                        st_obj = strict_json_loads(st_raw.rstrip(b"\n"))
+                        st_seq = st_obj.get("last_seq")
+                        st_h = st_obj.get("last_h")
+                        if expected_host is not None and st_obj.get("host") != expected_host:
+                            findings.append(
+                                TamperFinding("SINK_STATE_MISMATCH", None, "sink state.json host mismatch")
+                            )
+                        if expected_src is not None and st_obj.get("src") != expected_src:
+                            findings.append(
+                                TamperFinding("SINK_STATE_MISMATCH", None, "sink state.json src mismatch")
+                            )
+                        if not _is_exact_int(st_seq) or st_seq < 0:
+                            findings.append(
+                                TamperFinding("SINK_STATE_MISMATCH", None, "sink state.json invalid last_seq")
+                            )
+                        else:
+                            committed_by_seq = {r["seq"]: r for r, _ in sink_records}
+                            committed_max = max(committed_by_seq.keys(), default=0)
+                            if committed_max < st_seq:
+                                findings.append(
+                                    TamperFinding(
+                                        "SINK_TRUNCATED",
+                                        committed_max + 1,
+                                        f"sink committed log ends at seq {committed_max} while state.json expects {st_seq}",
+                                    )
+                                )
+                            elif st_seq > 0:
+                                rec_at = committed_by_seq.get(st_seq)
+                                if rec_at is None or not isinstance(st_h, str) or not hmac.compare_digest(rec_at["h"], st_h):
+                                    findings.append(
+                                        TamperFinding(
+                                            "SINK_STATE_MISMATCH",
+                                            st_seq,
+                                            f"sink state.json hash disagrees with committed seq {st_seq}",
+                                        )
+                                    )
+                    except AuditError as exc:
+                        findings.append(TamperFinding("SINK_STATE_MISMATCH", None, str(exc)))
+    except AuditFileSecurityError as exc:
+        return VerifyReport(
+            ok=False,
+            local_count=0,
+            sink_count=0,
+            quarantine_count=0,
+            findings=(TamperFinding("SINK_UNSAFE_DIR", None, str(exc)),),
         )
-    except AuditError as exc:
-        findings.append(TamperFinding("SINK_CORRUPT", None, str(exc)))
 
     sink_chain_findings = verify_chain_records(
         [r for r, _ in sink_records], expected_host=expected_host, expected_src=expected_src
@@ -1756,43 +2225,54 @@ def verify_local_against_sink(
     sink_max_seq = max(sink_by_seq.keys(), default=0)
 
     local_records: list[tuple[dict[str, Any], bytes]] = []
-    local_exists = local_jsonl_path.exists() or local_jsonl_path.is_symlink()
+    local_p = Path(local_jsonl_path)
+    local_exists = local_p.exists() or local_p.is_symlink()
     if not local_exists:
         if sink_max_seq > 0:
             findings.append(
                 TamperFinding(
                     "LOCAL_MISSING",
                     1,
-                    f"local audit log {local_jsonl_path} is missing while sink has {sink_max_seq} record(s)",
+                    f"local audit log {local_p} is missing while sink has {sink_max_seq} record(s)",
                 )
             )
     else:
         try:
-            local_records = _load_jsonl_records(
-                local_jsonl_path, expected_host=expected_host, expected_src=expected_src
-            )
-        except AuditError as exc:
-            findings.append(TamperFinding("LOCAL_PARSE_ERROR", None, str(exc)))
-            # Best-effort line-by-line scan so edits/deletions still get reported alongside parse error.
-            try:
-                raw_local = _read_regular_file(local_jsonl_path)
-                for raw_ln in raw_local.splitlines():
-                    if not raw_ln:
-                        continue
+            with _open_dir_fd(local_p.parent, require_private=False) as ldfd:
+                try:
+                    local_records = _load_jsonl_records_in_dir(
+                        ldfd, local_p.name, expected_host=expected_host, expected_src=expected_src
+                    )
+                except AuditFileSecurityError as exc:
+                    findings.append(TamperFinding("LOCAL_UNSAFE_FILE", None, str(exc)))
+                except AuditError as exc:
+                    findings.append(TamperFinding("LOCAL_PARSE_ERROR", None, str(exc)))
+                    # Best-effort streaming scan so edits/deletions still surface alongside parse error.
                     try:
-                        obj = strict_json_loads(raw_ln)
-                        if _is_exact_int(obj.get("seq")):
-                            local_records.append((obj, raw_ln))
+                        fd, _ = _open_regular_in_dir(ldfd, local_p.name, os.O_RDONLY)
+                        with os.fdopen(fd, "rb") as fh:
+                            for raw_ln in fh:
+                                raw_ln = raw_ln.rstrip(b"\n")
+                                if not raw_ln or len(raw_ln) > MAX_LINE_BYTES:
+                                    continue
+                                try:
+                                    obj = strict_json_loads(raw_ln)
+                                    if _is_exact_int(obj.get("seq")):
+                                        local_records.append((obj, raw_ln))
+                                except AuditError:
+                                    continue
                     except AuditError:
-                        continue
-            except AuditError:
-                pass
-        else:
-            local_chain_findings = verify_chain_records(
-                [r for r, _ in local_records], expected_host=expected_host, expected_src=expected_src
-            )
-            for f in local_chain_findings:
-                findings.append(TamperFinding(f"LOCAL_{f.code}", f.seq, f.detail))
+                        pass
+                else:
+                    local_chain_findings = verify_chain_records(
+                        [r for r, _ in local_records],
+                        expected_host=expected_host,
+                        expected_src=expected_src,
+                    )
+                    for f in local_chain_findings:
+                        findings.append(TamperFinding(f"LOCAL_{f.code}", f.seq, f.detail))
+        except AuditFileSecurityError as exc:
+            findings.append(TamperFinding("LOCAL_UNSAFE_FILE", None, str(exc)))
 
     local_by_seq: dict[int, tuple[dict[str, Any], bytes]] = {}
     for rec, raw in local_records:
@@ -1854,9 +2334,11 @@ def check_host_liveness(
     now_utc: datetime.datetime | None = None,
     max_silence_seconds: int = 600,
 ) -> LivenessReport:
-    """Report host audit liveness. A silent or unseen host is ALWAYS `"unknown"`, never `"fine"`."""
+    """Report host audit liveness. Silent, unseen, mismatched, or quarantined hosts are ALWAYS `"unknown"`."""
     _require_regex(host, HOST_NAME_RE, "host")
     _require_regex(src, SRC_RE, "src")
+    if not _is_exact_int(max_silence_seconds) or max_silence_seconds <= 0:
+        raise ValueError("max_silence_seconds must be a positive integer")
     now = now_utc if now_utc is not None else datetime.datetime.now(datetime.timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now_utc must be timezone-aware")
@@ -1875,12 +2357,43 @@ def check_host_liveness(
             quarantine_count=0,
         )
 
-    quarantine_count = _count_quarantine_lines(stream_dir)
-    state_path = stream_dir / "state.json"
-    if not state_path.exists() or state_path.is_symlink():
+    try:
+        with _open_dir_fd(stream_dir, require_private=False) as sdfd:
+            with _shared_lock_if_present(sdfd, ".sink.lock"):
+                quarantine_count = _count_lines_streaming_in_dir(sdfd, "quarantine.jsonl")
+                try:
+                    os.lstat("state.json", dir_fd=sdfd)
+                except FileNotFoundError:
+                    return LivenessReport(
+                        status="unknown",
+                        reason="sink state missing",
+                        host=host,
+                        src=src,
+                        last_seq=0,
+                        last_receive_ts=None,
+                        last_heartbeat_receive_ts=None,
+                        silence_seconds=None,
+                        quarantine_count=quarantine_count,
+                    )
+                raw = _read_small_regular_in_dir(sdfd, "state.json", max_bytes=MAX_LINE_BYTES)
+                state = strict_json_loads(raw.rstrip(b"\n"))
+    except (AuditError, OSError) as exc:
         return LivenessReport(
             status="unknown",
-            reason="sink state missing",
+            reason=f"sink state unreadable: {exc}",
+            host=host,
+            src=src,
+            last_seq=0,
+            last_receive_ts=None,
+            last_heartbeat_receive_ts=None,
+            silence_seconds=None,
+            quarantine_count=0,
+        )
+
+    if state.get("host") != host or state.get("src") != src:
+        return LivenessReport(
+            status="unknown",
+            reason="sink state host/src mismatch",
             host=host,
             src=src,
             last_seq=0,
@@ -1890,7 +2403,6 @@ def check_host_liveness(
             quarantine_count=quarantine_count,
         )
 
-    state = strict_json_loads(_read_regular_file(state_path, max_bytes=MAX_LINE_BYTES).rstrip(b"\n"))
     last_seq = state.get("last_seq", 0)
     last_rx = state.get("last_receive_ts") or None
     last_hb_rx = state.get("last_heartbeat_receive_ts") or None
@@ -1907,7 +2419,21 @@ def check_host_liveness(
             quarantine_count=quarantine_count,
         )
 
-    hb_dt = parse_utc_timestamp(last_hb_rx)
+    try:
+        hb_dt = parse_utc_timestamp(last_hb_rx)
+    except AuditValidationError:
+        return LivenessReport(
+            status="unknown",
+            reason="invalid heartbeat receive timestamp in sink state",
+            host=host,
+            src=src,
+            last_seq=last_seq,
+            last_receive_ts=last_rx,
+            last_heartbeat_receive_ts=last_hb_rx,
+            silence_seconds=None,
+            quarantine_count=quarantine_count,
+        )
+
     silence = (now - hb_dt).total_seconds()
     if silence < -60:
         return LivenessReport(
@@ -1925,6 +2451,18 @@ def check_host_liveness(
         return LivenessReport(
             status="unknown",
             reason=f"host silent for {int(silence)}s (threshold {max_silence_seconds}s)",
+            host=host,
+            src=src,
+            last_seq=last_seq,
+            last_receive_ts=last_rx,
+            last_heartbeat_receive_ts=last_hb_rx,
+            silence_seconds=silence,
+            quarantine_count=quarantine_count,
+        )
+    if quarantine_count > 0:
+        return LivenessReport(
+            status="unknown",
+            reason=f"sink has {quarantine_count} quarantined record(s) requiring investigation",
             host=host,
             src=src,
             last_seq=last_seq,
@@ -2041,7 +2579,11 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 print(json.dumps(out, sort_keys=True))
                 return 0 if report.ok else 1
-            records = _load_jsonl_records(args.local, expected_host=args.host, expected_src=args.src)
+            local_p = Path(args.local)
+            with _open_dir_fd(local_p.parent, require_private=False) as ldfd:
+                records = _load_jsonl_records_in_dir(
+                    ldfd, local_p.name, expected_host=args.host, expected_src=args.src
+                )
             findings = verify_chain_records(
                 [r for r, _ in records], expected_host=args.host, expected_src=args.src
             )
@@ -2069,7 +2611,7 @@ def main(argv: list[str] | None = None) -> int:
     except ForcedCommandError as exc:
         print(f"audit-log: denied: {exc}", file=sys.stderr)
         return 2
-    except AuditError as exc:
+    except (AuditError, OSError, ValueError) as exc:
         print(f"audit-log: error: {exc}", file=sys.stderr)
         return 1
     return 0

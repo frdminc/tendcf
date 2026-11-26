@@ -7,6 +7,7 @@
   "properties": {
     "v": {
       "description": "Envelope format version (shared contract v1).",
+      "type": "integer",
       "const": 1
     },
     "src": {
@@ -77,6 +78,15 @@
             "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
           }
         }
+      },
+      "else": {
+        "properties": {
+          "prev": {
+            "not": {
+              "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        }
       }
     },
     {
@@ -134,10 +144,11 @@
       "not": { "pattern": "\\n" }
     },
     "abs_path": {
-      "description": "Normalized absolute path with conservative printable ASCII characters and no `..` traversal or control characters.",
+      "description": "Normalized absolute file path with conservative printable ASCII characters and no `.` / `..` segments, `//`, trailing `/`, or control characters.",
       "type": "string",
-      "pattern": "^/[A-Za-z0-9._+@:,/-]{1,255}$",
-      "not": { "pattern": "(\\n|\\.\\.|//)" }
+      "maxLength": 256,
+      "pattern": "^/(?:(?:[A-Za-z0-9_+@:,-][A-Za-z0-9._+@:,-]*|\\.[A-Za-z0-9_+@:,-][A-Za-z0-9._+@:,-]*|\\.\\.[A-Za-z0-9._+@:,-]+)/)*(?:[A-Za-z0-9_+@:,-][A-Za-z0-9._+@:,-]*|\\.[A-Za-z0-9_+@:,-][A-Za-z0-9._+@:,-]*|\\.\\.[A-Za-z0-9._+@:,-]+)$",
+      "not": { "pattern": "\\n" }
     },
     "unit_name": {
       "type": "string",
