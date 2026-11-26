@@ -838,7 +838,7 @@ def validate_envelope(
     if verify_hash:
         unsigned = {k: v for k, v in obj.items() if k != "h"}
         expected_h = compute_envelope_hash(unsigned)
-        if not hmac.compare_digest(obj["h"], expected_h):
+        if not _safe_digest_equal(obj["h"], expected_h):
             raise AuditValidationError(f"envelope hash mismatch at seq {obj['seq']}")
     return obj
 
@@ -1296,7 +1296,7 @@ def verify_chain_records(
                     f"expected seq {expected_seq}, got {rec['seq']}",
                 )
             )
-        if not hmac.compare_digest(rec["prev"], expected_prev):
+        if not _safe_digest_equal(rec["prev"], expected_prev):
             findings.append(
                 TamperFinding(
                     "CHAIN_PREV_MISMATCH",
@@ -1368,6 +1368,10 @@ class AuditSpool:
             raise ChainTamperError("cursor.json local_seq 0 must use genesis hash")
         if obj["acked_seq"] == 0 and obj["acked_h"] != GENESIS_PREV:
             raise ChainTamperError("cursor.json acked_seq 0 must use genesis hash")
+        if obj["local_seq"] == 0 and obj.get("local_offset", 0) != 0:
+            raise ChainTamperError("cursor.json local_seq 0 must have local_offset 0")
+        if obj["acked_seq"] == 0 and obj.get("acked_offset", 0) != 0:
+            raise ChainTamperError("cursor.json acked_seq 0 must have acked_offset 0")
         return obj
 
     def _read_last_record_ending_at(
@@ -1645,6 +1649,8 @@ class AuditSpool:
                     new_acked_off = state["acked_offset"]
                 else:
                     found_off: int | None = None
+                    exp_seq = state["acked_seq"] + 1
+                    exp_prev = state["acked_h"] if state["acked_seq"] > 0 else GENESIS_PREV
                     try:
                         for _, line, end_off, _ in _iter_regular_lines_in_dir(
                             dfd, self.log_name, start_offset=state["acked_offset"]
@@ -1653,11 +1659,17 @@ class AuditSpool:
                             validate_envelope(
                                 obj, expected_host=self.host, expected_src=self.src, verify_hash=True
                             )
+                            if line != jcs_dumps(obj):
+                                raise AuditValidationError("non-canonical JCS bytes")
+                            if obj["seq"] != exp_seq or not _safe_digest_equal(obj["prev"], exp_prev):
+                                raise ChainTamperError("local audit.jsonl chain mismatch during ack")
                             if obj["seq"] == acked_seq:
                                 if not _safe_digest_equal(obj["h"], acked_h):
                                     raise TransportError(f"sink ack hash mismatch at seq {acked_seq}")
                                 found_off = end_off
                                 break
+                            exp_seq += 1
+                            exp_prev = obj["h"]
                     except AuditValidationError as exc:
                         raise ChainTamperError(f"local audit.jsonl unreadable during ack: {exc}") from exc
                     if found_off is None:
@@ -1891,7 +1903,7 @@ class AuditShipper:
                     # ahead (e.g. batch_size shrank or cursor.json was rebuilt),
                     # spool.advance_ack verifies ack_seq <= local_seq and exact hash
                     # match against the local audit chain.
-                    if ack_seq in sent_by_seq and not hmac.compare_digest(sent_by_seq[ack_seq], ack_h):
+                    if ack_seq in sent_by_seq and not _safe_digest_equal(sent_by_seq[ack_seq], ack_h):
                         raise TransportError("sink ack hash disagrees with sent record")
                     last_state = self.spool.advance_ack(ack_seq, ack_h)
             except (TransportError, AuditError, OSError) as exc:
@@ -2150,23 +2162,37 @@ class AuditSink:
                         break
                 state_dirty = True
 
-        # Append-only recovery for any interrupted partial trailing write on a daily file:
-        # seal with a single '\n' (chattr +a safe), pin its hash in state.json, and record
-        # a witness in quarantine.jsonl so subsequent retries succeed cleanly.
+        # Write-ahead append-only recovery for any interrupted partial trailing write on a
+        # daily file (crash-safe at every syscall boundary and compatible with chattr +a):
+        # 1. Verify against existing pin or record new pin + quarantine witness.
+        # 2. Atomically persist state.json BEFORE sealing the daily file with '\n'.
+        # 3. Append '\n' to seal each unterminated daily file.
         if unterminated:
             partials_list = list(obj.get("recovered_partials") or [])
+            partials_map = dict(recovered_partials)
+            need_pin_write = False
+            new_witnesses: list[bytes] = []
             for day_name, lineno, tail_bytes in unterminated:
-                _append_bytes_durable_in_dir(dir_fd, day_name, b"\n", mode=0o600)
                 tail_sha = f"sha256:{hashlib.sha256(tail_bytes).hexdigest()}"
+                tail_len = len(tail_bytes)
+                existing_pin = partials_map.get((day_name, lineno))
+                if existing_pin is not None:
+                    if existing_pin != (tail_sha, tail_len):
+                        raise ChainTamperError(
+                            f"unterminated partial line at {day_name}:{lineno} disagrees with persisted pin"
+                        )
+                    # Pin was already persisted before an earlier crash prior to '\n' seal.
+                    continue
                 partials_list.append(
                     {
                         "file": day_name,
                         "line": lineno,
                         "raw_sha256": tail_sha,
-                        "raw_len": len(tail_bytes),
+                        "raw_len": tail_len,
                     }
                 )
-                recovery_quarantine_lines.append(
+                partials_map[(day_name, lineno)] = (tail_sha, tail_len)
+                new_witnesses.append(
                     self._build_quarantine_line(
                         received_at=now_ts,
                         reason="sink_partial_write_recovered",
@@ -2175,8 +2201,17 @@ class AuditSink:
                         raw_line=tail_bytes,
                     )
                 )
-            obj["recovered_partials"] = partials_list
-            state_dirty = True
+                need_pin_write = True
+            if new_witnesses:
+                _append_bytes_durable_in_dir(
+                    dir_fd, self.quarantine_name, b"".join(new_witnesses), mode=0o600
+                )
+            if need_pin_write or state_dirty:
+                obj["recovered_partials"] = partials_list
+                _write_json_atomic_in_dir(dir_fd, self.state_name, obj, mode=0o600)
+                state_dirty = False
+            for day_name, _, _ in unterminated:
+                _append_bytes_durable_in_dir(dir_fd, day_name, b"\n", mode=0o600)
 
         return obj, committed_index, state_dirty, recovery_quarantine_lines
 
@@ -2291,7 +2326,7 @@ class AuditSink:
                     expected_seq = state["last_seq"] + 1
                     expected_prev = state["last_h"] if state["last_seq"] > 0 else GENESIS_PREV
 
-                    if seq == expected_seq and hmac.compare_digest(obj["prev"], expected_prev):
+                    if seq == expected_seq and _safe_digest_equal(obj["prev"], expected_prev):
                         accepted_buf.append(canonical + b"\n")
                         state["last_seq"] = seq
                         state["last_h"] = obj["h"]
@@ -2306,7 +2341,7 @@ class AuditSink:
                         existing = committed_index.get(seq)
                         if (
                             existing is not None
-                            and hmac.compare_digest(existing[0]["h"], obj["h"])
+                            and _safe_digest_equal(existing[0]["h"], obj["h"])
                             and existing[1] == canonical
                         ):
                             duplicates += 1

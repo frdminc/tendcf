@@ -1165,6 +1165,106 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertNotIn("LOCAL_EDITED", codes)
             self.assertIn("SINK_QUARANTINE_PRESENT", codes)
 
+    def test_r3_h1_write_ahead_partial_recovery_survives_crash_before_newline_seal(self) -> None:
+        # H1-R3: state.json pins (file, line, sha, len) BEFORE sealing '\n' on daily file.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            sink_root = root / "sink"
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            e1_bytes = audit.jcs_dumps(e1) + b"\n"
+            e2_bytes = audit.jcs_dumps(e2) + b"\n"
+
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e1_bytes,
+                receive_ts="2026-11-26T12:00:05Z",
+            )
+            day_file = sink_root / "pastebin" / "tendcf" / "2026-11-26.jsonl"
+            with open(day_file, "ab") as fh:
+                fh.write(e2_bytes[:100])
+
+            # Simulate crash right after state.json pin write, BEFORE '\n' seal on daily file.
+            orig_append = audit._append_bytes_durable_in_dir
+            call_order: list[str] = []
+            orig_write_state = audit._write_json_atomic_in_dir
+
+            def spy_write_state(dfd, name, payload, mode=0o600):
+                call_order.append(f"state:{name}")
+                return orig_write_state(dfd, name, payload, mode=mode)
+
+            def crash_on_newline_seal(dfd, name, payload, mode=0o600):
+                call_order.append(f"append:{name}:{len(payload)}")
+                if name == "2026-11-26.jsonl" and payload == b"\n":
+                    raise OSError("simulated power loss before newline seal")
+                return orig_append(dfd, name, payload, mode=mode)
+
+            audit._write_json_atomic_in_dir = spy_write_state
+            audit._append_bytes_durable_in_dir = crash_on_newline_seal
+            try:
+                with self.assertRaises(OSError):
+                    audit.run_forced_command(
+                        sink_root=sink_root,
+                        expected_host="pastebin",
+                        expected_src="tendcf",
+                        stdin_bytes=e1_bytes + e2_bytes,
+                        receive_ts="2026-11-26T12:00:10Z",
+                    )
+                # Confirm state.json was persisted BEFORE attempting '\n' seal.
+                self.assertLess(
+                    call_order.index("state:state.json"),
+                    call_order.index("append:2026-11-26.jsonl:1"),
+                )
+            finally:
+                audit._write_json_atomic_in_dir = orig_write_state
+                audit._append_bytes_durable_in_dir = orig_append
+
+            # Next retry completes the '\n' seal without duplicating pin/witness and commits e2.
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e1_bytes + e2_bytes,
+                receive_ts="2026-11-26T12:00:15Z",
+            )
+            self.assertTrue(ack["ok"])
+            self.assertEqual(ack["last_seq"], 2)
+            self.assertEqual(ack["accepted"], 1)
+            q_lines = (sink_root / "pastebin" / "tendcf" / "quarantine.jsonl").read_text().splitlines()
+            self.assertEqual(len(q_lines), 1)
+            st = json.loads((sink_root / "pastebin" / "tendcf" / "state.json").read_text())
+            self.assertEqual(len(st["recovered_partials"]), 1)
+
+    def test_r3_m1_cursor_zero_seq_nonzero_offset_and_advance_ack_chain_check(self) -> None:
+        # M1-R3 (1): acked_seq == 0 with nonzero acked_offset must raise ChainTamperError.
+        with tempfile.TemporaryDirectory() as td:
+            spool = audit.AuditSpool(Path(td) / "spool", host="pastebin", boot_id="boot-1")
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            cur = json.loads(spool.cursor_path.read_text(encoding="utf-8"))
+            cur["acked_offset"] = cur["local_offset"]
+            spool.cursor_path.write_text(json.dumps(cur) + "\n", encoding="utf-8")
+            with self.assertRaises(audit.ChainTamperError):
+                spool.unshipped()
+
+        # M1-R3 (2): advance_ack() checks JCS canonical bytes and chain continuity.
+        with tempfile.TemporaryDirectory() as td:
+            spool = audit.AuditSpool(Path(td) / "spool", host="pastebin", boot_id="boot-1")
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            # Rewrite e1 as non-canonical JSON (extra whitespace) while keeping e2 intact.
+            lines = spool.log_path.read_bytes().splitlines(keepends=True)
+            non_canon_e1 = json.dumps(e1, indent=None, separators=(", ", ": ")).encode("utf-8") + b"\n"
+            cur = json.loads(spool.cursor_path.read_text(encoding="utf-8"))
+            spool.log_path.write_bytes(non_canon_e1 + lines[1])
+            cur["local_offset"] = len(non_canon_e1) + len(lines[1])
+            spool.cursor_path.write_text(json.dumps(cur) + "\n", encoding="utf-8")
+            with self.assertRaises(audit.ChainTamperError):
+                spool.advance_ack(2, e2["h"])
+
     def test_cli_end_to_end_via_isolated_python(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
