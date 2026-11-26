@@ -907,6 +907,10 @@ def _check_ancestors_no_symlinks(path: Path) -> None:
 
 
 def _verify_private_dir_mode(st: os.stat_result, path: Path) -> None:
+    if st.st_uid != os.geteuid():
+        raise AuditFileSecurityError(
+            f"directory {path} is owned by uid {st.st_uid}, expected euid {os.geteuid()}"
+        )
     mode_bits = stat.S_IMODE(st.st_mode)
     if mode_bits & 0o077:
         raise AuditFileSecurityError(
@@ -1592,6 +1596,12 @@ class AuditSpool:
                 _write_json_atomic_in_dir(dfd, self.cursor_name, state, mode=0o600)
                 return envelope
 
+    def watermark(self) -> dict[str, Any]:
+        """Return synchronized O(1) cursor watermark without materializing pending records."""
+        with _open_dir_fd(self.spool_dir, require_private=True) as dfd:
+            with _exclusive_lock_in_dir(dfd, self.lock_name):
+                return dict(self._sync_state_unlocked(dfd))
+
     def unshipped(self, *, limit: int | None = None) -> tuple[list[tuple[dict[str, Any], bytes]], dict[str, Any]]:
         """Return unshipped `(envelope, canonical_line)` pairs by seeking to `acked_offset`."""
         with _open_dir_fd(self.spool_dir, require_private=True) as dfd:
@@ -1907,13 +1917,14 @@ class AuditShipper:
                         raise TransportError("sink ack hash disagrees with sent record")
                     last_state = self.spool.advance_ack(ack_seq, ack_h)
             except (TransportError, AuditError, OSError) as exc:
-                rem_pending, cur_state = self.spool.unshipped()
+                cur_state = self.spool.watermark()
+                rem_count = max(0, cur_state["local_seq"] - cur_state["acked_seq"])
                 return ShipResult(
                     ok=False,
                     shipped=total_shipped,
                     duplicates=total_dups,
                     quarantined=total_quarantined,
-                    remaining=len(rem_pending),
+                    remaining=rem_count,
                     last_acked_seq=cur_state["acked_seq"],
                     last_acked_h=cur_state["acked_h"] if cur_state["acked_seq"] > 0 else None,
                     error=str(exc),
@@ -1926,28 +1937,30 @@ class AuditShipper:
             )
 
             if last_state["acked_seq"] == prev_acked:
-                rem_pending, cur_state = self.spool.unshipped()
+                cur_state = self.spool.watermark()
+                rem_count = max(0, cur_state["local_seq"] - cur_state["acked_seq"])
                 return ShipResult(
                     ok=False,
                     shipped=total_shipped,
                     duplicates=total_dups,
                     quarantined=total_quarantined,
-                    remaining=len(rem_pending),
+                    remaining=rem_count,
                     last_acked_seq=cur_state["acked_seq"],
                     last_acked_h=cur_state["acked_h"] if cur_state["acked_seq"] > 0 else None,
                     error="sink did not advance watermark (head record quarantined or rejected)",
                 )
 
-        rem_pending, cur_state = self.spool.unshipped()
+        cur_state = self.spool.watermark()
+        rem_count = max(0, cur_state["local_seq"] - cur_state["acked_seq"])
         return ShipResult(
-            ok=len(rem_pending) == 0,
+            ok=rem_count == 0,
             shipped=total_shipped,
             duplicates=total_dups,
             quarantined=total_quarantined,
-            remaining=len(rem_pending),
+            remaining=rem_count,
             last_acked_seq=cur_state["acked_seq"],
             last_acked_h=cur_state["acked_h"] if cur_state["acked_seq"] > 0 else None,
-            error=None if not rem_pending else "max_batches reached with remaining records",
+            error=None if rem_count == 0 else "max_batches reached with remaining records",
         )
 
 
@@ -1969,32 +1982,56 @@ def _iter_sink_day_names(dir_fd: int) -> list[str]:
     return [name for _, name in entries]
 
 
-def _parse_recovered_partials(state_obj: dict[str, Any]) -> dict[tuple[str, int], tuple[str, int]]:
-    raw_list = state_obj.get("recovered_partials")
-    if raw_list is None:
-        return {}
-    if not isinstance(raw_list, list):
-        raise ChainTamperError("sink state.json invalid recovered_partials")
+RECOVERED_PARTIALS_NAME = "recovered_partials.jsonl"
+
+
+def _parse_recovered_partial_item(item: Any) -> tuple[tuple[str, int], tuple[str, int]]:
+    if not isinstance(item, dict) or set(item.keys()) != {"file", "line", "raw_sha256", "raw_len"}:
+        raise ChainTamperError("invalid recovered_partials entry")
+    fn = item.get("file")
+    ln = item.get("line")
+    sha = item.get("raw_sha256")
+    rlen = item.get("raw_len")
+    if (
+        not isinstance(fn, str)
+        or not DAY_FILE_RE.match(fn)
+        or not _is_exact_int(ln)
+        or ln < 1
+        or ln > MAX_SAFE_INT
+        or not isinstance(sha, str)
+        or not SHA256_RE.match(sha)
+        or not _is_exact_int(rlen)
+        or rlen < 1
+        or rlen > MAX_SAFE_INT
+    ):
+        raise ChainTamperError("malformed recovered_partials entry")
+    return (fn, ln), (sha, rlen)
+
+
+def _load_recovered_partials_in_dir(
+    dir_fd: int, legacy_state_obj: dict[str, Any] | None = None
+) -> dict[tuple[str, int], tuple[str, int]]:
+    """Stream recovered partial-write pins from `recovered_partials.jsonl` (unbounded, no 64 KiB cap)."""
     out: dict[tuple[str, int], tuple[str, int]] = {}
-    for item in raw_list:
-        if not isinstance(item, dict):
-            raise ChainTamperError("sink state.json invalid recovered_partials entry")
-        fn = item.get("file")
-        ln = item.get("line")
-        sha = item.get("raw_sha256")
-        rlen = item.get("raw_len")
-        if (
-            not isinstance(fn, str)
-            or not DAY_FILE_RE.match(fn)
-            or not _is_exact_int(ln)
-            or ln < 1
-            or not isinstance(sha, str)
-            or not SHA256_RE.match(sha)
-            or not _is_exact_int(rlen)
-            or rlen < 1
-        ):
-            raise ChainTamperError("sink state.json malformed recovered_partials entry")
-        out[(fn, ln)] = (sha, rlen)
+    if legacy_state_obj is not None and legacy_state_obj.get("recovered_partials") is not None:
+        raw_list = legacy_state_obj["recovered_partials"]
+        if not isinstance(raw_list, list):
+            raise ChainTamperError("sink state.json invalid recovered_partials")
+        for item in raw_list:
+            key, val = _parse_recovered_partial_item(item)
+            if key in out and out[key] != val:
+                raise ChainTamperError(f"conflicting recovered_partials pin for {key[0]}:{key[1]}")
+            out[key] = val
+    try:
+        for _, line, _, _ in _iter_regular_lines_in_dir(dir_fd, RECOVERED_PARTIALS_NAME):
+            key, val = _parse_recovered_partial_item(strict_json_loads(line))
+            if key in out and out[key] != val:
+                raise ChainTamperError(f"conflicting recovered_partials pin for {key[0]}:{key[1]}")
+            out[key] = val
+    except FileNotFoundError:
+        return out
+    except AuditValidationError as exc:
+        raise ChainTamperError(f"{RECOVERED_PARTIALS_NAME} corrupt: {exc}") from exc
     return out
 
 
@@ -2101,7 +2138,7 @@ class AuditSink:
                 or raw_state["last_seq"] > MAX_SAFE_INT
             ):
                 raise ChainTamperError("sink state.json invalid last_seq")
-            recovered_partials = _parse_recovered_partials(raw_state)
+        recovered_partials = _load_recovered_partials_in_dir(dir_fd, raw_state)
 
         committed_list, unterminated = _load_sink_committed_records_in_dir(
             dir_fd,
@@ -2163,14 +2200,15 @@ class AuditSink:
                 state_dirty = True
 
         # Write-ahead append-only recovery for any interrupted partial trailing write on a
-        # daily file (crash-safe at every syscall boundary and compatible with chattr +a):
-        # 1. Verify against existing pin or record new pin + quarantine witness.
-        # 2. Atomically persist state.json BEFORE sealing the daily file with '\n'.
+        # daily file (crash-safe at every syscall boundary, chattr +a compatible, and
+        # scalable without growing state.json beyond MAX_LINE_BYTES):
+        # 1. Verify against existing pin or build new pin + quarantine witness.
+        # 2. Durably append witness to `quarantine.jsonl` and pin to `recovered_partials.jsonl`
+        #    (and persist state.json if dirty) BEFORE sealing `day_name` with '\n'.
         # 3. Append '\n' to seal each unterminated daily file.
         if unterminated:
-            partials_list = list(obj.get("recovered_partials") or [])
             partials_map = dict(recovered_partials)
-            need_pin_write = False
+            new_pin_lines: list[bytes] = []
             new_witnesses: list[bytes] = []
             for day_name, lineno, tail_bytes in unterminated:
                 tail_sha = f"sha256:{hashlib.sha256(tail_bytes).hexdigest()}"
@@ -2183,14 +2221,13 @@ class AuditSink:
                         )
                     # Pin was already persisted before an earlier crash prior to '\n' seal.
                     continue
-                partials_list.append(
-                    {
-                        "file": day_name,
-                        "line": lineno,
-                        "raw_sha256": tail_sha,
-                        "raw_len": tail_len,
-                    }
-                )
+                pin_entry = {
+                    "file": day_name,
+                    "line": lineno,
+                    "raw_sha256": tail_sha,
+                    "raw_len": tail_len,
+                }
+                new_pin_lines.append(jcs_dumps(pin_entry) + b"\n")
                 partials_map[(day_name, lineno)] = (tail_sha, tail_len)
                 new_witnesses.append(
                     self._build_quarantine_line(
@@ -2201,13 +2238,15 @@ class AuditSink:
                         raw_line=tail_bytes,
                     )
                 )
-                need_pin_write = True
             if new_witnesses:
                 _append_bytes_durable_in_dir(
                     dir_fd, self.quarantine_name, b"".join(new_witnesses), mode=0o600
                 )
-            if need_pin_write or state_dirty:
-                obj["recovered_partials"] = partials_list
+            if new_pin_lines:
+                _append_bytes_durable_in_dir(
+                    dir_fd, RECOVERED_PARTIALS_NAME, b"".join(new_pin_lines), mode=0o600
+                )
+            if state_dirty:
                 _write_json_atomic_in_dir(dir_fd, self.state_name, obj, mode=0o600)
                 state_dirty = False
             for day_name, _, _ in unterminated:
@@ -2487,9 +2526,12 @@ def verify_local_against_sink(
                     try:
                         st_raw = _read_small_regular_in_dir(sdfd, "state.json", max_bytes=MAX_LINE_BYTES)
                         st_obj = strict_json_loads(st_raw.rstrip(b"\n"))
-                        recovered_partials = _parse_recovered_partials(st_obj)
                     except AuditError as exc:
                         findings.append(TamperFinding("SINK_STATE_MISMATCH", None, str(exc)))
+                try:
+                    recovered_partials = _load_recovered_partials_in_dir(sdfd, st_obj)
+                except AuditError as exc:
+                    findings.append(TamperFinding("SINK_STATE_MISMATCH", None, str(exc)))
 
                 try:
                     sink_records, _ = _load_sink_committed_records_in_dir(

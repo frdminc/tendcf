@@ -1166,7 +1166,8 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertIn("SINK_QUARANTINE_PRESENT", codes)
 
     def test_r3_h1_write_ahead_partial_recovery_survives_crash_before_newline_seal(self) -> None:
-        # H1-R3: state.json pins (file, line, sha, len) BEFORE sealing '\n' on daily file.
+        # H1-R3 + Macroscope 4712973914: recovered_partials.jsonl pins (file, line, sha, len)
+        # BEFORE sealing '\n' on the daily file, without growing state.json.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
@@ -1187,14 +1188,9 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             with open(day_file, "ab") as fh:
                 fh.write(e2_bytes[:100])
 
-            # Simulate crash right after state.json pin write, BEFORE '\n' seal on daily file.
+            # Simulate crash right after recovered_partials.jsonl pin write, BEFORE '\n' seal on daily file.
             orig_append = audit._append_bytes_durable_in_dir
             call_order: list[str] = []
-            orig_write_state = audit._write_json_atomic_in_dir
-
-            def spy_write_state(dfd, name, payload, mode=0o600):
-                call_order.append(f"state:{name}")
-                return orig_write_state(dfd, name, payload, mode=mode)
 
             def crash_on_newline_seal(dfd, name, payload, mode=0o600):
                 call_order.append(f"append:{name}:{len(payload)}")
@@ -1202,7 +1198,6 @@ class TestR1AdversaryRegressions(unittest.TestCase):
                     raise OSError("simulated power loss before newline seal")
                 return orig_append(dfd, name, payload, mode=mode)
 
-            audit._write_json_atomic_in_dir = spy_write_state
             audit._append_bytes_durable_in_dir = crash_on_newline_seal
             try:
                 with self.assertRaises(OSError):
@@ -1213,13 +1208,13 @@ class TestR1AdversaryRegressions(unittest.TestCase):
                         stdin_bytes=e1_bytes + e2_bytes,
                         receive_ts="2026-11-26T12:00:10Z",
                     )
-                # Confirm state.json was persisted BEFORE attempting '\n' seal.
-                self.assertLess(
-                    call_order.index("state:state.json"),
-                    call_order.index("append:2026-11-26.jsonl:1"),
+                # Confirm quarantine witness and recovered_partials.jsonl pin were persisted BEFORE '\n' seal.
+                pin_idx = next(
+                    i for i, entry in enumerate(call_order) if entry.startswith("append:recovered_partials.jsonl:")
                 )
+                seal_idx = call_order.index("append:2026-11-26.jsonl:1")
+                self.assertLess(pin_idx, seal_idx)
             finally:
-                audit._write_json_atomic_in_dir = orig_write_state
                 audit._append_bytes_durable_in_dir = orig_append
 
             # Next retry completes the '\n' seal without duplicating pin/witness and commits e2.
@@ -1235,8 +1230,125 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertEqual(ack["accepted"], 1)
             q_lines = (sink_root / "pastebin" / "tendcf" / "quarantine.jsonl").read_text().splitlines()
             self.assertEqual(len(q_lines), 1)
+            rp_lines = (sink_root / "pastebin" / "tendcf" / "recovered_partials.jsonl").read_text().splitlines()
+            self.assertEqual(len(rp_lines), 1)
             st = json.loads((sink_root / "pastebin" / "tendcf" / "state.json").read_text())
-            self.assertEqual(len(st["recovered_partials"]), 1)
+            self.assertNotIn("recovered_partials", st)
+
+    def test_private_dir_rejects_foreign_uid_owner(self) -> None:
+        # Macroscope 4712973907: _verify_private_dir_mode must enforce st_uid == os.geteuid().
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "priv"
+            p.mkdir(mode=0o700)
+            real_st = os.stat(p)
+            # Build a fake stat_result with mode 0700 but a different uid.
+            foreign_uid = real_st.st_uid + 1
+            fake_fields = list(real_st)
+            fake_fields[4] = foreign_uid  # st_uid
+            fake_st = os.stat_result(fake_fields)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit._verify_private_dir_mode(fake_st, p)
+
+    def test_shipper_error_and_max_batches_use_o1_watermark_without_unshipped_scan(self) -> None:
+        # Macroscope 4712973929: error/no-progress/max_batches paths use O(1) watermark(), not unshipped().
+        with tempfile.TemporaryDirectory() as td:
+            spool = audit.AuditSpool(Path(td) / "spool", host="pastebin", boot_id="boot-1")
+            for i in range(1, 6):
+                spool.append("heartbeat", _hb_data(), ts=f"2026-11-26T12:00:0{i}Z", mono_ms=i * 10)
+
+            orig_unshipped = spool.unshipped
+            unbounded_calls = 0
+
+            def spy_unshipped(*, limit=None):
+                nonlocal unbounded_calls
+                if limit is None:
+                    unbounded_calls += 1
+                return orig_unshipped(limit=limit)
+
+            spool.unshipped = spy_unshipped  # type: ignore[method-assign]
+
+            # 1) Transport failure path.
+            def failing_transport(_batch: bytes) -> dict:
+                raise audit.TransportError("network down")
+
+            shipper = audit.AuditShipper(spool, failing_transport, batch_size=2, max_batches=2)
+            res_err = shipper.ship()
+            self.assertFalse(res_err.ok)
+            self.assertEqual(res_err.remaining, 5)
+            self.assertEqual(unbounded_calls, 0)
+
+            # 2) max_batches exhaustion path.
+            sink_root = Path(td) / "sink"
+
+            def ok_transport(batch: bytes) -> dict:
+                return audit.run_forced_command(
+                    sink_root=sink_root,
+                    expected_host="pastebin",
+                    expected_src="tendcf",
+                    stdin_bytes=batch,
+                    receive_ts="2026-11-26T12:00:10Z",
+                )
+
+            shipper_cap = audit.AuditShipper(spool, ok_transport, batch_size=2, max_batches=1)
+            res_cap = shipper_cap.ship()
+            self.assertFalse(res_cap.ok)
+            self.assertEqual(res_cap.shipped, 2)
+            self.assertEqual(res_cap.remaining, 3)
+            self.assertEqual(unbounded_calls, 0)
+
+    def test_recovered_partials_log_scales_past_state_json_cap(self) -> None:
+        # Macroscope 4712973914: recovered_partials.jsonl streams beyond MAX_LINE_BYTES (64 KiB)
+        # while keeping state.json small and verify_local_against_sink intact.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            sink_root = root / "sink"
+            e1 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            e2 = spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:02Z", mono_ms=20)
+            e1_bytes = audit.jcs_dumps(e1) + b"\n"
+            e2_bytes = audit.jcs_dumps(e2) + b"\n"
+
+            audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e1_bytes,
+                receive_ts="2026-11-26T12:00:05Z",
+            )
+            sink_dir = sink_root / "pastebin" / "tendcf"
+            rp_path = sink_dir / "recovered_partials.jsonl"
+            # Pre-populate recovered_partials.jsonl with >70 KiB of historical partial pins (> MAX_LINE_BYTES).
+            dummy_sha = "sha256:" + ("a" * 64)
+            lines = [
+                audit.jcs_dumps(
+                    {
+                        "file": "2026-11-25.jsonl",
+                        "line": i,
+                        "raw_sha256": dummy_sha,
+                        "raw_len": 42,
+                    }
+                )
+                + b"\n"
+                for i in range(1, 650)
+            ]
+            rp_blob = b"".join(lines)
+            self.assertGreater(len(rp_blob), audit.MAX_LINE_BYTES)
+            rp_path.write_bytes(rp_blob)
+            os.chmod(rp_path, 0o600)
+
+            # Next sink append and local-vs-sink verify both succeed cleanly.
+            ack = audit.run_forced_command(
+                sink_root=sink_root,
+                expected_host="pastebin",
+                expected_src="tendcf",
+                stdin_bytes=e2_bytes,
+                receive_ts="2026-11-26T12:00:10Z",
+            )
+            self.assertTrue(ack["ok"])
+            self.assertEqual(ack["last_seq"], 2)
+            self.assertLess((sink_dir / "state.json").stat().st_size, 512)
+            ver = audit.verify_local_against_sink(spool.log_path, sink_dir, expected_host="pastebin")
+            self.assertTrue(ver.ok, f"unexpected findings: {ver.findings}")
 
     def test_r3_m1_cursor_zero_seq_nonzero_offset_and_advance_ack_chain_check(self) -> None:
         # M1-R3 (1): acked_seq == 0 with nonzero acked_offset must raise ChainTamperError.
