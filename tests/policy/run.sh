@@ -3674,20 +3674,37 @@ done
 check "uncomparable vars values: the object containers are not blamed" \
     bash -c "! grep -Eq \"key 'tendcf_(interlock|service)' content (differs|could not be compared)\" '$out'"
 
-# A key that is a plain identifier but longer than the 64 characters a report
-# may show (Astra round 3, A2): refused as before, and the report line shows at
-# most its first 64 characters. The 70-character key is the loader's own scalar
-# case again, so it is refused for the same reason as 'scalar' above.
-long_key="$(printf 'k%.0s' $(seq 1 70))"
-long_head="${long_key:0:64}"
-printf '{"vars":{"tendcf_interlock":{},"tendcf_service":{},"%s":"x"}}\n' "$long_key" >"$work/data/host_specific.json"
-out="$work/xc-longkey.out"
+# A key that is a plain identifier longer than 64 characters (issue #60 I1 / I1
+# extended, Astra round 3 A2): `safe_keys` and `tendcf_cmdb_problem_foreign_var`
+# bound identifier keys to `[A-Za-z0-9_]{1,64}` so per-key class names stay at
+# most 98 chars (well below EvalContextClassPutTagsSet's 1024-char limit).
+# Boundary check: 64 chars passes with no refusal and actuates normally;
+# 65, 70 and 995 chars (the L >= 994 silent-drop window of I1 extended) trip
+# `tendcf_cmdb_problem_badkey`, `tendcf_cmdb_problem_foreign_var` and
+# `tendcf_cmdb_refused` with zero actuation and report only the first 64 chars.
+key64="$(printf 'k%.0s' $(seq 1 64))"
+printf '{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{},"%s":{}}}\n' "$key64" >"$work/data/host_specific.json"
+out="$work/xc-key64.out"
 "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
-check "long key: refusal reported" refusal_reported "$out"
-check "long key: the report line shows its first 64 characters" \
-    grep -Eq "key '$long_head' content (differs|could not be compared) between" "$out"
-check "long key: no report line shows more than 64 characters of it" \
-    bash -c "! grep -q 'key .${long_head}[A-Za-z0-9_]' '$out'"
+check "64-char vars key (boundary): no cross-check refusal" no_crosscheck "$out"
+check "64-char vars key (boundary): actuates normally (pre_action ran)" \
+    grep -q "Executing .*'/usr/bin/true'" "$out"
+
+for key_len in 65 70 995; do
+    long_key="$(printf 'k%.0s' $(seq 1 "$key_len"))"
+    long_head="${long_key:0:64}"
+    printf '{"vars":{"tendcf_interlock":{"demo-check":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"demo_ok","pre_action":{"command":["/usr/bin/true"],"expect_exit":0,"timeout_seconds":5},"report":true,"state":"present"}},"tendcf_service":{},"%s":{}}}\n' "$long_key" >"$work/data/host_specific.json"
+    out="$work/xc-longkey-$key_len.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "long key ($key_len chars): refusal reported" refusal_reported "$out"
+    check "long key ($key_len chars): refusal reported once" refusal_once "$out"
+    check "long key ($key_len chars): badkey report shows first 64 chars" \
+        grep -q "key '$long_head' under 'vars' in .* is not a plain identifier (\[A-Za-z0-9_\]{1,64}" "$out"
+    check "long key ($key_len chars): foreign_var reported symmetrically" foreign_var_reported "$out"
+    check "long key ($key_len chars): no report line shows more than 64 chars of it" \
+        bash -c "! grep -q 'key .${long_head}[A-Za-z0-9_]' '$out'"
+    check "long key ($key_len chars): nothing actuated" no_actuation "$out"
+done
 
 # A `vars` key can preset any variable of the policy, the checker's own included
 # (adversary M1): a vars promise whose rvalue is a function call is skipped when
@@ -4063,7 +4080,7 @@ if [ "$fail" != 0 ]; then
     for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
-             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-longkey \
+             xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \
              malformed-unresolved malformed-index-key probe-control probe-capability probe-unresolved probe-index-key \
              strict-dup-member strict-dup-vars strict-trailing strict-class-space strict-class-exists strict-empty-dup-vars strict-empty-trailing probe-strict-empty-dup-vars probe-strict-empty-trailing \
              probe-strict-dup-member probe-strict-dup-vars probe-strict-trailing probe-strict-class-space \

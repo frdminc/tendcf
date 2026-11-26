@@ -205,11 +205,16 @@
 #     variable twice) and a `classes` section (which can define `interlock_ok_*`);
 #     the projector emits neither (N-2, bin/projector.py check_projection), so
 #     any other top-level key is refused rather than compared;
-#   - every key under `vars` must be a plain identifier ([A-Za-z0-9_]+). The
-#     loader reads a key as a variable reference (cmdb.c GetCMDBVariableRef,
-#     VarRefParse): `a.b` lands in scope a, `ns:b.c` in another namespace,
-#     `a[i]` is an array element. Such a key can preset a variable of THIS
-#     policy (`default:tendcf_services_apply.service_ids`), so it is refused;
+#   - every key under `vars` must be a plain identifier of 1-64 characters
+#     ([A-Za-z0-9_]{1,64}). The loader reads a key as a variable reference
+#     (cmdb.c GetCMDBVariableRef, VarRefParse): `a.b` lands in scope a,
+#     `ns:b.c` in another namespace, `a[i]` is an array element. Such a key can
+#     preset a variable of THIS policy (`default:tendcf_services_apply.service_ids`),
+#     so it is refused. The 64-character upper bound keeps every per-key class
+#     name (`tendcf_cmdb_problem_uncomparable_<k>`, `..._noverdict_<k>`,
+#     `..._differs_<k>`, `..._partial_<k>`, `tendcf_cmdb_json_same_<k>`) at
+#     most 98 characters, well below CFEngine's 1024-character limit in
+#     `EvalContextClassPutTagsSet` (issue #60 I1 / I1 extended);
 #   - for every key under `vars`, `data:variables.<key>` must exist;
 #   - per key, the set of entry ids in the file must equal the set of
 #     indices of the loaded container (a half-loaded container is caught);
@@ -228,7 +233,8 @@
 #     nor a difference could be evaluated), not the absence of a difference;
 #   - every `data:variables.*` the loader installed must be a key of `vars`
 #     in the file;
-#   - nothing the loader installed may lie outside `data:variables.<identifier>`:
+#   - nothing the loader installed may lie outside `data:variables.<identifier>`
+#     (1-64 characters, `[A-Za-z0-9_]{1,64}`):
 #     no CMDB-installed variable of any other name, and no CMDB-installed class.
 #     This is read from the loaded state (the variable table and the class
 #     table, by the tag the loader puts on everything it installs,
@@ -316,21 +322,32 @@
 # One file on purpose: the fork resolves each file's bundles when it is loaded
 # and the whole policy again afterwards (libpromises/loading.c), so `tendcf_cmdb`
 # decides in the file it shares with the gated bundles, before their ids are
-# first read. Were it split off, the literal empty `*_ids` lists under the
-# refusal would still redefine the ids, so it would fail closed, but this is why
-# the bundles live together.
+# first read. While the literal empty `*_ids` lists under the refusal are
+# intended to redefine the ids if split off, that "would still fail closed if
+# split" claim has NOT been traced through `loading.c` and must be re-tested
+# against a real build if `tendcf_cmdb` is ever moved into a separate file.
 #
 # What is NOT guaranteed: the check compares the file with the loader's state at
 # the evaluation. A file replaced after the last evaluation, or by a promise
 # that changes `data:variables.*` afterwards, is not seen; and nothing here makes
 # a publication atomic (`tendcf-install.sh data` installs by atomic rename, but
-# the agent can still start between the loader's read and ours). Not a sandbox
-# either: it is a consistency check between the file and what the loader
-# installed. A CMDB author (root) already chooses each pre_action executable,
-# `/bin/sh -c ...` included, and the unit commands, so it does not stop a hostile
-# but self-consistent file; it stops a file and a loader that disagree, and the
-# sections, keys, variables and classes through which a file could change what
-# the policy reads without showing up as a `vars` difference.
+# the agent can still start between the loader's read and ours). A CMDB key in
+# the `match` scope (e.g. `match.0`) lands in `ctx->match_variables`, which
+# `variablesmatching()` does not walk, so `tendcf_cmdb_problem_foreign_var`
+# cannot see it (caught by the file-side `tendcf_cmdb_problem_badkey` outside a
+# file-swap race; issue #60 I2). Not a sandbox either: it is a consistency check
+# between the file and what the loader installed. Root-only channels the check
+# does not model include `cf-agent -N tendcf_cmdb_refused`,
+# `-D interlock_ok_<id>`, `-D tendcf_cmdb_json_same_<k>` (which keeps
+# `tendcf_cmdb_problem_noverdict_<k>` unset), persistent classes
+# (`source=persistent`) of those names, and other policy files that write
+# `data:variables.*` or define `interlock_ok_*` or `tendcf_cmdb_json_same_*`
+# (issue #60 I4 / I4 extended). A CMDB author (root) already chooses each
+# pre_action executable, `/bin/sh -c ...` included, and the unit commands, so it
+# does not stop a hostile but self-consistent file; it stops a file and a loader
+# that disagree, and the sections, keys, variables and classes through which a
+# file could change what the policy reads without showing up as a `vars`
+# difference.
 
 bundle common tendcf_cmdb
 {
@@ -375,12 +392,14 @@ bundle common tendcf_cmdb
       "extra_sections"
         slist => difference("doc_sections", "allowed_sections");
 
-      # Only a plain identifier is a `vars` key this policy will look up. The
-      # grep() pattern is anchored by CFEngine. Every other key is refused as a
-      # whole (`..._problem_badkey`) and is never used to build a variable name
-      # below.
+      # Only a plain identifier of 1-64 characters is a `vars` key this policy
+      # will look up. The grep() pattern is anchored by CFEngine. Bounding the
+      # length to 64 keeps every per-key class name at most 98 characters, well
+      # below EvalContextClassPutTagsSet's 1024-char limit (issue #60 I1). Every
+      # other key is refused as a whole (`..._problem_badkey`) and is never used
+      # to build a variable name below.
       "safe_keys"
-        slist => grep("[A-Za-z0-9_]+", "file_keys");
+        slist => grep("[A-Za-z0-9_]{1,64}", "file_keys");
 
       "bad_keys"
         slist => difference("file_keys", "safe_keys");
@@ -435,9 +454,8 @@ bundle common tendcf_cmdb
       "key_canon[$(safe_keys)]"
         string => canonify("$(safe_keys)");
 
-      # The key as a report shows it: at most 64 characters (a safe key is a plain
-      # identifier, so no character replacement is needed, but its length is not
-      # bounded). Lookups and class names keep using the full `safe_keys`.
+      # The key as a report shows it: at most 64 characters (safe_keys is
+      # bounded to [A-Za-z0-9_]{1,64}; string_head is kept as defense in depth).
       "key_clean[$(safe_keys)]"
         string => string_head("$(safe_keys)", 64);
 
@@ -513,11 +531,12 @@ bundle common tendcf_cmdb
       # Read from the loaded state, with the calls inline: no variable here for
       # a CMDB key to preset. Every variable tagged by the CMDB loader or by the
       # augments loader is counted, and so is every one of them that is exactly
-      # data:variables.<identifier> AND tagged by the CMDB loader; any excess is
-      # a variable of another name (or from augments), which is a problem.
+      # data:variables.<identifier> (1-64 chars) AND tagged by the CMDB loader;
+      # any excess is a variable of another name (or >64 chars, or from augments),
+      # which is a problem.
       "tendcf_cmdb_problem_foreign_var"
         expression => isgreaterthan(length(variablesmatching(".*", "source=cmdb", "source=augments_file")),
-                                    length(variablesmatching("data:variables\.[A-Za-z0-9_]+", "source=cmdb")));
+                                    length(variablesmatching("data:variables\.[A-Za-z0-9_]{1,64}", "source=cmdb")));
 
       "tendcf_cmdb_problem_foreign_class"
         expression => classmatch(".*", "source=cmdb", "source=augments_file");
@@ -717,7 +736,7 @@ bundle agent tendcf_interlocks
         "tendcf: CMDB cross-check: the CMDB or an augments file defined a class; no class from either is accepted";
 
       "tendcf_cmdb_problem_badkey"::
-        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]+); the loader would read it as a variable reference";
+        "tendcf: CMDB cross-check: key '$(tendcf_cmdb.bad_clean)' under 'vars' in $(tendcf_cmdb.file) is not a plain identifier ([A-Za-z0-9_]{1,64}, 1-64 chars); the loader would read it as a variable reference or exceed the per-key class length bound";
 }
 
 bundle agent tendcf_ensure_user_launchagents(home_dir, owner)
