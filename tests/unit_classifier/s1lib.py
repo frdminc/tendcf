@@ -124,9 +124,24 @@ class Sandbox:
         self.undo.append(self._snapshot(p))
         if os.path.lexists(p):
             os.unlink(p)
-        with open(p, "w") as f:
-            f.write(text)
-        os.chmod(p, mode)
+        # Create with restricted mode 0o600 (O_CREAT|O_EXCL|O_NOFOLLOW) so there is never
+        # a window under umask 0 where the file is world-writable before fchmod sets `mode`.
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd_owned = False
+        try:
+            with os.fdopen(fd, "w") as f:
+                fd_owned = True
+                f.write(text)
+                f.flush()
+                os.fchmod(f.fileno(), mode)
+        except BaseException:
+            if not fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            _unlink_quiet(p)
+            raise
         return p
 
     def symlink(self, path, target):

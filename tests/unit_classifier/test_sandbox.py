@@ -6,12 +6,14 @@ stayed masked). And a restoration, stop or reload that fails must fail the run.
 
     python3 -m unittest discover -s tests/unit_classifier -p test_sandbox.py
 """
+import errno
 import os
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from s1lib import CleanupError, Sandbox  # noqa: E402
@@ -232,6 +234,102 @@ class CreatedDirectories(unittest.TestCase):
         finally:
             os.umask(old)
         self.assertFalse(os.path.exists(os.path.join(d, "gen")))
+
+
+class WriteFileModeAndCleanup(unittest.TestCase):
+    """Issue #85 (B3): Sandbox.write creates files with O_CREAT|O_EXCL|O_NOFOLLOW at 0o600
+    before fchmod, so under umask 0 there is never a world-writable window, and cleans up
+    without leaking an fd on failure."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="tendcf-s1-sbx-")
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.d]))
+
+    def test_write_mode_is_exact_under_zero_umask(self):
+        old = os.umask(0)
+        try:
+            with Sandbox(roots=[self.d], run=None) as sb:
+                p644 = sb.write(os.path.join(self.d, "unit.service"), "x\n", mode=0o644)
+                p755 = sb.write(os.path.join(self.d, "gen"), "#!/bin/sh\n", mode=0o755)
+                self.assertEqual(stat.S_IMODE(os.lstat(p644).st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(os.lstat(p755).st_mode), 0o755)
+        finally:
+            os.umask(old)
+
+    def test_write_uses_atomic_restricted_open_before_fchmod(self):
+        real_open = os.open
+        real_fchmod = os.fchmod
+        seen_open = []
+        mode_before_fchmod = []
+        target = os.path.join(self.d, "gen")
+
+        def spy_open(path, flags, mode=0o777, *args, **kwargs):
+            seen_open.append((path, flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        def spy_fchmod(fd, mode):
+            mode_before_fchmod.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return real_fchmod(fd, mode)
+
+        old = os.umask(0)
+        try:
+            with mock.patch("os.open", side_effect=spy_open), mock.patch("os.fchmod", side_effect=spy_fchmod):
+                with Sandbox(roots=[self.d], run=None) as sb:
+                    sb.write(target, "#!/bin/sh\n", mode=0o755)
+                    self.assertEqual(stat.S_IMODE(os.lstat(target).st_mode), 0o755)
+        finally:
+            os.umask(old)
+
+        self.assertEqual(seen_open, [(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)])
+        self.assertEqual(mode_before_fchmod, [0o600])
+
+    def test_write_cleans_up_and_closes_fd_when_fdopen_raises(self):
+        real_open = os.open
+        opened_fds = []
+        target = os.path.join(self.d, "fail-fdopen")
+
+        def spy_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        with mock.patch("os.open", side_effect=spy_open), mock.patch("os.fdopen", side_effect=OSError("fdopen failed")):
+            with Sandbox(roots=[self.d], run=None) as sb:
+                with self.assertRaisesRegex(OSError, "fdopen failed"):
+                    sb.write(target, "x\n")
+                self.assertFalse(os.path.lexists(target))
+
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError) as cm:
+            os.fstat(opened_fds[0])
+        self.assertEqual(cm.exception.errno, errno.EBADF)
+
+    def test_write_cleans_up_without_fd_leak_and_restores_prior_file_when_fchmod_raises(self):
+        real_open = os.open
+        opened_fds = []
+        target = os.path.join(self.d, "existing.service")
+        with open(target, "w") as f:
+            f.write("original\n")
+        os.chmod(target, 0o640)
+
+        def spy_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        with Sandbox(roots=[self.d], run=None) as sb:
+            with mock.patch("os.open", side_effect=spy_open), mock.patch("os.fchmod", side_effect=OSError("fchmod failed")):
+                with self.assertRaisesRegex(OSError, "fchmod failed"):
+                    sb.write(target, "replacement\n", mode=0o755)
+            self.assertFalse(os.path.lexists(target), "partial file must be unlinked on failure")
+
+        # Sandbox.__exit__ still restores the pre-existing file from its snapshot.
+        self.assertEqual(read(target), "original\n")
+        self.assertEqual(stat.S_IMODE(os.lstat(target).st_mode), 0o640)
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError) as cm:
+            os.fstat(opened_fds[0])
+        self.assertEqual(cm.exception.errno, errno.EBADF)
 
 
 if __name__ == "__main__":

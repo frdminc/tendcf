@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import s1_probe  # noqa: E402
+from s1lib import CleanupError, Sandbox  # noqa: E402
 
 
 def run(steps, cleanup=lambda: None):
@@ -249,12 +250,104 @@ class Item3Observations(unittest.TestCase):
         left, _, failures = self.leftovers({etc: True, run_: False}, etc, run_, outd)
         self.assertEqual((left, failures), ([], []))
 
+    def test_leftovers_fail_on_dot_prefixed_sandbox_temp_file_and_ignore_other_dotfiles(self):
+        for which in ("etc", "run", "out"):
+            with self.subTest(which=which):
+                etc, run_, outd = self.make_dirs()
+                d = {"etc": etc, "run": run_, "out": outd}[which]
+                os.makedirs(d)
+                stale = os.path.join(d, ".tendcf-s1-restore-1234-1")
+                open(stale, "w").close()
+                open(os.path.join(d, ".keep"), "w").close()
+                existed = {etc: True, run_: True}
+                left, text, failures = self.leftovers(existed, etc, run_, outd)
+                self.assertEqual(left, [stale])
+                self.assertEqual(len(failures), 1)
+                self.assertIn("item 3 leftovers: FOUND", text)
+        etc, run_, outd = self.make_dirs()
+        for d in (etc, run_, outd):
+            os.makedirs(d)
+            open(os.path.join(d, ".keep"), "w").close()
+        left, text, failures = self.leftovers({etc: True, run_: True}, etc, run_, outd)
+        self.assertEqual((left, failures), ([], []))
+        self.assertIn("item 3 leftovers: none", text)
+
     def test_the_name_check_judges_both_generated_units(self):
         both = "tendcf-s1-gen-nosrc.service generated -\ntendcf-s1-gen.service       generated -\n"
         self.assertEqual(s1_probe.missing_generated(both), [])
         self.assertEqual(s1_probe.missing_generated("tendcf-s1-gen-nosrc.service generated -\n"), ["tendcf-s1-gen.service"])
         self.assertEqual(s1_probe.missing_generated("tendcf-s1-gen.service generated -\n"), ["tendcf-s1-gen-nosrc.service"])
         self.assertEqual(len(s1_probe.missing_generated("")), 2)
+
+    def _run_gen_in_run(self, *, sh_fn, reload_fn, sandbox_run):
+        root = tempfile.mkdtemp(prefix="tendcf-s1-genrun-test-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        run_gen = os.path.join(root, "run-gen")
+
+        def make_sandbox(extra_roots=(), **kw):
+            return Sandbox(roots=[run_gen], run=sandbox_run)
+
+        with (
+            mock.patch.object(s1_probe, "GEN_RUN", run_gen),
+            mock.patch.object(s1_probe, "Sandbox", side_effect=make_sandbox),
+            mock.patch.object(s1_probe, "daemon_reload", side_effect=reload_fn),
+            mock.patch.object(s1_probe, "sh", side_effect=sh_fn),
+        ):
+            rc, out, err = run([s1_probe.item3_generator_in_run])
+        return rc, out, err, run_gen
+
+    def test_item3_generator_in_run_fails_when_daemon_reload_raises(self):
+        def ok_sh(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def bad_reload():
+            raise RuntimeError("systemctl daemon-reload rc=1: manager busy")
+
+        rc, out, _, run_gen = self._run_gen_in_run(sh_fn=ok_sh, reload_fn=bad_reload, sandbox_run=ok_sh)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(s1_probe.FAILURES), 1)
+        self.assertIn("step item3_generator_in_run raised", out)
+        self.assertIn("manager busy", out)
+        self.assertFalse(os.path.exists(run_gen), "Sandbox must still tear down the temp generator dir")
+
+    def test_item3_generator_in_run_fails_when_sandbox_cleanup_raises(self):
+        def ok_sh(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def failing_sandbox_run(argv):
+            if argv[:2] == ["systemctl", "daemon-reload"]:
+                return subprocess.CompletedProcess(argv, 1, "", "reload failed on teardown")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        rc, out, _, _ = self._run_gen_in_run(sh_fn=ok_sh, reload_fn=lambda: None, sandbox_run=failing_sandbox_run)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(s1_probe.FAILURES), 1)
+        self.assertIn(CleanupError.__name__, out)
+        self.assertIn("reload failed on teardown", out)
+
+    def test_item3_generator_in_run_stays_observation_on_noexec_empty_or_nonzero_listing(self):
+        for list_rc in (0, 1):
+            with self.subTest(list_rc=list_rc):
+                def sh_fn(argv, **kw):
+                    if argv[:2] == ["systemctl", "list-unit-files"]:
+                        return subprocess.CompletedProcess(argv, list_rc, "", "")
+                    if argv[:1] == ["findmnt"]:
+                        return subprocess.CompletedProcess(argv, 0, "/run tmpfs rw,nosuid,nodev,noexec,relatime\n", "")
+                    if argv[:1] == ["journalctl"]:
+                        return subprocess.CompletedProcess(
+                            argv, 0, "systemd: Failed to execute /run/systemd/system-generators/tendcf-s1-genrun: Permission denied\n", ""
+                        )
+                    return subprocess.CompletedProcess(argv, 0, "Amazon EC2\n", "")
+
+                rc, out, _, run_gen = self._run_gen_in_run(
+                    sh_fn=sh_fn,
+                    reload_fn=lambda: None,
+                    sandbox_run=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""),
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(s1_probe.FAILURES, [])
+                self.assertIn("did not run: no units were generated", out)
+                self.assertFalse(os.path.exists(run_gen))
 
 
 if __name__ == "__main__":
