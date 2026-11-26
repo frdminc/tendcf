@@ -18,18 +18,26 @@ and [`../../tools/audit_log.py`](../../tools/audit_log.py) unchanged.
 
 Per the 2026-11-14 operator rulings recorded in
 [`../review-2026-11-13/07-android-landscape.md`](../review-2026-11-13/07-android-landscape.md)
-§5 (`B3` Termux CFEngine + thin Kotlin agent; `Q3` Kotlin agent owns device
-JSONL and index):
+§5 (`B3` Termux CFEngine + thin Kotlin agent; `Q3` Kotlin agent keeps the
+device JSONL and index support role already in State 1):
 
-1. **No UID collapse:** Termux (`com.termux` UID) runs CFEngine convergence and
-   `tendcf-validate`, while `tendcf-agent` (its own Android app UID) owns the
-   trust anchor, consent decisions, and the device's canonical audit JSONL +
-   index in app-private storage (`/data/user/0/<agent-pkg>/files/audit/`).
-2. **No inbound listener or cross-profile localhost socket:** Android 17 blocks
+1. **Single canonical log owner (`tendcf-agent` app UID):** Even in State 1,
+   the thin Kotlin `tendcf-agent` owns the trust anchor, consent decisions, and
+   the device's canonical hash-chained audit JSONL and index inside its
+   app-private storage (`/data/user/0/<agent-pkg>/files/audit/`). Termux
+   (`com.termux` UID) runs CFEngine convergence and `tendcf-validate`, and does
+   **not** directly read or write `tendcf-agent`'s private spool.
+2. **Deferred cross-UID event handoff:** The constrained handoff of convergence
+   outcomes from Termux CFEngine into `tendcf-agent` (for example via a
+   signed/validated intent or Binder surface, never a world-writable file or
+   cross-profile localhost socket) is explicitly deferred until the thin Kotlin
+   `tendcf-agent` prototype is built. Until then, Termux does not independently
+   ship `tendcf-agent`'s canonical spool.
+3. **No inbound listener or cross-profile localhost socket:** Android 17 blocks
    cross-profile loopback traffic by default (`07-android-landscape.md` §3.4),
    and `cf-serverd` in Termux dies when backgrounded. Audit shipping is strictly
    **device-initiated outbound push**, never a host-to-phone pull.
-3. **Never blocks convergence:** Mirroring the Linux and macOS contract, a
+4. **Never blocks convergence:** Mirroring the Linux and macOS contract, a
    missing network or unreachable sink only delays shipping. Local append to the
    hash-chained spool succeeds offline; `cf-agent` in Termux never waits on the
    sink.
@@ -45,13 +53,13 @@ command output, no env vars, no secrets/keys, no free-text consent notes).
 
 | Phase | Owner | Transport | Key storage | Trigger |
 | --- | --- | --- | --- | --- |
-| **State 1 (Termux prototype)** | Termux userland (`tools/audit_log.py ship`) | Hardened OpenSSH forced-command drop (`audit-append tendcf`) to `nixncus` | Per-device write-only Ed25519 key in Termux private dir (`0700`/`0600`), pinned `known_hosts` | `Termux:Boot` / periodic `runit` or `crond` job when network is up |
-| **State 2 (thin Kotlin `tendcf-agent`)** | `tendcf-agent` app UID | Primary: SSH append-only drop (`audit-append tendcf`) via embedded SSH client; Fallback: HTTPS mTLS / Ed25519-signed POST bridge to the same append-only sink contract if SSH is constrained by network or sandbox | Hardware-backed Android Keystore key (non-exportable) or app-private `0600` write-only SSH key | Android `WorkManager` periodic job (`NetworkType.CONNECTED`, backoff on failure; respects Android 16 JobScheduler quotas) |
+| **State 1–2 (thin Kotlin `tendcf-agent`, ruled log owner)** | `tendcf-agent` app UID | Primary: SSH append-only drop (`audit-append tendcf`) to `nixncus`; Secondary: HTTPS mTLS / Ed25519-signed POST bridge to the same append-only sink contract if SSH is constrained by network or sandbox | Hardware-backed Android Keystore key (non-exportable) or app-private `0600` write-only Ed25519 SSH key with pinned `known_hosts` | Android `WorkManager` periodic job (`NetworkType.CONNECTED`, exponential backoff on failure; respects Android 16 JobScheduler quotas) |
+| **Optional Termux diagnostic stream (separate `src` only, if ever needed)** | Termux UID (`com.termux`) | Hardened OpenSSH forced-command drop via `tools/audit_log.py ship` under a distinct Termux-scoped key and stream (never touching `tendcf-agent`'s private spool) | Termux-private `0700`/`0600` write-only key | `Termux:Boot` / periodic `runit` job (deferred; only if a separate Termux diagnostic stream is wanted before the cross-UID handoff lands) |
 
-Both phases target the exact same per-host append-only sink stream
-(`<sink_root>/<host>/tendcf/YYYY-MM-DD.jsonl`) enforced by
-`tools/audit_log.py sink-append`, where the device's credential can only append
-(no read, list, rename, truncate, or delete).
+All streams target the same per-host append-only sink receiver
+(`tools/audit_log.py sink-append`, `<sink_root>/<host>/<src>/YYYY-MM-DD.jsonl`),
+where the device's credential can only append (no read, list, rename, truncate,
+or delete).
 
 ## 3. Intermittent Connectivity and Privilege-Degradation Semantics
 
@@ -64,9 +72,16 @@ Both phases target the exact same per-host append-only sink stream
    `"unknown"` (never silently treated as compliant).
 3. **Shizuku/helper reboot drop:** When an unrooted phone reboots and loses its
    wireless-debugging Shizuku helper until Wi-Fi + unattended boot start recover
-   it (`07-android-landscape.md` §2, §5.4), `tendcf-agent` records a `lifecycle`
-   or `promise_outcome` event (`not_kept`, `privilege-unavailable`) rather than
-   silently skipping shell-tier promises.
+   it (`07-android-landscape.md` §2, §5.4), `tendcf-agent` records affected
+   shell-tier promises using valid v1 `promise_outcome` enum values from
+   [`../../schema/common.schema.json`](../../schema/common.schema.json)
+   (`mode: "enforce", outcome: "error"` — or `mode: "audit", outcome: "error"`
+   / `"n-a"` when the promise is skipped as inapplicable) rather than silently
+   omitting them. Distinguishing the specific `privilege-unavailable`
+   degradation reason in structured envelope metadata is not part of the v1
+   `data_promise_outcome` schema (`additionalProperties: false`) and is
+   deferred to a future additive schema revision once Android implementation
+   begins.
 
 ## 4. Tripwire Boundary on Unrooted Android
 
@@ -92,6 +107,6 @@ Implementation moves from deferred to active once:
 
 1. `nixncus` append-only sink host is provisioned and accepting per-host
    write-only SSH keys ([djbclark-ade #1013](https://github.com/djbclark/djbclark-ade/issues/1013)).
-2. The State 1 Termux + thin Kotlin `tendcf-agent` workspace exists in the repo,
-   providing a concrete build/test harness for the `WorkManager` shipper and
-   local spool integration.
+2. The thin Kotlin `tendcf-agent` workspace and its constrained Termux-to-agent
+   event handoff exist in the repo, providing a concrete build/test harness for
+   the `WorkManager` shipper and local spool integration.

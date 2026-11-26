@@ -27,6 +27,7 @@ import datetime
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1583,23 +1584,40 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             self.assertTrue(out["ok"])
             self.assertTrue(out["skipped"])
 
-            # Mixing --config with explicit target flags fails closed.
-            p_mix = subprocess.run(
-                [
-                    sys.executable, "-I", "-S", str(AUDIT_TOOL),
-                    "ship", "--config", str(cfg), "--host", "pastebin",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(p_mix.returncode, 0)
-            self.assertIn("--config cannot be combined", p_mix.stderr)
+            # Mixing --config with explicit target/defaulted flags fails closed (L1).
+            for extra_flag in (
+                ["--host", "pastebin"],
+                ["--src", "tendcf"],
+                ["--ssh-bin", "/usr/bin/ssh"],
+                ["--batch-size", "10"],
+            ):
+                p_mix = subprocess.run(
+                    [
+                        sys.executable, "-I", "-S", str(AUDIT_TOOL),
+                        "ship", "--config", str(cfg), *extra_flag,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(p_mix.returncode, 0, f"expected refusal for {extra_flag}")
+                self.assertIn("--config cannot be combined", p_mix.stderr)
 
-            # Group-readable config file rejected.
-            os.chmod(cfg, 0o640)
-            with self.assertRaises(audit.AuditFileSecurityError):
-                audit.load_shipper_config(cfg)
+            # Group-readable (0640) and owner-exec (0700) config files both rejected (L1: exact 0600).
+            for bad_mode in (0o640, 0o700, 0o1600):
+                os.chmod(cfg, bad_mode)
+                with self.assertRaises(audit.AuditFileSecurityError):
+                    audit.load_shipper_config(cfg)
+
+            # Hardlinked config file rejected (H1/L1: nlink == 1).
+            os.chmod(cfg, 0o600)
+            hardlink = etc / "audit-shipper.hardlink"
+            os.link(cfg, hardlink)
+            try:
+                with self.assertRaises(audit.AuditFileSecurityError):
+                    audit.load_shipper_config(cfg)
+            finally:
+                hardlink.unlink()
 
             # Unknown key rejected even when 0600.
             os.chmod(cfg, 0o600)
@@ -1607,7 +1625,7 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             with self.assertRaises(audit.AuditValidationError):
                 audit.load_shipper_config(cfg)
 
-            # Enabled config validates required paths & host/target cleanly.
+            # Enabled config validates required paths, expected_spool_dir & host/target cleanly.
             cfg.write_text(
                 json.dumps(
                     {
@@ -1625,10 +1643,117 @@ class TestR1AdversaryRegressions(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            loaded = audit.load_shipper_config(cfg)
+            loaded = audit.load_shipper_config(cfg, expected_spool_dir=root / "spool")
             self.assertTrue(loaded["enabled"])
             self.assertEqual(loaded["port"], 2222)
             self.assertEqual(loaded["batch_size"], 50)
+            with self.assertRaises(audit.AuditValidationError):
+                audit.load_shipper_config(cfg, expected_spool_dir=root / "other-spool")
+
+    def test_h2_projector_source_loader_ignores_poisoned_pycache_pyc(self) -> None:
+        # H2: _load_projector_module reads raw projector.py source via O_NOFOLLOW, never __pycache__/*.pyc.
+        import importlib.util as _ilu
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o755)
+            shutil.copy2(REPO_ROOT / "tools" / "projector.py", bin_dir / "projector.py")
+            shutil.copy2(AUDIT_TOOL, bin_dir / "audit_log.py")
+            # Plant a poisoned .pyc matching projector.py's cache path that would create a marker if executed!
+            marker = root / "pyc_pwned.marker"
+            pyc_path = Path(_ilu.cache_from_source(str(bin_dir / "projector.py")))
+            pyc_path.parent.mkdir(parents=True, exist_ok=True)
+            evil_src = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('pwned')\n"
+            import py_compile
+            evil_py = root / "evil.py"
+            evil_py.write_text(evil_src, encoding="utf-8")
+            py_compile.compile(str(evil_py), cfile=str(pyc_path), doraise=True)
+            # Match mtime/size header to projector.py so normal importlib WOULD have loaded evil .pyc.
+            st_proj = (bin_dir / "projector.py").stat()
+            raw_pyc = bytearray(pyc_path.read_bytes())
+            import struct
+            raw_pyc[8:16] = struct.pack("<II", int(st_proj.st_mtime) & 0xFFFFFFFF, st_proj.st_size & 0xFFFFFFFF)
+            pyc_path.write_bytes(bytes(raw_pyc))
+
+            etc = root / "etc"
+            etc.mkdir(mode=0o700)
+            cfg = etc / "audit-shipper.json"
+            cfg.write_text(json.dumps({"enabled": False}) + "\n", encoding="utf-8")
+            os.chmod(cfg, 0o600)
+
+            p = subprocess.run(
+                [sys.executable, "-I", "-S", str(bin_dir / "audit_log.py"), "ship", "--config", str(cfg)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse(marker.exists(), "poisoned __pycache__ .pyc was executed!")
+
+            # Also verify standalone execution without sibling projector.py at all, exercising JCS via append,
+            # and verify exact JCS byte-for-byte parity with tools/projector.py::_stdlib_jcs_dumps.
+            (bin_dir / "projector.py").unlink()
+            spool_dir = root / "spool"
+            spool_dir.mkdir(mode=0o700)
+            p2 = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    str(bin_dir / "audit_log.py"),
+                    "emit",
+                    "--spool-dir",
+                    str(spool_dir),
+                    "--host",
+                    "pastebin",
+                    "--boot-id",
+                    "boot-1",
+                    "--type",
+                    "heartbeat",
+                    "--data-json",
+                    json.dumps(_hb_data()),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p2.returncode, 0, p2.stderr)
+            self.assertFalse(marker.exists(), "poisoned __pycache__ .pyc was executed on append!")
+            proj_spec = importlib.util.spec_from_file_location("_tendcf_proj_parity", REPO_ROOT / "tools" / "projector.py")
+            assert proj_spec is not None and proj_spec.loader is not None
+            proj_mod = importlib.util.module_from_spec(proj_spec)
+            proj_spec.loader.exec_module(proj_mod)
+            sample = {"z": 1, "a": [True, False, None, 0.0, -0.0, 1e-6, 1e20, "x\n\t\x01\"\\"], "\ue000": 1, "\U00010000": 2}
+            self.assertEqual(audit.jcs_dumps(sample), proj_mod._stdlib_jcs_dumps(sample))
+
+    def test_m6_ssh_stderr_sentinel_never_leaks_to_ship_output(self) -> None:
+        # M6: remote-influenced SSH stderr must never appear in TransportError, ShipResult, stdout, or stderr.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool = audit.AuditSpool(root / "spool", host="pastebin", boot_id="boot-1")
+            spool.append("heartbeat", _hb_data(), ts="2026-11-26T12:00:01Z", mono_ms=10)
+            sentinel = "REMOTE_SECRET_BANNER_SENTINEL_999"
+            fake_ssh = root / "fake-ssh"
+            fake_ssh.write_text(f"#!/bin/sh\necho '{sentinel}' >&2\nexit 255\n", encoding="utf-8")
+            fake_ssh.chmod(0o755)
+            id_file = root / "id_ed25519"
+            id_file.write_text("dummy\n", encoding="utf-8")
+            id_file.chmod(0o600)
+            kh_file = root / "known_hosts"
+            kh_file.write_text("example ssh-ed25519 AAAA\n", encoding="utf-8")
+            kh_file.chmod(0o644)
+
+            transport = audit.make_ssh_append_transport(
+                target="audit@nixncus.internal",
+                identity_file=id_file,
+                known_hosts_file=kh_file,
+                ssh_bin=str(fake_ssh),
+            )
+            res = audit.AuditShipper(spool, transport).ship()
+            self.assertFalse(res.ok)
+            self.assertEqual(res.error, "ssh_exit_255")
+            self.assertNotIn(sentinel, res.error or "")
 
     def test_recovered_partials_regex_rejects_trailing_newline(self) -> None:
         # N1-R6: \Z anchor rejects trailing newline filenames inside recovered_partials/.

@@ -106,7 +106,7 @@ audit_etc_dir="$prefix/etc"
 audit_shipper_cfg="$audit_etc_dir/audit-shipper.json"
 audit_spool_dir="$prefix/var/audit-spool"
 tripwire_share_dir="$prefix/share/tendcf/tripwire"
-osquery_packs_dir=/var/osquery/packs
+osquery_packs_dir=/private/var/osquery/packs
 osquery_pack_path="$osquery_packs_dir/tendcf-tripwire.conf"
 
 cf_agent="$prefix/bin/cf-agent"
@@ -134,12 +134,16 @@ put_data_had_prev=0
 publish_lock_held=0
 changed=0
 upgrade_needs_execd_restart=0
+upgrade_needs_shipper_restart=0
 upgrade_rollback_armed=0
 upgrade_backup_prefix=""
 upgrade_staged_tree=""
 upgrade_moved_var=0
+upgrade_moved_etc=0
 upgrade_was_loaded=0
 upgrade_had_plist=0
+upgrade_shipper_was_loaded=0
+upgrade_had_shipper_plist=0
 upgrade_snapshot_taken=0
 upgrade_saved_workdir=""
 upgrade_saved_inputs=0
@@ -150,6 +154,10 @@ say() { echo "tendcf-install: $*"; }
 
 bootout_execd() {
     /bin/launchctl bootout "system/$label" 9>&-
+}
+
+bootout_shipper() {
+    /bin/launchctl bootout "system/$shipper_label" 9>&-
 }
 
 cleanup_stage() {
@@ -181,6 +189,10 @@ cleanup_stage() {
                 bootout_execd >/dev/null 2>&1 || true
                 wait_execd_unloaded || true
             fi
+            if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                bootout_shipper >/dev/null 2>&1 || true
+                wait_shipper_unloaded || true
+            fi
             local failed_prefix="$prefix.failed.$$"
             /bin/rm -rf "$failed_prefix" || true
             if [ -e "$prefix" ] || [ -L "$prefix" ]; then
@@ -193,13 +205,22 @@ cleanup_stage() {
                     /bin/mv "$upgrade_staged_tree/var" "$upgrade_backup_prefix/var" || true
                 fi
             fi
+            if [ "${upgrade_moved_etc:-0}" -eq 1 ] && [ ! -e "$upgrade_backup_prefix/etc" ]; then
+                if [ -d "$failed_prefix/etc" ]; then
+                    /bin/mv "$failed_prefix/etc" "$upgrade_backup_prefix/etc" || true
+                elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/etc" ]; then
+                    /bin/mv "$upgrade_staged_tree/etc" "$upgrade_backup_prefix/etc" || true
+                fi
+            fi
             if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
                 if /bin/mv "$upgrade_backup_prefix" "$prefix"; then
                     restored_prefix=1
                 fi
             fi
             if [ "$upgrade_moved_var" -eq 0 ] || [ ! -e "$failed_prefix/var" ]; then
-                /bin/rm -rf "$failed_prefix" || true
+                if [ "${upgrade_moved_etc:-0}" -eq 0 ] || [ ! -e "$failed_prefix/etc" ]; then
+                    /bin/rm -rf "$failed_prefix" || true
+                fi
             fi
             if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ]; then
                 if [ "$upgrade_saved_inputs" -eq 1 ] && [ -d "$stage_dir/upgrade-var-backup/inputs" ]; then
@@ -228,8 +249,21 @@ cleanup_stage() {
             fi
             /bin/rm -f "$plist_path" || true
         fi
+        if [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
+            && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
+            if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                bootout_shipper >/dev/null 2>&1 || true
+                wait_shipper_unloaded || true
+            fi
+            /bin/rm -f "$shipper_plist_path" || true
+        fi
         if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
             bootstrap_execd_with_retry >/dev/null 2>&1 || true
+        fi
+        if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] && [ -n "${shipper_plist_path:-}" ] \
+            && [ -f "$shipper_plist_path" ] \
+            && declare -F shipper_is_loaded >/dev/null 2>&1 && ! shipper_is_loaded; then
+            bootstrap_shipper_with_retry >/dev/null 2>&1 || true
         fi
         if [ "$restored_prefix" -eq 1 ]; then
             echo "tendcf-install: rolled back failed upgrade to previous $prefix" >&2
@@ -1087,25 +1121,39 @@ install_tarball() {
         /bin/mv "$staged_tree" "$prefix"
         upgrade_prefix_swapped=1
     else
-        # Upgrade in place: fail fast if $prefix/var is a symlink BEFORE touching
-        # any running cf-execd, then arm the EXIT-trap rollback across the swap
-        # and all post-swap cmd_install steps (backup_prefix is deleted only in
-        # cmd_install after every post-upgrade step and enable_execd succeed).
+        # Upgrade in place: fail fast if $prefix/var or $prefix/etc is a symlink
+        # BEFORE touching any running daemon, then arm the EXIT-trap rollback
+        # across the swap and all post-swap cmd_install steps (H4).
         if [ -L "$prefix/var" ]; then
             die "existing $prefix/var is a symlink; refusing upgrade"
+        fi
+        if [ -L "$prefix/etc" ]; then
+            die "existing $prefix/etc is a symlink; refusing upgrade"
         fi
         if [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
             upgrade_had_plist=1
         else
             upgrade_had_plist=0
         fi
-        local was_loaded=0
+        if [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
+            upgrade_had_shipper_plist=1
+        else
+            upgrade_had_shipper_plist=0
+        fi
+        local was_loaded=0 shipper_loaded=0
         if execd_is_loaded; then
             was_loaded=1
             upgrade_was_loaded=1
             upgrade_rollback_armed=1
             /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed before upgrade"
             wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
+        fi
+        if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+            shipper_loaded=1
+            upgrade_shipper_was_loaded=1
+            upgrade_rollback_armed=1
+            /bin/launchctl bootout "system/$shipper_label" 9>&- || die "launchctl bootout system/$shipper_label failed before upgrade"
+            wait_shipper_unloaded || die "$shipper_label remained loaded after bootout before upgrade"
         fi
         local backup_prefix="$prefix.old.$$"
         /bin/rm -rf "$backup_prefix"
@@ -1114,9 +1162,12 @@ install_tarball() {
         upgrade_staged_tree="$staged_tree"
         upgrade_rollback_armed=1
         # Belt-and-suspenders check after move (concurrent symlink swap): EXIT trap
-        # restores $upgrade_backup_prefix -> $prefix and restarts org.tendcf.execd.
+        # restores $upgrade_backup_prefix -> $prefix and restarts prior daemons.
         if [ -L "$backup_prefix/var" ]; then
             die "existing $prefix/var is a symlink; refusing upgrade"
+        fi
+        if [ -L "$backup_prefix/etc" ]; then
+            die "existing $prefix/etc is a symlink; refusing upgrade"
         fi
         if [ -d "$backup_prefix/var" ]; then
             /bin/rm -rf "${staged_tree:?}/var"
@@ -1124,11 +1175,20 @@ install_tarball() {
                 || die "failed to preserve $prefix/var during upgrade"
             upgrade_moved_var=1
         fi
+        if [ -d "$backup_prefix/etc" ]; then
+            /bin/rm -rf "${staged_tree:?}/etc"
+            /bin/mv "$backup_prefix/etc" "$staged_tree/etc" \
+                || die "failed to preserve $prefix/etc during upgrade"
+            upgrade_moved_etc=1
+        fi
         /bin/mv "$staged_tree" "$prefix" \
             || die "failed to install new tree at $prefix"
         upgrade_prefix_swapped=1
         if [ "$was_loaded" -eq 1 ]; then
             upgrade_needs_execd_restart=1
+        fi
+        if [ "$shipper_loaded" -eq 1 ]; then
+            upgrade_needs_shipper_restart=1
         fi
     fi
     changed=1
@@ -1778,8 +1838,92 @@ prepare_audit_log_source() {
     audit_log_prepared=1
 }
 
+# Validate any pre-existing private audit state BEFORE install_tarball() or
+# check_tree() so untrusted config/credentials/spool can never be laundered (H1).
+check_private_dir_exact() {  # check_private_dir_exact DIR
+    local d="$1" meta owner group mode
+    [ ! -L "$d" ] && [ -d "$d" ] || die "$d is not a real directory; refusing"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp' "$d")" || die "cannot stat $d"
+    read -r owner group mode <<< "$meta"
+    [ "$owner" = root ] && [ "$group" = wheel ] && [ $((8#$mode)) -eq $((8#700)) ] \
+        || die "$d has untrusted ownership/mode ($owner:$group $mode), expected root:wheel 700"
+    if has_acl_path "$d"; then
+        die "$d has an extended ACL; refusing"
+    fi
+}
+
+check_private_file_exact() {  # check_private_file_exact FILE
+    local f="$1" meta owner group mode nlink
+    [ ! -L "$f" ] && [ -f "$f" ] || die "$f is not a regular non-symlink file; refusing"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp %l' "$f")" || die "cannot stat $f"
+    read -r owner group mode nlink <<< "$meta"
+    [ "$owner" = root ] && [ "$group" = wheel ] && [ $((8#$mode)) -eq $((8#600)) ] && [ "$nlink" = 1 ] \
+        || die "$f has untrusted ownership/mode/links ($owner:$group $mode links=$nlink), expected root:wheel 600 links=1"
+    if has_acl_path "$f"; then
+        die "$f has an extended ACL; refusing"
+    fi
+}
+
+validate_existing_audit_state_before_repair() {
+    check_ancestors "$prefix"
+    if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+        check_dir_root_unwritable "$prefix"
+    fi
+    if [ -e "$prefix/share/tendcf/bin/__pycache__" ] || [ -L "$prefix/share/tendcf/bin/__pycache__" ]; then
+        die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
+    fi
+    if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
+        check_private_dir_exact "$audit_etc_dir"
+        if [ -e "$audit_shipper_cfg" ] || [ -L "$audit_shipper_cfg" ]; then
+            check_private_file_exact "$audit_shipper_cfg"
+        fi
+        local had_ng=0 had_dg=0 ent base meta owner group mode nlink
+        shopt -q nullglob && had_ng=1
+        shopt -q dotglob && had_dg=1
+        shopt -s nullglob dotglob
+        for ent in "$audit_etc_dir"/*; do
+            base="${ent##*/}"
+            [ "$base" != "." ] && [ "$base" != ".." ] || continue
+            [ ! -L "$ent" ] && [ -f "$ent" ] || die "unsafe entry in $audit_etc_dir: $ent"
+            meta="$(/usr/bin/stat -f '%Su %Sg %Lp %l' "$ent")" || die "cannot stat $ent"
+            read -r owner group mode nlink <<< "$meta"
+            [ "$owner" = root ] && [ "$group" = wheel ] && [ $((8#$mode & 8#6022)) -eq 0 ] && [ "$nlink" = 1 ] \
+                || die "$ent has untrusted ownership/mode/links ($owner:$group $mode links=$nlink)"
+            if has_acl_path "$ent"; then
+                die "$ent has an extended ACL; refusing"
+            fi
+        done
+        if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+        if [ "$had_dg" -eq 0 ]; then shopt -u dotglob; fi
+    fi
+    if [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; then
+        check_dir_root_unwritable "$prefix/var"
+        check_private_dir_exact "$audit_spool_dir"
+        local had_ng=0 had_dg=0 ent base
+        shopt -q nullglob && had_ng=1
+        shopt -q dotglob && had_dg=1
+        shopt -s nullglob dotglob
+        for ent in "$audit_spool_dir"/*; do
+            base="${ent##*/}"
+            [ "$base" != "." ] && [ "$base" != ".." ] || continue
+            check_private_file_exact "$ent"
+        done
+        if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+        if [ "$had_dg" -eq 0 ]; then shopt -u dotglob; fi
+    fi
+}
+
 detach_unsafe_installed_audit_log() {
+    # Validate complete parent chain BEFORE touching chflags or unlinking any leaf (H3).
+    check_ancestors "$prefix"
     installed_audit_log_originally_clean=0
+    local d
+    for d in "$prefix" "$prefix/share" "$prefix/share/tendcf" "$prefix/share/tendcf/bin"; do
+        if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+            break
+        fi
+        check_dir_root_unwritable "$d"
+    done
     if [ -e "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
         if installed_audit_log_clean_ok; then
             installed_audit_log_originally_clean=1
@@ -1854,13 +1998,22 @@ place_audit_log() {
 }
 
 place_audit_shipper_state() {
-    ensure_dir 700 "$audit_etc_dir"
-    ensure_dir 755 "$prefix/var"
-    ensure_dir 700 "$audit_spool_dir"
-    if [ -L "$audit_shipper_cfg" ] || [ -d "$audit_shipper_cfg" ]; then
-        die "$audit_shipper_cfg is not a regular file; refusing"
+    if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
+        check_private_dir_exact "$audit_etc_dir"
+    else
+        ensure_dir 700 "$audit_etc_dir"
+        check_private_dir_exact "$audit_etc_dir"
     fi
-    if [ ! -f "$audit_shipper_cfg" ]; then
+    ensure_dir 755 "$prefix/var"
+    if [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; then
+        check_private_dir_exact "$audit_spool_dir"
+    else
+        ensure_dir 700 "$audit_spool_dir"
+        check_private_dir_exact "$audit_spool_dir"
+    fi
+    if [ -e "$audit_shipper_cfg" ] || [ -L "$audit_shipper_cfg" ]; then
+        check_private_file_exact "$audit_shipper_cfg"
+    else
         local host_name old_umask tmp_cfg
         host_name="$(/bin/hostname -s 2>/dev/null || /bin/hostname 2>/dev/null || echo localhost)"
         if [[ ! "$host_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
@@ -1882,7 +2035,7 @@ place_audit_shipper_state() {
 
 render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
     local dest="$1"
-    /bin/cat > "$dest" <<EOF
+    /bin/cat > "$dest" <<OSQUERY_EOF
 {
   "file_paths": {
     "tendcf_binaries": [
@@ -1911,12 +2064,12 @@ render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
     }
   }
 }
-EOF
+OSQUERY_EOF
 }
 
 render_darwin_tripwire_eslogger() {  # render_darwin_tripwire_eslogger DEST
     local dest="$1"
-    /bin/cat > "$dest" <<EOF
+    /bin/cat > "$dest" <<ESLOGGER_EOF
 {
   "schema": "tendcf-darwin-eslogger-tripwire-v1",
   "note": "Requires macOS Full Disk Access for eslogger; watch list mirrors osquery-fim.conf (issue #119).",
@@ -1944,7 +2097,7 @@ render_darwin_tripwire_eslogger() {  # render_darwin_tripwire_eslogger DEST
     "/var/root/.ssh/authorized_keys"
   ]
 }
-EOF
+ESLOGGER_EOF
 }
 
 install_managed_file_idempotent() {  # install_managed_file_idempotent SRC DEST MODE
@@ -2224,7 +2377,7 @@ check_launchd_dir() {
 
 render_shipper_plist() {  # render_shipper_plist DEST PYTHON_BIN
     local dest="$1" py_bin="$2"
-    /bin/cat > "$dest" <<EOF
+    /bin/cat > "$dest" <<SHIPPER_PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -2240,6 +2393,8 @@ render_shipper_plist() {  # render_shipper_plist DEST PYTHON_BIN
         <string>ship</string>
         <string>--config</string>
         <string>$audit_shipper_cfg</string>
+        <string>--expected-spool-dir</string>
+        <string>$audit_spool_dir</string>
     </array>
     <key>UserName</key>
     <string>root</string>
@@ -2255,7 +2410,7 @@ render_shipper_plist() {  # render_shipper_plist DEST PYTHON_BIN
     <string>$workdir/outputs/audit-shipper.stderr.log</string>
 </dict>
 </plist>
-EOF
+SHIPPER_PLIST_EOF
     /usr/sbin/chown root:wheel "$dest"
     /bin/chmod 0644 "$dest"
     /usr/bin/plutil -lint "$dest" >/dev/null || die "plutil -lint rejected generated $shipper_label plist"
@@ -2529,6 +2684,7 @@ cmd_install() {
     check_no_stale_upgrade_dirs
     prepare_projector_source
     prepare_audit_log_source
+    validate_existing_audit_state_before_repair
     if [ -n "$tarball" ]; then
         if [ -z "$sha256_file" ]; then
             sha256_file="${tarball}.sha256"
@@ -2568,12 +2724,17 @@ cmd_install() {
     fi
     if [ "$do_enable" -eq 1 ] || [ "$upgrade_needs_execd_restart" -eq 1 ]; then
         enable_execd
-        enable_audit_shipper
         if [ "$upgrade_needs_execd_restart" -eq 1 ]; then
             say "restarted: $label after upgrade"
         fi
     fi
-    # All post-upgrade steps and daemon restart succeeded; disarm rollback,
+    if [ "$do_enable" -eq 1 ] || [ "${upgrade_needs_shipper_restart:-0}" -eq 1 ]; then
+        enable_audit_shipper
+        if [ "${upgrade_needs_shipper_restart:-0}" -eq 1 ]; then
+            say "restarted: $shipper_label after upgrade"
+        fi
+    fi
+    # All post-upgrade steps and daemon restarts succeeded; disarm rollback,
     # remove the pre-upgrade backup tree, and only then release the shared lock.
     upgrade_rollback_armed=0
     if [ -n "$upgrade_backup_prefix" ]; then
@@ -2582,8 +2743,13 @@ cmd_install() {
     fi
     upgrade_staged_tree=""
     upgrade_moved_var=0
+    upgrade_moved_etc=0
     upgrade_was_loaded=0
     upgrade_had_plist=0
+    upgrade_shipper_was_loaded=0
+    upgrade_had_shipper_plist=0
+    upgrade_needs_execd_restart=0
+    upgrade_needs_shipper_restart=0
     upgrade_snapshot_taken=0
     upgrade_saved_workdir=""
     upgrade_saved_inputs=0
@@ -2604,8 +2770,11 @@ cmd_run_once() {
 }
 
 cmd_enable() {
+    acquire_publish_lock
+    init_paths
     enable_execd
     enable_audit_shipper
+    release_publish_lock
     if [ "$changed" -eq 0 ]; then
         say "no change ($label already loaded)"
     else
@@ -2614,6 +2783,7 @@ cmd_enable() {
 }
 
 cmd_disable() {
+    acquire_publish_lock
     check_launchd_dir
     disable_audit_shipper
     if execd_is_loaded; then
@@ -2625,6 +2795,7 @@ cmd_disable() {
         /bin/rm -f "$plist_path"
         changed=1
     fi
+    release_publish_lock
     if [ "$changed" -eq 0 ]; then
         say "no change ($label already disabled)"
     else
@@ -2641,6 +2812,48 @@ remove_managed_file_safe() {  # remove_managed_file_safe PATH
     [ ! -L "$target" ] && [ -f "$target" ] || die "$target is not a regular file; refusing removal"
     /usr/bin/chflags 0 "$target" 2>/dev/null || true
     /bin/rm -f "$target"
+    changed=1
+}
+
+purge_audit_spool_safe() {
+    if [ ! -e "$audit_spool_dir" ] && [ ! -L "$audit_spool_dir" ]; then
+        return 0
+    fi
+    check_ancestors "$audit_spool_dir"
+    check_private_dir_exact "$audit_spool_dir"
+    local parent_dev spool_dev
+    parent_dev="$(/usr/bin/stat -f '%d' "$(/usr/bin/dirname "$audit_spool_dir")")" \
+        || die "cannot stat parent of $audit_spool_dir"
+    spool_dev="$(/usr/bin/stat -f '%d' "$audit_spool_dir")" || die "cannot stat $audit_spool_dir"
+    [ "$spool_dev" = "$parent_dev" ] || die "$audit_spool_dir crosses a mount boundary; refusing purge"
+    local had_ng=0 had_dg=0 ent base ent_dev
+    local to_remove=()
+    shopt -q nullglob && had_ng=1
+    shopt -q dotglob && had_dg=1
+    shopt -s nullglob dotglob
+    for ent in "$audit_spool_dir"/*; do
+        base="${ent##*/}"
+        [ "$base" != "." ] && [ "$base" != ".." ] || continue
+        case "$base" in
+            audit.jsonl|.audit.cursor|.audit.lock) ;;
+            *)
+                if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+                if [ "$had_dg" -eq 0 ]; then shopt -u dotglob; fi
+                die "unexpected entry in $audit_spool_dir ($base); refusing purge"
+                ;;
+        esac
+        check_private_file_exact "$ent"
+        ent_dev="$(/usr/bin/stat -f '%d' "$ent")" || die "cannot stat $ent"
+        [ "$ent_dev" = "$spool_dev" ] || die "$ent crosses a mount boundary; refusing purge"
+        to_remove+=("$ent")
+    done
+    if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+    if [ "$had_dg" -eq 0 ]; then shopt -u dotglob; fi
+    for ent in "${to_remove[@]}"; do
+        /usr/bin/chflags 0 "$ent" 2>/dev/null || true
+        /bin/rm -f "$ent"
+    done
+    /bin/rmdir "$audit_spool_dir" || die "could not remove $audit_spool_dir (not empty or busy)"
     changed=1
 }
 
@@ -2667,21 +2880,17 @@ cmd_uninstall() {
     remove_managed_file_safe "$osquery_pack_path"
     remove_managed_file_safe "$installed_audit_log"
     remove_managed_file_safe "$audit_shipper_cfg"
+    # Remove ONLY the two managed tripwire files; rmdir if empty (never blind rm -rf or chflags -R; H5).
     if [ -e "$tripwire_share_dir" ] || [ -L "$tripwire_share_dir" ]; then
         check_ancestors "$tripwire_share_dir"
         [ ! -L "$tripwire_share_dir" ] && [ -d "$tripwire_share_dir" ] \
             || die "$tripwire_share_dir is not a real directory; refusing removal"
-        /usr/bin/chflags -R 0 "$tripwire_share_dir" 2>/dev/null || true
-        /bin/rm -rf "$tripwire_share_dir"
-        changed=1
+        remove_managed_file_safe "$tripwire_share_dir/osquery-fim.conf"
+        remove_managed_file_safe "$tripwire_share_dir/eslogger-events.json"
+        /bin/rmdir "$tripwire_share_dir" 2>/dev/null || true
     fi
-    if [ "$purge_spool" -eq 1 ] && { [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; }; then
-        check_ancestors "$audit_spool_dir"
-        [ ! -L "$audit_spool_dir" ] && [ -d "$audit_spool_dir" ] \
-            || die "$audit_spool_dir is not a real directory; refusing removal"
-        /usr/bin/chflags -R 0 "$audit_spool_dir" 2>/dev/null || true
-        /bin/rm -rf "$audit_spool_dir"
-        changed=1
+    if [ "$purge_spool" -eq 1 ]; then
+        purge_audit_spool_safe
     fi
     release_publish_lock
     if [ "$changed" -eq 0 ]; then
@@ -2770,7 +2979,7 @@ case "$sub" in
         if [ "$changed" -eq 0 ]; then say "no change ($data)"; fi
         ;;
     run-once) init_paths; cmd_run_once ;;
-    enable) init_paths; cmd_enable ;;
+    enable) cmd_enable ;;
     status) cmd_status ;;
     *) die "unknown command: $sub" ;;
 esac

@@ -1957,6 +1957,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
                     "prepare_audit_log_source() { return 0; }\n"
+                    "validate_existing_audit_state_before_repair() { return 0; }\n"
                     "detach_unsafe_installed_audit_log() { return 0; }\n"
                     "place_audit_log() { return 0; }\n"
                     "place_audit_shipper_state() { return 0; }\n"
@@ -2153,6 +2154,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                         "init_paths() { return 0; }\n"
                         "lay_out() { return 0; }\n"
                         "prepare_audit_log_source() { return 0; }\n"
+                        "validate_existing_audit_state_before_repair() { return 0; }\n"
                         "detach_unsafe_installed_audit_log() { return 0; }\n"
                         "place_audit_log() { return 0; }\n"
                         "place_audit_shipper_state() { return 0; }\n"
@@ -2345,6 +2347,7 @@ class TendcfInstallHardeningContract(unittest.TestCase):
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
                     "prepare_audit_log_source() { return 0; }\n"
+                    "validate_existing_audit_state_before_repair() { return 0; }\n"
                     "detach_unsafe_installed_audit_log() { return 0; }\n"
                     "place_audit_log() { return 0; }\n"
                     "place_audit_shipper_state() { return 0; }\n"
@@ -2858,7 +2861,9 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
         self.assertIn("--audit-log-src)", cmd_fn)
         self.assertIn("--audit-log-sha256)", cmd_fn)
         order = [
+            "acquire_publish_lock",
             "prepare_audit_log_source",
+            "validate_existing_audit_state_before_repair",
             "detach_unsafe_installed_audit_log",
             "check_tree",
             "place_audit_log",
@@ -2869,6 +2874,26 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
         for name, idx in zip(order, idxs):
             self.assertNotEqual(idx, -1, f"missing {name} in cmd_install")
         self.assertEqual(idxs, sorted(idxs))
+
+        # M4: macOS osquery packs path must use /private/var/osquery/packs (not /var symlink).
+        self.assertIn("osquery_packs_dir=/private/var/osquery/packs", self.src)
+        self.assertNotIn("osquery_packs_dir=/var/osquery/packs", self.src)
+
+        # H3: detach_unsafe_installed_audit_log checks parent chain BEFORE chflags/rm.
+        da_fn = _extract_func(self.src, "detach_unsafe_installed_audit_log")
+        self.assertLess(da_fn.find('check_dir_root_unwritable "$d"'), da_fn.find('/bin/rm -f "$installed_audit_log"'))
+
+        # H4: install_tarball preserves etc/ and quiesces shipper; cleanup_stage restores etc/ & shipper.
+        it_fn = _extract_func(self.src, "install_tarball")
+        self.assertIn('upgrade_moved_etc=1', it_fn)
+        self.assertIn('upgrade_shipper_was_loaded=1', it_fn)
+        cs_fn = _extract_func(self.src, "cleanup_stage")
+        self.assertIn('upgrade_moved_etc', cs_fn)
+        self.assertIn('upgrade_shipper_was_loaded', cs_fn)
+
+        # M1: standalone enable and disable serialize under acquire_publish_lock.
+        self.assertIn("acquire_publish_lock", _extract_func(self.src, "cmd_enable"))
+        self.assertIn("acquire_publish_lock", _extract_func(self.src, "cmd_disable"))
 
         pa_fn = _extract_func(self.src, "place_audit_log")
         pa_code = "\n".join(l for l in pa_fn.splitlines() if not l.lstrip().startswith("#"))
@@ -2889,7 +2914,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             prefix = root / "opt" / "tendcf"
             workdir = prefix / "var" / "libntech"
             launchd_dir = root / "LaunchDaemons"
-            osq_dir = root / "osquery" / "packs"
+            osq_dir = root / "private" / "var" / "osquery" / "packs"
             (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
             (workdir / "inputs").mkdir(parents=True)
             (workdir / "data").mkdir(parents=True)
@@ -2902,6 +2927,10 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             fns = "\n".join(
                 _extract_func(self.src, name)
                 for name in (
+                    "check_dir_root_unwritable",
+                    "check_private_dir_exact",
+                    "check_private_file_exact",
+                    "validate_existing_audit_state_before_repair",
                     "place_audit_shipper_state",
                     "render_darwin_tripwire_osquery",
                     "render_darwin_tripwire_eslogger",
@@ -2910,10 +2939,10 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                     "render_shipper_plist",
                     "disable_audit_shipper",
                     "remove_managed_file_safe",
+                    "purge_audit_spool_safe",
                     "cmd_uninstall",
                 )
             )
-            # Shim root-only ownership/stat/install/launchctl calls for unprivileged hermetic runs.
             real_install = shutil.which("install") or "/usr/bin/install"
             install_shim = root / "install-shim"
             install_shim.write_text(
@@ -2936,9 +2965,15 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             stat_shim.write_text(
                 f"#!{sys.executable}\n"
                 "import os, stat, sys\n"
-                "p = sys.argv[-1]\n"
-                "mode = stat.S_IMODE(os.lstat(p).st_mode)\n"
-                "print(f'root:wheel {mode:o}')\n",
+                "fmt = sys.argv[2]\n"
+                "p = sys.argv[3]\n"
+                "st = os.lstat(p)\n"
+                "mode = stat.S_IMODE(st.st_mode)\n"
+                "if fmt == '%Su:%Sg %Lp': print(f'root:wheel {mode:o}')\n"
+                "elif fmt == '%Su %Sg %Lp': print(f'root wheel {mode:o}')\n"
+                "elif fmt == '%Su %Sg %Lp %l': print(f'root wheel {mode:o} {st.st_nlink}')\n"
+                "elif fmt == '%d': print(f'{st.st_dev}')\n"
+                "else: raise SystemExit(f'unexpected stat fmt: {fmt}')\n",
                 encoding="utf-8",
             )
             stat_shim.chmod(0o755)
@@ -3018,6 +3053,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue(audit_cfg.is_file())
             self.assertEqual(stat.S_IMODE(audit_cfg.stat().st_mode), 0o600)
             self.assertTrue(shipper_plist.is_file())
+            self.assertIn("--expected-spool-dir", shipper_plist.read_text(encoding="utf-8"))
             osq_obj = _json.loads((trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
             self.assertIn("tendcf_file_events", osq_obj["queries"])
             self.assertEqual(osq_pack.read_text(encoding="utf-8"), (trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
@@ -3039,9 +3075,23 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r_idem.returncode, 0, r_idem.stderr)
             self.assertIn("CHANGED=0", r_idem.stdout)
 
-            # Verify uninstall preserves spool by default and removes all shipper/tripwire files.
+            # H1: Dirty config (0644) fails validate_existing_audit_state_before_repair.
+            os.chmod(audit_cfg, 0o644)
+            r_dirty = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_dirty.returncode, 0)
+            os.chmod(audit_cfg, 0o600)
+
+            # H5: Unrelated file under tripwire_share_dir survives uninstall; unexpected file in spool blocks purge.
+            unrelated_trip = trip_dir / "operator-custom.conf"
+            unrelated_trip.write_text("keep me\n", encoding="utf-8")
             spool_marker = spool_dir / "audit.jsonl"
             spool_marker.write_text("witness\n", encoding="utf-8")
+            os.chmod(spool_marker, 0o600)
             r_un = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall\n"],
                 capture_output=True,
@@ -3049,11 +3099,24 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(r_un.returncode, 0, r_un.stderr)
-            for gone in (execd_plist, shipper_plist, osq_pack, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py", trip_dir):
+            for gone in (execd_plist, shipper_plist, osq_pack, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
                 self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
+            self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
             self.assertTrue(spool_marker.is_file())
 
-            # Uninstall with --purge-spool removes spool and re-run reports no change.
+            rogue_spool = spool_dir / "operator-notes.txt"
+            rogue_spool.write_text("do not delete\n", encoding="utf-8")
+            r_refuse = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_refuse.returncode, 0)
+            self.assertTrue(rogue_spool.is_file())
+            rogue_spool.unlink()
+
+            # Uninstall with --purge-spool removes known spool files & rmdir cleanly and re-run reports no change.
             r_purge = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\nchanged=0\ncmd_uninstall --purge-spool\n"],
                 capture_output=True,
@@ -3063,6 +3126,58 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r_purge.returncode, 0, r_purge.stderr)
             self.assertFalse(spool_dir.exists())
             self.assertIn("no change (already uninstalled)", r_purge.stdout)
+
+    def test_h4_cleanup_stage_restores_moved_etc_and_shipper_on_failed_upgrade(self) -> None:
+        # H4: interrupted upgrade after moving etc/ and var/ restores enabled config and re-bootstraps shipper.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefix = root / "opt" / "tendcf"
+            backup = root / "opt" / "tendcf.old.999"
+            (prefix / "etc").mkdir(parents=True)
+            (prefix / "var" / "audit-spool").mkdir(parents=True)
+            backup.mkdir(parents=True)
+            enrolled = '{"enabled":true,"host":"macbook","spool_dir":"/opt/tendcf/var/audit-spool","src":"tendcf"}\n'
+            (prefix / "etc" / "audit-shipper.json").write_text(enrolled, encoding="utf-8")
+            (prefix / "var" / "audit-spool" / "audit.jsonl").write_text("rec1\n", encoding="utf-8")
+            shipper_plist = root / "org.tendcf.audit-shipper.plist"
+            shipper_plist.write_text("<plist/>", encoding="utf-8")
+            log_file = root / "actions.log"
+
+            cs_fn = _extract_func(self.src, "cleanup_stage")
+            script = (
+                "set -euo pipefail\n"
+                f'prefix="{prefix}"\n'
+                f'upgrade_backup_prefix="{backup}"\n'
+                'upgrade_staged_tree=""\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_moved_var=1\n'
+                'upgrade_moved_etc=1\n'
+                'upgrade_was_loaded=0\n'
+                'upgrade_had_plist=0\n'
+                'upgrade_shipper_was_loaded=1\n'
+                'upgrade_had_shipper_plist=1\n'
+                'upgrade_snapshot_taken=0\n'
+                'upgrade_saved_workdir=""\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=0\n'
+                f'plist_path="{root}/execd.plist"\n'
+                f'shipper_plist_path="{shipper_plist}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                'stage_dir=""\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 1; }\n'
+                'shipper_is_loaded() { return 1; }\n'
+                f'bootstrap_shipper_with_retry() {{ echo "bootstrapped_shipper" >> "{log_file}"; return 0; }}\n'
+                f"{cs_fn}\n"
+                "cleanup_stage\n"
+            )
+            r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((prefix / "etc" / "audit-shipper.json").read_text(encoding="utf-8"), enrolled)
+            self.assertEqual((prefix / "var" / "audit-spool" / "audit.jsonl").read_text(encoding="utf-8"), "rec1\n")
+            self.assertIn("bootstrapped_shipper", log_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

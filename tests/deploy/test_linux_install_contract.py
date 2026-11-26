@@ -979,12 +979,17 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "verify_tree_binaries() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
+                    "acquire_lifecycle_lock() { return 0; }\n"
+                    "release_lifecycle_lock() { return 0; }\n"
                     "prepare_audit_log_source() { return 0; }\n"
+                    "validate_existing_audit_state_before_repair() { return 0; }\n"
                     "detach_unsafe_installed_audit_log() { return 0; }\n"
                     "place_audit_log() { return 0; }\n"
                     "place_audit_shipper_state() { return 0; }\n"
                     "place_tripwire_rules() { return 0; }\n"
                     f"place_policy() {{ {place_pol_body}; }}\n"
+                    f'audit_etc_dir="{prefix}/etc"\n'
+                    f'audit_spool_dir="{prefix}/var/audit-spool"\n'
                     f'prefix="{prefix}"\n'
                     f'cf_lib_path="{prefix}/lib"\n'
                     f'cf_agent="{prefix}/bin/cf-agent"\n'
@@ -1453,12 +1458,15 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
         self.assertIn("--audit-log-sha256)", cmd_fn)
         self.assertIn("--lock-auditd)", cmd_fn)
         order = [
+            "acquire_lifecycle_lock",
             "prepare_audit_log_source",
+            "validate_existing_audit_state_before_repair",
             "detach_unsafe_installed_audit_log",
             "check_tree",
             "place_audit_log",
             "place_audit_shipper_state",
             "place_tripwire_rules",
+            "release_lifecycle_lock",
         ]
         idxs = [cmd_fn.find(name) for name in order]
         for name, idx in zip(order, idxs):
@@ -1472,15 +1480,20 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
         self.assertNotIn("prepare_audit_log_source", pa_code)
         self.assertIn("$prepared_audit_log_file", pa_code)
 
-        # detach_unsafe_installed_audit_log never mutates directory permissions.
+        # detach_unsafe_installed_audit_log checks full parent chain BEFORE unlink and never mutates dirs (H3).
         da_fn = _extract_func(self.src, "detach_unsafe_installed_audit_log")
         da_code = "\n".join(l for l in da_fn.splitlines() if not l.lstrip().startswith("#"))
         self.assertNotIn("chown", da_code)
         self.assertNotIn("chmod", da_code)
+        self.assertLess(da_code.find('check_dir_root_unwritable "$d"'), da_code.find('rm -f "$installed_audit_log"'))
 
-        # enable_audit_shipper uses isolated python3 -I -S and systemd sandboxing.
+        # enable_audit_shipper uses isolated python3 -I -S, mktemp (M1), --expected-spool-dir (N1), and systemd sandboxing.
         es_fn = _extract_func(self.src, "enable_audit_shipper")
-        self.assertIn("ExecStart=$py -I -S $installed_audit_log ship --config $audit_shipper_cfg", es_fn)
+        self.assertIn(
+            "ExecStart=$py -I -S $installed_audit_log ship --config $audit_shipper_cfg --expected-spool-dir $audit_spool_dir",
+            es_fn,
+        )
+        self.assertIn("mktemp /etc/systemd/system/.tendcf-audit-shipper.service.new.XXXXXX", es_fn)
         self.assertIn("NoNewPrivileges=yes", es_fn)
         self.assertIn("ProtectSystem=strict", es_fn)
         self.assertIn("ReadWritePaths=$audit_spool_dir", es_fn)
@@ -1491,6 +1504,25 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             shim_dir = root / "shims"
             shim_dir.mkdir()
             _make_linux_shims(shim_dir)
+            # Extend stat shim to support '%u %g %a %h' (nlink) and '%d' (st_dev).
+            stat_shim = shim_dir / "stat"
+            stat_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                "fmt = sys.argv[2]\n"
+                "p = sys.argv[3]\n"
+                "st = os.lstat(p)\n"
+                "mode = stat.S_IMODE(st.st_mode)\n"
+                "if fmt == '%U:%G %a': print(f'root:root {mode:o}')\n"
+                "elif fmt == '%u %g %a': print(f'0 0 {mode:o}')\n"
+                "elif fmt == '%u %g %a %h': print(f'0 0 {mode:o} {st.st_nlink}')\n"
+                "elif fmt == '%u %a': print(f'0 {mode:o}')\n"
+                "elif fmt == '%u': print('0')\n"
+                "elif fmt == '%d': print(f'{st.st_dev}')\n"
+                "else: raise SystemExit(f'unexpected stat fmt: {fmt}')\n",
+                encoding="utf-8",
+            )
+            stat_shim.chmod(0o755)
             prefix = root / "opt" / "tendcf"
             workdir = prefix / "var" / "libntech"
             etc_dir = root / "etc"
@@ -1500,7 +1532,6 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             (workdir / "data").mkdir(parents=True)
             systemd_dir.mkdir(parents=True)
 
-            # Place real projector.py + audit_log.py in installed location to test real ship --config.
             shutil.copy2(PROJECTOR, prefix / "share" / "tendcf" / "bin" / "projector.py")
             shutil.copy2(REPO / "tools" / "audit_log.py", prefix / "share" / "tendcf" / "bin" / "audit_log.py")
 
@@ -1510,19 +1541,24 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "check_dir_root_unwritable",
                     "check_regular_file_root_unwritable",
                     "check_dir_chain_strict_under_prefix",
+                    "check_private_dir_exact",
+                    "check_private_file_exact",
+                    "validate_existing_audit_state_before_repair",
                     "verify_installed_projector",
                     "verify_installed_audit_log",
                     "place_audit_shipper_state",
                     "render_linux_tripwire_auditd",
                     "render_linux_tripwire_aide",
+                    "reload_auditd_tripwire",
                     "place_tripwire_rules",
                     "enable_audit_shipper",
+                    "stop_and_disable_unit",
                     "disable_units",
                     "remove_managed_file_safe",
+                    "purge_audit_spool_safe",
                     "cmd_uninstall",
                 )
             )
-            # Point /etc/audit, /etc/aide, /etc/systemd/system into our temp root for hermetic execution.
             fns_patched = (
                 fns.replace("/etc/audit", f"{etc_dir}/audit")
                 .replace("/etc/aide", f"{etc_dir}/aide")
@@ -1544,6 +1580,8 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
                 'say() { echo "tendcf-install: $*"; }\n'
                 "check_ancestors_ok() { return 0; }\n"
+                "acquire_lifecycle_lock() { return 0; }\n"
+                "release_lifecycle_lock() { return 0; }\n"
                 f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
                 f'prefix="{prefix}"\n'
                 f'workdir="{workdir}"\n'
@@ -1584,14 +1622,17 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue(tmr_path.is_file())
             auditd_text = auditd_rules.read_text(encoding="utf-8")
             self.assertIn("-k tendcf_tripwire", auditd_text)
-            self.assertIn("host_specific.json", auditd_text)
+            self.assertIn(f"-w {workdir}/data -p wa", auditd_text)
             self.assertIn("/etc/sudoers", auditd_text)
-            self.assertIn("/root/.ssh/authorized_keys", auditd_text)
             self.assertNotIn("\n-e 2\n", auditd_text)
 
-            # Default disabled config passes real python3 -I -S audit_log.py ship --config cleanly.
+            # Default disabled config passes real python3 -I -S audit_log.py ship --config --expected-spool-dir.
             p_ship = subprocess.run(
-                [sys.executable, "-I", "-S", str(prefix / "share" / "tendcf" / "bin" / "audit_log.py"), "ship", "--config", str(audit_cfg)],
+                [
+                    sys.executable, "-I", "-S",
+                    str(prefix / "share" / "tendcf" / "bin" / "audit_log.py"),
+                    "ship", "--config", str(audit_cfg), "--expected-spool-dir", str(spool_dir),
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1599,19 +1640,33 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(p_ship.returncode, 0, p_ship.stderr)
             self.assertIn('"skipped": true', p_ship.stdout)
 
-            # 2) --lock-auditd adds -e 2.
+            # 2) M3: --lock-auditd fails closed when active auditd/augenrules is unavailable.
             r_lock = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "lock_auditd=1\nplace_tripwire_rules\n"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertEqual(r_lock.returncode, 0, r_lock.stderr)
-            self.assertIn("\n-e 2\n", auditd_rules.read_text(encoding="utf-8"))
+            self.assertNotEqual(r_lock.returncode, 0)
+            self.assertIn("--lock-auditd requested", r_lock.stderr)
 
-            # 3) Leave a witness file in audit-spool, run uninstall WITHOUT --purge-spool -> spool preserved, rest removed.
+            # 3) H1: Dirty pre-existing audit-shipper.json (0644) is rejected BEFORE repair.
+            os.chmod(audit_cfg, 0o644)
+            r_dirty_cfg = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_dirty_cfg.returncode, 0)
+            os.chmod(audit_cfg, 0o600)
+
+            # 4) H5: Unrelated file under tripwire_share_dir survives ordinary uninstall; unexpected file in spool blocks purge.
+            unrelated_trip = prefix / "share" / "tendcf" / "tripwire" / "operator-custom.conf"
+            unrelated_trip.write_text("keep me\n", encoding="utf-8")
             spool_marker = spool_dir / "audit.jsonl"
             spool_marker.write_text("witness\n", encoding="utf-8")
+            os.chmod(spool_marker, 0o600)
             r_un = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall\n"],
                 capture_output=True,
@@ -1619,11 +1674,25 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(r_un.returncode, 0, r_un.stderr)
-            for gone in (execd_path, svc_path, tmr_path, auditd_rules, aide_rules, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py", prefix / "share" / "tendcf" / "tripwire"):
+            for gone in (execd_path, svc_path, tmr_path, auditd_rules, aide_rules, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
                 self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
+            self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
             self.assertTrue(spool_marker.is_file(), "default uninstall must preserve audit spool")
 
-            # 4) Uninstall WITH --purge-spool removes spool cleanly and is idempotent.
+            # Unexpected entry inside spool dir blocks --purge-spool (H5).
+            rogue_spool = spool_dir / "operator-notes.txt"
+            rogue_spool.write_text("do not delete\n", encoding="utf-8")
+            r_refuse_purge = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_refuse_purge.returncode, 0)
+            self.assertTrue(rogue_spool.is_file())
+            rogue_spool.unlink()
+
+            # 5) Clean --purge-spool removes known spool files & rmdir cleanly and is idempotent.
             r_purge = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\ncmd_uninstall --purge-spool\n"],
                 capture_output=True,
@@ -1632,6 +1701,66 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             )
             self.assertEqual(r_purge.returncode, 0, r_purge.stderr)
             self.assertFalse(spool_dir.exists())
+
+    def test_m2_disable_stop_failure_propagates_and_preserves_files(self) -> None:
+        # M2: real systemctl stop failure must abort disable_units/cmd_uninstall BEFORE unlinking unit/config.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_linux_shims(shim_dir)
+            fake_sys = shim_dir / "systemctl"
+            fake_sys.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  show) echo loaded; exit 0 ;;\n"
+                "  is-enabled|is-active) exit 0 ;;\n"
+                "  disable|stop) echo 'simulated stop failure' >&2; exit 1 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_sys.chmod(0o755)
+            fake_run_systemd = root / "run_systemd"
+            fake_run_systemd.mkdir()
+            svc = root / "tendcf-audit-shipper.service"
+            tmr = root / "tendcf-audit-shipper.timer"
+            unit = root / "tendcf-execd.service"
+            cfg = root / "audit-shipper.json"
+            for p in (svc, tmr, unit, cfg):
+                p.write_text("x\n", encoding="utf-8")
+
+            fns = "\n".join(
+                _extract_func(self.src, n)
+                for n in ("stop_and_disable_unit", "disable_units", "remove_managed_file_safe", "cmd_uninstall")
+            ).replace("/run/systemd/system", str(fake_run_systemd))
+            script = (
+                "set -euo pipefail\n"
+                f'export PATH="{shim_dir}:$PATH"\n'
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                'say() { :; }\n'
+                "check_ancestors_ok() { return 0; }\n"
+                "acquire_lifecycle_lock() { return 0; }\n"
+                "release_lifecycle_lock() { return 0; }\n"
+                'unit="tendcf-execd.service"\n'
+                'shipper_service="tendcf-audit-shipper.service"\n'
+                'shipper_timer="tendcf-audit-shipper.timer"\n'
+                f'unit_path="{unit}"\n'
+                f'shipper_service_path="{svc}"\n'
+                f'shipper_timer_path="{tmr}"\n'
+                f'auditd_rules_path="{root}/none1"\n'
+                f'aide_rules_path="{root}/none2"\n'
+                f'installed_audit_log="{root}/none3"\n'
+                f'audit_shipper_cfg="{cfg}"\n'
+                f'tripwire_share_dir="{root}/none4"\n'
+                f'audit_spool_dir="{root}/none5"\n'
+                f"{fns}\n"
+                "cmd_uninstall\n"
+            )
+            r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(tmr.is_file(), "M2: timer file must not be unlinked when stop fails")
+            self.assertTrue(cfg.is_file(), "M2: config must not be removed when stop fails")
 
 
 if __name__ == "__main__":

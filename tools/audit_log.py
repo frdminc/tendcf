@@ -56,8 +56,9 @@ import errno
 import fcntl
 import hashlib
 import hmac
-import importlib.util
+import io
 import json
+import math
 import os
 import re
 import secrets
@@ -72,25 +73,156 @@ from typing import Any, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
-# Load sibling tools/projector.py for pure-stdlib RFC 8785 JCS canonicalization
+# Self-contained pure-stdlib RFC 8785 (JCS) canonicalizer (H2).
+# Keeps audit_log.py 100% standalone under `python3 -I -S` with zero sibling
+# module imports, zero dynamic exec/importlib calls, and zero __pycache__
+# bytecode execution risk. Matches tools/projector.py::_stdlib_jcs_dumps.
+#
+# Attribution: `_jcs_write_float` and `_JCS_ESCAPE_MAP` are adapted from the
+# `rfc8785` Python package and Andrew Rundgren's `cyberphone/json-canonicalization`
+# reference implementation (Apache License, Version 2.0).
 # ---------------------------------------------------------------------------
 
-def _load_projector_module() -> Any:
-    proj_path = Path(__file__).resolve().with_name("projector.py")
-    spec = importlib.util.spec_from_file_location("_tendcf_projector_jcs", proj_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"unable to load projector module at {proj_path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
+_JCS_INT_MAX = 2**53 - 1
+_JCS_INT_MIN = -(2**53) + 1
+_JCS_ESCAPE_RE = re.compile(r'[\x00-\x1f\\"]')
+_JCS_ESCAPE_MAP: dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+for _cp in range(0x20):
+    _JCS_ESCAPE_MAP.setdefault(chr(_cp), f"\\u{_cp:04x}")
+
+
+def _jcs_write_str(s: str, sink: io.BytesIO) -> None:
+    """Serialize a JSON string per RFC 8785 §3.2.2.2."""
+    sink.write(b'"')
+    escaped = _JCS_ESCAPE_RE.sub(lambda m: _JCS_ESCAPE_MAP[m.group(0)], s)
     try:
-        spec.loader.exec_module(mod)
-    except BaseException:
-        sys.modules.pop(spec.name, None)
-        raise
-    return mod
+        sink.write(escaped.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("input contains lone surrogate or non-UTF-8 codepoints") from exc
+    sink.write(b'"')
 
 
-_PROJECTOR = _load_projector_module()
+def _jcs_write_float(f: float, sink: io.BytesIO) -> None:
+    """Serialize a finite IEEE-754 float per ES6 / RFC 8785 §3.2.2.3."""
+    if math.isnan(f) or math.isinf(f):
+        raise ValueError(f"{f} is not representable in JCS")
+    if f == 0:
+        sink.write(b"0")
+        return
+    if f < 0:
+        sink.write(b"-")
+        _jcs_write_float(-f, sink)
+        return
+
+    stringified = str(f)
+    exponent_str = ""
+    exponent_value = 0
+    q = stringified.find("e")
+    if q > 0:
+        exponent_str = stringified[q:]
+        if exponent_str[2:3] == "0":
+            exponent_str = exponent_str[:2] + exponent_str[3:]
+        stringified = stringified[:q]
+        exponent_value = int(exponent_str[1:])
+
+    first = stringified
+    dot = ""
+    last = ""
+    q = stringified.find(".")
+    if q > 0:
+        dot = "."
+        first = stringified[:q]
+        last = stringified[q + 1 :]
+
+    if last == "0":
+        dot = ""
+        last = ""
+
+    if 0 < exponent_value < 21:
+        first += last
+        last = ""
+        dot = ""
+        exponent_str = ""
+        q = exponent_value - len(first)
+        while q >= 0:
+            q -= 1
+            first += "0"
+    elif -7 < exponent_value < 0:
+        last = first + last
+        first = "0"
+        dot = "."
+        exponent_str = ""
+        q = exponent_value
+        while q < -1:
+            q += 1
+            last = "0" + last
+
+    sink.write(f"{first}{dot}{last}{exponent_str}".encode("ascii"))
+
+
+def _jcs_write_value(obj: Any, sink: io.BytesIO) -> None:
+    if obj is None:
+        sink.write(b"null")
+    elif isinstance(obj, bool):
+        sink.write(b"true" if bool(obj) else b"false")
+    elif isinstance(obj, int):
+        n = int(obj)
+        if n < _JCS_INT_MIN or n > _JCS_INT_MAX:
+            raise ValueError(f"{n} exceeds safe integer domain for JSON floats")
+        sink.write(str(n).encode("ascii"))
+    elif isinstance(obj, str):
+        _jcs_write_str(obj, sink)
+    elif isinstance(obj, float):
+        _jcs_write_float(float(obj), sink)
+    elif isinstance(obj, (list, tuple)):
+        if not obj:
+            sink.write(b"[]")
+            return
+        sink.write(b"[")
+        for idx, elem in enumerate(obj):
+            if idx > 0:
+                sink.write(b",")
+            _jcs_write_value(elem, sink)
+        sink.write(b"]")
+    elif isinstance(obj, dict):
+        if not obj:
+            sink.write(b"{}")
+            return
+        keyed: list[tuple[bytes, str, Any]] = []
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise ValueError("object keys must be strings")
+            try:
+                sort_key = k.encode("utf-16-be")
+            except UnicodeEncodeError as exc:
+                raise ValueError("object key contains lone surrogate or non-UTF-8 codepoints") from exc
+            keyed.append((sort_key, k, v))
+        keyed.sort(key=lambda item: item[0])
+        sink.write(b"{")
+        for idx, (_, key, value) in enumerate(keyed):
+            if idx > 0:
+                sink.write(b",")
+            _jcs_write_str(key, sink)
+            sink.write(b":")
+            _jcs_write_value(value, sink)
+        sink.write(b"}")
+    else:
+        raise ValueError(f"unsupported type for JCS: {type(obj).__name__}")
+
+
+def _stdlib_jcs_dumps(obj: Any) -> bytes:
+    """Pure-stdlib RFC 8785 JCS serializer returning canonical UTF-8 bytes."""
+    sink = io.BytesIO()
+    _jcs_write_value(obj, sink)
+    return sink.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +555,9 @@ def strict_json_loads(raw: bytes | str) -> dict[str, Any]:
 
 
 def jcs_dumps(obj: Any) -> bytes:
-    """Serialize `obj` to RFC 8785 JCS canonical UTF-8 bytes (pure stdlib via projector.py)."""
+    """Serialize `obj` to RFC 8785 JCS canonical UTF-8 bytes (self-contained pure stdlib)."""
     try:
-        return bytes(_PROJECTOR._jcs_dumps(obj))
+        return _stdlib_jcs_dumps(obj)
     except Exception as exc:
         raise AuditValidationError(f"JCS canonicalization failed ({type(exc).__name__})") from exc
 
@@ -1697,12 +1829,33 @@ class AuditSpool:
 # Hardened SSH append-only transport and offline-resilient shipper
 # ---------------------------------------------------------------------------
 
+def _check_ancestors_trusted_unwritable(path: Path, *, allowed_uids: set[int]) -> None:
+    """Verify every ancestor directory from `/` down to `path.parent` is real, trusted-owned, and go-w."""
+    parts = path.parts
+    if not parts or parts[0] != "/":
+        raise AuditFileSecurityError(f"path must be absolute: {path}")
+    cur = Path("/")
+    for idx in range(len(parts) - 1):
+        if idx > 0:
+            cur = cur / parts[idx]
+        st = os.lstat(cur)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise AuditFileSecurityError(f"ancestor {cur} is symlink or non-directory")
+        if st.st_uid not in allowed_uids:
+            raise AuditFileSecurityError(f"ancestor {cur} owned by untrusted uid {st.st_uid}")
+        if (stat.S_IMODE(st.st_mode) & 0o022) != 0:
+            raise AuditFileSecurityError(
+                f"ancestor {cur} is group- or world-writable (mode {oct(stat.S_IMODE(st.st_mode))})"
+            )
+
+
 def _validate_ssh_safe_file_path(
     p: Path,
     *,
     label: str,
     require_private_mode: bool = False,
     require_exec: bool = False,
+    enforce_owner_and_ancestors: bool = False,
 ) -> Path:
     if not p.is_absolute():
         raise AuditFileSecurityError(f"{label} must be an absolute path")
@@ -1716,9 +1869,18 @@ def _validate_ssh_safe_file_path(
     st = os.lstat(p)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise AuditFileSecurityError(f"{label} must be a regular non-symlink file")
-    if require_private_mode and (stat.S_IMODE(st.st_mode) & 0o077) != 0:
+    mode = stat.S_IMODE(st.st_mode)
+    if enforce_owner_and_ancestors:
+        euid = os.geteuid()
+        allowed = {0} if euid == 0 else {0, euid}
+        _check_ancestors_trusted_unwritable(p, allowed_uids=allowed)
+        if st.st_uid not in allowed:
+            raise AuditFileSecurityError(f"{label} owned by untrusted uid {st.st_uid}")
+        if (mode & 0o6022) != 0:
+            raise AuditFileSecurityError(f"{label} has writable or SUID/SGID mode {oct(mode)}")
+    if require_private_mode and (mode & 0o6077) != 0:
         raise AuditFileSecurityError(
-            f"{label} must not be group- or world-accessible (mode {oct(stat.S_IMODE(st.st_mode))})"
+            f"{label} must be private without group/other or SUID/SGID bits (mode {oct(mode)})"
         )
     if require_exec and not os.access(p, os.X_OK):
         raise AuditFileSecurityError(f"{label} is not executable")
@@ -1734,16 +1896,29 @@ def build_ssh_append_argv(
     ssh_bin: str = "/usr/bin/ssh",
     port: int | None = None,
     connect_timeout_s: int = 10,
+    enforce_owner_and_ancestors: bool = False,
 ) -> list[str]:
     """Build a hardened, non-interactive argv list for SSH append-only shipping."""
     _require_regex(src, SRC_RE, "src")
     if not isinstance(target, str) or not SSH_TARGET_RE.match(target) or target.startswith("-"):
         raise TransportError("unsafe SSH target")
-    ssh_path = _validate_ssh_safe_file_path(Path(ssh_bin), label="ssh_bin", require_exec=True)
-    id_path = _validate_ssh_safe_file_path(
-        identity_file, label="identity_file", require_private_mode=True
+    ssh_path = _validate_ssh_safe_file_path(
+        Path(ssh_bin),
+        label="ssh_bin",
+        require_exec=True,
+        enforce_owner_and_ancestors=enforce_owner_and_ancestors,
     )
-    kh_path = _validate_ssh_safe_file_path(known_hosts_file, label="known_hosts_file")
+    id_path = _validate_ssh_safe_file_path(
+        identity_file,
+        label="identity_file",
+        require_private_mode=True,
+        enforce_owner_and_ancestors=enforce_owner_and_ancestors,
+    )
+    kh_path = _validate_ssh_safe_file_path(
+        known_hosts_file,
+        label="known_hosts_file",
+        enforce_owner_and_ancestors=enforce_owner_and_ancestors,
+    )
     if not _is_exact_int(connect_timeout_s) or connect_timeout_s < 1 or connect_timeout_s > 120:
         raise TransportError("invalid connect_timeout_s")
 
@@ -1788,6 +1963,7 @@ def make_ssh_append_transport(
     port: int | None = None,
     connect_timeout_s: int = 10,
     io_timeout_s: int = 30,
+    enforce_owner_and_ancestors: bool = False,
 ) -> Callable[[bytes], dict[str, Any]]:
     """Create a callable transport that pipes JSONL batches to the SSH forced command."""
     if not _is_exact_int(io_timeout_s) or io_timeout_s < 1 or io_timeout_s > 600:
@@ -1800,6 +1976,7 @@ def make_ssh_append_transport(
         ssh_bin=ssh_bin,
         port=port,
         connect_timeout_s=connect_timeout_s,
+        enforce_owner_and_ancestors=enforce_owner_and_ancestors,
     )
 
     def _send(batch_bytes: bytes) -> dict[str, Any]:
@@ -1811,18 +1988,22 @@ def make_ssh_append_transport(
                 timeout=io_timeout_s,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise TransportError("ssh_timeout") from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise TransportError(f"ssh transport failed: {exc}") from exc
+            err_code = getattr(exc, "errno", None)
+            suffix = f"_errno_{err_code}" if err_code is not None else ""
+            raise TransportError(f"ssh_exec_error{suffix}") from exc
         if proc.returncode != 0:
-            err_msg = proc.stderr.decode("utf-8", errors="replace").strip()[:200]
-            raise TransportError(f"ssh exited {proc.returncode}: {err_msg or 'no stderr'}")
+            # Never propagate remote-influenced stderr into structured results or scheduler logs (M6).
+            raise TransportError(f"ssh_exit_{proc.returncode}")
         out = proc.stdout.strip()
         if not out:
-            raise TransportError("ssh sink returned empty acknowledgment")
+            raise TransportError("ssh_empty_ack")
         try:
             return strict_json_loads(out)
         except AuditValidationError as exc:
-            raise TransportError(f"malformed sink ack JSON: {exc}") from exc
+            raise TransportError("ssh_malformed_ack") from exc
 
     return _send
 
@@ -2968,10 +3149,14 @@ SHIPPER_CONFIG_KEYS = frozenset(
 )
 
 
-def load_shipper_config(config_path: Path) -> dict[str, Any]:
-    """Load and validate a private (`0600` inside `0700` dir) shipper JSON config."""
+def load_shipper_config(
+    config_path: Path, *, expected_spool_dir: Path | None = None
+) -> dict[str, Any]:
+    """Load and validate a private (exact `0600`, `nlink==1`, inside `0700` dir) shipper JSON config."""
     abs_cfg = config_path if config_path.is_absolute() else (Path.cwd() / config_path)
     _check_ancestors_no_symlinks(abs_cfg)
+    if os.geteuid() == 0:
+        _check_ancestors_trusted_unwritable(abs_cfg, allowed_uids={0})
     with _open_dir_fd(abs_cfg.parent, require_private=True) as dfd:
         fd, _ = _open_regular_in_dir(dfd, abs_cfg.name, os.O_RDONLY)
         try:
@@ -2980,10 +3165,14 @@ def load_shipper_config(config_path: Path) -> dict[str, Any]:
                 raise AuditFileSecurityError(
                     f"shipper config {abs_cfg} owned by uid {st.st_uid}, expected euid {os.geteuid()}"
                 )
-            mode = stat.S_IMODE(st.st_mode)
-            if mode & 0o6077:
+            if st.st_nlink != 1:
                 raise AuditFileSecurityError(
-                    f"shipper config {abs_cfg} mode {oct(mode)} must be private (0600, no SUID/SGID)"
+                    f"shipper config {abs_cfg} has link count {st.st_nlink}, expected 1"
+                )
+            mode = stat.S_IMODE(st.st_mode)
+            if mode != 0o600:
+                raise AuditFileSecurityError(
+                    f"shipper config {abs_cfg} mode {oct(mode)} must be exact 0600"
                 )
             chunks: list[bytes] = []
             total = 0
@@ -3027,6 +3216,10 @@ def load_shipper_config(config_path: Path) -> dict[str, Any]:
     ):
         if not isinstance(val, str) or not ABS_PATH_RE.match(val):
             raise AuditValidationError(f"shipper config '{label}' must be an absolute path")
+    if expected_spool_dir is not None and Path(spool_dir) != expected_spool_dir:
+        raise AuditValidationError("shipper config 'spool_dir' does not match pinned spool path")
+    if os.geteuid() == 0 and ssh_bin != "/usr/bin/ssh":
+        raise AuditFileSecurityError("root shipper config must pin ssh_bin to /usr/bin/ssh")
     _require_regex(host, HOST_NAME_RE, "host")
     _require_regex(src, SRC_RE, "src")
     if not isinstance(target, str) or not target or target.startswith("-"):
@@ -3066,16 +3259,17 @@ def main(argv: list[str] | None = None) -> int:
     p_emit.add_argument("--data-json", required=True, help="JSON object for event data")
 
     p_ship = sub.add_parser("ship", help="ship unshipped spool events over hardened SSH")
-    p_ship.add_argument("--config", type=Path, help="private 0600 JSON shipper config file")
-    p_ship.add_argument("--spool-dir", type=Path)
-    p_ship.add_argument("--host")
-    p_ship.add_argument("--src", default=DEFAULT_SRC)
-    p_ship.add_argument("--target")
-    p_ship.add_argument("--identity", type=Path)
-    p_ship.add_argument("--known-hosts", type=Path)
-    p_ship.add_argument("--ssh-bin", default="/usr/bin/ssh")
-    p_ship.add_argument("--port", type=int)
-    p_ship.add_argument("--batch-size", type=int, default=100)
+    p_ship.add_argument("--config", type=Path, help="private exact-0600 JSON shipper config file")
+    p_ship.add_argument("--expected-spool-dir", type=Path, help="optional pinned spool_dir when using --config")
+    p_ship.add_argument("--spool-dir", type=Path, default=None)
+    p_ship.add_argument("--host", default=None)
+    p_ship.add_argument("--src", default=None)
+    p_ship.add_argument("--target", default=None)
+    p_ship.add_argument("--identity", type=Path, default=None)
+    p_ship.add_argument("--known-hosts", type=Path, default=None)
+    p_ship.add_argument("--ssh-bin", default=None)
+    p_ship.add_argument("--port", type=int, default=None)
+    p_ship.add_argument("--batch-size", type=int, default=None)
 
     p_sink = sub.add_parser("sink-append", help="append-only SSH forced-command receiver")
     p_sink.add_argument("--sink-root", type=Path, required=True)
@@ -3107,10 +3301,20 @@ def main(argv: list[str] | None = None) -> int:
             if args.config is not None:
                 if any(
                     v is not None
-                    for v in (args.spool_dir, args.host, args.target, args.identity, args.known_hosts, args.port)
+                    for v in (
+                        args.spool_dir,
+                        args.host,
+                        args.src,
+                        args.target,
+                        args.identity,
+                        args.known_hosts,
+                        args.ssh_bin,
+                        args.port,
+                        args.batch_size,
+                    )
                 ):
                     raise AuditValidationError("--config cannot be combined with explicit ship target flags")
-                cfg = load_shipper_config(args.config)
+                cfg = load_shipper_config(args.config, expected_spool_dir=args.expected_spool_dir)
                 if not cfg["enabled"]:
                     print(
                         json.dumps(
@@ -3132,7 +3336,10 @@ def main(argv: list[str] | None = None) -> int:
                 ssh_bin = cfg["ssh_bin"]
                 port = cfg["port"]
                 batch_size = cfg["batch_size"]
+                strict_paths = True
             else:
+                if args.expected_spool_dir is not None:
+                    raise AuditValidationError("--expected-spool-dir requires --config")
                 missing = [
                     flag
                     for flag, val in (
@@ -3148,13 +3355,14 @@ def main(argv: list[str] | None = None) -> int:
                     raise AuditValidationError(f"ship requires --config or {', '.join(missing)}")
                 spool_dir = args.spool_dir
                 host = args.host
-                src = args.src
+                src = args.src if args.src is not None else DEFAULT_SRC
                 target = args.target
                 identity = args.identity
                 known_hosts = args.known_hosts
-                ssh_bin = args.ssh_bin
+                ssh_bin = args.ssh_bin if args.ssh_bin is not None else "/usr/bin/ssh"
                 port = args.port
-                batch_size = args.batch_size
+                batch_size = args.batch_size if args.batch_size is not None else 100
+                strict_paths = os.geteuid() == 0
             spool = AuditSpool(spool_dir, host=host, src=src)
             transport = make_ssh_append_transport(
                 target=target,
@@ -3163,6 +3371,7 @@ def main(argv: list[str] | None = None) -> int:
                 src=src,
                 ssh_bin=ssh_bin,
                 port=port,
+                enforce_owner_and_ancestors=strict_paths,
             )
             res = AuditShipper(spool, transport, batch_size=batch_size).ship()
             print(json.dumps(dataclasses.asdict(res), sort_keys=True))
