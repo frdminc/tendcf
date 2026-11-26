@@ -53,7 +53,7 @@ class WorkflowPermissionsLintTests(unittest.TestCase):
 name: Spike
 on:
   push:
-    branches: ['spike/*']
+    branches: ['spike/**']
 permissions:
   contents: read
 jobs:
@@ -90,7 +90,7 @@ jobs:
 """
         self.assertEqual(lint.lint_workflow_text(wf, "locked.yml"), [])
 
-    def test_literal_word_secrets_in_comments_and_plain_shell_passes(self) -> None:
+    def test_literal_word_secrets_in_comments_plain_shell_and_single_quoted_expressions_passes(self) -> None:
         wf = """\
 # No secrets are used in this workflow.
 name: Echo
@@ -100,13 +100,22 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'secrets' && github.actor != 'don''t leak secrets'
+    snapshot:
+      image-name: my-snap
+      if: github.ref_name != 'secrets'
+    env:
+      LABEL: ${{ 'secrets' }}
+      ESCAPED: ${{ 'don''t leak secrets' }}
+      PROP: ${{ github.event.secrets }}
+      SPACED_PROP: ${{ github.event . secrets }}
     steps:
       - name: Check secrets policy
-        run: echo "no secrets here"
-      - name: Unrelated identifier in expression
-        if: ${{ github.actor != 'my_secrets' && inputs.no_secrets != 'yes' }}
-        run: echo "${{ matrix.secrets_mode }}"
+        if: ${{ github.actor != 'secrets' }}
+        run: echo "no secrets here ${{ 'secrets' }}"
+      - name: Unrelated identifiers in expression
+        if: ${{ github.actor != 'my_secrets' && inputs.no_secrets != 'yes' && inputs.secrets-foo != 'x' }}
+        run: echo "${{ matrix.secrets_mode }} ${{ inputs.my_secrets }} ${{ inputs.secrets-foo }}"
 """
         self.assertEqual(lint.lint_workflow_text(wf, "echo.yml"), [])
 
@@ -125,7 +134,10 @@ jobs:
       - run: echo hi
 """
         findings = lint.lint_workflow_text(wf, "bad.yml")
-        self.assertTrue(any("contents" in f and "write" in f for f in findings), findings)
+        self.assertTrue(
+            any("permissions.contents: disallowed permission level 'write'" in f for f in findings),
+            findings,
+        )
 
     def test_top_level_write_all_and_read_all_fail(self) -> None:
         for val in ("write-all", "read-all"):
@@ -141,9 +153,9 @@ jobs:
       - run: echo hi
 """
                 findings = lint.lint_workflow_text(wf, "bad.yml")
-                self.assertTrue(any("mapping" in f for f in findings), findings)
+                self.assertTrue(any("must be an explicit YAML mapping" in f for f in findings), findings)
 
-    def test_missing_or_null_top_level_permissions_fails(self) -> None:
+    def test_missing_empty_or_explicit_tagged_top_level_permissions_fails(self) -> None:
         wf_missing = """\
 name: Missing
 on: push
@@ -154,30 +166,42 @@ jobs:
       - run: echo hi
 """
         findings = lint.lint_workflow_text(wf_missing, "missing.yml")
-        self.assertTrue(any("missing required top-level `permissions:`" in f for f in findings), findings)
+        self.assertTrue(any("missing required top-level `permissions:` mapping" in f for f in findings), findings)
 
-        wf_null = """\
-name: Null
+        for label, perm_line, expected in (
+            ("empty scalar", "permissions:", "must be an explicit YAML mapping"),
+            ("empty string", 'permissions: ""', "must be an explicit YAML mapping"),
+            ("tilde null", "permissions: ~", "must be an explicit YAML mapping"),
+            ("explicit !!null", 'permissions: !!null ""', "YAML parse error"),
+            ("explicit !!bool", "permissions: !!bool true", "YAML parse error"),
+        ):
+            with self.subTest(case=label):
+                wf = f"""\
+name: BadPerm
 on: push
-permissions:
+{perm_line}
 jobs:
   a:
     runs-on: ubuntu-latest
     steps:
       - run: echo hi
 """
-        findings = lint.lint_workflow_text(wf_null, "null.yml")
-        self.assertTrue(any("mapping" in f for f in findings), findings)
+                findings = lint.lint_workflow_text(wf, "badperm.yml")
+                self.assertTrue(any(expected in f for f in findings), findings)
 
     def test_job_level_elevated_permissions_fail(self) -> None:
         cases = [
-            ("id-token: write", "    permissions:\n      id-token: write\n"),
-            ("packages: read", "    permissions:\n      packages: read\n"),
-            ("write-all", "    permissions: write-all\n"),
-            ("read-all", "    permissions: read-all\n"),
-            ("reusable workflow write", "    uses: org/repo/.github/workflows/w.yml@main\n    permissions:\n      contents: write\n"),
+            ("id-token: write", "    permissions:\n      id-token: write\n", "disallowed permission level 'write'"),
+            ("packages: read", "    permissions:\n      packages: read\n", "disallowed permission level 'read'"),
+            ("write-all", "    permissions: write-all\n", "must be an explicit YAML mapping"),
+            ("read-all", "    permissions: read-all\n", "must be an explicit YAML mapping"),
+            (
+                "reusable workflow write",
+                "    uses: org/repo/.github/workflows/w.yml@main\n    permissions:\n      contents: write\n",
+                "disallowed permission level 'write'",
+            ),
         ]
-        for label, job_block in cases:
+        for label, job_block, expected in cases:
             with self.subTest(case=label):
                 wf = f"""\
 name: JobPerm
@@ -191,43 +215,68 @@ jobs:
       - run: echo hi
 """
                 findings = lint.lint_workflow_text(wf, "jobperm.yml")
-                self.assertGreaterEqual(len(findings), 1, f"{label} should fail")
-                self.assertTrue(any("jobs.bad.permissions" in f for f in findings), findings)
+                self.assertTrue(
+                    any("jobs.bad.permissions" in f and expected in f for f in findings),
+                    findings,
+                )
 
-    def test_duplicate_permissions_key_fails(self) -> None:
+    def test_duplicate_keys_exact_and_case_insensitive_fail(self) -> None:
+        cases = [
+            (
+                "duplicate top-level permissions",
+                "name: Dup\non: push\npermissions:\n  contents: read\npermissions:\n  contents: write\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            ),
+            (
+                "case-insensitive top-level Permissions",
+                "name: DupCI\non: push\npermissions:\n  contents: read\nPermissions:\n  contents: write\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            ),
+            (
+                "duplicate nested permission scope",
+                "name: DupNested\non: push\npermissions:\n  contents: write\n  contents: read\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            ),
+            (
+                "case-insensitive nested Contents scope",
+                "name: DupNestedCI\non: push\npermissions:\n  contents: read\n  Contents: write\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            ),
+        ]
+        for label, wf in cases:
+            with self.subTest(case=label):
+                findings = lint.lint_workflow_text(wf, "dup.yml")
+                self.assertTrue(any("found duplicate key" in f for f in findings), findings)
+
+    def test_case_insensitive_capitalized_policy_keys_are_enforced(self) -> None:
         wf = """\
-name: Dup
-on: push
-permissions:
-  contents: read
-permissions:
+name: Caps
+ON:
+  WORKFLOW_CALL:
+    SECRETS:
+      tok:
+        required: true
+Permissions:
   contents: write
-jobs:
+JOBS:
   a:
     runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
+    PERMISSIONS:
+      id-token: write
+    SECRETS: inherit
+    IF: secrets.FOO != ''
+    SNAPSHOT:
+      IF: secrets.BAR != ''
+    STEPS:
+      - IF: secrets.BAZ != ''
+        run: echo hi
 """
-        findings = lint.lint_workflow_text(wf, "dup.yml")
-        self.assertTrue(any("duplicate key" in f for f in findings), findings)
+        findings = lint.lint_workflow_text(wf, "caps.yml")
+        self.assertTrue(any("permissions.contents: disallowed permission level 'write'" in f for f in findings), findings)
+        self.assertTrue(any("on.workflow_call.secrets: secrets declaration is disallowed" in f for f in findings), findings)
+        self.assertTrue(any("jobs.a.permissions.id-token: disallowed permission level 'write'" in f for f in findings), findings)
+        self.assertTrue(any("jobs.a.secrets: secrets forwarding is disallowed" in f for f in findings), findings)
+        self.assertTrue(any("JOBS.a.IF: expression references `secrets` context" in f for f in findings), findings)
+        self.assertTrue(any("JOBS.a.SNAPSHOT.IF: expression references `secrets` context" in f for f in findings), findings)
+        self.assertTrue(any("JOBS.a.STEPS[0].IF: expression references `secrets` context" in f for f in findings), findings)
 
-    def test_duplicate_nested_permission_scope_fails(self) -> None:
-        wf = """\
-name: DupNested
-on: push
-permissions:
-  contents: write
-  contents: read
-jobs:
-  a:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"""
-        findings = lint.lint_workflow_text(wf, "dupnested.yml")
-        self.assertTrue(any("duplicate key" in f for f in findings), findings)
-
-    def test_yaml_anchor_and_merge_smuggling_fails(self) -> None:
+    def test_yaml_anchor_alias_and_merge_keys_fail(self) -> None:
         wf_alias = """\
 name: Anchor
 on: push
@@ -241,51 +290,93 @@ jobs:
       - run: echo hi
 """
         findings = lint.lint_workflow_text(wf_alias, "anchor.yml")
-        self.assertTrue(any("contents" in f and "write" in f for f in findings), findings)
+        self.assertTrue(
+            any("permissions.contents: disallowed permission level 'write'" in f for f in findings),
+            findings,
+        )
 
-        wf_merge = """\
-name: Merge
+        merge_cases = [
+            (
+                "single mapping merge",
+                "name: M1\non: push\nx-e: &e\n  id-token: write\npermissions:\n  <<: *e\n  contents: read\njobs: {}\n",
+            ),
+            (
+                "sequence merge",
+                "name: M2\non: push\nx-a: &a\n  contents: read\nx-b: &b\n  contents: write\npermissions:\n  <<: [*a, *b]\njobs: {}\n",
+            ),
+            (
+                "anchored key merge",
+                "name: M3\non: push\nx-a: &a\n  contents: write\npermissions:\n  &mk <<: *a\njobs: {}\n",
+            ),
+            (
+                "explicit !!merge tag",
+                "name: M4\non: push\nx-a: &a\n  contents: write\npermissions:\n  !!merge <<: *a\njobs: {}\n",
+            ),
+        ]
+        for label, wf in merge_cases:
+            with self.subTest(case=label):
+                findings = lint.lint_workflow_text(wf, "merge.yml")
+                self.assertTrue(
+                    any("YAML merge key '<<' is disallowed" in f for f in findings),
+                    findings,
+                )
+
+    def test_yaml_11_python_dict_slot_collision_exploits_caught(self) -> None:
+        """Adversary F2 [HIGH]: BaseLoader keeps keys as strings so `yes`/`1`, `no`/`0`,
+        `on`/`1.0`, `2`/`2.0` cannot collide in Python dict slots and overwrite a secret."""
+        cases = [
+            ("env yes/1", '    env:\n      yes: "${{ secrets.EXFIL }}"\n      1: "benign"\n'),
+            ("env no/0", '    env:\n      no: "${{ secrets.EXFIL }}"\n      0: "benign"\n'),
+            ("env on/1.0", '    env:\n      on: "${{ secrets.EXFIL }}"\n      1.0: "benign"\n'),
+            ("env 2/2.0", '    env:\n      2: "${{ secrets.EXFIL }}"\n      2.0: "benign"\n'),
+            (
+                "step with on/1",
+                '    steps:\n      - uses: actions/checkout@v4\n        with:\n          on: "${{ secrets.EXFIL }}"\n          1: "benign"\n',
+            ),
+        ]
+        for label, block in cases:
+            with self.subTest(case=label):
+                wf = f"""\
+name: Collide
 on: push
-x-elev: &elev
-  id-token: write
 permissions:
-  <<: *elev
   contents: read
 jobs:
   a:
     runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"""
-        findings = lint.lint_workflow_text(wf_merge, "merge.yml")
-        self.assertTrue(any("id-token" in f and "write" in f for f in findings), findings)
+{block}"""
+                findings = lint.lint_workflow_text(wf, "collide.yml")
+                self.assertTrue(
+                    any("expression references `secrets` context" in f for f in findings),
+                    findings,
+                )
 
-        wf_merge_override = """\
-name: MergeOverride
-on: push
-x-elev: &elev
-  contents: write
-permissions:
-  <<: *elev
-  contents: read
-jobs:
-  a:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-"""
-        findings = lint.lint_workflow_text(wf_merge_override, "merge-override.yml")
-        self.assertTrue(any("duplicate key" in f for f in findings), findings)
+    def test_alias_expansion_bomb_fails_closed_within_node_budget(self) -> None:
+        lines = [
+            "name: Bomb",
+            "on: push",
+            "permissions:",
+            "  contents: read",
+            "x-a0: &a0 [x, x]",
+        ]
+        for i in range(1, 25):
+            lines.append(f"x-a{i}: &a{i} [*a{i - 1}, *a{i - 1}]")
+        lines.append("jobs: {}")
+        wf = "\n".join(lines) + "\n"
+        findings = lint.lint_workflow_text(wf, "bomb.yml")
+        self.assertTrue(any("exceeds node traversal limit" in f for f in findings), findings)
 
-    # ---- Negative cases: secrets
+    # ---- Negative cases: secrets & malformed expressions
 
     def test_expression_secrets_references_fail(self) -> None:
         expressions = [
             "${{ secrets.MY_SECRET }}",
+            "${{ secrets . MY_SECRET }}",
             "${{ secrets['MY_SECRET'] }}",
             '${{ secrets["MY_SECRET"] }}',
             "${{ toJSON(secrets) }}",
             "${{ SECRETS.FOO }}",
+            "${{ !secrets.FOO }}",
             "${{ '}}' && secrets.HIDDEN }}",
         ]
         for expr in expressions:
@@ -304,9 +395,65 @@ jobs:
       - run: echo hi
 """
                 findings = lint.lint_workflow_text(wf, "secexpr.yml")
-                self.assertTrue(any("secrets" in f for f in findings), findings)
+                self.assertTrue(
+                    any("expression references `secrets` context" in f for f in findings),
+                    findings,
+                )
 
-    def test_bare_if_secrets_references_fail_at_job_and_step_levels(self) -> None:
+    def test_unclosed_expression_and_unclosed_single_quote_fail_closed(self) -> None:
+        wf_unclosed_expr = """\
+name: UnclosedExpr
+on: push
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env:
+      X: "${{ 'unclosed }} ${{ secrets.FOO }}"
+    steps:
+      - run: echo hi
+"""
+        findings = lint.lint_workflow_text(wf_unclosed_expr, "unclosed-expr.yml")
+        self.assertTrue(any("malformed expression (unclosed '${{' delimiter)" in f for f in findings), findings)
+        self.assertTrue(any("malformed expression (unclosed single-quoted string literal)" in f for f in findings), findings)
+
+        wf_unclosed_bare_if = """\
+name: UnclosedIf
+on: push
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    if: "'unclosed || secrets.FOO"
+    steps:
+      - run: echo hi
+"""
+        findings = lint.lint_workflow_text(wf_unclosed_bare_if, "unclosed-if.yml")
+        self.assertTrue(
+            any("jobs.a.if: malformed expression (unclosed single-quoted string literal)" in f for f in findings),
+            findings,
+        )
+
+        wf_unclosed_tail_secret = """\
+name: UnclosedTail
+on: push
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    env:
+      X: "${{ secrets.FOO"
+    steps:
+      - run: echo hi
+"""
+        findings = lint.lint_workflow_text(wf_unclosed_tail_secret, "unclosed-tail.yml")
+        self.assertTrue(any("malformed expression (unclosed '${{' delimiter)" in f for f in findings), findings)
+        self.assertTrue(any("expression references `secrets` context" in f for f in findings), findings)
+
+    def test_bare_if_secrets_references_fail_at_job_step_and_snapshot_levels(self) -> None:
         wf_job_if = """\
 name: BareJobIf
 on: push
@@ -320,7 +467,10 @@ jobs:
       - run: echo hi
 """
         findings = lint.lint_workflow_text(wf_job_if, "jobif.yml")
-        self.assertTrue(any("jobs.a.if" in f and "secrets" in f for f in findings), findings)
+        self.assertTrue(
+            any("jobs.a.if: expression references `secrets` context" in f for f in findings),
+            findings,
+        )
 
         wf_step_if = """\
 name: BareStepIf
@@ -335,7 +485,30 @@ jobs:
         run: echo hi
 """
         findings = lint.lint_workflow_text(wf_step_if, "stepif.yml")
-        self.assertTrue(any("jobs.a.steps[0].if" in f and "secrets" in f for f in findings), findings)
+        self.assertTrue(
+            any("jobs.a.steps[0].if: expression references `secrets` context" in f for f in findings),
+            findings,
+        )
+
+        wf_snapshot_if = """\
+name: BareSnapshotIf
+on: push
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    snapshot:
+      image-name: snap
+      if: secrets.MY_SECRET != ''
+    steps:
+      - run: echo hi
+"""
+        findings = lint.lint_workflow_text(wf_snapshot_if, "snapif.yml")
+        self.assertTrue(
+            any("jobs.a.snapshot.if: expression references `secrets` context" in f for f in findings),
+            findings,
+        )
 
     def test_reusable_workflow_secrets_fail(self) -> None:
         wf_inherit = """\
@@ -349,7 +522,10 @@ jobs:
     secrets: inherit
 """
         findings = lint.lint_workflow_text(wf_inherit, "inherit.yml")
-        self.assertTrue(any("jobs.call.secrets" in f for f in findings), findings)
+        self.assertTrue(
+            any("jobs.call.secrets: secrets forwarding is disallowed" in f for f in findings),
+            findings,
+        )
 
         wf_map = """\
 name: ReuseMap
@@ -363,7 +539,14 @@ jobs:
       tok: ${{ secrets.MY_TOK }}
 """
         findings = lint.lint_workflow_text(wf_map, "map.yml")
-        self.assertTrue(any("jobs.call.secrets" in f for f in findings), findings)
+        self.assertTrue(
+            any("jobs.call.secrets: secrets forwarding is disallowed" in f for f in findings),
+            findings,
+        )
+        self.assertTrue(
+            any("expression references `secrets` context" in f for f in findings),
+            findings,
+        )
 
         wf_callee = """\
 name: Callee
@@ -381,7 +564,10 @@ jobs:
       - run: echo hi
 """
         findings = lint.lint_workflow_text(wf_callee, "callee.yml")
-        self.assertTrue(any("on.workflow_call.secrets" in f for f in findings), findings)
+        self.assertTrue(
+            any("on.workflow_call.secrets: secrets declaration is disallowed" in f for f in findings),
+            findings,
+        )
 
     # ---- Negative cases: filesystem & malformed YAML
 
@@ -411,7 +597,7 @@ jobs:
             "name: Ok\non: push\npermissions:\n  contents: read\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
         )
         _, findings = lint.lint_workflows_dir(wf_dir)
-        self.assertTrue(any("non-regular file" in f for f in findings), findings)
+        self.assertTrue(any("non-regular file not allowed" in f for f in findings), findings)
 
     def test_malformed_yaml_fails(self) -> None:
         wf = "name: Broken\non: [push\npermissions:\n  contents: read\n"

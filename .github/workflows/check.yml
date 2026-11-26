@@ -2,7 +2,7 @@ name: Check
 
 on:
   push:
-    branches: [master, 'spike/*']
+    branches: [master, 'spike/**']
   pull_request:
   workflow_dispatch:
   schedule:
@@ -41,10 +41,13 @@ jobs:
       - name: Cross-reference lint
         run: bin/xref_lint.py
 
-      # Issue #63 / AGENTS.md standing rule 3 (spike lane hardening): enforce
+      # Issue #63 / AGENTS.md standing rule 3 (spike lane hardening): gates PRs
+      # to `master` and checks pushes to `master` and `spike/**` for explicit
       # `permissions: contents: read` (no writes, no non-contents reads) and no
-      # secrets across every workflow in .github/workflows/, including pushes
-      # to `spike/*` branches.
+      # secrets across `.github/workflows/`. Preventing CI bypass or repo-secret
+      # exposure additionally depends on GitHub repo settings (branch ruleset
+      # requiring `check` on `master`, `default_workflow_permissions: read`, and
+      # zero repo-level secrets or `master`-only Environments).
       - name: Workflow permissions lint
         run: |
           bin/workflow_permissions_lint.py
