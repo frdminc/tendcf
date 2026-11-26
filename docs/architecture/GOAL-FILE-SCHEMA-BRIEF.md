@@ -26,7 +26,7 @@ opinion falsifiable.
    `schema/services.schema.json`, `schema/report-row.schema.json` — the house
    style you must match, and the existing `$defs` you should reuse rather than
    reinvent. Also `examples/` and `examples/broken/` for the fixture
-   convention, and `bin/schema_lint.py` for what lint enforces.
+   convention, and `tools/schema_lint.py` for what lint enforces.
 
 ## Context in one paragraph
 

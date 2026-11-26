@@ -26,9 +26,9 @@ case), or `UNVERIFIABLE` (and why).
   byte-identical", "134 findings", "49 frozen / 27 linted" (b12ee79 — note a
   later commit changes this, so check which number belongs to which commit).
 - **The eight mutations in d699fd6.** Each claims a specific failure mode and
-  message. Re-run them: apply the mutation, run `bin/schema_lint.py`, confirm
-  it goes red for the stated reason, restore. `bin/projector.py` is tracked
-  now, so `git checkout bin/projector.py` restores it. Report any mutation
+  message. Re-run them: apply the mutation, run `tools/schema_lint.py`, confirm
+  it goes red for the stated reason, restore. `tools/projector.py` is tracked
+  now, so `git checkout tools/projector.py` restores it. Report any mutation
   whose claimed result you cannot reproduce.
 - **The three mutations in 505393e** (`required`->`minLength`,
   `if/then`->`if/else`, `propertyNames`->`additionalProperties` go red;

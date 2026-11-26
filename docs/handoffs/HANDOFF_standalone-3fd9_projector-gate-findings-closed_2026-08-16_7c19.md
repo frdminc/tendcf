@@ -36,11 +36,11 @@ master `f51f31b`, clean, everything pushed. Seven commits since `159628e`:
 | `21a4ef5` | F5 | `\Z` not `$`, ×3, with fixtures 79–81 |
 | `dac29dd` | F7 | N-5 reads value position; fixtures 82–83 |
 | `849326b` | F6 | innermost `$ref` only; `items` out of `APPLICATORS` |
-| `6700be2` | F8 | fixtures 84–92, N-8 as a property, `bin/flag_coverage.py` |
+| `6700be2` | F8 | fixtures 84–92, N-8 as a property, `tools/flag_coverage.py` |
 | `f51f31b` | F9 | canonical-bytes claim made true again |
 
-19 files, +352/−54. One new tool (`bin/flag_coverage.py`), 15 new fixtures
-(78–92), `bin/projector.py` and `bin/schema_lint.py` modified,
+19 files, +352/−54. One new tool (`tools/flag_coverage.py`), 15 new fixtures
+(78–92), `tools/projector.py` and `tools/schema_lint.py` modified,
 `examples/broken/README.md` extended.
 
 Gate state, all re-measured at `f51f31b`:
@@ -58,7 +58,7 @@ F3–F9 are closed here, so nothing is open from the review.
 **Open questions, both design rather than defect:** (1) device-trust's
 destination, §11 — see Where We're Going item 1; (2) F7's fourth trust body,
 which is genuinely undecidable from projection bytes and is recorded as a
-stated limit in `bin/projector.py`'s docstring rather than as a TODO. Neither
+stated limit in `tools/projector.py`'s docstring rather than as a TODO. Neither
 blocks anything; both are named so the next session does not rediscover them
 as surprises.
 
@@ -139,7 +139,7 @@ on disk", loop iterates `EXAMPLES`, `OUTPUT_ONLY_EXAMPLES` removes
    with the anchor passed as `argv`; both then bit correctly.
    **This is the single most important process note in this document.** An
    unapplied mutation and a surviving check are indistinguishable in the
-   output. `bin/flag_coverage.py` refuses to report a number if any
+   output. `tools/flag_coverage.py` refuses to report a number if any
    mutation fails to apply, for exactly this reason.
 2. **A README swap anchor matched 3 times** (`` schema (`const`) | `` is
    not unique in `examples/broken/README.md`). The assert caught it; redone
@@ -158,7 +158,7 @@ on disk", loop iterates `EXAMPLES`, `OUTPUT_ONLY_EXAMPLES` removes
   whole thesis is that a check which is not mutation-guarded is not a check,
   and "8/19" was a number nobody could re-derive. Rejected the smaller fix
   because it would have left ten sites deletable in silence.
-- **`bin/flag_coverage.py` stays OUT of `schema_lint`.** It runs the whole
+- **`tools/flag_coverage.py` stays OUT of `schema_lint`.** It runs the whole
   lint once per site — ~21 runs, ~18s, against a lint that takes 0.86s and
   runs on every commit. Measured both numbers before deciding. Rejected
   wiring it in.
@@ -232,7 +232,7 @@ All 59 negative fixtures still pass with their existing parentheticals, so
 no cell was leaning on the loose evidence. The `oneOf` looseness is
 deliberately kept and is now most of the remaining width.
 
-**`flag()` coverage of `check_projection()`**, `bin/flag_coverage.py`:
+**`flag()` coverage of `check_projection()`**, `tools/flag_coverage.py`:
 
 - review measured 8/19 · re-measured at session start 11/21 · **now 21/21**
 - the ten that survived at session start: lines 341, 351, 354, 391, 414,
@@ -248,7 +248,7 @@ fixture-76 lesson: a fixture carrying a second defect lets the check under
 test stop firing unnoticed.
 
 **Timing measured before the flag_coverage placement decision:**
-`bin/schema_lint.py` 0.86s real; `bin/flag_coverage.py` ~18s (21 lint runs).
+`tools/schema_lint.py` 0.86s real; `tools/flag_coverage.py` ~18s (21 lint runs).
 
 ## Operator Feedback
 
@@ -281,7 +281,7 @@ test stop firing unnoticed.
 3. **nix2cf** — in the operator's approved scope for two sessions now and
    still never touched. Worth explicitly deciding whether it is still in
    scope rather than letting it ride a third time.
-4. **Run `bin/flag_coverage.py` after any change to `check_projection()`.**
+4. **Run `tools/flag_coverage.py` after any change to `check_projection()`.**
    It must stay 21/21. It is NOT part of `schema_lint` (see Key Decisions).
 5. Unrelated, carried from `c60a`/`ad4c`/`0b22`/`7b18`/`4a48`/`b0ff`:
    confirm `track-issue-activity.yml`'s Discussion path fires in
@@ -295,16 +295,16 @@ test stop firing unnoticed.
 cd /Users/djbclark/src/tendcf && git log --oneline -8
 
 # All three gates. These are the numbers to expect at f51f31b:
-bin/schema_lint.py     # OK (8 schemas, 59 negative, 6 byte-class, 27 projection)
-bin/xref_lint.py       # 0 findings, 28 live / 57 frozen
-bin/flag_coverage.py   # 21/21 rules independently guarded  (~18s, on demand only)
-bin/projector.py examples/goal-file.json | cmp - examples/host_specific.json
+tools/schema_lint.py     # OK (8 schemas, 59 negative, 6 byte-class, 27 projection)
+tools/xref_lint.py       # 0 findings, 28 live / 57 frozen
+tools/flag_coverage.py   # 21/21 rules independently guarded  (~18s, on demand only)
+tools/projector.py examples/goal-file.json | cmp - examples/host_specific.json
 
 # The design question that is next (§11):
 sed -n '/^## 11/,/^## 12/p' docs/architecture/projector-reconciliation-2026-08-16.md
 
 # What F7 left open, in the projector's own words:
-sed -n '/Two limits of that checker/,/^The id patterns/p' bin/projector.py
+sed -n '/Two limits of that checker/,/^The id patterns/p' tools/projector.py
 
 # The review this chain has now fully answered (all nine findings closed):
 sed -n '1,20p' docs/paper/reviews/2026-08-16_opus-5-high_projector-gate-review.md
@@ -315,8 +315,8 @@ sed -n '1,20p' docs/paper/reviews/2026-08-16_opus-5-high_projector-gate-review.m
 ```bash
 git add -A && git commit -m "..."   # 1. commit the fix FIRST
 python3 mutate.py "<anchor>" "<replacement>"   # 2. mutate — ASSERT the anchor
-bin/schema_lint.py                             #    matched exactly once
-git checkout bin/projector.py                  # 3. restore
+tools/schema_lint.py                             #    matched exactly once
+git checkout tools/projector.py                  # 3. restore
 ```
 
 Pass anchors as `argv` from a script file, never inside a `python3 -c`

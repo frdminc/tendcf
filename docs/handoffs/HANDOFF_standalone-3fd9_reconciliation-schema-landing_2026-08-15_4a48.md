@@ -22,7 +22,7 @@ follow-on edits itself. Its §18 lists five items, operator-gated, to be
 landed one at a time: (1) the goal-file/goal-diff/approval-record schema
 family, (2) a `report-row.schema.json` addition, (3) seven
 `architecture-DEFINITIVE-v3.md` amendments, (4) guide amendments, (5)
-extending `bin/schema_lint.py`'s fixture mechanism. This session resumed
+extending `tools/schema_lint.py`'s fixture mechanism. This session resumed
 from handoff `b0ff` (which had landed the glossary and the xref linter)
 and worked through items 3, 1, and 2, in that order, at the operator's
 direction each time.
@@ -38,8 +38,8 @@ session started (`466e68d`):
 - `3bb0a9d` — `report-row.schema.json`'s `schema_ceiling` addition
   (§18 item 2).
 
-`bin/schema_lint.py` passes clean: 8 schemas, 43/43 negative fixtures
-caught. `bin/xref_lint.py` reports only 3 pre-existing findings, all
+`tools/schema_lint.py` passes clean: 8 schemas, 43/43 negative fixtures
+caught. `tools/xref_lint.py` reports only 3 pre-existing findings, all
 unrelated to this session's work (two in the E1 adjudication docs, one
 in the Grok opinion — `docs/architecture/e1-adjudication-2026-08-15.md:316`,
 `e1-adjudication-xhigh-2026-08-15.md:49`, `goal-file-schema-opinion-grok.md:278`,
@@ -86,12 +86,12 @@ correction-in-place:
   build" list. Fixed both citations (lines 430, 1159 of the reconciliation
   doc) to read "Grok §9, cut 12" rather than "Grok §9.12" — this was
   flagged as a blocker in the parent handoff and is now resolved;
-  `bin/xref_lint.py` confirms zero findings against either file it
+  `tools/xref_lint.py` confirms zero findings against either file it
   touched.
 - **Byte-class negatives explicitly deferred to §18 item 5, not built
   now.** Reconciliation §13 names negatives that need raw pre-parse byte
   comparison (a pretty-printed twin of the happy path, duplicate keys,
-  non-NFC strings, a `15.0` spelling of `15`) — `bin/schema_lint.py`
+  non-NFC strings, a `15.0` spelling of `15`) — `tools/schema_lint.py`
   parses fixtures with `json.loads`/`yaml.safe_load` before any
   comparison happens, so these are structurally uncatchable without a
   new mechanism. Rather than build that mechanism inline (a real feature:
@@ -99,14 +99,14 @@ correction-in-place:
   idempotence check), the 31 fixtures landed this session are exactly
   the JSON-Schema-catchable negatives from reconciliation §10's list, and
   the byte-class set stays explicitly named as future work (in the
-  `bin/schema_lint.py` docstring and `examples/broken/README.md`).
+  `tools/schema_lint.py` docstring and `examples/broken/README.md`).
   Rejected alternative: silently skip mentioning them, which would read
   as "the negative set is complete" when it isn't.
 - **`goal-diff.schema.json` / `approval-record.schema.json` got outline
   treatment, not full adversarial fixtures.** Reconciliation §11 says so
   explicitly: "outline... not this document's tested surface." Built
   each with one happy canonical-JCS fixture, paired and registered in
-  `bin/schema_lint.py`'s `EXAMPLES`, but no negative fixture set and no
+  `tools/schema_lint.py`'s `EXAMPLES`, but no negative fixture set and no
   goal-file/goal-diff hunk-consistency cross-check ("applying hunks to
   old yields new," named in §13). Deferred alongside item 5's harness
   work, not before it — building that consistency check well needs the
@@ -130,10 +130,10 @@ correction-in-place:
 
 ## Evidence & Data
 
-- `uv run bin/schema_lint.py` → `schema-lint: OK (8 schemas, 43 negative
+- `uv run tools/schema_lint.py` → `schema-lint: OK (8 schemas, 43 negative
   fixtures)` (confirmed after each of the three commits, most recently
   at `3bb0a9d`).
-- `python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'`
+- `python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'`
   → 3 findings, all pre-existing (confirmed unchanged before and after
   this session's edits — see Where We Are for the exact three).
 - `examples/goal-file.json`: 1403 bytes, JCS-canonical, idempotent under
@@ -179,7 +179,7 @@ correction-in-place:
    and re-read `docs/architecture/architecture-DEFINITIVE-v3.md` §9.8 and
    §4.1 (both amended this session in `726a4ef`) as the target shape the
    guide needs to match.
-2. **§18 item 5: extend `bin/schema_lint.py` per reconciliation §13.**
+2. **§18 item 5: extend `tools/schema_lint.py` per reconciliation §13.**
    The byte-class fixture mechanism (raw bytes compared before parsing),
    JCS idempotence checking as a lint layer (not just a one-off script
    during fixture authoring), goal-file/goal-diff hunk-consistency
@@ -204,8 +204,8 @@ correction-in-place:
 ```bash
 cd ~/src/tendcf
 git log --oneline -5   # confirm HEAD is 3bb0a9d or a descendant
-uv run bin/schema_lint.py   # expect: schema-lint: OK (8 schemas, 43 negative fixtures)
-python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # expect: 3 pre-existing findings, unrelated
+uv run tools/schema_lint.py   # expect: schema-lint: OK (8 schemas, 43 negative fixtures)
+python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # expect: 3 pre-existing findings, unrelated
 
 # Start item 4 (the guide amendments):
 grep -n "C-9\|C-4" docs/architecture/goal-file-schema-reconciliation-2026-08-15.md

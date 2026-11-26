@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 INSTALLER = REPO / "deploy" / "darwin" / "tendcf-install.sh"
-PROJECTOR = REPO / "bin" / "projector.py"
+PROJECTOR = REPO / "tools" / "projector.py"
 DARWIN_CANARY_PRESENT = REPO / "deploy" / "darwin" / "canary" / "host_specific.json"
 DARWIN_CANARY_ABSENT = REPO / "deploy" / "darwin" / "canary" / "host_specific-absent.json"
 DARWIN_OK_CF_SCRIPT = (
@@ -1099,8 +1099,8 @@ class TendcfInstallHardeningContract(unittest.TestCase):
         res_fn = _extract_func(self.src, "resolve_projector_src")
         self.assertLess(
             res_fn.find("$here/bin/projector.py"),
-            res_fn.find("$here/../../bin/projector.py"),
-            "sibling $here/bin/projector.py must take precedence over $here/../../bin/projector.py",
+            res_fn.find("$here/../../tools/projector.py"),
+            "sibling $here/bin/projector.py must take precedence over $here/../../tools/projector.py",
         )
 
         acq_fn = _extract_func(self.src, "acquire_publish_lock")
@@ -1463,11 +1463,11 @@ class TendcfInstallHardeningContract(unittest.TestCase):
             r_restore = run_place(str(PROJECTOR), sha=proj_sha)
             self.assertEqual(r_restore.returncode, 0, r_restore.stderr)
 
-            # 6. Sibling $here/bin/projector.py wins over competing $here/../../bin/projector.py
+            # 6. Sibling $here/bin/projector.py wins over competing $here/../../tools/projector.py
             outer = root / "outer"
-            (outer / "bin").mkdir(parents=True)
+            (outer / "tools").mkdir(parents=True)
             (outer / "a" / "b" / "bin").mkdir(parents=True)
-            (outer / "bin" / "projector.py").write_bytes(b"# outer\n")
+            (outer / "tools" / "projector.py").write_bytes(b"# outer\n")
             sib_bytes = PROJECTOR.read_bytes()
             (outer / "a" / "b" / "bin" / "projector.py").write_bytes(sib_bytes)
             r_prec = run_place(

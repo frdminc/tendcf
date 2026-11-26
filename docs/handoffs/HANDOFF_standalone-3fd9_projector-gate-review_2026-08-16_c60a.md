@@ -23,8 +23,8 @@ point and carries the findings; everything else in `9229` still stands.**
 
 The review asked the one question none of the earlier work had: *can a
 projection be wrong under the reconciliation yet be accepted by
-`validate_projection()`, or can `bin/projector.py` be changed to emit wrong
-bytes while `bin/schema_lint.py` still reports OK?* The session had claimed
+`validate_projection()`, or can `tools/projector.py` be changed to emit wrong
+bytes while `tools/schema_lint.py` still reports OK?* The session had claimed
 eight mutations all bit; the brief explicitly asked for a ninth that does
 not.
 
@@ -81,7 +81,7 @@ all raised. Now a refusal in both places.
 
 ### Failed / cost time
 
-1. **`git checkout bin/projector.py` to undo a mutation wiped the
+1. **`git checkout tools/projector.py` to undo a mutation wiped the
    uncommitted F1+F2 fixes.** This is the SECOND time this exact mistake
    happened in one session — `9229` records the first, on
    `examples/broken/README.md`. **Rule: commit the fix, THEN mutate, then
@@ -130,7 +130,7 @@ Mutations added this session (each restored, tree clean afterwards):
 
 - **F3 · HIGH · the ninth mutation.** There is no NFC fixture; 66–75 cover
   N-2, N-3, N-4, N-5, N-6-JCS, N-7, N-9, N-10, N-12. Neutering the NFC
-  check at `bin/projector.py:448` alone leaves `schema-lint: OK` while
+  check at `tools/projector.py:448` alone leaves `schema-lint: OK` while
   `project()` emits `b"cafe\xcc\x81"` for `working_dir "/srv/café"`. The
   eight mutations in `d699fd6` never reach that check; only the golden
   guards it, and the golden is all-ASCII. **This is the specific claim
@@ -143,7 +143,7 @@ Mutations added this session (each restored, tree clean afterwards):
   cannot see it either — the only absent entry in the example
   (`com.tendcf.caddy.retired`) is `state`-only, so it has no argv to
   permute.
-- **F5 · MEDIUM · N-9 evadable.** `bin/projector.py:139-142` restates the
+- **F5 · MEDIUM · N-9 evadable.** `tools/projector.py:139-142` restates the
   schema patterns with Python `re`, where `$` matches before a final `\n`;
   JSON Schema `pattern` is ECMA-262, where it does not. An interlock id
   `"caddy-config-valid\n"` is accepted. `SECRETSPEC_NAME` (`:147`) has the
@@ -173,7 +173,7 @@ Mutations added this session (each restored, tree clean afterwards):
   tombstone split is **not independently guarded by any fixture**. Note
   their method: bytecode caching had to be disabled or it silently masked
   the first run.
-- **F9 · LOW · a docstring is now false.** `bin/schema_lint.py:382` says
+- **F9 · LOW · a docstring is now false.** `tools/schema_lint.py:382` says
   "Every `.json` fixture on disk is canonical bytes"; it iterates
   `EXAMPLES`, and `OUTPUT_ONLY_EXAMPLES` now removes `host_specific.json`
   from that set. Coverage is fine — `check_projector_golden()` byte-compares
@@ -191,7 +191,7 @@ fixture. `_refs_along()` could not be made to walk into the wrong subtree.
 ## Operator Feedback
 
 Unchanged from `9229` — the four scoping answers still bind (opinion panel
-then adjudicate; `bin/projector.py` as reference implementation; the
+then adjudicate; `tools/projector.py` as reference implementation; the
 four-item queue; scope tendcf + nix2cf, broad only if genuinely dry and
 confident it is useful). Standing authorization to commit and push.
 
@@ -210,21 +210,21 @@ resumed at 12:11 the same day. Elapsed time, not work done.
    where the gate stays *green* while the projector emits bytes the mapping
    forbids. Add an NFC fixture to `examples/broken-projection/` (78),
    bump `EXPECTED_PROJECTION` to 13, add its README row, then mutation-verify
-   by neutering `bin/projector.py:448` and confirming the lint goes red.
+   by neutering `tools/projector.py:448` and confirming the lint goes red.
    Until this lands, "the projector gate is mutation-verified" is not a
    claim anyone should make.
 2. **F4** — strengthen N-1 beyond `_shape()`. It must compare list *order*,
    not just length. Consider comparing the full document with only the
    flipped entry's `state` normalised, rather than erasing all leaves.
 3. **F5** — replace `$` with `\Z` in `ENTRY_ID_PATTERNS` and
-   `SECRETSPEC_NAME` (`bin/projector.py:139-147`). Small and mechanical.
+   `SECRETSPEC_NAME` (`tools/projector.py:139-147`). Small and mechanical.
 4. **F7** — make N-5 detect trust content in values, not only key position.
 5. **F6** — narrow `_refs_along()` to the def carrying the failing keyword,
    and drop `items` from `APPLICATORS`.
 6. **F8** — give `:373` and `:465` each an independent fixture so they stop
    masking each other; consider a coverage check that neuters each `flag()`
    site, since that is what found this.
-7. **F9** — correct the docstring at `bin/schema_lint.py:382`.
+7. **F9** — correct the docstring at `tools/schema_lint.py:382`.
 8. **device-trust's destination** — still the top open DESIGN question
    (`projector-reconciliation-2026-08-16.md` §11). P-1 removed it from the
    projection; R21's third arrow names "the agent's own config", a file
@@ -242,8 +242,8 @@ resumed at 12:11 the same day. Elapsed time, not work done.
 
 ```bash
 cd /Users/djbclark/src/tendcf && git log --oneline -6
-bin/schema_lint.py    # OK (8 schemas, 59 negative, 6 byte-class, 12 projection)
-bin/xref_lint.py      # 0 findings, 28 live / 56 frozen
+tools/schema_lint.py    # OK (8 schemas, 59 negative, 6 byte-class, 12 projection)
+tools/xref_lint.py      # 0 findings, 28 live / 56 frozen
 
 # The seven open findings, with repros:
 sed -n '/^### F3/,$p' docs/paper/reviews/2026-08-16_opus-5-high_projector-gate-review.md
@@ -251,7 +251,7 @@ sed -n '/^### F3/,$p' docs/paper/reviews/2026-08-16_opus-5-high_projector-gate-r
 # F3, the next action — confirm the hole is real before fixing it:
 python3 - <<'EOF'
 import importlib.util, json, copy
-s=importlib.util.spec_from_file_location("p","bin/projector.py")
+s=importlib.util.spec_from_file_location("p","tools/projector.py")
 m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
 g=json.load(open("examples/goal-file.json")); d=copy.deepcopy(g)
 d["domains"]["supervision"]["entries"]["service"]["com.tendcf.caddy.main"]["working_dir"]="/srv/café"
@@ -262,6 +262,6 @@ EOF
 # This was violated twice in one session and cost real rework.
 git add -A && git commit -m "..."      # fix committed
 python3 -c "...neuter one check..."    # mutate
-bin/schema_lint.py                     # must go RED, for the right reason
-git checkout bin/projector.py          # restore
+tools/schema_lint.py                     # must go RED, for the right reason
+git checkout tools/projector.py          # restore
 ```

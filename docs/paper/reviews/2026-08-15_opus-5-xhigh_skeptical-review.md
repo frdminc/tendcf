@@ -7,7 +7,7 @@ guide, declared to win over all other living documents).
 **Background consulted, not reviewed:** `tendcf-architecture-paper.md`,
 `docs/architecture/architecture-DEFINITIVE-v3.md`, plus the repository
 artifacts the guide makes factual claims about (`schema/`, `examples/`,
-`examples/broken/`, `bin/schema_lint.py`).
+`examples/broken/`, `tools/schema_lint.py`).
 **Independence:** I did not open the other review files in this directory.
 Findings here are my own; overlap with other reviewers is coincidental.
 
@@ -750,7 +750,7 @@ treat the fixture as compilable input. `[C: high / S: medium]`
 
 **F-3a — §3's schema/example pairing claim is false as implemented.** "The lint
 fails if a schema arrives without its example, or the other way around." In
-`bin/schema_lint.py` the pairing is a hardcoded four-entry `EXAMPLES` dict;
+`tools/schema_lint.py` the pairing is a hardcoded four-entry `EXAMPLES` dict;
 schemas are loaded by glob and never checked for a fixture. A new
 `schema/foo.schema.json` with no example passes. `schema/common.schema.json`
 already has no paired example, which proves the rule cannot hold as stated. The

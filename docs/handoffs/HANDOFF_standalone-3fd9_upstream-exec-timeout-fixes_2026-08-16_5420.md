@@ -319,7 +319,7 @@ cd ~/src/cfengine-core/tests/unit && ./process_terminate_unix_test
 cd ~/src/cfengine-core/tests/unit && make check 2>&1 | grep -cE '^PASS: '   # expect 64
 
 # tendcf gates
-cd ~/src/tendcf && bin/schema_lint.py && bin/xref_lint.py && bin/flag_coverage.py
+cd ~/src/tendcf && tools/schema_lint.py && tools/xref_lint.py && tools/flag_coverage.py
 
 # The exec_timeout repro lives in the filing package, paste-ready
 sed -n '/^## Repro, paste-ready/,/^## What the evidence/p' \

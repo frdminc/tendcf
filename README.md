@@ -18,19 +18,19 @@ living document disagrees on the current design, **the guide wins**.
 | --- | --- |
 | [`docs/architecture/architecture-DEFINITIVE-v3.md`](docs/architecture/architecture-DEFINITIVE-v3.md) | Implementer map (decisions, build order, protection). Must agree with the guide. |
 | [`docs/paper/tendcf-architecture-paper.md`](docs/paper/tendcf-architecture-paper.md) | Technical paper |
-| [`schema/`](schema/), [`examples/`](examples/), [`bin/schema_lint.py`](bin/schema_lint.py) | Site Model contract, fixtures, lint |
+| [`schema/`](schema/), [`examples/`](examples/), [`tools/schema_lint.py`](tools/schema_lint.py) | Site Model contract, fixtures, lint |
 | [`examples/broken/`](examples/broken/), [`examples/broken-bytes/`](examples/broken-bytes/), [`examples/broken-projection/`](examples/broken-projection/) | One hundred eighty-seven deliberately broken fixtures (153 + 6 + 28) the lint must catch |
 | [`docs/architecture/change-process.md`](docs/architecture/change-process.md) | How a change lands: lockfile, release, rollback, CI gates (issue #2) |
-| [`overlay/`](overlay/), [`bin/overlay.py`](bin/overlay.py), [`docs/architecture/upstream-overlay.md`](docs/architecture/upstream-overlay.md) | Patch overlay on libntech / cfengine/core that the generic bundle depends on (issue #3) |
-| [`compiler/`](compiler/) | The nix2cf compiler (Site Model → per-host goal file; was the separate `frdminc/nix2cf` repository, history preserved). See [`compiler/README.md`](compiler/README.md). |
+| [`overlay/`](overlay/), [`tools/overlay.py`](tools/overlay.py), [`docs/architecture/upstream-overlay.md`](docs/architecture/upstream-overlay.md) | Patch overlay on libntech / cfengine/core that the generic bundle depends on (issue #3) |
+| [`compiler/`](compiler/), [`plugins/`](plugins/) | The `tendcf` compiler (`tendcf compile`; Site Model → per-host goal file; was the separate `frdminc/nix2cf` repository, history preserved) and its in-tree plugins (static import table). See [`compiler/README.md`](compiler/README.md). |
 
 Nothing described here is deployed. Some data formats exist and are
-checked. The compiler exists only as its first piece (`buildfile`, in
-[`compiler/`](compiler/)); the rest of it, the on-device executor, and the
-consent surface are still to be built.
+checked. The compiler exists as `tendcf compile` in [`compiler/`](compiler/)
+with in-tree plugins under [`plugins/`](plugins/); the rest of it, the
+on-device executor, and the consent surface are still to be built.
 
 ```bash
-bin/schema_lint.py
+tools/schema_lint.py
 ```
 
 CI runs it on every push and pull request. Locally, it also runs as a

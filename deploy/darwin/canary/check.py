@@ -349,8 +349,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    lint = load("schema_lint", REPO / "bin" / "schema_lint.py")
-    projector = load("projector", REPO / "bin" / "projector.py")
+    lint = load("schema_lint", REPO / "tools" / "schema_lint.py")
+    projector = load("projector", REPO / "tools" / "projector.py")
     schemas, registry = lint.load_schemas()
     problems: list[str] = []
 

@@ -123,7 +123,7 @@ C7. P-§2.3-02. Weight: `improves`, to agree with 06 P-§2.3-s21. Cut "conflicts
 C8. P-§2.4-01, proposed text. Replace the last sentence ("Whether a CFEngine agent runs on Android at all, or tendcf-agent applies the goal file itself, is open.") with:
 > How CFEngine's agent runs on Android, as a native helper or behind a Termux reporter, is open (§2.4; the compiler does not yet offer an `android` platform).
 
-Replace the Merge's "D45 against s5:666-668" with "how cf-agent runs on Android (map R4; `compiler/nix2cf/cli.py` --platform)". Mark "reaches the other profiles through ShizukuPlus's privileged process" as not checked: the ShizukuPlus README (https://github.com/thejaustin/ShizukuPlus) describes "a privileged process started with adb or root" and says nothing about work profiles.
+Replace the Merge's "D45 against s5:666-668" with "how cf-agent runs on Android (map R4; `compiler/tendcf/cli.py` --platform)". Mark "reaches the other profiles through ShizukuPlus's privileged process" as not checked: the ShizukuPlus README (https://github.com/thejaustin/ShizukuPlus) describes "a privileged process started with adb or root" and says nothing about work profiles.
 
 C9. P-§2.5-01 and P-§9-07. Change Merge to "needs the operator's ruling first (how the score is computed)". The proposed texts state as settled a mechanical ceiling on the score, provenance counting and never showing 100%; none of these is in G4 (README rule 4).
 

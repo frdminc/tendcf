@@ -17,7 +17,7 @@ defaults, no prose, no nulls, no floats (goal-file reconciliation §2.1).
 reconciliation (§9) are explicit that the goal file never reaches CFEngine and
 that `host_specific.json` is produced *device-side, after approval* by a
 policy-free projection whose reference implementation is
-`tendcf/bin/projector.py`. nix2cf therefore renders the goal file, and
+`tendcf/tools/projector.py`. nix2cf therefore renders the goal file, and
 `buildfile --project` runs tendcf's projector over it as a preview of what
 `cf-agent` would read. Two implementations of the projection would drift; the
 oracle for the one that exists is `tendcf/examples/host_specific.json`.
@@ -51,7 +51,7 @@ Python 3.11+, packaged with `uv` (`pyproject.toml`, `uv run pytest`). The
 reasons:
 
 1. The contract's own tooling is Python with the same three libraries
-   (`tendcf/bin/schema_lint.py`, `bin/projector.py`: `jsonschema`, `pyyaml`,
+   (`tendcf/tools/schema_lint.py`, `tools/projector.py`: `jsonschema`, `pyyaml`,
    `rfc8785`). Using the same JSON Schema dialect implementation and the same
    JCS implementation means the compiler and the lint cannot disagree on what
    "valid" or "canonical" means.
@@ -101,7 +101,7 @@ Each of these is marked `TODO(operator)` in `nix2cf/compile.py` at the spot.
 | `supervisor` | A required host input (`--supervisor launchd\|systemd\|runit\|nixos`) next to `platform`, **no default** (house rule; spec Q1/Q8). Written into `device-trust.entries.supervisor` as `{"host":{"name":X,"state":"present"}}`. A supplied `device-trust` document whose `supervisor` entry differs is refused; one that omits it is fine. | No inventory schema exists (spec Q8); the flag goes when it does. |
 | Platform ↔ supervisor | `macos` has `launchd`; `linux` has `systemd`, `runit` or `nixos`; any other pairing, and `android`, is refused. | Not in the spec. Android/Termux is deferred (linux-targets ruling 2026-10-29), so `android` is refused rather than mapped to runit. |
 | `nixos` host | Any selected service is refused ("host is nixos-supervised; its units are the Nix configuration's"). With none, the goal file carries `supervision: {"coverage": "deliberately-unmanaged"}` and no unit-writer registry; tendcf's projector reads it as `{"vars":{}}`. | Spec §6.2 item 3, Q3. |
-| Older `schema_version` | Library only (`compile_host(..., schema_version=N)`): 3 renders without the `supervisor` entry; 4, 5, 6 and 7 omit `unit.launchd.domain` (refusing `user-gui`/`user-background`, exact launchd unit-writer labels and launchd `tendcf-install`, which exist from v8/v9); 8 emits `unit.launchd.domain: "system"` and v8 unit-writer keys (refusing `user-gui`/`user-background`, which exist from v9, with no silent rewrite) and matches v9 bar the number on `system` launchd and service-free hosts (`nixos`, `systemd`, `runit`). That is not a migration claim for arbitrary historical v4 output: v4 permitted `dpkg` unit-writer claims, which v5 rejects. A `nixos` host is refused below 4; anything else is refused. The CLI always renders the current version, and an older file is not schema-validated (tendcf's schema is a const). | Spec §6.2 item 6; schema-v5 spec §4 items 1 and 11; issues #99, #94, #103. |
+| Older `schema_version` | Removed in D46 Step 4 (`docs/architecture/plugin-layout.md` §4 "Current schema version only"). The compiler renders only `GOAL_FILE_SCHEMA_VERSION` (9) and refuses every other version. Multi-version rendering returns with map §9.6's ceiling check when non-operator devices enroll. | D46 §4; map §9.6. |
 | Unit-writer keys (schema v8) | Launchd prefixes (`.*`) and exact reverse-DNS labels (including `org.tendcf.execd` with `writer: tendcf-install`) are emitted from `launchd-writers.yml` (v2). No `unit-package` (systemd only). Schema-validated v5+ output carries no `dpkg` writer (retired in v5: the writers schema and the goal-file schema both refuse it); the renderer copies declared writers unchanged, so an old Site Model with one still renders at v4 (unvalidated) and is refused at v5+. A systemd host gets no `supervision` domain (its renderer is not built), so the "systemd prefix must be cfengine" rule has nothing to apply to. | Schema-v5 spec §2.1, §7 item 12; issue #99. |
 | Tombstones | Cannot be rendered: the Site Model has no way to say "absent". So the v5 rules that a tombstone sit under a same-domain `cfengine` claim and that no unit be present in one domain and absent in another cannot fire on nix2cf output. | Goal file supports them; the Site Model does not yet. |
 
@@ -127,7 +127,7 @@ establish the local workspace resolver (`nix2cf/workspace.py`) and
 - **Base directory:** `~/tendcf-ops`, overridden by `--ops-root` >
   `TENDCF_OPS_ROOT` > `~/tendcf-ops`. Holds optional `tendcf/` (strictly
   informational in `nix2cf workspace`; `buildfile` never auto-loads schemas or
-  `bin/projector.py` from it), required `tendcf-private-<site>/`, optional
+  `tools/projector.py` from it), required `tendcf-private-<site>/`, optional
   `tendcf-public-<site>/`, and read-only foreign `tendcf-public-<other>/`
   clones. Development worktrees live outside the site scan namespace (`~/src/`
   or `~/tendcf-ops/.worktrees/`); `-wt` suffixes are rejected as site slugs and
@@ -161,9 +161,9 @@ establish the local workspace resolver (`nix2cf/workspace.py`) and
 
 ## Tests
 
-`uv run pytest` (through `~/ops/site-private/bin/bg` on the operator's machine).
+`uv run --locked pytest` (through `~/ops/site-private/bin/bg` on the operator's machine).
 Goldens under `tests/golden/` are the compiler's regression test (paper §6.2);
-regenerate with `NIX2CF_UPDATE_GOLDEN=1` and read the diff first. The tests
+regenerate with `TENDCF_UPDATE_GOLDEN=1` and read the diff first. The tests
 also validate the output against `goal-file.schema.json`, re-serialize it with
 JCS to prove the bytes are canonical, and run tendcf's projector over it with
 zero findings.

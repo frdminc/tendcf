@@ -1,4 +1,4 @@
-"""Pure-logic tests of bin/unit_classifier.py: canned systemctl/dpkg-query output,
+"""Pure-logic tests of tools/unit_classifier.py: canned systemctl/dpkg-query output,
 no systemd and no root, so they run on the Mac. They prove the section 3.4
 verdict table and the parsers; the real behaviour of systemd and dpkg is proven by
 test_fixtures.py on the CI VMs.
@@ -10,7 +10,7 @@ import re
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 import unit_classifier as uc  # noqa: E402
 
 U = "/usr/lib/systemd/system"

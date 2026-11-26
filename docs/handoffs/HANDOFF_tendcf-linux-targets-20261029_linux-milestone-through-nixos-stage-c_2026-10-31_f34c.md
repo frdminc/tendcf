@@ -118,7 +118,7 @@ disposable.
    `~/.local/state/bigteam/nixos-cfengine-tendcf-20261031/stage-a-report.md`.
 6. Tests: `tests/policy/run.sh` passes on Mac (checks 1-4, 6 refusal path) and on CI
    (VMs: check 6 lifecycle; debian-13: check 7 NixOS shape); `tests/deploy/*.sh` green
-   on CI; `bin/schema_lint.py` 63 negative fixtures; `deploy/linux/canary/check.py` 3
+   on CI; `tools/schema_lint.py` 63 negative fixtures; `deploy/linux/canary/check.py` 3
    goal files.
 
 ## Operator Feedback

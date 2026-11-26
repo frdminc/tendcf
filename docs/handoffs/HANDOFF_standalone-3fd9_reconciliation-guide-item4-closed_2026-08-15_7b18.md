@@ -30,14 +30,14 @@ prior session — now pushed as a side effect of this session's push):
 
 - `64df1ea` — the §7 projection sentence, closing §18 item 4 in full.
 
-`bin/schema_lint.py`: `schema-lint: OK (8 schemas, 43 negative fixtures)`.
-`bin/xref_lint.py`: 3 findings, all pre-existing and unrelated (same three
+`tools/schema_lint.py`: `schema-lint: OK (8 schemas, 43 negative fixtures)`.
+`tools/xref_lint.py`: 3 findings, all pre-existing and unrelated (same three
 named in handoff `4a48`, confirmed unchanged: two in the E1 adjudication
 docs, one in the Grok opinion).
 
 §18 item 4 is now **fully closed**: §4 (YAML claim), §7 (removals
 paragraph + projection sentence), and §16.A (preview-channel marking) are
-all landed. Item 5 (extend `bin/schema_lint.py` per §13) is the only
+all landed. Item 5 (extend `tools/schema_lint.py` per §13) is the only
 remaining item and is **not started**.
 
 ## What We Tried
@@ -86,9 +86,9 @@ Nothing failed this session, but the starting assumption needed correction:
 - `git merge-base --is-ancestor d0c306f HEAD` → true (exit 0), confirming
   `d0c306f` (guide corrections C-9/C-4) was already landed, contra `4a48`'s
   "not started" claim.
-- `uv run bin/schema_lint.py` → `schema-lint: OK (8 schemas, 43 negative
+- `uv run tools/schema_lint.py` → `schema-lint: OK (8 schemas, 43 negative
   fixtures)` (confirmed after the commit).
-- `python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'` →
+- `python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'` →
   3 findings, all pre-existing (unchanged from `4a48`'s baseline):
   `docs/architecture/e1-adjudication-2026-08-15.md:316`,
   `docs/architecture/e1-adjudication-xhigh-2026-08-15.md:49`,
@@ -112,7 +112,7 @@ Nothing failed this session, but the starting assumption needed correction:
 
 ## Where We're Going
 
-1. **THE NEXT ACTION — §18 item 5: extend `bin/schema_lint.py` per
+1. **THE NEXT ACTION — §18 item 5: extend `tools/schema_lint.py` per
    reconciliation §13.** Byte-class fixture mechanism (raw bytes compared
    before parsing — pretty-printed twins, duplicate keys, non-NFC
    strings, a `15.0` spelling of `15`), JCS idempotence checking as a
@@ -141,10 +141,10 @@ Nothing failed this session, but the starting assumption needed correction:
 ```bash
 cd ~/src/tendcf
 git log --oneline -5   # confirm HEAD is 64df1ea or a descendant
-uv run bin/schema_lint.py   # expect: schema-lint: OK (8 schemas, 43 negative fixtures)
-python3 bin/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # expect: 3 pre-existing findings, unrelated
+uv run tools/schema_lint.py   # expect: schema-lint: OK (8 schemas, 43 negative fixtures)
+python3 tools/xref_lint.py | grep -vE 'reviews/|deprecated/|handoffs/'   # expect: 3 pre-existing findings, unrelated
 
 # Start item 5 (extend schema_lint.py per §13):
 sed -n '/^## 13\./,/^## 14\./p' docs/architecture/goal-file-schema-reconciliation-2026-08-15.md
-cat bin/schema_lint.py   # current lint surface to extend
+cat tools/schema_lint.py   # current lint surface to extend
 ```

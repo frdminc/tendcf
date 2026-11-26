@@ -133,7 +133,7 @@ sources check's verdict and names its item.
 > think it is weakest.
 
 **Merge:** replace the abstract; `<N>` takes the Bcfg2 idea count settled under 06 P-refs-s16 (four in the paper, six in the guide; the same count in both documents)
-**Checked:** verified, for the status claims: compiler launchd-only (inventory §A, `RENDERED_SUPERVISORS`); canary since 2026-10-31 (`docs/architecture/linux-targets.md:39`); no Mac or Android deployment (inventory §G4); independently checked 2026-11-13: weakened, corrected (the Android sentence reworded; the compiler limit narrowed to service units, `compiler/nix2cf/compile.py:95`; the idea count deferred to 06 P-refs-s16)
+**Checked:** verified, for the status claims: compiler launchd-only (inventory §A, `RENDERED_SUPERVISORS`); canary since 2026-10-31 (`docs/architecture/linux-targets.md:39`); no Mac or Android deployment (inventory §G4); independently checked 2026-11-13: weakened, corrected (the Android sentence reworded; the compiler limit narrowed to service units, `compiler/tendcf/compile.py:95`; the idea count deferred to 06 P-refs-s16)
 
 ---
 
@@ -283,7 +283,7 @@ sources check's verdict and names its item.
 **Goal:** G2
 **Weight:** blocks-goal
 **Finding:** The paragraph makes Nix optional and promises that an adopter "is never required to know Nix". G2 puts real Nix with NixOS-style options first, with YAML/JSON beneath it as the data form it evaluates to, still writable by hand. The paragraph also omits the reason G2 gives: existing NixOS and nix-darwin configs carry over. The fact that the JSON, not the Nix, is what is validated and signed survives, and should stay.
-**Evidence:** paper lines 243-251; goal G2, difference 2; `compiler/nix2cf/cli.py:203` (`eval-nix` exists, thin); inventory §A ("the Nix module frontend of D12 ... is not built").
+**Evidence:** paper lines 243-251; goal G2, difference 2; `compiler/tendcf/cli.py:203` (`eval-nix` exists, thin); inventory §A ("the Nix module frontend of D12 ... is not built").
 **Proposed text:**
 
 > The Site Model is written in the Nix language, using the module system as
@@ -353,7 +353,7 @@ sources check's verdict and names its item.
 **Goal:** G2
 **Weight:** misleads
 **Finding:** The command today is `nix2cf buildfile`, with `eval-nix` beside it. `tendcf compile` is the name D46 plans for a later restructure. The second paragraph of §2.2 says so, but the section opens in the present tense with the planned name, and §2.1 does the same ("The compiler (`tendcf compile`, §2.2) is a tool").
-**Evidence:** `compiler/pyproject.toml:18` (`nix2cf = "nix2cf.cli:main"`); `compiler/nix2cf/cli.py:179,203`; paper lines 255, 238.
+**Evidence:** `compiler/pyproject.toml:18` (`nix2cf = "nix2cf.cli:main"`); `compiler/tendcf/cli.py:179,203`; paper lines 255, 238.
 **Proposed text:**
 
 > A compiler reads the Site Model and renders a per-host goal file. Today
@@ -504,7 +504,7 @@ sources check's verdict and names its item.
 
 **Ruled:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections, and the Kotlin agent holds trust and consent only (05 Idea 4). So "as a native helper or behind a Termux reporter" is answered for state 1: CFEngine runs in Termux. Also "1. Field on entries" (B3 sub 1, X-android-05): one host per phone, each Android promise names its target user and the work profile's owner app. Ruled; implementation pending. The proposed text's sentence that tendcf-agent "owns the JSONL capture and the SQLite index" stands as a support role (operator ruling, 2026-11-14, PR 62 review Q3, "1. Agent keeps log role"): "only" is about decisions; the thin Kotlin agent still writes the device JSONL and index; map and D18 stand.
 
-**Merge:** replace the paragraph; the question on how cf-agent runs on Android is ruled (map R4; `compiler/nix2cf/cli.py` --platform)
+**Merge:** replace the paragraph; the question on how cf-agent runs on Android is ruled (map R4; `compiler/tendcf/cli.py` --platform)
 **Checked:** verified (rg over paper); not checked: ShizukuPlus's cross-user behaviour on a real device, and the clause "reaches the other profiles through ShizukuPlus's privileged process" (the ShizukuPlus README, https://github.com/thejaustin/ShizukuPlus, describes "a privileged process started with adb or root" and says nothing about work profiles); independently checked 2026-11-13: weakened, corrected (no D45/R4 conflict: `docs/architecture/architecture-DEFINITIVE-v3.md:105-115`)
 
 ### P-§2.4-02: "Any central or shared view is optional" against a required archive

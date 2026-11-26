@@ -177,7 +177,7 @@ rediscover.
   **schema addition D44 requires**, not an existing field.
 - `schema-lint: OK (5 schemas, 12 negative fixtures)` after DOC-4 — unchanged
   counts, so `EXPECTED_BROKEN` was unaffected. **Run it with
-  `uv run --with jsonschema bin/schema_lint.py`** — bare `python3` fails with
+  `uv run --with jsonschema tools/schema_lint.py`** — bare `python3` fails with
   `ModuleNotFoundError: jsonschema`.
 
 ### Quota mechanics (measured, and load-bearing)
@@ -347,7 +347,7 @@ export CFENGINE_TEST_OVERRIDE_WORKDIR=/tmp/cfsim && mkdir -p "$CFENGINE_TEST_OVE
 cd tests/acceptance && ./testall --gainroot=env --bindir=~/opt/cfengine-dev/bin 29_simulate_mode/keep_chroot.cf
 
 # 6. tendcf schema lint (bare python3 FAILS — needs jsonschema)
-cd ~/src/tendcf && uv run --with jsonschema bin/schema_lint.py
+cd ~/src/tendcf && uv run --with jsonschema tools/schema_lint.py
 
 # 7. Verify a subagent's real model/effort from harness records, never by asking it
 #    NOTE: pane w1H:pN uses an isolated profile:

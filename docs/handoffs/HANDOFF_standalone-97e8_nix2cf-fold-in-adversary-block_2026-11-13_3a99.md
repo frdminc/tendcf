@@ -28,7 +28,7 @@ Target layout (A1):
 1. **Import done.** [PR 45](https://github.com/frdminc/tendcf/pull/45) was merged as `ca4fa90`.
    1. `compiler/` holds nix2cf with its full 30-commit history (git-filter-repo, then an unrelated-histories merge).
    2. Follow-ups:
-      1. `compiler/nix2cf/cli.py` `_in_tree_tendcf()` / `_tendcf_dir`, resolution order `--tendcf` > `TENDCF_DIR` > in-tree;
+      1. `compiler/tendcf/cli.py` `_in_tree_tendcf()` / `_tendcf_dir`, resolution order `--tendcf` > `TENDCF_DIR` > in-tree;
       2. tests;
       3. a `compiler` job in `.github/workflows/check.yml`;
       4. `compiler/.github` and `compiler/LICENSE` removed.
@@ -81,9 +81,9 @@ Target layout (A1):
 1. **Reviews of PR 46.** Astra (`gpt-6-astra`, high) and Fable (`claude-fable-5-2`, high) both ended at MERGE after three rounds.
 2. **Review of PR 45.** Astra found no correctness issues; the adversary approved, and its L1 was fixed in `fa7e7cc`.
 3. **Adversary review of PR 46.** The report is `~/.local/state/agent-reports/15d84c6a-3414-4a29-b8a1-e6a586f272a4/adversary-review-of-merged-46-report.md`, a local file that may be gone later. Issue #48 holds the full content.
-4. **Lint.** `bin/schema_lint.py` was OK (8 schemas, 125 negative, 6 byte-class, 28 projection fixtures). `bin/xref_lint.py` found 0 issues across 107 live documents.
+4. **Lint.** `tools/schema_lint.py` was OK (8 schemas, 125 negative, 6 byte-class, 28 projection fixtures). `tools/xref_lint.py` found 0 issues across 107 live documents.
 5. **Unchecked.** That the bare `fable` alias resolves to 5.2 comes only from an agent's report.
-6. **Note for the restructure.** `compiler/nix2cf/cli.py` `_in_tree_tendcf()` hard-codes `bin/projector.py`, so it must change when `bin/` becomes `tools/`.
+6. **Note for the restructure.** `compiler/tendcf/cli.py` `_in_tree_tendcf()` hard-codes `tools/projector.py`, so it must change when `bin/` becomes `tools/`.
 
 ## Operator Feedback
 
@@ -102,7 +102,7 @@ Target layout (A1):
 2. **Write the decisions down** in a docs PR that amends D46 and `plugin-layout.md` §4/§7. It can also carry the wording fixes for F6-F10 and the "planned" tags (F9).
 3. **Restructure PR, after #41 and #42 merge and #48 is decided,** per `plugin-layout.md` §5 step 4. It also:
    1. fixes guide §16's stale line;
-   2. updates `cli.py`'s `bin/projector.py` check;
+   2. updates `cli.py`'s `tools/projector.py` check;
    3. rewrites path references in every file, dated records included.
 4. **Operator, secretspec:** `sudo-secretspec template-check` reports drift after the runtime `add` of `PYPI_API_TOKEN`. The tracked file is updated, but installing the declarations is an operator-authorized lifecycle step. Earlier drift wasn't measured.
 

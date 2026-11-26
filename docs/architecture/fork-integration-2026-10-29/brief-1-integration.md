@@ -48,8 +48,8 @@ skipping it and saying so).
      (`git merge-base --is-ancestor`) before merging so you merge tips, not every intermediate. The old
      `simulate-json` (08-17, base 17eb78e6d) is superseded by `-v2` unless a diff shows otherwise; say which.
    - Overlay patches: `fix/cmdb-name-offending-key` (B-5a) and `fix/cmdb-one-bad-entry-skips-only-that-entry`
-     (B-5b, contains 5a). After the merge, `~/src/tendcf/bin/overlay.py check core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration`
-     must report the overlay as already present/applies cleanly (read `bin/overlay.py --help`-equivalent docstring
+     (B-5b, contains 5a). After the merge, `~/src/tendcf/tools/overlay.py check core --repo ~/src/cfengine-core-integration-wt --against tendcf-integration`
+     must report the overlay as already present/applies cleanly (read `tools/overlay.py --help`-equivalent docstring
      first; it is a plain Python script, read its usage from the source, never guess flags).
    - Also: `fix/process-darwin` (B-3), `fix/json-number-rendering` (B-10 core half), `pr-getopt-optstring-fixes`,
      `fix/eval-integral-result` (B-6), `fix/cmdb-dotted-key-warning` (B-7), `fix/cmdb-null-value-crash` (B-20),

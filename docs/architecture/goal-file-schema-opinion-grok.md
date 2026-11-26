@@ -2,7 +2,7 @@
 
 **Author:** Cursor Grok 4.6, independent cold pass, 2026-08-15.
 **Brief:** `docs/architecture/GOAL-FILE-SCHEMA-BRIEF.md`.
-**Binding inputs:** E1 xhigh adjudication; architecture-DEFINITIVE-v3 §9; guide §7; `schema/`, `examples/`, `bin/schema_lint.py`.
+**Binding inputs:** E1 xhigh adjudication; architecture-DEFINITIVE-v3 §9; guide §7; `schema/`, `examples/`, `tools/schema_lint.py`.
 **Empirical extra:** CFEngine Core 3.27.1 (`/opt/homebrew/bin/cf-agent`) against `def.json` / `host_specific.json`. Not in the brief’s reading list; used only to settle hard part 7 with a running parser rather than the docs about it.
 
 This note does not edit any schema, fixture, or architecture document other than itself. `schema/goal-file.schema.json` is not created. The sketch in §10 is the falsifiable artifact.
@@ -50,7 +50,7 @@ E1 §5.2 is right that this is a consent property, and right that JSON Schema ca
 - NFC on every string before JCS. Schema cannot see normalization form.
 - `entries` sorted by `(domain, kind, id)` using the same string order JCS uses (UTF-8 code points of the NFC form). JSON Schema cannot require array order by key.
 - Uniqueness of `(domain, kind, id)`.
-- Adapter-block presence vs `host.platform` (launchd on macos, systemd on linux, termux on android). Putting `platform` on each service as well as on `host` would be two spellings; omit it on entries and leave the check to lint, matching how `bin/schema_lint.py` already does launchd-prefix membership.
+- Adapter-block presence vs `host.platform` (launchd on macos, systemd on linux, termux on android). Putting `platform` on each service as well as on `host` would be two spellings; omit it on entries and leave the check to lint, matching how `tools/schema_lint.py` already does launchd-prefix membership.
 
 **Where two spellings still leak if we are sloppy:**
 
@@ -673,7 +673,7 @@ Omitted keys are omitted. `entries` shown in sort order. A real fixture must be 
 
 First-adoption for this host would drop the `caddy` service and the `edge-http` bundle, keep coverage as `not-yet-migrated` for `macos-launchd-services`, and still carry `engine` + `trust` coverage, policy-tree, and validator. That is the minimal-claim file. The instance above is a later, still-small, reviewable diff.
 
-Lint that this sketch cannot express, inherited from `bin/schema_lint.py` layer 4:
+Lint that this sketch cannot express, inherited from `tools/schema_lint.py` layer 4:
 
 - `(domain, kind, id)` unique and sorted.
 - Every entry’s `domain` has a `coverage` declaration; `trust` and `engine` are `comprehensive`.

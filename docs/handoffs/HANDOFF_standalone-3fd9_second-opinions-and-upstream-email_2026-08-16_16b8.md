@@ -368,5 +368,5 @@ cd ~/src/cfengine-core/tests/unit && make check 2>&1 | tail -4        # expect "
 #   see docs/handoffs/ HANDOFF 16b8 "Evidence & Data" for expected numbers
 
 # tendcf gates
-cd ~/src/tendcf && bin/schema_lint.py && bin/xref_lint.py && bin/flag_coverage.py
+cd ~/src/tendcf && tools/schema_lint.py && tools/xref_lint.py && tools/flag_coverage.py
 ```

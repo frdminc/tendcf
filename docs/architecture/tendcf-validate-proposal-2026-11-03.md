@@ -117,7 +117,7 @@ Each was read in the pinned fork source or in this repository on
    binaries in the store, work directory `/var/lib/cfengine-tendcf`, an
    optional root `cf-execd --no-fork` unit. The module installs no policy
    and no `promises.cf`, so it sets no `exec_command`.
-10. **`bin/projector.py` is the projection plus the N-series, and no
+10. **`tools/projector.py` is the projection plus the N-series, and no
     more.** It does not validate the schema, does not refuse a goal file
     that is not canonical, has no version ceiling and keeps no state. Its
     `main()` reads a path and writes bytes to stdout.
@@ -192,7 +192,7 @@ projection that passed validation, and only that projection?
    `run` holds the lock until cf-agent exits. `tendcf-install.sh run-once`
    becomes `tendcf-validate run -- cf-agent --no-augments -K -I -f …`.
    The projection is a pure function of the baseline (`project()` is
-   pure, `bin/projector.py:251`), so re-deriving it costs one parse of
+   pure, `tools/projector.py:251`), so re-deriving it costs one parse of
    one file of at most 5 MiB. Nothing retained between runs is trusted
    without re-checking.
 2. **Once per approval, with a check in policy on every run.** `tendcf-validate
@@ -647,7 +647,7 @@ ever sees integers here. `projector.py` imports it once, for
 **(d) Recommendation: option 1.** It is a small pure-Python package with
 no dependencies, so vendoring costs a directory and a digest, and it keeps
 D45's "one implementation" literal. CI's golden gate then runs exactly the
-installed tree (`python3 -I`), instead of `bin/projector.py` under
+installed tree (`python3 -I`), instead of `tools/projector.py` under
 `uv`. The repo's `uv run --script` header becomes a development
 convenience only.
 
@@ -779,7 +779,7 @@ project.** `unit-writer` and `unit-package` are "detector data and do
 not project" (v5 reconciliation §2.1, and item 7 of its §7;
 `projector.py` P-1, lines 27-29). A bundle-resident detector therefore
 cannot reach the claims through `host_specific.json`. Some other path
-must deliver them. Also: `bin/unit_classifier.py` already implements the
+must deliver them. Also: `tools/unit_classifier.py` already implements the
 detector contract as a read-only Python prototype. It was proven on CI
 fixtures and in an unprivileged read of pastebin (v5 reconciliation
 §3.6-§3.7), and its docstring says "no root needed, nothing is written".
@@ -850,7 +850,7 @@ item 3 option 2's first-build duties, item 4 option 1 or 2, item 5 option
    needs a validator library (an implementation detail this proposal
    does not choose): vendor it like `rfc8785` and bring it under the
    same digest, or check the v5 schema's constraints in code held to
-   `bin/schema_lint.py`'s verdicts on the corpus.
+   `tools/schema_lint.py`'s verdicts on the corpus.
 2. **Subcommands.** `check` and `project` are the CI call site. `adopt
    FILE` runs as root and refuses `local_yes_required: true`. `run --
    CF-AGENT-ARGV` follows item 1, and writes one `device_convergence`
@@ -969,12 +969,12 @@ that hold the stale text, per its brief.
    landed (`9fdf437`, 2026-08-15; `policy_tree_map`, "R8 paid at the
    schema layer"). What is unpaid is R23 (the tree's byte sequence) and
    a device-side verifier, not the schema binding.
-3. **`bin/projector.py:142-144`** (E-5: an expansion sequence "fails the
+3. **`tools/projector.py:142-144`** (E-5: an expansion sequence "fails the
    ENTIRE CMDB load"): true of stock 3.27.1, which the comment cites.
    On the pinned fork it is false: `ReadCMDBVars` skips only the
    offending entry (fact 2). The N-3 refusal matters more there, not
    less, because a partial load can drop the interlocks alone.
-4. **`bin/schema_lint.py:802-803`** ("the projection is hash-bound on the
+4. **`tools/schema_lint.py:802-803`** ("the projection is hash-bound on the
    approval record"): it is not. The `H(projected_augments)` extension
    was dropped
    ([`goal-file-schema-reconciliation-2026-08-15.md`](goal-file-schema-reconciliation-2026-08-15.md),
@@ -1059,7 +1059,7 @@ CFEngine.
 **(b) Options.**
 
 1. **Projector-synthesized per-service interlock reference** (Argon).
-   This touches `bin/projector.py` (P-1, P-2 and the goldens), the
+   This touches `tools/projector.py` (P-1, P-2 and the goldens), the
    Kotlin port (R22) and `policy/tendcf_services.cf`. It violates R21
    and P-2 as above. Not recommended.
 2. **Author-declared binding in the goal file (schema v6).** A service

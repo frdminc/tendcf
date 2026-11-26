@@ -14,7 +14,7 @@ import tempfile
 ALLOWED_ROOTS = ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system")
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-CLASSIFIER = os.path.join(REPO, "bin", "unit_classifier.py")
+CLASSIFIER = os.path.join(REPO, "tools", "unit_classifier.py")
 
 
 def sh(argv, check=False, input=None, env=None):

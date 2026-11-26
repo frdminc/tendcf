@@ -114,7 +114,7 @@ platform, `architecture-DEFINITIVE-v3.md` D45.
 ### tendcf-validate / tendcf-agent
 
 **`tendcf-validate`** is the device-side component on Linux and macOS: a
-small Python command, `bin/projector.py` promoted (not built yet), that
+small Python command, `tools/projector.py` promoted (not built yet), that
 validates the approved goal file and writes its projection, then exits.
 Not a daemon.
 **`tendcf-agent`** exists only on Android and is written in Kotlin; its

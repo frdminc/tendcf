@@ -90,7 +90,7 @@ Failed approaches and near-misses, chronological. These are the expensive ones
 to rediscover.
 
 1. **Nearly filed `§0 rule 6` as a stale cross-reference.** `common.schema.json`
-   and `bin/schema_lint.py:20` both cite it. Three *other* cross-references in
+   and `tools/schema_lint.py:20` both cite it. Three *other* cross-references in
    the same file are genuinely wrong, so the fourth looked wrong by association.
    It is correct — `architecture-DEFINITIVE-v3.md` §0 rule 6 really is "prefer
    machine-checkable to conventional." **Do not "fix" it.** The consistency
@@ -199,7 +199,7 @@ re-checkable); would not have been acceptable for B/C/E.
 **Findings that are verified fact, not opinion** (checked against the repo this
 session — a later reader can trust these without re-deriving):
 
-- `bin/schema_lint.py:49` drives schema↔example pairing from a hardcoded
+- `tools/schema_lint.py:49` drives schema↔example pairing from a hardcoded
   four-entry `EXAMPLES` dict. `check_schemas_valid` globs `schema/*.schema.json`
   for validity only. **A new schema with no fixture is not caught**, and neither
   is a new example not registered in the dict. `schema/common.schema.json`

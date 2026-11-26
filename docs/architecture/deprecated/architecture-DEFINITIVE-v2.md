@@ -306,7 +306,7 @@ edit small data files, not a sprawling config tree — cheap to read).
   planning-language generation, that "examples consistently outperform
   descriptions" and that documentation bundling both dramatically
   outperforms either alone (`ai-optimization-review-2026-08-13.md` item 3).
-  Extend `bin/schema_lint.py` to fail if any schema lacks a matching
+  Extend `tools/schema_lint.py` to fail if any schema lacks a matching
   example (or vice versa) — the pairing already exists; this makes it
   checked rather than customary, per rule 6/R13's second clause.
 - **Existence checks extend past ports/paths (D28, new).** A 2025 error
@@ -1689,7 +1689,7 @@ Two consequences of the sequence, both deliberate:
   three D16 fields from §4.1** — `provides`/`requires` per type,
   `interlocks` per bundle, `comprehensive`/`opt_out_reason` per domain.
   _Schemas written 2026-08-13 and living in `frdminc/nix2cf` per D21
-  (§4.2), alongside a `bin/schema_lint.py` carrying the cross-file rules
+  (§4.2), alongside a `tools/schema_lint.py` carrying the cross-file rules
   JSON Schema cannot state on its own — reference resolution, launchd
   labels against the writer prefixes, no prefix nested in another. The
   remaining Step 0 work is transcription and the provenance gate, below._
@@ -1907,7 +1907,7 @@ unresolved, it should write a question doc and stop, not improvise.
 | --- | --- | --- |
 | D23 (new) | Site Model fallback-authoring format | **Add a canonicalizing pre-commit check (parse, re-serialize, diff) for the YAML fallback path** (§4.3) — until D12's Nix frontend exists, YAML is the only authoring path in practice (`nix2cf/examples/*.yml`). Originally proposed as "prefer JSON, LLMs generate it more reliably"; checked directly against the cited study and **that claim does not hold** — no consistent format winner across models/tasks. Kept on YAML's own documented spec ambiguities (type coercion, indentation, anchors) instead, independent of any LLM-specific claim. |
 | D24 (new) | Registry lookup CLI | **A `nix2cf registry check` (or equivalent) tool-call lookup, alongside the `buildfile` self-check CLI** (§4.4) — answers a single registry fact without an agent reading the whole file. Serves R13 (accuracy) and R12 (token budget) simultaneously — one of the few places those objectives aren't in tension. |
-| D25 (new) | Schema/example pairing enforcement | **`bin/schema_lint.py` fails if any `schema/*.schema.json` lacks a matching `examples/*.yml`, or vice versa** (§4.1) — the pairing already exists in `nix2cf`; this makes it checked, not customary. |
+| D25 (new) | Schema/example pairing enforcement | **`tools/schema_lint.py` fails if any `schema/*.schema.json` lacks a matching `examples/*.yml`, or vice versa** (§4.1) — the pairing already exists in `nix2cf`; this makes it checked, not customary. |
 | D26 (new) | Root `AGENTS.md` per repo | **Checked, not adopted on a performance rationale — see §16.** The dedicated study found context files do not generally improve task success and raise cost 20%+; recorded so this isn't re-proposed and re-researched later. If ever added, discoverability only, minimal, hand-curated. |
 | D27 (new) | This document's own edit-protection, mechanized | **A pre-commit/CI check fails any diff touching `architecture-DEFINITIVE-v2.md` without an explicit `Approved-change:` trailer** (§8.1) — the same automated-check-not-prose treatment §8.1 already gives the worktree-provenance problem, applied to this file's own header notice. |
 | D28 (new) | Guardrails weighted by the real IaC error distribution | **No design change; makes explicit why existing guardrails are aimed where they are** (§4.1, §4.5.1(d), §7.5). Real LLM-IaC errors: 65% factual incorrectness, 26.5% incompleteness, 7% contextual reasoning failure, 1.5% structural (Nekrasov et al., paper §3.1; percentages re-verified directly against the paper's table). Registry existence-checks (extended past ports/paths) defend the largest category; D16(d)'s default-on comprehensiveness already happens to defend the second-largest; schema validation alone defends the smallest. |

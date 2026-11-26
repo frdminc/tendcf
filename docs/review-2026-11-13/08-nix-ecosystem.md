@@ -186,7 +186,7 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 **Goal:** G2, G4
 **Weight:** improves
 **Finding:** The planned frontend is described only as "the D12 Nix module frontend". Its safety depends on what is in scope during evaluation. If it uses `lib.evalModules` from a pinned nixpkgs `lib` and does **not** pass `pkgs`, a site cannot produce a store path or build anything, and its output is pure data. Without that rule, one `"${pkgs.caddy}/bin/caddy"` puts a Nix-only path in a goal file for a Nix-less Mac.
-**Evidence:** `plugin-layout.md:83`; `compiler/nix2cf/cli.py:150-170` (`nix-instantiate --eval --strict --json`); [IFD manual](https://nix.dev/manual/nix/stable/language/import-from-derivation).
+**Evidence:** `plugin-layout.md:83`; `compiler/tendcf/cli.py:150-170` (`nix-instantiate --eval --strict --json`); [IFD manual](https://nix.dev/manual/nix/stable/language/import-from-derivation).
 **Proposed text:**
 
 > the D12 Nix module frontend, named `nix2cf`; `eval-nix` moves here. It evaluates the site's modules with `lib.evalModules` from a nixpkgs `lib` pinned in the site lock, passes no `pkgs`, runs read-only with import-from-derivation off, and refuses any output string containing `/nix/store/`. Only the Site Model option tree is read; the result is the Site Model JSON the YAML frontend would produce.
@@ -346,7 +346,7 @@ The community lessons, all in nix.dev best practices (fetched): quote URLs, avoi
 **Goal:** G2
 **Weight:** nit
 **Finding:** The plan names `nix eval` (needs the experimental `nix-command`, and flakes for a flake ref). The hook uses `nix-instantiate --eval --strict --json`, which DESIGN.md chose as flake-free and stable. nix-darwin's README still calls flakes experimental. Pick one, and say why.
-**Evidence:** `linux-targets.md:82-86`; `compiler/nix2cf/cli.py:14-18`; `compiler/docs/DESIGN.md:60-69`.
+**Evidence:** `linux-targets.md:82-86`; `compiler/tendcf/cli.py:14-18`; `compiler/docs/DESIGN.md:60-69`.
 **Proposed text:**
 
 > evaluates (`nix-instantiate --eval --strict --json`, read-only, the stable flake-free evaluator; no `nix-command` or flakes feature is required)

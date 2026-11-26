@@ -58,7 +58,7 @@ That layer needs an actual projector implementation, which does not exist
 yet; it is the one part of §18 item 5 still open.
 
 Exit 0 clean, 1 findings, 2 cannot read/parse.
-Run from repo root:  bin/schema_lint.py
+Run from repo root:  tools/schema_lint.py
 """
 
 from __future__ import annotations
@@ -822,7 +822,7 @@ def check_byte_class_fixtures(declared: dict[str, str]) -> int:
 
 
 def load_projector() -> Any | None:
-    """Import bin/projector.py as a module.
+    """Import tools/projector.py as a module.
 
     Not a package import: both files are `uv run --script` entry points with
     their own PEP-723 metadata, and bin/ is deliberately not importable. The
@@ -833,7 +833,7 @@ def load_projector() -> Any | None:
     """
     if not PROJECTOR.is_file():
         fail(
-            "bin/projector.py is missing — the projector goldens of §13 have "
+            "tools/projector.py is missing — the projector goldens of §13 have "
             "nothing to invoke",
             rule=RULE_HARNESS,
         )
@@ -846,7 +846,7 @@ def load_projector() -> Any | None:
     try:
         spec.loader.exec_module(module)
     except Exception as exc:  # noqa: BLE001 - report, don't crash the lint
-        fail(f"bin/projector.py failed to import: {exc}", rule=RULE_HARNESS)
+        fail(f"tools/projector.py failed to import: {exc}", rule=RULE_HARNESS)
         return None
     return module
 
@@ -2176,7 +2176,7 @@ def check_goal_file_cross_file(loaded: dict[str, Any], name: str) -> None:
     # (schema-v5-dpkg-reconciliation-2026-11-02.md §2.2(4), S0.) Any coverage:
     # `not-yet-migrated` admits entries too, and the adapter does not look at
     # coverage. `supervision` is the one projecting domain
-    # (bin/projector.py PROJECTING_DOMAIN); the adapter's teardown checks
+    # (tools/projector.py PROJECTING_DOMAIN); the adapter's teardown checks
     # neither coverage nor writer, so a `state: absent` here is an actuated
     # removal of whatever the id names. launchd has no existence gate at all:
     # a plist is a plain file whoever wrote it, so this rule is the only

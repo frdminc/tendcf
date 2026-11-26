@@ -66,7 +66,7 @@ Tombstone writer validation should be considered for every coverage mode that ad
 
 ### A4. HIGH — Domain scope is inconsistent between schema, lint and detector
 
-**References:** design:118–143, 165–166, 185, 209; `bin/schema_lint.py:1531–1549`, `:1577–1599`; `schema/goal-file.schema.json:294–319`.
+**References:** design:118–143, 165–166, 185, 209; `tools/schema_lint.py:1531–1549`, `:1577–1599`; `schema/goal-file.schema.json:294–319`.
 
 The new kind is permitted in every ordinary state domain, and package duplication is checked globally. Yet C.3 operates only in `supervision`, with consent addresses likewise assuming that domain.
 
@@ -142,7 +142,7 @@ C2’s rejection and C5’s status as a stopgap are reasonable. C2′ is a credi
 
 ### A8. MEDIUM — Migration and cases 113–132 do not yet establish the claimed contract
 
-**References:** design:239–279; `schema/goal-diff.schema.json:26`; `bin/schema_lint.py:1630–1640`.
+**References:** design:239–279; `schema/goal-diff.schema.json:26`; `tools/schema_lint.py:1630–1640`.
 
 The overall migration inventory is useful, including case 98, broken bytes, embedded projection case 75 and version-family hashes. However, absence of new required fields does not itself make a version-only migration valid. Every existing baseline must remain valid apart from its version, including writer vocabulary, key length and tombstone restrictions.
 

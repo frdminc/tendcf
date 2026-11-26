@@ -3,7 +3,7 @@
 **Date:** 2026-10-09. **Author:** Claude Fable 5.1 (ClaudeHelm worker).
 **Status:** design and implementation for
 [frdminc/tendcf#3](https://github.com/frdminc/tendcf/issues/3); the
-mechanism is `bin/overlay.py`, the content is `overlay/`. The register of
+mechanism is `tools/overlay.py`, the content is `overlay/`. The register of
 every defect behind it stays
 [`upstream-register.md`](upstream-register.md), and the standing rules for
 talking to upstream stay in `~/src/cfengine-all/AGENTS.md`; this document
@@ -88,7 +88,7 @@ overlay/
   fork.json             the full-fork commit Linux CI builds (§2 ruling)
   libntech/0001-….patch  git format-patch output, applied in order onto libntech.base
   core/0001-….patch      the same for cfengine/core
-bin/overlay.py          lint · status · check · retired · apply · export · self-test
+tools/overlay.py          lint · status · check · retired · apply · export · self-test
 ```
 
 **The patch files are the artifact; the manifest is the provenance.** Each
@@ -97,7 +97,7 @@ line is the fork commit and `git am` reproduces that commit's tree exactly.
 The manifest holds, per component, the upstream URL, the fork URL, the
 pinned base commit, and per patch: file, commit, subject, register id
 (`B-14`), fork branch, upstream PR and its state, Jira key, what shipped
-code it protects, and the retire condition. `bin/overlay.py lint` holds the
+code it protects, and the retire condition. `tools/overlay.py lint` holds the
 two together (every listed file present, every file listed, order, ids,
 `From` line equal to the manifest commit).
 
@@ -131,8 +131,8 @@ all #3 asks for):
 git clone https://github.com/cfengine/core ~/src/core-overlay
 git -C ~/src/core-overlay checkout a0bca6aaf310515f69fef60e6c56b3e60bd337ac
 git -C ~/src/core-overlay submodule update --init libntech        # lands on 0c0620d
-bin/overlay.py apply core     --checkout ~/src/core-overlay
-bin/overlay.py apply libntech --checkout ~/src/core-overlay/libntech
+tools/overlay.py apply core     --checkout ~/src/core-overlay
+tools/overlay.py apply libntech --checkout ~/src/core-overlay/libntech
 git -C ~/src/core-overlay add libntech                              # submodule now points at the applied HEAD
 cd ~/src/core-overlay && NO_CONFIGURE=1 ./autogen.sh && ./configure --enable-debug && make -j4
 ```
@@ -144,7 +144,7 @@ patches and the per-entry-skip B-5b. It now applies six libntech patches
 (0005 and 0006 add `JsonParseStrict()`/`JsonParseFileStrict()`, B-24, which
 the core loader calls) and core's all-or-nothing loader; the commands are
 unchanged. The `overlay-build` CI job (`linux.yml`) applies the overlay with
-`bin/overlay.py apply`, then runs the same dependency, configure, build and
+`tools/overlay.py apply`, then runs the same dependency, configure, build and
 install steps as the `build-fork` action (`.github/actions/build-fork`:
 `ci/dependencies.sh`, `./autogen.sh --enable-debug --prefix=... --with-systemd-service=no`,
 `make -j"$(nproc)" CFLAGS="-Wall"`, `make install`), not the hand recipe above,
@@ -174,8 +174,8 @@ Drift is "the pinned series no longer applies where we want to build". Two
 places want to know, and the same command serves both:
 
 ```bash
-bin/overlay.py check libntech --repo <any repo with the objects> --against origin/master
-bin/overlay.py check core     --repo ~/src/cfengine-core          --against 3.27.1-build7
+tools/overlay.py check libntech --repo <any repo with the objects> --against origin/master
+tools/overlay.py check core     --repo ~/src/cfengine-core          --against 3.27.1-build7
 ```
 
 `check` reads the target tree into a **temporary index** and `git apply
@@ -218,8 +218,8 @@ older libntech patches against the newer base.
 onto the new upstream commit and push it; then
 
 ```bash
-bin/overlay.py export libntech --repo <fork checkout> --base <new upstream rev> --tip <branch tip> [--tip <second independent tip>]
-bin/overlay.py check  libntech --repo <fork checkout>
+tools/overlay.py export libntech --repo <fork checkout> --base <new upstream rev> --tip <branch tip> [--tip <second independent tip>]
+tools/overlay.py check  libntech --repo <fork checkout>
 ```
 
 and commit the regenerated files with the manifest. `export` keeps every
@@ -230,7 +230,7 @@ Update `upstream-register.md` in the same commit (its own rule).
 ## 6. How a patch retires
 
 ```bash
-bin/overlay.py retired core --repo ~/src/cfengine-core --against upstream/master --strict
+tools/overlay.py retired core --repo ~/src/cfengine-core --against upstream/master --strict
 ```
 
 For each patch, `git patch-id --stable` is compared with every non-merge
@@ -357,7 +357,7 @@ primitive array, holding an integer past `long` or exponent form without a dot
 validation passed: nothing is evaluated, so it is not a partial install, but the
 policy cannot refuse or report it. A real installs as `%.2f` (`string_lib.c`
 `StringFromDouble()`), so `0.00049` arrives as `0.00`; the fork installs
-`0.00049`. Reach: the projector refuses floats (`bin/projector.py:523`) and
+`0.00049`. Reach: the projector refuses floats (`tools/projector.py:523`) and
 writes no exponents, and tendcf's variables are containers, so projected data
 does not reach it; a hand-edited file does. No test holds a bare number, so CI
 does not see it. Decided 2026-11-17: B-4, B-10 and the `rlist.c` fix do not
@@ -381,7 +381,7 @@ against a later patch series, and what would trigger it, is
    and it makes the fork load-bearing for a public repository's build.
 4. **quilt / stgit / `git-series`.** Fine tools, but they add a dependency
    to a mechanism whose whole job is `git am` in order, and none of them
-   gives the retirement check for free. `bin/overlay.py` is under 600 lines with
+   gives the retirement check for free. `tools/overlay.py` is under 600 lines with
    no dependency but git.
 5. **Vendoring libntech and core source into tendcf.** Rejected for the
    same reasons as vendoring in `change-process.md` §9: duplicated review,

@@ -21,7 +21,7 @@ Before the exercise, the repo state as of 2026-08-15:
 | Total commits | 55 |
 | Commits prefixed `docs:` | 53 of 55 (the other two are `ci:`) |
 | Lines of prose under `docs/` | 16,276 across 48 files |
-| Lines of code + schema | 1,024 (`bin/schema_lint.py` 364, `bin/check_protected_docs.py` 109, five schemas ~551) |
+| Lines of code + schema | 1,024 (`tools/schema_lint.py` 364, `bin/check_protected_docs.py` 109, five schemas ~551) |
 | Commits on 2026-08-13 alone | 43 of 55 |
 | `nix2cf` repo (the compiler, Step 3) | 3 files: `LICENSE`, `README.md`, `.gitignore`. Six commits, all `docs:`. It has been refactored *to zero* — it used to hold the schemas and they were moved out. |
 | Superseded architecture drafts in `docs/architecture/deprecated/` | 9 files, ~5,400 lines, from at least three different model families (`-grok-v1`, `-openai-v1`, plus Gemini reviews) |

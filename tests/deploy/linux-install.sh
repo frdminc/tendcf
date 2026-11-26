@@ -48,8 +48,8 @@ owned_by_root_unwritable() {  # no entry under PATH is non-root or group/other-w
 unit_prop() { systemctl show -p "$1" --value "$unit"; }
 
 echo "# 1. install"
-proj_sha="$(sha256sum "$repo/bin/projector.py" | awk '{print $1}')"
-"$installer" install --projector-src "$repo/bin/projector.py" --projector-sha256 "$proj_sha" --data "$canary/host_specific.json"
+proj_sha="$(sha256sum "$repo/tools/projector.py" | awk '{print $1}')"
+"$installer" install --projector-src "$repo/tools/projector.py" --projector-sha256 "$proj_sha" --data "$canary/host_specific.json"
 wd="$("$installer" workdir)"
 check "/opt/tendcf is root-owned and not group/other-writable" owned_by_root_unwritable /opt/tendcf
 check "installed policy is root-owned and not group/other-writable" \

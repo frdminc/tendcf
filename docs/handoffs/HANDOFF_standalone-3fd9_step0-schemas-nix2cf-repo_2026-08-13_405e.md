@@ -149,7 +149,7 @@ Minor, but it is the kind of thing that is free now and a migration later.
 
 ## Evidence & Data
 
-**Tests run: yes.** `bin/schema_lint.py` — three layers (schema validity,
+**Tests run: yes.** `tools/schema_lint.py` — three layers (schema validity,
 fixture validation, cross-file rules).
 
 - Baseline: `schema-lint: OK (5 schemas)`, exit 0.
@@ -184,7 +184,7 @@ schema/roles.schema.json             role -> {main, backups[], peers[]}
 schema/launchd-writers.schema.json   one writer per label prefix
 schema/report-row.schema.json        D18 rows: promise_outcome,
                                      domain_coverage, device_convergence
-bin/schema_lint.py                   uv-script header, exit 0/1/2, matching
+tools/schema_lint.py                   uv-script header, exit 0/1/2, matching
                                      site-djbclark's registry_lint.py pattern
 examples/{services,roles,launchd-writers,report-rows}.yml
 README.md                            the contract's rationale, not a tutorial
@@ -309,7 +309,7 @@ $EDITOR ~/src/tendcf/docs/architecture/architecture-DEFINITIVE-v2.md
 #   §15  decision register (D22 newest)
 
 # The contract written this session:
-cd ~/src/nix2cf && ./bin/schema_lint.py     # expect: OK (5 schemas), exit 0
+cd ~/src/nix2cf && ./tools/schema_lint.py     # expect: OK (5 schemas), exit 0
 git log --oneline -1                        # f5f01e0
 
 cd ~/src/tendcf && git log --oneline -3  # ecb42a1 at HEAD, clean, pushed

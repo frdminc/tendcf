@@ -17,7 +17,7 @@ digest synchronized with the canonical JCS bytes (RFC 8785, no trailing
 newline).
 
 Security boundaries:
-  - Always imports the bundled `bin/projector.py` next to this script (never
+  - Always imports the bundled `tools/projector.py` next to this script (never
     loads code from `--root`).
   - Anchors all fixture directory traversal, regular-file reads, exclusive
     sibling temp-file creation, `os.fchmod`, atomic `os.replace`, and error
@@ -75,9 +75,9 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 def _load_bundled_jcs_dumps():
-    """Always load the bundled `bin/projector.py` beside this script — NEVER
+    """Always load the bundled `tools/projector.py` beside this script — NEVER
     execute code from `--root`."""
-    projector_path = REPO_ROOT / "bin" / "projector.py"
+    projector_path = REPO_ROOT / "tools" / "projector.py"
     if not projector_path.is_file() or projector_path.is_symlink():
         raise RuntimeError(f"bundled projector missing or symlink: {projector_path}")
     spec = importlib.util.spec_from_file_location("tendcf_projector_jcs", projector_path)
@@ -448,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         print(
             f"recompute_goal_hashes: {len(changes)} file(s) out of date; "
-            "run bin/recompute_goal_hashes.py to update",
+            "run tools/recompute_goal_hashes.py to update",
             file=sys.stderr,
         )
         return 1

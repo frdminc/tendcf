@@ -1337,7 +1337,7 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   the projector’s checker has a fixture that trips **that rule alone** —
   a suite where one fixture trips three rules cannot tell you the other two
   work.
-- **A reference projector** (`bin/projector.py`) for §7’s projection step,
+- **A reference projector** (`tools/projector.py`) for §7’s projection step,
   gated in CI against golden bytes. It is to be promoted to
   `tendcf-validate`, the command Linux and macOS hosts run, so that CI
   tests the device code itself; the Android agent’s Kotlin port must agree
@@ -1347,7 +1347,7 @@ observe themselves crossing is a disclaimer rather than a ceiling.
   thing here that CFEngine actually executes (§16.C;
   [`linux-targets.md`](../architecture/linux-targets.md) §3).
 - **A patch overlay on libntech and cfengine/core** (`overlay/`,
-  `bin/overlay.py`): the six fork commits that bundle depends on (§19),
+  `tools/overlay.py`): the six fork commits that bundle depends on (§19),
   pinned to one upstream commit per component, with a lint, a self-test, a
   drift check against upstream, and a retirement check, so the "correct
   build" the bundle was verified against is reproducible from this
@@ -1377,7 +1377,7 @@ coherent, describable state):
 
 | Step | What | Notes |
 | --- | --- | --- |
-| 0 | Schemas in tendcf | Existing contract is `schema/` + `examples/` + `bin/schema_lint.py`. Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
+| 0 | Schemas in tendcf | Existing contract is `schema/` + `examples/` + `tools/schema_lint.py`. Remaining: peer_actions, trust-policy shape, generic unit-writers, lookup stub, YAML canonicalize. Transcribe reality (`not-yet-migrated` is the correct day-one state). |
 | 1 | macOS services adapter | **Started.** `policy/tendcf_services.cf` renders and loads launchd services from projected data, with interlocks enforced (§16.C; the interlock verdict was split into its own bundle on 2026-10-29 after the pass path was found never to open). Still open in this step: package and file promises, environment rendering, the unit-writer detector. Dry-run default. Not in this step: nix-darwin. |
 | 2 | Android under the Site Model | Same vocabulary. Agent owns JSONL+SQLite in app-private storage. |
 | 3 | Compiler (`tendcf compile`, was `nix2cf`) | “What would device X receive?” first, then conflict check, extra-entry reporting, then inference. Inference waits until types exist on two platforms. **Started:** `buildfile` (merge, conflict check, render) exists in `compiler/` (imported from `frdminc/nix2cf` on 2026-11-13); the restructure splits it into plugins ([`plugin-layout.md`](../architecture/plugin-layout.md)). |

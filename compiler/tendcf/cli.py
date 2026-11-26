@@ -1,32 +1,35 @@
-"""`nix2cf` command line.
+"""`tendcf` compiler command line (D46 Step 4).
 
-    nix2cf buildfile --host mac --platform macos --supervisor launchd \
+    tendcf compile --host mac --platform macos --supervisor launchd \
         --host-key ed25519:… --device-trust trust.json \
         (--site DIR | --site-name SLUG [--ops-root DIR] | --workspace [--ops-root DIR]) \
         [--override-input NS=PATH ...] [--allow-tainted] [--check-releasable] \
         [--tendcf DIR] [--project] [-o OUT]
 
-Renders exactly what one host would receive — the Bcfg2 `buildfile` shape the
-guide (§4) and the paper (§6.2) say to build first — without touching the
-host. Output is the canonical goal file; `--project` instead prints the
-`host_specific.json` tendcf's reference projector derives from it, which is
-the only shape `cf-agent` reads.
+Renders exactly what one host would receive (the Bcfg2 `buildfile` lineage,
+replaced outright by `tendcf compile` with no alias per D46 §6) without
+touching the host. Output is the canonical goal file; `--project` instead
+prints the `host_specific.json` tendcf's reference projector (`tools/projector.py`)
+derives from it, which is the only shape `cf-agent` reads.
 
-    nix2cf workspace [--ops-root DIR] [--site-name SLUG] [--config PATH] \
+When `--check-releasable` is active, `--override-input`, `--tendcf`, and
+`$TENDCF_DIR` overrides are all refused (D46 §4 Activation step 7 / F9): a
+release build runs strictly from the verified in-tree tendcf checkout.
+
+    tendcf workspace [--ops-root DIR] [--site-name SLUG] [--config PATH] \
         [--override-input NS=PATH ...] [--check-releasable] [--json]
-    nix2cf workspace --list [--ops-root DIR] [--json]
+    tendcf workspace --list [--ops-root DIR] [--json]
 
 Resolves or lists the multi-site local ops workspace (`~/tendcf-ops`,
 `tendcf-{private,public}-<site>`, issue #98) with deterministic, fail-closed
 slug pairing and dev-only override taint tracking.
 
-    nix2cf eval-nix site.nix
+    tendcf eval-nix site.nix
 
-Evaluates a Nix expression to the JSON the compiler consumes, via
-`nix-instantiate --eval --strict --json` (the stable, flake-free evaluator;
-Nix manual 2.26, command-ref/nix-instantiate). The Nix *module* frontend of
-D12 (`mkOption`/`mkIf`/`mkDefault`) is not built; this is the hook it would
-land behind.
+Evaluates a Nix expression to Site Model JSON via the in-tree Nix frontend
+plugin (`plugins/frontends/nix/eval.py`, named `nix2cf`) under the tested D-b
+restricted evaluation limits (`restrict-eval true`, no IFD, empty
+`allowed-uris`, no unsafe native code, isolated Nix env, `-I <RECIPE_DIR>`).
 
 Exit codes mirror tendcf's tooling: 0 clean, 1 compile/release refused, 2 cannot read.
 """
@@ -37,15 +40,15 @@ import argparse
 import importlib.util
 import json
 import os
-import shutil
-import subprocess
+import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .compile import SUPERVISORS, CompileError, HostSpec, compile_host
-from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, load_document, load_site_model, validate_site_model
+from .plugins import PluginError, load_plugin
+from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, validate_site_model
 from .workspace import (
     WorkspaceError,
     WorkspaceResolution,
@@ -58,30 +61,50 @@ from .workspace import (
 )
 
 
+def _is_real_dir(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+
+def _is_real_file(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+
 def _in_tree_tendcf() -> Path | None:
-    """The enclosing tendcf checkout: this file is <root>/compiler/nix2cf/cli.py.
+    """The enclosing tendcf checkout: this file is `<root>/compiler/tendcf/cli.py`.
 
     The root is accepted only if the package really sits in a checkout: the
-    directory two levels up is named `compiler` and holds the compiler's
-    pyproject.toml, and the root beside it has the schema and the projector.
-    Anything else (pip --target, PYTHONPATH, a venv's site-packages, ...) gives
-    None, because the grandparent of such an install is not ours, and a
-    projector found there would be run (--project) and schemas found there
-    would be trusted for validation.
+    directory two levels up is a real directory named `compiler` holding
+    `pyproject.toml`, and `<root>` beside it holds real `schema/goal-file.schema.json`,
+    `tools/projector.py`, and `plugins/`. Anything else (pip --target,
+    PYTHONPATH, a venv's site-packages, ...) returns None.
     """
     here = Path(__file__).resolve()
+    if len(here.parents) < 3:
+        return None
     compiler_dir, root = here.parents[1], here.parents[2]
     ok = (
         compiler_dir.name == "compiler"
-        and (compiler_dir / "pyproject.toml").is_file()
-        and (root / "schema" / "goal-file.schema.json").is_file()
-        and (root / "bin" / "projector.py").is_file()
+        and _is_real_dir(compiler_dir)
+        and _is_real_file(compiler_dir / "pyproject.toml")
+        and _is_real_dir(root / "schema")
+        and _is_real_file(root / "schema" / "goal-file.schema.json")
+        and _is_real_dir(root / "tools")
+        and _is_real_file(root / "tools" / "projector.py")
+        and _is_real_dir(root / "plugins")
     )
     return root if ok else None
 
 
 def _tendcf_dir(arg: str | None) -> Path | None:
-    """--tendcf, else $TENDCF_DIR, else the enclosing tendcf checkout."""
+    """`--tendcf`, else `$TENDCF_DIR`, else the enclosing tendcf checkout."""
     if arg is not None:
         return Path(arg).expanduser()
     raw = os.environ.get("TENDCF_DIR")
@@ -89,17 +112,29 @@ def _tendcf_dir(arg: str | None) -> Path | None:
 
 
 def load_projector(tendcf: Path) -> Any:
-    """Import tendcf's reference projector from its checkout (no copy here)."""
-    path = tendcf / "bin" / "projector.py"
-    spec = importlib.util.spec_from_file_location("tendcf_projector", path)
+    """Import tendcf's reference projector (`tools/projector.py`) from its checkout."""
+    path = tendcf / "tools" / "projector.py"
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise SiteModelError(f"cannot read projector at {path}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise SiteModelError(f"projector must be a regular non-symlink file: {path}")
+    resolved = path.resolve(strict=True)
+    spec = importlib.util.spec_from_file_location("tendcf_projector", resolved)
     if spec is None or spec.loader is None:
-        raise SiteModelError(f"cannot import {path}")
+        raise SiteModelError(f"cannot import {resolved}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
-def cmd_buildfile(args: argparse.Namespace) -> int:
+def cmd_compile(args: argparse.Namespace) -> int:
     for flag, val in (
         ("--site", args.site),
         ("--services", args.services),
@@ -110,7 +145,7 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
         ("--device-trust", args.device_trust),
     ):
         if val is not None and not str(val).strip():
-            print(f"nix2cf: ERROR: {flag} must not be empty", file=sys.stderr)
+            print(f"tendcf: ERROR: {flag} must not be empty", file=sys.stderr)
             return 2
 
     has_site_dir = args.site is not None
@@ -120,13 +155,13 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
     )
     if has_site_dir and has_workspace_flags:
         print(
-            "nix2cf: ERROR: --site cannot be combined with --site-name, --ops-root, or --workspace",
+            "tendcf: ERROR: --site cannot be combined with --site-name, --ops-root, or --workspace",
             file=sys.stderr,
         )
         return 2
     if has_explicit_files and has_workspace_flags:
         print(
-            "nix2cf: ERROR: explicit --services/--roles/--launchd-writers cannot be combined "
+            "tendcf: ERROR: explicit --services/--roles/--launchd-writers cannot be combined "
             "with --site-name, --ops-root, or --workspace",
             file=sys.stderr,
         )
@@ -135,19 +170,48 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
     try:
         overrides = parse_override_inputs(args.override_input)
     except WorkspaceError as exc:
-        print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
-    if args.check_releasable and overrides:
-        try:
-            refuse_release_if_tainted(overrides)
-        except WorkspaceError as exc:
-            print(f"nix2cf: REFUSED: {exc}", file=sys.stderr)
+    # Release-mode guards (D46 §4 Activation step 7 / F9 + issue #98 taint gate):
+    # refuse dev overrides AND any --tendcf / $TENDCF_DIR override.
+    plugin_root: Path | None = None
+    if args.check_releasable:
+        if overrides:
+            try:
+                refuse_release_if_tainted(overrides)
+            except WorkspaceError as exc:
+                print(f"tendcf: REFUSED: {exc}", file=sys.stderr)
+                return 1
+        if args.tendcf is not None:
+            print(
+                "tendcf: REFUSED: --check-releasable forbids --tendcf override; "
+                "release builds must use the verified in-tree tendcf checkout",
+                file=sys.stderr,
+            )
             return 1
+        if "TENDCF_DIR" in os.environ:
+            print(
+                "tendcf: REFUSED: --check-releasable forbids TENDCF_DIR environment override; "
+                "release builds must use the verified in-tree tendcf checkout",
+                file=sys.stderr,
+            )
+            return 1
+        tendcf = _in_tree_tendcf()
+        if tendcf is None:
+            print(
+                "tendcf: REFUSED: --check-releasable requires running from a verified "
+                "in-tree tendcf checkout (none found)",
+                file=sys.stderr,
+            )
+            return 1
+        plugin_root = tendcf
+    else:
+        tendcf = _tendcf_dir(args.tendcf)
 
     if args.output is not None and overrides and not args.allow_tainted:
         print(
-            f"nix2cf: REFUSED: refusing to write artifact {args.output!r} while dev-only "
+            f"tendcf: REFUSED: refusing to write artifact {args.output!r} while dev-only "
             f"--override-input is active ({format_overrides_summary(overrides)}); pass "
             "--allow-tainted for dev-only local preview output (never for release signing)",
             file=sys.stderr,
@@ -170,17 +234,17 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
             )
             site = resolve_site_input_dir(workspace.private_dir)
         except WorkspaceError as exc:
-            print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+            print(f"tendcf: ERROR: {exc}", file=sys.stderr)
             return 2
         print(
-            f"nix2cf: workspace: site={workspace.site_slug} source={workspace.selection_source} "
+            f"tendcf: workspace: site={workspace.site_slug} source={workspace.selection_source} "
             f"private={workspace.private_dir} public={workspace.public_dir or 'none'}",
             file=sys.stderr,
         )
 
     if overrides:
         print(
-            f"nix2cf: WARNING: dev-only --override-input active ({format_overrides_summary(overrides)}): "
+            f"tendcf: WARNING: dev-only --override-input active ({format_overrides_summary(overrides)}): "
             "paths validated and build marked TAINTED (not releasable); site.lock foreign-input "
             "substitution is not yet wired into compile_host (Site Model inputs are not substituted "
             "from the override path)",
@@ -196,32 +260,34 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
             paths[attr] = site / default_name
         else:
             print(
-                f"nix2cf: ERROR: --{attr.replace('_', '-')} or --site is required "
+                f"tendcf: ERROR: --{attr.replace('_', '-')} or --site is required "
                 "(or select a workspace site with --site-name / --workspace / TENDCF_SITE)",
                 file=sys.stderr,
             )
             return 2
 
     try:
-        model: SiteModel = load_site_model(paths["services"], paths["roles"], paths["launchd_writers"])
-        trust_doc = load_document(Path(args.device_trust))
-    except SiteModelError as exc:
-        print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+        yaml_plugin = load_plugin("frontend", "yaml", tendcf_root=plugin_root)
+        model: SiteModel = yaml_plugin.load_site_model(
+            paths["services"], paths["roles"], paths["launchd_writers"]
+        )
+        trust_doc = yaml_plugin.load_document(Path(args.device_trust))
+    except (SiteModelError, PluginError) as exc:
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
     schemas: Schemas | None = None
-    tendcf = _tendcf_dir(args.tendcf)
     if tendcf is not None:
         try:
             schemas = Schemas(tendcf / "schema")
         except SiteModelError as exc:
-            print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+            print(f"tendcf: ERROR: {exc}", file=sys.stderr)
             return 2
         problems = validate_site_model(model, schemas)
         if problems:
             for p in problems:
-                print(f"nix2cf: FAIL: {p}", file=sys.stderr)
-            print(f"nix2cf: {len(problems)} Site Model schema finding(s); not compiled", file=sys.stderr)
+                print(f"tendcf: FAIL: {p}", file=sys.stderr)
+            print(f"tendcf: {len(problems)} Site Model schema finding(s); not compiled", file=sys.stderr)
             return 1
 
     host = HostSpec(
@@ -232,27 +298,41 @@ def cmd_buildfile(args: argparse.Namespace) -> int:
         device_trust=trust_doc.data,
     )
     try:
-        result = compile_host(model, host, schemas, overrides=overrides)
+        result = compile_host(
+            model,
+            host,
+            schemas,
+            overrides=overrides,
+            tendcf_root=plugin_root,
+        )
     except CompileError as exc:
         for f in exc.findings:
-            print(f"nix2cf: REFUSED: {f}", file=sys.stderr)
-        print(f"nix2cf: {len(exc.findings)} finding(s); no goal file written", file=sys.stderr)
+            print(f"tendcf: REFUSED: {f}", file=sys.stderr)
+        print(f"tendcf: {len(exc.findings)} finding(s); no goal file written", file=sys.stderr)
         return 1
     for d in result.diagnostics:
         if d.startswith("TAINTED (not releasable):"):
             continue
-        print(f"nix2cf: note: {d}", file=sys.stderr)
+        print(f"tendcf: note: {d}", file=sys.stderr)
 
     out = result.canonical
     if args.project:
         if tendcf is None:
-            print("nix2cf: ERROR: --project needs a tendcf checkout to find bin/projector.py (not inside one: pass --tendcf or set TENDCF_DIR)", file=sys.stderr)
+            print(
+                "tendcf: ERROR: --project needs a tendcf checkout to find tools/projector.py "
+                "(not inside one: pass --tendcf or set TENDCF_DIR)",
+                file=sys.stderr,
+            )
             return 2
-        projector = load_projector(tendcf)
+        try:
+            projector = load_projector(tendcf)
+        except SiteModelError as exc:
+            print(f"tendcf: ERROR: {exc}", file=sys.stderr)
+            return 2
         try:
             out = projector.project(json.loads(result.canonical))
         except projector.ProjectionRefused as exc:
-            print(f"nix2cf: REFUSED by tendcf projector: {exc}", file=sys.stderr)
+            print(f"tendcf: REFUSED by tendcf projector: {exc}", file=sys.stderr)
             return 1
 
     if args.output is not None:
@@ -271,7 +351,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             or args.override_input
         ):
             print(
-                "nix2cf: ERROR: --list cannot be combined with --site-name, --config, "
+                "tendcf: ERROR: --list cannot be combined with --site-name, --config, "
                 "--override-input, or --check-releasable",
                 file=sys.stderr,
             )
@@ -279,7 +359,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         try:
             inventory = list_sites(ops_root=args.ops_root)
         except WorkspaceError as exc:
-            print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+            print(f"tendcf: ERROR: {exc}", file=sys.stderr)
             return 2
         if args.json:
             json.dump(inventory.to_dict(), sys.stdout, indent=2, sort_keys=True)
@@ -304,10 +384,10 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         return 0
 
     if args.config is not None and not args.config.strip():
-        print("nix2cf: ERROR: --config must not be empty", file=sys.stderr)
+        print("tendcf: ERROR: --config must not be empty", file=sys.stderr)
         return 2
     if args.config is not None and args.site_name is not None:
-        print("nix2cf: ERROR: --config cannot be combined with --site-name", file=sys.stderr)
+        print("tendcf: ERROR: --config cannot be combined with --site-name", file=sys.stderr)
         return 2
 
     try:
@@ -319,12 +399,12 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             overrides=overrides,
         )
     except WorkspaceError as exc:
-        print(f"nix2cf: ERROR: {exc}", file=sys.stderr)
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
     if ws.tainted:
         print(
-            f"nix2cf: WARNING: dev-only local override active ({format_overrides_summary(ws.overrides)}); "
+            f"tendcf: WARNING: dev-only local override active ({format_overrides_summary(ws.overrides)}); "
             "release signing/publishing is BLOCKED",
             file=sys.stderr,
         )
@@ -353,29 +433,24 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         try:
             ws.assert_releasable()
         except WorkspaceError as exc:
-            print(f"nix2cf: REFUSED: {exc}", file=sys.stderr)
+            print(f"tendcf: REFUSED: {exc}", file=sys.stderr)
             return 1
     return 0
 
 
 def cmd_eval_nix(args: argparse.Namespace) -> int:
-    exe = shutil.which("nix-instantiate")
-    if exe is None:
-        print("nix2cf: ERROR: nix-instantiate not found on PATH; the Nix frontend needs a Nix install", file=sys.stderr)
-        return 2
-    proc = subprocess.run(
-        [exe, "--eval", "--strict", "--json", str(args.file)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr)
+    try:
+        nix_plugin = load_plugin("frontend", "nix")
+    except PluginError as exc:
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
     try:
-        value = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        print(f"nix2cf: ERROR: nix-instantiate did not return JSON: {exc}", file=sys.stderr)
+        value = nix_plugin.eval_nix_file(
+            Path(args.file),
+            recipe_dir=Path(args.recipe_dir) if args.recipe_dir is not None else None,
+        )
+    except nix_plugin.NixEvalError as exc:
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
     json.dump(value, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
@@ -383,70 +458,70 @@ def cmd_eval_nix(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nix2cf", description=__doc__.splitlines()[0])
-    parser.add_argument("--version", action="version", version=f"nix2cf {__version__}")
+    parser = argparse.ArgumentParser(prog="tendcf", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"tendcf {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    b = sub.add_parser("buildfile", help="render what one host would receive")
-    b.add_argument("--host", required=True, help="host name as used in the Site Model (hosts:, roles)")
-    b.add_argument("--host-key", required=True, help="device public key, ed25519:<64 hex>")
-    b.add_argument("--platform", required=True, choices=["macos", "linux"], help="no default; android is not offered until Termux is decided")
-    b.add_argument(
+    c = sub.add_parser("compile", help="render what one host would receive")
+    c.add_argument("--host", required=True, help="host name as used in the Site Model (hosts:, roles)")
+    c.add_argument("--host-key", required=True, help="device public key, ed25519:<64 hex>")
+    c.add_argument("--platform", required=True, choices=["macos", "linux"], help="no default; android is not offered until Termux is decided")
+    c.add_argument(
         "--supervisor",
         required=True,
         choices=list(SUPERVISORS),
         help="what runs the host's units; no default. Written into device-trust.entries.supervisor",
     )
-    b.add_argument(
+    c.add_argument(
         "--device-trust",
         required=True,
         help="JSON/YAML file holding the goal file's device-trust domain; its supervisor entry, if any, must match --supervisor",
     )
-    b.add_argument(
+    c.add_argument(
         "--site",
         help="explicit directory holding services.yml, roles.yml, launchd-writers.yml (mutually exclusive with --site-name/--ops-root/--workspace)",
     )
-    b.add_argument(
+    c.add_argument(
         "--ops-root",
         dest="ops_root",
         help="ops workspace root holding tendcf-{private,public}-<site> (default $TENDCF_OPS_ROOT or ~/tendcf-ops)",
     )
-    b.add_argument(
+    c.add_argument(
         "--site-name",
         dest="site_name",
         help="site slug inside the ops workspace (precedence: --site-name > $TENDCF_SITE > XDG active-site)",
     )
-    b.add_argument(
+    c.add_argument(
         "--workspace",
         action="store_true",
         help="resolve site from the ops workspace via $TENDCF_SITE or XDG active-site (fails closed if unset)",
     )
-    b.add_argument(
+    c.add_argument(
         "--override-input",
         dest="override_input",
         action="append",
         metavar="NS=PATH",
         help="repeatable dev-only local checkout binding; validates path, marks output TAINTED, blocks -o without --allow-tainted, and fails --check-releasable",
     )
-    b.add_argument(
+    c.add_argument(
         "--allow-tainted",
         dest="allow_tainted",
         action="store_true",
         help="explicitly allow writing -o/--output when --override-input is active (dev-only preview; never releasable)",
     )
-    b.add_argument(
+    c.add_argument(
         "--check-releasable",
         dest="check_releasable",
         action="store_true",
-        help="refuse with exit 1 if any dev-only --override-input is active",
+        help="refuse with exit 1 if any dev-only --override-input, --tendcf, or $TENDCF_DIR override is active",
     )
-    b.add_argument("--services")
-    b.add_argument("--roles")
-    b.add_argument("--launchd-writers", dest="launchd_writers")
-    b.add_argument("--tendcf", help="tendcf checkout (schemas + projector); default $TENDCF_DIR, else the enclosing tendcf checkout")
-    b.add_argument("--project", action="store_true", help="print the projector's host_specific.json instead of the goal file")
-    b.add_argument("-o", "--output")
-    b.set_defaults(func=cmd_buildfile)
+    c.add_argument("--services")
+    c.add_argument("--roles")
+    c.add_argument("--launchd-writers", dest="launchd_writers")
+    c.add_argument("--tendcf", help="tendcf checkout (schemas + projector); default $TENDCF_DIR, else the enclosing tendcf checkout (forbidden with --check-releasable)")
+    c.add_argument("--project", action="store_true", help="print the projector's host_specific.json instead of the goal file")
+    c.add_argument("-o", "--output")
+    c.set_defaults(func=cmd_compile)
 
     w = sub.add_parser("workspace", help="resolve or list the multi-site local ops workspace (~/tendcf-ops)")
     w.add_argument(
@@ -484,8 +559,13 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     w.set_defaults(func=cmd_workspace)
 
-    e = sub.add_parser("eval-nix", help="evaluate a Nix expression to Site Model JSON")
-    e.add_argument("file")
+    e = sub.add_parser("eval-nix", help="evaluate a Nix expression to Site Model JSON (restricted mode)")
+    e.add_argument("file", help="Nix expression file to evaluate")
+    e.add_argument(
+        "--recipe-dir",
+        dest="recipe_dir",
+        help="allowed recipe directory passed to nix-instantiate -I (default: parent directory of FILE)",
+    )
     e.set_defaults(func=cmd_eval_nix)
     return parser
 

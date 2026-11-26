@@ -26,9 +26,9 @@ unit directory). One caveat is inherent in enumerating through the manager:
 purpose of this contract and never starts, stops, enables or reloads anything.
 
 Run on a Debian host (python3 and systemd; no root needed, nothing is written):
-    bin/unit_classifier.py --claims CLAIMS.json
+    tools/unit_classifier.py --claims CLAIMS.json
 or from a workstation with nothing copied to the host:
-    ssh HOST python3 - --claims-json "'$(tr -d '\\n' < CLAIMS.json)'" < bin/unit_classifier.py
+    ssh HOST python3 - --claims-json "'$(tr -d '\\n' < CLAIMS.json)'" < tools/unit_classifier.py
 """
 from __future__ import annotations
 

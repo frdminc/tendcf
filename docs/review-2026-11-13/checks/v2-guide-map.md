@@ -41,7 +41,7 @@ Every blocks-goal and misleads item in both reports is listed. Improves items ma
 | G-§20-04 | confirmed | guide:1049-1053 free-text `description` in the Site Model | none |
 | G-§4-01 (spot) | confirmed | guide:236-239, 251-252 | none (D46 ruling flagged) |
 | G-§4-02 (spot) | confirmed | rerun: `command -v nix` prints nothing; `/opt/homebrew/bin/cf-agent --version` gives `CFEngine Core 3.29.0` | none |
-| G-§8-03 (spot) | confirmed | `overlay/`, `bin/overlay.py` exist; guide:620-622 | none |
+| G-§8-03 (spot) | confirmed | `overlay/`, `tools/overlay.py` exist; guide:620-622 | none |
 | G-§10-01 (spot) | confirmed | `compile.py:18` "inference — NOT implemented"; guide:689-693 | none (ruling flagged) |
 | G-§13-01 (spot) | confirmed | ShizukuTendCF README: headless broadcasts `af.shizuku.plus.api.HEADLESS_STATUS` | none; ADB-after-reboot stays inferred, as the item says |
 | G-§14-01 (spot) | confirmed | guide:845 Release row | Conflicts with M-§10-02 (see Disagreements) |
@@ -109,7 +109,7 @@ By report: guide 32 checked (25 confirmed, 7 weakened); map 42 checked (24 confi
 2. Replace the proposed parenthesis with: "(Today pastebin runs `cf-execd` only, and get.sipb.cloud schedules nothing.)"
 
 **G-§16-01.** Replace the proposed text with:
-> In **A** and **B** the outputs are hand-authored. Some of their shapes are now emitted by code: the compiler renders the goal file, `bin/projector.py` its projection, and the generic bundle the launchd plist. But nothing derives ordering edges (§10), and B's per-bundle promise sketch is illustrative: the generic bundle, not per-bundle CFEngine text, enforces interlocks (§16.C).
+> In **A** and **B** the outputs are hand-authored. Some of their shapes are now emitted by code: the compiler renders the goal file, `tools/projector.py` its projection, and the generic bundle the launchd plist. But nothing derives ordering edges (§10), and B's per-bundle promise sketch is illustrative: the generic bundle, not per-bundle CFEngine text, enforces interlocks (§16.C).
 
 **G-§18-02.**
 1. Replace the Finding's first sentence with: "The table is the order from before 2026-10-29: macOS adapter, then Android, compiler, Linux, signing at Step 6 and consent at Step 9. It does not record D22's Android deferral, which the map's table does."

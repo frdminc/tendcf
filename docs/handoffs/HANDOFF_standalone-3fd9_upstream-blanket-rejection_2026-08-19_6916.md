@@ -320,8 +320,8 @@ curl -s "https://northerntech.atlassian.net/rest/api/2/issue/CFE-4736?fields=sta
 #   curl -u "djbclark@gmail.com:$TOKEN" https://northerntech.atlassian.net/rest/api/2/...
 
 # Lints, if touching docs (uv run, never python3, per the register):
-uv run bin/schema_lint.py
-uv run bin/xref_lint.py
+uv run tools/schema_lint.py
+uv run tools/xref_lint.py
 ```
 
 Parent handoff: `docs/handoffs/HANDOFF_standalone-3fd9_paper-destale-for-comment_2026-08-18_5c31.md`

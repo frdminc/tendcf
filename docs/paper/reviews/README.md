@@ -22,7 +22,7 @@ uniformly; the prompt for each is saved alongside as `prompt_<pass>.txt`.
 
 | File | Model / effort | Pass |
 | --- | --- | --- |
-| `2026-08-15_opus-5_consistency-audit.md` | Opus 5 / medium | Guide vs implementer map vs `schema/` vs `bin/schema_lint.py` |
+| `2026-08-15_opus-5_consistency-audit.md` | Opus 5 / medium | Guide vs implementer map vs `schema/` vs `tools/schema_lint.py` |
 | `2026-08-15_opus-5_guide-paper-parity.md` | Opus 5 / medium | Guide vs the technical paper |
 | `2026-08-15_opus-5-xhigh_skeptical-review.md` | Opus 5 / xhigh | Skeptical peer review, whole document |
 | `2026-08-15_opus-5-max_redteam-trust-consent.md` | Opus 5 / **max** | Adversarial, §§7–9 and 14–15 |
@@ -68,7 +68,7 @@ feasibility is assessed separately in
 - Both Bcfg2 numeric claims (the `0 / 2308` first-run figures and the FTE
   figures) confirmed exact against primary sources.
 - The `§0 rule 6` references in `schema/common.schema.json` and
-  `bin/schema_lint.py` are **correct** against `architecture-DEFINITIVE-v3.md`
+  `tools/schema_lint.py` are **correct** against `architecture-DEFINITIVE-v3.md`
   §0. Do not "fix" them — three neighbouring references in the same file are
   genuinely stale, which makes this one look wrong by association.
 

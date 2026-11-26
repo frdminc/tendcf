@@ -22,12 +22,12 @@ Sources consulted: firecrawl (scrape) — Nix manual `restrict-eval`/`pure-eval`
 | 2 | Root install and a root `cf-execd` on the Mac | `deploy/linux/tendcf-install.sh` (refuses non-Linux at :47) | A macOS installer and a LaunchDaemon for `cf-execd` | ~200 lines, 1–2 days | C-deploy-01 |
 | 3 | A launchd adapter that converges | `policy/tendcf_services.cf:274-317`, `policy/templates/launchd.plist.mustache` | env, reload on change, error visibility, tombstone guard, backup files, a "data loaded" guard, tests | ~150 policy + ~150 test lines, 3–5 days | C-policy-01..06, C-tests-01 |
 | 4 | Device identity and a signed update | ed25519 `host` patterns in schemas; approval-record `signature` member (fixtures only) | A device key that exists, a signature over the goal file, verification before projection | 400–800 lines, 1–2 weeks | C-schema-01, C-schema-02, C-bin-01 |
-| 5 | See and refuse (G4's minimum) | `goal-diff.schema.json`; lint-only `apply_diff` (`bin/schema_lint.py:1821`) | A diff the owner reads and accepts or refuses on the device | 300–600 lines, ~1 week | C-bin-03, C-deploy-02 |
-| 6 | Nix authoring with NixOS-style options | `nix2cf eval-nix` (`compiler/nix2cf/cli.py:150-171`), a plain attrset | A module system with tendcf options, and a whole-site Nix input | 300–600 lines, 1–2 weeks (carry-over importers: +1–2 weeks) | C-compiler-01 |
+| 5 | See and refuse (G4's minimum) | `goal-diff.schema.json`; lint-only `apply_diff` (`tools/schema_lint.py:1821`) | A diff the owner reads and accepts or refuses on the device | 300–600 lines, ~1 week | C-bin-03, C-deploy-02 |
+| 6 | Nix authoring with NixOS-style options | `nix2cf eval-nix` (`compiler/tendcf/cli.py:150-171`), a plain attrset | A module system with tendcf options, and a whole-site Nix input | 300–600 lines, 1–2 weeks (carry-over importers: +1–2 weeks) | C-compiler-01 |
 | 7 | Android in the contract | nothing: the compiler refuses android (`compile.py:85-88`), the schema has no Android supervisor or domain | Android domains (apps per user/profile, appops, settings, grants) in a schema bump, plus compiler rendering | ~400 schema + ~300 compiler lines, 1–2 weeks | C-schema-03, C-compiler-05 |
 | 8 | Android client | nothing in tendcf; substrate in stayturgid's Kotlin agent, Termux CFEngine and ShizukuTendCF | Receive, verify, diff/consent UI, apply via Shizuku, report | 3–6k Kotlin lines, 4–8 weeks (less if Termux CFEngine converges: needs a ruling) | C-android-01..05 |
 | 9 | Transport and peer handshake | nothing (inventory §H "Push: nothing") | Mac to Android delivery, and acceptance from any peer that completes the handshake | 1–2 weeks | C-schema-02 |
-| 10 | Logs archived on the Mac | `schema/report-row.schema.json` (only `bin/unit_classifier.py`, Linux, uses it) | A sender on Android, a receiver and archive on the Mac, and a goal-file shape for both | 300–500 lines, ~1 week | C-macos-02 |
+| 10 | Logs archived on the Mac | `schema/report-row.schema.json` (only `tools/unit_classifier.py`, Linux, uses it) | A sender on Android, a receiver and archive on the Mac, and a goal-file shape for both | 300–500 lines, ~1 week | C-macos-02 |
 | 11 | Fail-closed CMDB on the Mac build | PR #41 (open when written; merged 2026-11-14, daa4530) | Merge it, and add a policy-side guard | days | C-policy-06 |
 
 The total is a guess of 3 to 5 months of focused work. Rows 4, 5 and 8 dominate.
@@ -35,7 +35,7 @@ The total is a guess of 3 to 5 months of focused work. Rows 4, 5 and 8 dominate.
 **Ruled, row 8:** "3. Termux CFEngine + thin Kotlin" (operator ruling, 2026-11-14, B3): state 1 on Android is Termux CFEngine fed tendcf projections; the Kotlin agent holds trust and consent only (Idea 4 below). The row's "less if Termux CFEngine converges: needs a ruling" is answered.
 
 **(b) Share of code by platform** (`wc -l` over the tracked files in the target dirs: 16,181 lines).
-1. Linux-only: about 5,200 lines (32%). This is `bin/unit_classifier.py` 896 plus `tests/unit_classifier/` 3,135, `deploy/` 405, `tests/deploy/` 162, `run.sh` check 6 (about 194 lines, :163-356), the systemd half of the policy (66 lines naming systemd) and its template (13), `linux.yml` 118 and `build-fork` 81.
+1. Linux-only: about 5,200 lines (32%). This is `tools/unit_classifier.py` 896 plus `tests/unit_classifier/` 3,135, `deploy/` 405, `tests/deploy/` 162, `run.sh` check 6 (about 194 lines, :163-356), the systemd half of the policy (66 lines naming systemd) and its template (13), `linux.yml` 118 and `build-fork` 81.
 2. macOS-specific: about 60 lines, all policy and template, plus the launchd-only renderer inside `compiler/` (1,139 Python lines that render launchd units only).
 3. Android: 0.
 4. Platform-neutral contract machinery: the rest, about 10,900 lines (schemas, schema_lint 2,260, projector 620, overlay 2,029 plus 626, xref and flag lint). It is neutral in platform but CFEngine-shaped (C-bin-02).
@@ -81,12 +81,12 @@ D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tens
 
 ### C-compiler-01: The Nix frontend evaluates JSON; it is not NixOS-style options
 
-**Target:** `compiler/nix2cf/cli.py` `cmd_eval_nix`, at "Evaluates a Nix expression to the JSON the compiler consumes"
+**Target:** `compiler/tendcf/cli.py` `cmd_eval_nix`, at "Evaluates a Nix expression to the JSON the compiler consumes"
 **Kind:** add
 **Goal:** G2
 **Weight:** blocks-goal
 **Finding:** `eval-nix` runs `nix-instantiate --eval --strict --json FILE` and pretty-prints the result. That is all there is. The example is a plain attribute set with "No nixpkgs, no `lib`, no module system". It encodes only `services.yml`: roles and launchd-writers have no Nix form. `buildfile` cannot consume `eval-nix` output directly. It needs three separate files (`--services`, `--roles`, `--launchd-writers`), and it parses any non-`.json` suffix as YAML. So "existing NixOS and nix-darwin configs carry over" is entirely unbuilt. A NixOS host is passthrough by design (`NIXOS_REFUSAL`): tendcf writes none of its units, so a NixOS configuration "carries over" only by staying where it is; nothing imports it into the Site Model.
-**Evidence:** `compiler/nix2cf/cli.py:150-171`, `:82-90`; `compiler/nix2cf/sitemodel.py:99-112`; `compiler/examples/site/site.nix:1-13`; `compiler/nix2cf/compile.py:96`, `:430-434`.
+**Evidence:** `compiler/tendcf/cli.py:150-171`, `:82-90`; `compiler/tendcf/sitemodel.py:99-112`; `compiler/examples/site/site.nix:1-13`; `compiler/tendcf/compile.py:96`, `:430-434`.
 **Proposed text:**
 
 > Build the Nix frontend as a module evaluation, not a JSON dump: `lib.evalModules` over a `tendcf` option tree (`tendcf.services.<name>`, `tendcf.roles`, `tendcf.writers`, later `tendcf.android.*`), evaluated with `--restrict-eval`, whose `config.tendcf` is the whole Site Model in one document. Add two importers that read an existing configuration's evaluated options: nix-darwin `config.launchd.daemons.<name>.serviceConfig` (ProgramArguments, UserName, WorkingDirectory, EnvironmentVariables, RunAtLoad, KeepAlive) to launchd services, and NixOS `config.systemd.services` to systemd services. `buildfile --site site.nix` takes the result directly.
@@ -96,12 +96,12 @@ D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tens
 
 ### C-compiler-02: `eval-nix` evaluates untrusted Nix with full file and network access
 
-**Target:** `compiler/nix2cf/cli.py` `cmd_eval_nix`, at `[exe, "--eval", "--strict", "--json", str(args.file)]`
+**Target:** `compiler/tendcf/cli.py` `cmd_eval_nix`, at `[exe, "--eval", "--strict", "--json", str(args.file)]`
 **Kind:** correct
 **Goal:** G4, G6
 **Weight:** improves
 **Finding:** Config is AI-authored (G6), so a `.nix` file is untrusted input. The evaluator is run with defaults. `restrict-eval` is false by default, so `builtins.readFile` of the author's SSH private key or `builtins.fetchurl` works, and the value is printed to stdout and can travel into a goal file. A file named after `--` (`nix2cf eval-nix -- -x`) reaches nix-instantiate as an option, because the argv has no `--` before the path. Import-from-derivation is also on by default, so evaluation can trigger builds. Scope: this runs on the authoring machine, not on a managed device; no device runs `eval-nix`.
-**Evidence:** `compiler/nix2cf/cli.py:155-160`; Nix manual: https://nix.dev/manual/nix/2.28/command-ref/conf-file.html#conf-restrict-eval ("Default: false").
+**Evidence:** `compiler/tendcf/cli.py:155-160`; Nix manual: https://nix.dev/manual/nix/2.28/command-ref/conf-file.html#conf-restrict-eval ("Default: false").
 **Proposed text:**
 
 > Run the evaluator as `nix-instantiate --eval --strict --json --option restrict-eval true --option allowed-uris '' -I site=<site dir> -- <file>` and refuse a file outside the site directory. A frontend that reads anything else is a compile error.
@@ -111,7 +111,7 @@ D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tens
 
 ### C-compiler-03: Outside a tendcf checkout the compiler writes an unvalidated goal file and exits 0
 
-**Target:** `compiler/nix2cf/compile.py` `compile_host`, at "no tendcf schema directory found"
+**Target:** `compiler/tendcf/compile.py` `compile_host`, at "no tendcf schema directory found"
 **Kind:** correct
 **Goal:** G1, G4
 **Weight:** improves
@@ -122,7 +122,7 @@ D45 (a Kotlin agent) is consistent with stayturgid's native agent. It is in tens
 4. it writes the goal file with exit 0.
 
 The docstring "Raises CompileError; never emits a wrong file" is then false. Unvalidated input also reaches `rec["launchd"]`, `rec["bundle"]` and the like as raw KeyErrors. This is the path every adopter (G8 state 3) takes.
-**Evidence:** `compiler/nix2cf/cli.py:40-59`, `:99-113`; `compiler/nix2cf/compile.py:663`, `:707-711`.
+**Evidence:** `compiler/tendcf/cli.py:40-59`, `:99-113`; `compiler/tendcf/compile.py:663`, `:707-711`.
 **Proposed text:**
 
 > Ship the schemas and the projector as package data of the compiler and validate always; with no schemas available, refuse (exit 2) rather than emit.
@@ -132,12 +132,12 @@ The docstring "Raises CompileError; never emits a wrong file" is then false. Unv
 
 ### C-compiler-04: A `platform: any` service crashes the compiler with a traceback
 
-**Target:** `compiler/nix2cf/compile.py` `conflict_check`, at `entry_id = sel.record["launchd"]["label"]`
+**Target:** `compiler/tendcf/compile.py` `conflict_check`, at `entry_id = sel.record["launchd"]["label"]`
 **Kind:** correct
 **Goal:** G1
 **Weight:** improves
 **Finding:** `select_services` accepts `platform in (host.platform, "any")`. `services.schema.json` requires `launchd` only `if platform == macos`. So a schema-valid `platform: any` service selected for a launchd host has no `launchd` key, and `conflict_check` raises KeyError. The CLI catches only `CompileError`, so the user gets a Python traceback.
-**Evidence:** `compiler/nix2cf/compile.py:238`, `:293`, `:535`; `schema/services.schema.json` top-level `allOf` (macos→launchd, linux→systemd); `compiler/nix2cf/cli.py:121-127`.
+**Evidence:** `compiler/tendcf/compile.py:238`, `:293`, `:535`; `schema/services.schema.json` top-level `allOf` (macos→launchd, linux→systemd); `compiler/tendcf/cli.py:121-127`.
 **Proposed text:**
 
 > In `select_services`, a selected service that lacks the host supervisor's unit block (`launchd` on a launchd host) is a compile error naming the record and line: "service X is platform any but has no launchd block; add one or set platform".
@@ -147,12 +147,12 @@ The docstring "Raises CompileError; never emits a wrong file" is then false. Unv
 
 ### C-compiler-05: Android is refused at every layer although the Site Model admits it
 
-**Target:** `compiler/nix2cf/compile.py` `PLATFORM_SUPERVISORS`
+**Target:** `compiler/tendcf/compile.py` `PLATFORM_SUPERVISORS`
 **Kind:** add
 **Goal:** G5, G8
 **Weight:** blocks-goal
 **Finding:** The Site Model's `platform` enum includes `android`, and the example declares an `android-termux-services` domain. But `PLATFORM_SUPERVISORS` has no android row, `--platform` offers only macos and linux, and the goal file has no Android supervisor or domain. G5's platform 2 cannot be compiled for at all.
-**Evidence:** `compiler/nix2cf/compile.py:81-88`; `compiler/nix2cf/cli.py:182`; `schema/services.schema.json` (`platform` enum `["macos","android","linux","any"]`); `compiler/examples/site/site.nix:27-32`.
+**Evidence:** `compiler/tendcf/compile.py:81-88`; `compiler/tendcf/cli.py:182`; `schema/services.schema.json` (`platform` enum `["macos","android","linux","any"]`); `compiler/examples/site/site.nix:27-32`.
 **Proposed text:**
 
 > Add `android` as a platform whose host fact is not a unit supervisor but an agent (`tendcf-agent`), with its own domains (C-schema-03); render those domains, and refuse services (launchd/systemd units) on it.
@@ -162,12 +162,12 @@ The docstring "Raises CompileError; never emits a wrong file" is then false. Unv
 
 ### C-compiler-06: Only one actuated domain exists, so logs, files and packages have nowhere to go
 
-**Target:** `compiler/nix2cf/compile.py` `SUPERVISION_DOMAIN` and `render_goal_file`, at "keep one host's services in one domain"
+**Target:** `compiler/tendcf/compile.py` `SUPERVISION_DOMAIN` and `render_goal_file`, at "keep one host's services in one domain"
 **Kind:** add
 **Goal:** G3, G8
 **Weight:** blocks-goal
 **Finding:** The compiler maps exactly one Site Model domain to `supervision` and refuses a host whose services span two. The "Site-Model-domain → goal-file-domain mapping is not written down anywhere". A Mac that archives logs and an Android device that ships them need state beyond "a daemon runs": a log endpoint, a receiver, retention, a forwarding config, and files. The pipeline has no domain for any of these, and the projector projects only `supervision`.
-**Evidence:** `compiler/nix2cf/compile.py:63-74`, `:503-511`; `bin/projector.py:127-128`.
+**Evidence:** `compiler/tendcf/compile.py:63-74`, `:503-511`; `tools/projector.py:127-128`.
 **Proposed text:**
 
 > Write the domain mapping down and add the first two non-service domains the finish line needs: `log-forward` (client: where reports go, signed by whom) and `log-archive` (server: where they land, retention).
@@ -182,7 +182,7 @@ The docstring "Raises CompileError; never emits a wrong file" is then false. Unv
 **Goal:** G4
 **Weight:** blocks-goal
 **Finding:** The compiler emits only `state: present`. A service deleted from the Site Model simply vanishes from the next goal file. The policy acts only on ids it is given, and extra-entry detection is not wired, so the daemon keeps running and its plist stays. G4's "exact difference" then reports a removal that never happens on the device. The removal hunk exists in the diff schema but not in reality.
-**Evidence:** `compiler/README.md:93`; `compiler/nix2cf/compile.py:536-551` (present only); `policy/tendcf_services.cf:104-105` (acts on `getindices` of the given ids only).
+**Evidence:** `compiler/README.md:93`; `compiler/tendcf/compile.py:536-551` (present only); `policy/tendcf_services.cf:104-105` (acts on `getindices` of the given ids only).
 **Proposed text:**
 
 > Derive tombstones from the previous accepted goal file (baseline) rather than from the Site Model: an id present in the baseline and absent from the new render becomes `{"state":"absent"}` in a comprehensive domain.
@@ -192,18 +192,18 @@ The docstring "Raises CompileError; never emits a wrong file" is then false. Unv
 
 ### C-compiler-08: Invariants the lint enforces are not enforced at compile time
 
-**Target:** `compiler/nix2cf/compile.py` `render_goal_file`, at `owners = [w for w in writers if _prefix_matches(...)]`
+**Target:** `compiler/tendcf/compile.py` `render_goal_file`, at `owners = [w for w in writers if _prefix_matches(...)]`
 **Kind:** correct
 **Goal:** G4
 **Weight:** improves
-**Finding:** Several rules are lint-only (`bin/schema_lint.py`), but the compiler never imports or runs that lint on user input or on its own output:
+**Finding:** Several rules are lint-only (`tools/schema_lint.py`), but the compiler never imports or runs that lint on user input or on its own output:
 1. nested writer prefixes are refused (:1421-1429);
 2. goal-file unit-writer keys must not overlap;
 3. every interlock bundle must be used;
 4. a tombstone must fall under a cfengine prefix.
 
 With nested prefixes the compiler takes `owners[0]`, the first declared, not the most specific, so its writer check depends on file order. The tests call the lint's cross-file check (`test_compile.py:70-74`); the CLI does not.
-**Evidence:** `compiler/nix2cf/compile.py:599-612`; `bin/schema_lint.py:1408-1431`, `:1611`; `schema/goal-file.schema.json:520` ("Lint: no two keys overlap"); `rg lint compiler/nix2cf` (docstring mentions only).
+**Evidence:** `compiler/tendcf/compile.py:599-612`; `tools/schema_lint.py:1408-1431`, `:1611`; `schema/goal-file.schema.json:520` ("Lint: no two keys overlap"); `rg lint compiler/nix2cf` (docstring mentions only).
 **Proposed text:**
 
 > Move the cross-file checks into an importable library that `compile_host` runs over the Site Model and the rendered goal file, and that the device validator runs again; the lint calls the same library.
@@ -213,12 +213,12 @@ With nested prefixes the compiler takes `owners[0]`, the first declared, not the
 
 ### C-compiler-09: Source locations exist for YAML only, so the Nix path cannot point at code
 
-**Target:** `compiler/nix2cf/sitemodel.py` `load_document`, at `return Document(path, data)`
+**Target:** `compiler/tendcf/sitemodel.py` `load_document`, at `return Document(path, data)`
 **Kind:** add
 **Goal:** G2, G4
 **Weight:** improves
 **Finding:** Locations are recorded per YAML mapping only (`_LineLoader`). JSON input gets none, and the Nix route goes through JSON, so every error message and any future highlight points at a temporary file, not at the line in the `.nix` file. Entries in the goal file carry no provenance back to the Site Model at all.
-**Evidence:** `compiler/nix2cf/sitemodel.py:33-45`, `:99-104`; `compiler/nix2cf/cli.py:169`.
+**Evidence:** `compiler/tendcf/sitemodel.py:33-45`, `:99-104`; `compiler/tendcf/cli.py:169`.
 **Proposed text:**
 
 > Carry a source map beside the goal file (`entry pointer -> file:line`, from `builtins.unsafeGetAttrPos` on the Nix side and `_LineLoader` on the YAML side); it is not part of the signed bytes.
@@ -234,8 +234,8 @@ With nested prefixes the compiler takes `owners[0]`, the first declared, not the
 **Kind:** correct
 **Goal:** G4, G6
 **Weight:** blocks-goal
-**Finding:** The policy builds the command string with `join(" ", …[pre_action][command])` and runs it with `useshell => "true"`. The goal-file schema puts no alphabet limit on `pre_action.command` items (contrast the systemd argv alphabet). So `["tailscale", "status; curl …|sh"]` runs as root every five minutes. Under G6 the author is an AI, which is exactly the input the comment calls trusted. A mechanical diff shows an argv array, but the device executes a different thing (a shell string), so what the owner sees is not what runs. The only other filter on these strings is the projector's refusal of `$(`, `${`, `@(`, `@{` (`bin/projector.py:145`). It does not stop `;`, `|`, `&&`, backticks or redirection, and `tendcf-install.sh data` installs a projection without running the projector. No other lint restricts them: `bin/schema_lint.py`, `bin/xref_lint.py`, `bin/overlay.py` and the compiler never mention `pre_action`, and the Site Model's `common.schema.json` items are plain strings too. The proposed text first given here (promiser `command[0]` with "absolute path required by schema", `arglist` from a container slice) cited a schema rule that does not exist and is not proven expressible in CFEngine: `getvalues()` can turn the container path into an slist, but whether that slist, split into head and tail, parses as an `arglist` is exactly what the policy comment reports failing, and needs a real `cf-promises` run. It is replaced below by the fallback, restricting the argument alphabet in the schema, as a certain step 1, with the no-shell `arglist` form as step 2 once a test proves it.
-**Evidence:** `policy/tendcf_services.cf:72-98`, `:370-374`; `schema/goal-file.schema.json:497-504`; `bin/projector.py:145`; CFEngine `commands` reference (<https://docs.cfengine.com/docs/master/reference/promise-types/commands/>: `arglist` is an slist, `useshell` defaults to `noshell`) and `getvalues()` reference (<https://docs.cfengine.com/docs/master/reference/functions/getvalues/>).
+**Finding:** The policy builds the command string with `join(" ", …[pre_action][command])` and runs it with `useshell => "true"`. The goal-file schema puts no alphabet limit on `pre_action.command` items (contrast the systemd argv alphabet). So `["tailscale", "status; curl …|sh"]` runs as root every five minutes. Under G6 the author is an AI, which is exactly the input the comment calls trusted. A mechanical diff shows an argv array, but the device executes a different thing (a shell string), so what the owner sees is not what runs. The only other filter on these strings is the projector's refusal of `$(`, `${`, `@(`, `@{` (`tools/projector.py:145`). It does not stop `;`, `|`, `&&`, backticks or redirection, and `tendcf-install.sh data` installs a projection without running the projector. No other lint restricts them: `tools/schema_lint.py`, `tools/xref_lint.py`, `tools/overlay.py` and the compiler never mention `pre_action`, and the Site Model's `common.schema.json` items are plain strings too. The proposed text first given here (promiser `command[0]` with "absolute path required by schema", `arglist` from a container slice) cited a schema rule that does not exist and is not proven expressible in CFEngine: `getvalues()` can turn the container path into an slist, but whether that slist, split into head and tail, parses as an `arglist` is exactly what the policy comment reports failing, and needs a real `cf-promises` run. It is replaced below by the fallback, restricting the argument alphabet in the schema, as a certain step 1, with the no-shell `arglist` form as step 2 once a test proves it.
+**Evidence:** `policy/tendcf_services.cf:72-98`, `:370-374`; `schema/goal-file.schema.json:497-504`; `tools/projector.py:145`; CFEngine `commands` reference (<https://docs.cfengine.com/docs/master/reference/promise-types/commands/>: `arglist` is an slist, `useshell` defaults to `noshell`) and `getvalues()` reference (<https://docs.cfengine.com/docs/master/reference/functions/getvalues/>).
 **Proposed text:**
 
 > Step 1, certainly expressible today: set `useshell => "noshell"` (CFEngine's default) in `tendcf_interlock_contain`, so no shell parses the joined string, and require `pre_action.command[0]` to match `^/` and every item to match the systemd argv alphabet plus "no ASCII space" (schema bump, to `schema_version` 6; `contract_version` is the exact pin `const: 2`), so that the joined string splits back into the same argv. Step 2, once proven against a real build: build an slist per interlock with `getvalues("data:variables.tendcf_interlock[$(id)][pre_action][command]")` under a canonified, non-bracket name, and pass its tail as `arglist` with its head as the promiser. Keep step 1's alphabet until step 2 passes a test.
@@ -257,7 +257,7 @@ Ruled; the schema half is implemented: `schema_version` 6 and `contract_version`
 **Goal:** G4, G8
 **Weight:** blocks-goal
 **Finding:** The compiler emits `env` (litellm's `LITELLM_MASTER_KEY`, `OPENAI_API_KEY`), and the projector carries it into `host_specific.json`. Neither the launchd plist template nor the systemd unit template mentions it. No code resolves a secretspec name to a value. The service starts without its environment and nothing reports it. The goal file and the diff say one thing and the device does another, which G4 rules out.
-**Evidence:** `compiler/nix2cf/compile.py:548-550`; `examples/host_specific.json` (`"env":{"CADDY_ADMIN_TOKEN":…}`); `policy/templates/launchd.plist.mustache:1-32`; `policy/templates/systemd.service.mustache:1-13`; `rg secretspec policy bin deploy compiler/nix2cf` (projector name check only).
+**Evidence:** `compiler/tendcf/compile.py:548-550`; `examples/host_specific.json` (`"env":{"CADDY_ADMIN_TOKEN":…}`); `policy/templates/launchd.plist.mustache:1-32`; `policy/templates/systemd.service.mustache:1-13`; `rg secretspec policy bin deploy compiler/nix2cf` (projector name check only).
 **Proposed text:**
 
 > Until a device-side secret resolver exists, refuse (report, do not actuate) any service entry carrying `env`; when it exists, render `EnvironmentVariables` from a root-only file the resolver writes, never inline values in the plist.
@@ -384,7 +384,7 @@ Ruled; the schema half is implemented: `schema_version` 6 and `contract_version`
 **Kind:** question
 **Goal:** G4
 **Weight:** improves
-**Finding:** Only `bin/schema_lint.py` references goal-diff and approval-record. report-row is used also by the Linux-only unit classifier. No compiler, projector, installer or policy code reads or writes any of the three. That is the review record's pre-mortem C1 ("validates files that nothing consumes") in concrete form. These are exactly the shapes G4 and the log archive need, so they should get their first consumer before any further bump.
+**Finding:** Only `tools/schema_lint.py` references goal-diff and approval-record. report-row is used also by the Linux-only unit classifier. No compiler, projector, installer or policy code reads or writes any of the three. That is the review record's pre-mortem C1 ("validates files that nothing consumes") in concrete form. These are exactly the shapes G4 and the log archive need, so they should get their first consumer before any further bump.
 **Evidence:** `rg -l goal-diff|approval-record|report-row bin compiler/nix2cf policy deploy tests .github`, which gives schema_lint.py for all three plus unit_classifier.py for report-row.
 **Proposed text:**
 
@@ -400,7 +400,7 @@ Ruled; the schema half is implemented: `schema_version` 6 and `contract_version`
 **Goal:** G5
 **Weight:** improves
 **Finding:** v5 added a `unit-package` kind whose only writer is `dpkg`. It also widened the unit-writer key language to systemd suffixes, and its `tendcf-install` writer is "systemd hosts only". All three changes were made for the pastebin Debian host, i.e. G5's platform 4. Each costs a `schema_version` bump that macOS and Android files must also carry. Per v5, rpm would need another bump. Note that 5,200 lines (32%) of the target code is Linux-only (summary (b)).
-**Evidence:** `schema/goal-file.schema.json:520-555`, `:535`; `compiler/nix2cf/compile.py:47-56`.
+**Evidence:** `schema/goal-file.schema.json:520-555`, `:535`; `compiler/tendcf/compile.py:47-56`.
 **Proposed text:**
 
 > Move platform-specific kinds into per-platform domain schemas that a goal file includes by `supervisor`, so a Linux bump does not version a Mac or Android file.
@@ -429,7 +429,7 @@ Ruled; the schema half is implemented: `schema_version` 6 and `contract_version`
 
 ### C-bin-01: The only device-side code checks nothing about authenticity or ownership
 
-**Target:** `bin/projector.py` module docstring, at "Neither exists yet and this repo is contract-only"
+**Target:** `tools/projector.py` module docstring, at "Neither exists yet and this repo is contract-only"
 **Kind:** add
 **Goal:** G3, G4, G8
 **Weight:** blocks-goal
@@ -442,7 +442,7 @@ Ruled; the schema half is implemented: `schema_version` 6 and `contract_version`
 6. ask anything.
 
 The installer then bypasses even the projector (C-deploy-02). `tendcf-validate`, which is meant to do all of this on Mac and Linux, is a proposal only. Every G4 step needs it first.
-**Evidence:** `bin/projector.py:14-25`, `:251-332`; inventory §H ("Validator (tendcf-validate): prose only").
+**Evidence:** `tools/projector.py:14-25`, `:251-332`; inventory §H ("Validator (tendcf-validate): prose only").
 **Proposed text:**
 
 > Build `tendcf-validate` minimal for the Mac first: verify envelope (C-schema-02), refuse `host != self`, schema-validate, diff against the stored baseline (goal-diff), print the diff, require an explicit yes, then project and atomically replace `host_specific.json` and the baseline.
@@ -452,7 +452,7 @@ The installer then bypasses even the projector (C-deploy-02). `tendcf-validate`,
 
 ### C-bin-02: The Android agent must port a CFEngine-shaped contract byte for byte
 
-**Target:** `bin/projector.py` docstring, at "the Android agent's Kotlin port must reproduce it byte-for-byte (R22)"
+**Target:** `tools/projector.py` docstring, at "the Android agent's Kotlin port must reproduce it byte-for-byte (R22)"
 **Kind:** question
 **Goal:** G5, G7
 **Weight:** improves
@@ -462,7 +462,7 @@ The installer then bypasses even the projector (C-deploy-02). `tendcf-validate`,
 3. containers because dotted keys become scopes.
 
 R22 requires the Kotlin agent to reproduce it byte for byte. If no `cf-agent` reads it on Android (D45), it is a second implementation of a format nobody on that device consumes. If Termux CFEngine does read it (C-android-01), the port is justified.
-**Evidence:** `bin/projector.py:20-25`, `:137-145`, `:43-50`.
+**Evidence:** `tools/projector.py:20-25`, `:137-145`, `:43-50`.
 **Proposed text:**
 
 > Decide per platform what the agent consumes: on Android, either the goal file directly (no projection, no CMDB rules) or the projection fed to Termux cf-agent; R22 applies only in the second case.
@@ -474,12 +474,12 @@ R22 requires the Kotlin agent to reproduce it byte for byte. If no `cf-agent` re
 
 ### C-bin-03: The only diff application and ceremony derivation live inside the lint
 
-**Target:** `bin/schema_lint.py` `apply_diff` and `derive_ceremony_class`
+**Target:** `tools/schema_lint.py` `apply_diff` and `derive_ceremony_class`
 **Kind:** move
 **Goal:** G4
 **Weight:** improves
 **Finding:** `apply_diff` (L1821) and `derive_ceremony_class` (L1791) are the nearest working code to G4's "exact, mechanically checked difference" and to a risk class. They live in a 2,260-line lint script and check fixtures only. A device validator or a CLI would have to copy them, the same second-implementation drift the projector docstring warns about.
-**Evidence:** `bin/schema_lint.py:1791-1821`; graft skeleton of schema_lint.py.
+**Evidence:** `tools/schema_lint.py:1791-1821`; graft skeleton of schema_lint.py.
 **Proposed text:**
 
 > Move `apply_diff`, `derive_ceremony_class` and the cross-file checks into a `tendcf.contract` library module; the lint, the compiler and tendcf-validate import it.
@@ -489,7 +489,7 @@ R22 requires the Kotlin agent to reproduce it byte for byte. If no `cf-agent` re
 
 ### C-bin-04: The largest code investment serves platforms 4 and 5 only
 
-**Target:** `bin/unit_classifier.py` and `tests/unit_classifier/`
+**Target:** `tools/unit_classifier.py` and `tests/unit_classifier/`
 **Kind:** question
 **Goal:** G5
 **Weight:** improves
@@ -498,7 +498,7 @@ R22 requires the Kotlin agent to reproduce it byte for byte. If no `cf-agent` re
 2. 3,135 test and probe lines, including the 312-line `pastebin-claims.json`.
 
 They also run as root in every Linux VM CI row. Under G5 this is platform-4/5 work and should stop until platforms 1 and 2 converge. The code is sound as far as I read; the question is ordering.
-**Evidence:** `bin/unit_classifier.py:20-21`, `:54-57`; `.github/workflows/linux.yml:51-67`.
+**Evidence:** `tools/unit_classifier.py:20-21`, `:54-57`; `.github/workflows/linux.yml:51-67`.
 **Proposed text:**
 
 > Park the classifier (keep CI green, add nothing) until G8 state 1; the s5 design waits with it.
@@ -659,7 +659,7 @@ The operator's global rule allows no macOS leg in PR checks unless asked by name
 3. requires a byte-identical Kotlin projector port.
 
 D45 chose no CFEngine on Android ("No daemon beside CFEngine off Android", `architecture-DEFINITIVE-v3.md:87-90`) without weighing the Termux CFEngine already deployed. A Termux cf-agent could consume tendcf's projection now, leaving the Kotlin agent to do trust, consent UI and the Shizuku-only actions. That would cut row 8 of the gap list substantially.
-**Evidence:** stayturgid `device/termux/cfengine/README.md:1-30`; stayturgid `device/termux/cfengine/policy/` (cf-serverd.cf 96, stayturgid.cf 278 lines); `bin/projector.py:14-23`.
+**Evidence:** stayturgid `device/termux/cfengine/README.md:1-30`; stayturgid `device/termux/cfengine/policy/` (cf-serverd.cf 96, stayturgid.cf 278 lines); `tools/projector.py:14-23`.
 **Proposed text:**
 
 > Ruling requested: on Android, does tendcf converge with Termux cf-agent (fed the projection; Kotlin agent = trust, diff/consent UI, Shizuku actions), or with the Kotlin agent alone (no CFEngine on Android, R22 dropped)?
@@ -824,7 +824,7 @@ cf-agent's own outcomes on a device go only to stdout and the CFEngine workdir.
 
 ### C-g4-01: The safety scan and the confidence figure attach to the diff, between compile and sign
 
-**Target:** `compiler/nix2cf/compile.py` `compile_host`, between `conflict_check` and `canonical_bytes`; device side in tendcf-validate (C-bin-01)
+**Target:** `compiler/tendcf/compile.py` `compile_host`, between `conflict_check` and `canonical_bytes`; device side in tendcf-validate (C-bin-01)
 **Kind:** add
 **Goal:** G4
 **Weight:** blocks-goal
@@ -840,7 +840,7 @@ cf-agent's own outcomes on a device go only to stdout and the CFEngine workdir.
 5. network-facing port.
 
 The AI review is one more scanner with its own weight. The figure out of 100 and the explanation belong in an unsigned report beside the signed bytes, not inside them.
-**Evidence:** `compiler/nix2cf/compile.py:681-714`; `bin/schema_lint.py:1791-1821`; `schema/goal-diff.schema.json`.
+**Evidence:** `compiler/tendcf/compile.py:681-714`; `tools/schema_lint.py:1791-1821`; `schema/goal-diff.schema.json`.
 **Proposed text:**
 
 > Add `tendcf.safety`: input a goal-diff, output `{score: 0-100, reasons: [...], findings: [{pointer, severity, scanner, why}]}`; scanners are plug-ins (rule scanners first, an AI scanner second); the device recomputes and shows its own result.
@@ -852,12 +852,12 @@ The AI review is one more scanner with its own weight. The figure out of 100 and
 
 ### C-g4-02: Graded highlighting needs a source map back to the authored line
 
-**Target:** `compiler/nix2cf/sitemodel.py` `Document.where`
+**Target:** `compiler/tendcf/sitemodel.py` `Document.where`
 **Kind:** add
 **Goal:** G4, G2
 **Weight:** improves
 **Finding:** A finding has a goal-file pointer. To highlight "the questionable code" G4 needs the Nix or YAML span that produced it. `Document.where` gives YAML lines per mapping, JSON gives none, and Nix gives none (C-compiler-09). Severity → intensity is then a renderer concern.
-**Evidence:** `compiler/nix2cf/sitemodel.py:77-91`, `:99-104`.
+**Evidence:** `compiler/tendcf/sitemodel.py:77-91`, `:99-104`.
 **Proposed text:**
 
 > Each safety finding carries `source: file:line-span` from the C-compiler-09 source map; the CLI and TUI colour that span by severity band.
@@ -867,12 +867,12 @@ The AI review is one more scanner with its own weight. The figure out of 100 and
 
 ### C-g4-03: The CLI attaches as subcommands beside `buildfile`, with no `tendcf` command yet
 
-**Target:** `compiler/nix2cf/cli.py` `build_parser`
+**Target:** `compiler/tendcf/cli.py` `build_parser`
 **Kind:** add
 **Goal:** G4, G1
 **Weight:** improves
 **Finding:** The only CLI is `nix2cf` with `buildfile` and `eval-nix`. The D46 layout plans `tendcf compile`. The G4 command-line mode should be `tendcf review <old> <new>` with the diff, score, reasons and highlighted source, and `tendcf accept|refuse`, which signs or discards. It also needs the device-side twin in tendcf-validate.
-**Evidence:** `compiler/nix2cf/cli.py:174-206`; digest-current-plan-docs A3 (plugin-layout `tendcf compile`).
+**Evidence:** `compiler/tendcf/cli.py:174-206`; digest-current-plan-docs A3 (plugin-layout `tendcf compile`).
 **Proposed text:**
 
 > Add `review`, `accept` and `refuse` subcommands to the planned `tendcf` entry point; `review` exits non-zero below a configurable score so an AI caller cannot skip it.

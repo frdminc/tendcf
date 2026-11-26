@@ -3,7 +3,7 @@ I'll start by reading the design document and AGENTS.md.Now the schemas, lint, p
 
 # Stage D design review (Fable 5.1, independent seat 2 of 2)
 
-Design read whole; repo read at `review-policy-rule` (cd7cb26). Verified by reading, not running: `bin/schema_lint.py` paths cited below, the installed jsonschema 4.26.0 in the schema-lint uv env, all four schemas, the policy bundle, both deploy goal-file sets, nix2cf `compile.py`/`cli.py`, the NixOS module. Not run: the lint, check.py, cf-agent, nix. Not read: get's flake/lock (not on this machine).
+Design read whole; repo read at `review-policy-rule` (cd7cb26). Verified by reading, not running: `tools/schema_lint.py` paths cited below, the installed jsonschema 4.26.0 in the schema-lint uv env, all four schemas, the policy bundle, both deploy goal-file sets, nix2cf `compile.py`/`cli.py`, the NixOS module. Not run: the lint, check.py, cf-agent, nix. Not read: get's flake/lock (not on this machine).
 
 **Verdict: sound with changes.** The schema delta (B.2) does what it claims under 2020-12; the device-trust placement (B.1) is the right one and D2 is satisfied in substance. The consent-diff section (D) has two defects that must be fixed before S3, the migration plan (E) miscounts the regeneration set and misses nix2cf's real state, and three doc/message details are wrong by one step.
 

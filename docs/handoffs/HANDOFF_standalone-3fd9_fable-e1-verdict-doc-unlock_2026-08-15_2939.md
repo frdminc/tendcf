@@ -172,7 +172,7 @@ Two of the six reviewers had independently asked for this: **pre-mortem N9** and
 changing your mind expensive, which is backwards for a design carrying nine open
 questions.
 
-**Tests run: none.** `bin/schema_lint.py` was not executed this session, and the
+**Tests run: none.** `tools/schema_lint.py` was not executed this session, and the
 `.githooks/pre-commit` hook fires only if `git config core.hooksPath .githooks`
 is set (unverified in this checkout). CI on `04fa5bc` was not observed.
 
@@ -204,7 +204,7 @@ binding constraint.
    consent class for total (first-adoption / schema-migration) diffs, artifact
    digests, and the TC-25 privileged-region policy. Pair every schema with
    `examples/` fixtures and negatives under `examples/broken/`, then exhibit one
-   plan end-to-end in guide §16. `bin/schema_lint.py` derives schema↔example
+   plan end-to-end in guide §16. `tools/schema_lint.py` derives schema↔example
    pairing from the filesystem, so new pairs are picked up automatically.
 2. **Decide whether to re-run the adjudication at `xhigh`.** The verdict was
    produced at `high`. It is detailed and internally consistent, so this is
@@ -230,7 +230,7 @@ binding constraint.
    `SendMessage` with the `name [ref]` form — bare names are rejected.
 
 **Do NOT** "fix" the `map section 0 rule 6` references in
-`schema/common.schema.json` or `bin/schema_lint.py` — they are correct against
+`schema/common.schema.json` or `tools/schema_lint.py` — they are correct against
 v3 and are now explicitly qualified.
 
 **Open question:** does the map's §14.2 adversarial-review gate apply to the
@@ -250,7 +250,7 @@ sed -n '196,244p' docs/architecture/e1-adjudication-2026-08-15.md   # §6 Model 
 
 # Current schema surface, before adding the ChangePlan family
 ls schema/ examples/ examples/broken/
-bin/schema_lint.py            # expect OK: 5 schemas / 12 fixtures
+tools/schema_lint.py            # expect OK: 5 schemas / 12 fixtures
 
 # Confirm the protection really is gone
 grep -rn "check_protected_docs" --exclude-dir=.git --exclude-dir=docs .   # expect no hits

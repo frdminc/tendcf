@@ -26,11 +26,11 @@ jobs:
 
       - name: Schema lint
         run: |
-          bin/schema_lint.py
-          bin/recompute_goal_hashes.py --check
+          tools/schema_lint.py
+          tools/recompute_goal_hashes.py --check
           python3 -I -m unittest discover -s tests/schema -v
 
-      # Runs the projector too: schema_lint imports bin/projector.py and gates
+      # Runs the projector too: schema_lint imports tools/projector.py and gates
       # project(goal-file.json) against examples/host_specific.json, which is
       # reconciliation §13's "CI invokes the agent's own projector". Since
       # map D45 that is the projector Linux and macOS hosts run, promoted
@@ -42,7 +42,7 @@ jobs:
       # and is mutation-checked, so a finding here is a real dangling
       # reference rather than the 52-finding backlog it used to report.
       - name: Cross-reference lint
-        run: bin/xref_lint.py
+        run: tools/xref_lint.py
 
       # Issue #63 / AGENTS.md standing rule 3 (spike lane hardening): gates PRs
       # to `master` and checks pushes to `master` and `spike/**` for explicit
@@ -51,9 +51,11 @@ jobs:
       # exposure additionally depends on GitHub repo settings (branch ruleset
       # requiring `check` on `master`, `default_workflow_permissions: read`, and
       # zero repo-level secrets or `master`-only Environments).
-      - name: Workflow permissions lint
+      # Also enforces D46 Step 4 structural device boundary (`tools/device_boundary_lint.py`).
+      - name: Workflow permissions and device-boundary lint
         run: |
-          bin/workflow_permissions_lint.py
+          tools/workflow_permissions_lint.py
+          python3 -I -S tools/device_boundary_lint.py
           uv run --with pyyaml python -m unittest discover -s tests/ci -v
 
       # The canary goal files (deploy/{linux,darwin}/canary/) are what a live
@@ -73,7 +75,7 @@ jobs:
       - name: State 1 VM harness tests
         run: python3 -I -m unittest discover -s tests/darwin -v
 
-      # Pure-stdlib RFC 8785 JCS fallback (bin/projector.py, issue #53): run both
+      # Pure-stdlib RFC 8785 JCS fallback (tools/projector.py, issue #53): run both
       # with rfc8785 installed (byte-for-byte parity) and under isolated stdlib-only
       # python3 -I -S (bare target host execution; fail loudly if rfc8785 is present).
       - name: Projector JCS stdlib fallback tests
@@ -82,7 +84,7 @@ jobs:
           python3 -I -S -c 'import importlib.util, sys; sys.exit(1 if importlib.util.find_spec("rfc8785") is not None else 0)'
           python3 -I -S -m unittest discover -s tests/projector -v
 
-      # Pure-stdlib v9 standing-approval enforcement engine (bin/approval_enforce.py,
+      # Pure-stdlib v9 standing-approval enforcement engine (tools/approval_enforce.py,
       # issue #76): runs under isolated stdlib-only python3 -I -S (zero third-party deps).
       - name: Approval enforcement tests
         run: python3 -I -S -m unittest discover -s tests/approval -v
@@ -98,14 +100,12 @@ jobs:
       # reported as retirable. Hermetic: no upstream clone.
       - name: Overlay lint and self-test
         run: |
-          bin/overlay.py lint
-          bin/overlay.py self-test
+          tools/overlay.py lint
+          tools/overlay.py self-test
 
-  # The nix2cf compiler (compiler/), imported from frdminc/nix2cf. It reads
-  # this checkout's schemas and projector in-tree, so this job sets no
-  # TENDCF_DIR. The library tests and the "defaults to the enclosing checkout"
-  # CLI test (compiler/tests/test_compile.py) exercise that default; the other
-  # CLI tests pass TENDCF_DIR explicitly via their `_run` helper.
+  # The tendcf compiler (compiler/), imported from frdminc/nix2cf and renamed
+  # in D46 Step 4. It reads this checkout's schemas, plugins, and projector
+  # in-tree, so this job sets no TENDCF_DIR.
   compiler:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
@@ -148,12 +148,12 @@ jobs:
           git -C /tmp/core fetch -q origin "$base_core"
       - name: libntech still applies and nothing is retired
         run: |
-          bin/overlay.py check libntech --repo /tmp/libntech --against origin/master
-          bin/overlay.py retired libntech --repo /tmp/libntech --against origin/master --strict
+          tools/overlay.py check libntech --repo /tmp/libntech --against origin/master
+          tools/overlay.py retired libntech --repo /tmp/libntech --against origin/master --strict
       - name: core still applies and nothing is retired
         run: |
-          bin/overlay.py check core --repo /tmp/core --against origin/master
+          tools/overlay.py check core --repo /tmp/core --against origin/master
           tag=$(git -C /tmp/core tag -l '3.27.*' --sort=-v:refname | head -1)
-          [ -n "$tag" ] && bin/overlay.py check core --repo /tmp/core --against "$tag"
-          bin/overlay.py retired core --repo /tmp/core --against origin/master --strict
+          [ -n "$tag" ] && tools/overlay.py check core --repo /tmp/core --against "$tag"
+          tools/overlay.py retired core --repo /tmp/core --against origin/master --strict
 

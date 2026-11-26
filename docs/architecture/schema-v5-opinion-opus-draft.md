@@ -275,7 +275,7 @@ Take the exact class and location strings from a real lint run, and correct the 
 
 ### D.4 Test plan (all through `~/ops/site-private/bin/bg`)
 
-1. **Lint and canary:** `bin/schema_lint.py`, then `deploy/linux/canary/check.py`.
+1. **Lint and canary:** `tools/schema_lint.py`, then `deploy/linux/canary/check.py`.
 2. **Discrimination run** (F8, reconciliation `:184`): delete each new rule alone, and exactly its case goes red.
 3. **Overlap truth table,** both directions:
 
@@ -335,12 +335,12 @@ Recommendations are mine; each needs a ruling.
 | D16(d) definition | `schema/common.schema.json:117` |
 | `extra_entries` is a counter | `schema/report-row.schema.json:86-90` |
 | Diff hunks and `version_bump` rule | `schema/goal-diff.schema.json:26`, `:68-87` |
-| Present-only collection | `bin/schema_lint.py:1536` |
-| Duplicate, nesting, cfengine rules | `bin/schema_lint.py:1541-1549`, `:1566-1575`, `:1581-1599` |
-| Ceremony derivation | `bin/schema_lint.py:1630-1639` |
-| Case count; applicators | `bin/schema_lint.py:87`, `:36`, `:1105-1116` |
-| Trust-region property test extends itself | `bin/schema_lint.py:1922-1947` |
-| Projection scope | `bin/projector.py:23-25`, `:122-123`, `:431-439` |
+| Present-only collection | `tools/schema_lint.py:1536` |
+| Duplicate, nesting, cfengine rules | `tools/schema_lint.py:1541-1549`, `:1566-1575`, `:1581-1599` |
+| Ceremony derivation | `tools/schema_lint.py:1630-1639` |
+| Case count; applicators | `tools/schema_lint.py:87`, `:36`, `:1105-1116` |
+| Trust-region property test extends itself | `tools/schema_lint.py:1922-1947` |
+| Projection scope | `tools/projector.py:23-25`, `:122-123`, `:431-439` |
 | Adapter touches only `/etc/systemd/system` | `policy/tendcf_services.cf:240-245`, `:256`, `:275-278` |
 | NixOS read-only guard | `policy/tendcf_services.cf:165-171` |
 | Canary goal file, projection pairs | `deploy/linux/canary/goal-file.json:1`, `deploy/linux/canary/check.py:31-39` |

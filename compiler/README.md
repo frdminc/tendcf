@@ -1,39 +1,42 @@
-# nix2cf
+# tendcf compiler
 
 The **compiler tool** for the [tendcf](..) architecture, living in `compiler/`
-of the tendcf repository (it was the separate `frdminc/nix2cf` repository
-until 2026-11-13; its history was imported here intact): **Site Model → merge → conflict check → (inference, later) →
+of the tendcf repository (imported from the archived `frdminc/nix2cf` repository
+with full history on 2026-11-13 and renamed `tendcf` in D46 Step 4): **Site Model → merge → conflict check → (inference, later) →
 per-host canonical goal file**.
 
-The name is historical. YAML and JSON are the inputs. An optional Nix module
-frontend may author the same JSON later (tendcf D12); `nix2cf eval-nix` is
-the hook it would land behind. This directory does not hold site facts,
+YAML and JSON are the primary inputs (`plugins/frontends/yaml/loader.py`). An
+optional Nix frontend (`plugins/frontends/nix/eval.py`, named `nix2cf`)
+evaluates Nix expressions under restricted D-b limits via `tendcf eval-nix`.
+In-tree plugins (frontends and supervisor renderers under `../plugins/`) are
+loaded strictly through `compiler/tendcf/plugins.py`'s static import table
+(never Python entry points). This directory does not hold site facts,
 inventory, schemas, or the product engine.
 
 **Schemas and types live in tendcf** (D21):
 [`schema/`](../schema/),
 [`examples/`](../examples/),
-[`bin/schema_lint.py`](../bin/schema_lint.py),
-[`bin/projector.py`](../bin/projector.py).
+[`tools/schema_lint.py`](../tools/schema_lint.py),
+[`tools/projector.py`](../tools/projector.py).
 A schema change is a tendcf interface change. This tool consumes that
 contract from the enclosing tendcf checkout; it does not own or copy it.
 
 > Authority: `tendcf/docs/paper/tendcf-architecture-guide.md` (vetted
 > current-state). If this README and that guide disagree, the guide wins.
 > `architecture-DEFINITIVE-v3.md` is the implementer map and must agree
-> with the guide. nix2cf's own choices are in [`docs/DESIGN.md`](docs/DESIGN.md).
+> with the guide. The compiler's own choices are in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## What it does today
 
-The first compiler piece the guide (§4) and the paper (§6.2) say to build:
-**`buildfile`** — render exactly what one host would receive, without
-touching the host.
+The primary compiler command: **`tendcf compile`** (replacing `nix2cf buildfile`
+outright with no alias, per D46 §6) — render exactly what one host would
+receive, without touching the host.
 
 ```sh
 # Run from compiler/. The schemas and reference projector are found in the
-# enclosing tendcf checkout; TENDCF_DIR (or --tendcf) is optional and
-# overrides that.
-uv run nix2cf buildfile \
+# enclosing tendcf checkout; TENDCF_DIR (or --tendcf) is optional in dev mode
+# and refused under --check-releasable.
+uv run tendcf compile \
     --host mac --platform macos --supervisor launchd \
     --host-key ed25519:a1a1…a1 \
     --device-trust examples/site/device-trust.json \
@@ -43,14 +46,15 @@ uv run nix2cf buildfile \
 `--platform` (`macos` or `linux`) and `--supervisor` (`launchd`, `systemd`,
 `runit` or `nixos`) are both required and have no default. It is written into the goal file's `device-trust.entries.supervisor`;
 a `--device-trust` document that already carries a different `supervisor` is
-refused. The output is **schema_version 9** (tendcf's `goal-file.schema.json`);
-CI fails when `GOAL_FILE_SCHEMA_VERSION` and tendcf's schema const differ.
+refused. The output is **schema_version 9** only (tendcf's `goal-file.schema.json`;
+older-version rendering was removed in D46 Step 4); CI fails when
+`GOAL_FILE_SCHEMA_VERSION` and tendcf's schema const differ.
 
 That prints the host's **goal file**: the canonical (RFC 8785, no trailing
 newline) JSON document of guide §7 that a release carries, that consent binds
 to, and that `tendcf/schema/goal-file.schema.json` checks. Add `--project` to
 print instead the `host_specific.json` that tendcf's *device-side* projector
-derives from it — the only shape `cf-agent` reads. nix2cf does not emit
+derives from it — the only shape `cf-agent` reads. The compiler does not emit
 CFEngine Augments itself; see `docs/DESIGN.md` for why.
 
 What the compile does, in order:
@@ -77,7 +81,7 @@ carries `supervision: {"coverage": "deliberately-unmanaged"}` with the
 `examples/site/` is tendcf's own fixtures with one edit, so an interlock
 renders. Fixture, not site data.
 
-### Multi-site workspace (`nix2cf workspace` and `--site-name`)
+### Multi-site workspace (`tendcf workspace` and `--site-name`)
 
 For multi-site local ops workspaces under `~/tendcf-ops` (override:
 `--ops-root` or `TENDCF_OPS_ROOT`), a single validated site slug pairs
@@ -86,11 +90,11 @@ For multi-site local ops workspaces under `~/tendcf-ops` (override:
 
 ```sh
 # Inspect the resolved workspace (human-readable or --json)
-uv run nix2cf workspace --site-name djbclark --json
-uv run nix2cf workspace --list
+uv run tendcf workspace --site-name djbclark --json
+uv run tendcf workspace --list
 
 # Compile from a workspace site (prints selected site + source to stderr)
-uv run nix2cf buildfile \
+uv run tendcf compile \
     --host mac --platform macos --supervisor launchd \
     --host-key ed25519:a1a1…a1 \
     --device-trust ~/tendcf-ops/tendcf-private-djbclark/device-trust.json \
@@ -102,17 +106,20 @@ uv run nix2cf buildfile \
   `~/.config/tendcf/active-site`), or explicit `--config PATH` on `workspace`
   (mutually exclusive with `--site-name`, honored ahead of ambient
   `TENDCF_SITE`, and failing closed if missing). Fails closed when unset (never
-  globs a sole checkout; zero legacy aliases). On `buildfile`, XDG `active-site`
+  globs a sole checkout; zero legacy aliases). On `compile`, XDG `active-site`
   is read only when workspace mode is explicitly opted in (`--workspace`,
   `--ops-root`, or ambient `TENDCF_SITE` with no `--site` or explicit file
   flags), keeping omitted-`--site` invocations hermetic.
 - **`--site DIR`** and explicit `--services`/`--roles`/`--launchd-writers`
   remain available and are mutually exclusive with `--site-name`, `--ops-root`,
   and `--workspace`.
-- **`<ops_root>/tendcf`** is reported by `nix2cf workspace` strictly as
-  informational metadata; `buildfile` never auto-loads schemas or
-  `bin/projector.py` from a sibling `<ops_root>/tendcf` checkout.
-- **Dev-only `--override-input NS=PATH`** (repeatable on `buildfile` and
+- **`<ops_root>/tendcf`** is reported by `tendcf workspace` strictly as
+  informational metadata; `tendcf compile` never auto-loads schemas or
+  `tools/projector.py` from a sibling `<ops_root>/tendcf` checkout.
+- **Release guard (`--check-releasable`):** refuses `--override-input`,
+  `--tendcf`, and `$TENDCF_DIR` overrides so release builds run strictly from
+  the verified in-tree tendcf checkout (D46 §4 Activation step 7 / F9).
+- **Dev-only `--override-input NS=PATH`** (repeatable on `compile` and
   `workspace`): today it validates the namespace and target directory, warns
   loudly on stderr, records taint on `WorkspaceResolution` and `CompileResult`,
   refuses `-o`/`--output` writes unless `--allow-tainted` is also passed, and
@@ -131,29 +138,31 @@ uv run nix2cf buildfile \
   edge kind to render into.
 - **Units for any supervisor but launchd** (Steps 1–2, 4, 6). A `systemd` or
   `runit` host gets its `supervisor` entry, but a service selected for it is a
-  compile error, not a guess: the systemd renderer (and with it the v2
-  `restart`/`wanted_by` fields) is step 6 proper. `nixos` needs no renderer,
-  as above. Android has no supervisor decided: it is not a `--platform` choice.
+  compile error via its in-tree stub renderer (`plugins/supervisors/{systemd,runit}/renderer.py`):
+  the systemd renderer (and with it the v2 `restart`/`wanted_by` fields) is
+  step 6 proper. `nixos` needs no renderer, as above. Android has no supervisor
+  decided: it is not a `--platform` choice.
 - **Extra-entry reporting** (device-side, tendcf-agent) and `def.json`.
 - **Inventory, trust policy, peer actions** as Site Model inputs (Step 0
   remaining): the host key, platform, supervisor and `device-trust` domain are
   passed on the command line until those schemas exist.
 - **Tombstones** from the Site Model (it cannot yet say "absent").
-- **The Nix module frontend** (D12). `nix2cf eval-nix FILE` evaluates a plain
-  Nix expression with `nix-instantiate --eval --strict --json`; the test for
-  it is skipped without a Nix install.
+- **The Nix module frontend** (D12). `tendcf eval-nix FILE` evaluates a plain
+  Nix expression through `plugins/frontends/nix/eval.py` (`nix2cf`) under the
+  tested D-b `restrict-eval` limits; the integration test is skipped without a
+  Nix install.
 
-Every choice the paper leaves open is marked `TODO(operator)` in
-`nix2cf/compile.py` and tabulated in `docs/DESIGN.md`.
+Every choice the paper leaves open is marked in `tendcf/compile.py` and
+tabulated in `docs/DESIGN.md`.
 
 ## Tests
 
 ```sh
-uv run pytest        # from compiler/; TENDCF_DIR=<dir> overrides the tendcf checkout
+uv run --locked pytest        # from compiler/; TENDCF_DIR=<dir> overrides in dev mode
 ```
 
 Goldens under `tests/golden/` are the compiler's own regression test; update
-them deliberately with `NIX2CF_UPDATE_GOLDEN=1` and read the diff first.
+them deliberately with `TENDCF_UPDATE_GOLDEN=1` and read the diff first.
 CI runs the same command from the `compiler` job of the root `.github/workflows/check.yml`.
 
 License: [GPL-3.0-or-later](../LICENSE) (the repository's license).

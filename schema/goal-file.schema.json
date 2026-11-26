@@ -449,7 +449,7 @@
               "type": "object",
               "properties": {
                 "domain": {
-                  "description": "Which launchd domain runs the job: `system` (`/Library/LaunchDaemons`, boot-before-login, root-owned, emits `UserName`), `user-gui` (`~/Library/LaunchAgents`, non-root `gui/<uid>`, `LimitLoadToSessionType=Aqua`, GUI/Keychain/`loginwindow` auto-load, defers fail-closed when headless), or `user-background` (`~/Library/LaunchAgents`, non-root `user/<uid>`, `LimitLoadToSessionType=Background`, works over headless SSH and survives GUI logout, re-bootstrapped by scheduled `cf-agent` after reboot). Required in the goal file (no hidden default); optional in the Site Model (nix2cf defaults omitted to `system`).",
+                  "description": "Which launchd domain runs the job: `system` (`/Library/LaunchDaemons`, boot-before-login, root-owned, emits `UserName`), `user-gui` (`~/Library/LaunchAgents`, non-root `gui/<uid>`, `LimitLoadToSessionType=Aqua`, GUI/Keychain/`loginwindow` auto-load, defers fail-closed when headless), or `user-background` (`~/Library/LaunchAgents`, non-root `user/<uid>`, `LimitLoadToSessionType=Background`, works over headless SSH and survives GUI logout, re-bootstrapped by scheduled `cf-agent` after reboot). Required in the goal file (no hidden default); optional in the Site Model (the tendcf compiler defaults omitted to `system`).",
                   "enum": ["system", "user-gui", "user-background"]
                 },
                 "run_at_load": { "type": "boolean" },

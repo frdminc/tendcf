@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/frdminc/tendcf/schema/common.schema.json",
   "title": "tendcf — shared Site Model definitions",
-  "description": "Definitions shared by every Site Model file. The three D16 fields (provides/requires, interlocks, comprehensive/opt_out_reason) live here because they are cross-cutting. Schemas live in tendcf (D21); nix2cf is the compiler. Current-design facts follow docs/paper/tendcf-architecture-guide.md.",
+  "description": "Definitions shared by every Site Model file. The three D16 fields (provides/requires, interlocks, comprehensive/opt_out_reason) live here because they are cross-cutting. Schemas and the tendcf compiler live in tendcf (D21, D46). Current-design facts follow docs/paper/tendcf-architecture-guide.md.",
 
   "$defs": {
     "contract_version": {
@@ -51,7 +51,7 @@
     },
 
     "requires": {
-      "description": "What this entry needs. nix2cf infers ordering edges by matching these against other entries' `provides`. Every inferred edge carries the rule that produced it (D16(b), edge attribution is mandatory).",
+      "description": "What this entry needs. The tendcf compiler infers ordering edges by matching these against other entries' `provides`. Every inferred edge carries the rule that produced it (D16(b), edge attribution is mandatory).",
       "type": "array",
       "items": { "$ref": "common.schema.json#/$defs/token" },
       "uniqueItems": true
@@ -65,7 +65,7 @@
     },
 
     "source_location": {
-      "description": "Where a declaration was written. Required in conflict errors (D16(a)) and on authored edges (D16(b)); nix2cf fills it in, authors do not write it.",
+      "description": "Where a declaration was written. Required in conflict errors (D16(a)) and on authored edges (D16(b)); the tendcf compiler fills it in, authors do not write it.",
       "type": "object",
       "properties": {
         "file": { "type": "string" },

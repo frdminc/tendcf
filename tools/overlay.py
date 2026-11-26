@@ -128,7 +128,7 @@ def load_manifest(overlay: Path) -> dict:
     if canonical != text:
         raise Finding(
             f"{path}: not in canonical form (2-space indent, sorted keys, "
-            f"trailing newline). Rewrite with: bin/overlay.py lint --fix"
+            f"trailing newline). Rewrite with: tools/overlay.py lint --fix"
         )
     return data
 
@@ -301,7 +301,7 @@ def check(overlay: Path, name: str, repo: Path, against: str | None) -> list[str
                             f"DRIFT: {name}/{path.name} does not apply to {rev} ({resolved[:12]}):",
                             *("    " + ln for ln in err.splitlines()),
                             (
-                                f"Rebase the fork branch onto {rev}, re-export with `bin/overlay.py export`, "
+                                f"Rebase the fork branch onto {rev}, re-export with `tools/overlay.py export`, "
                                 f"and bump {name}.base in {MANIFEST_NAME} — or retire the patch if upstream carries it."
                             ),
                         ]

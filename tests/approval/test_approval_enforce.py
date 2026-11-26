@@ -1,4 +1,4 @@
-"""Comprehensive pure-stdlib tests for bin/approval_enforce.py (issue #76).
+"""Comprehensive pure-stdlib tests for tools/approval_enforce.py (issue #76).
 
 Runs under `python3 -I -S -m unittest discover -s tests/approval -v` with zero
 third-party packages, proving bare-host stdlib execution parity alongside
@@ -59,7 +59,7 @@ from typing import Any
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
-ENFORCE_PATH = REPO / "bin" / "approval_enforce.py"
+ENFORCE_PATH = REPO / "tools" / "approval_enforce.py"
 SIGNER_PATH = Path(__file__).resolve().with_name("_ed25519_test_signer.py")
 
 
@@ -383,7 +383,7 @@ class TestSection0Ed25519AndStrictParsing(unittest.TestCase):
         # Codex #1 / Neon F1 / Adversary H1: Python 3.14 dataclasses requires sys.modules registration.
         self.assertIn("tendcf_approval_enforce_under_test", sys.modules)
         self.assertIn("_tendcf_projector_jcs", sys.modules)
-        # Codex Other #1 / Adversary M3: non-constant-time signing helpers NOT exported by bin/approval_enforce.py.
+        # Codex Other #1 / Adversary M3: non-constant-time signing helpers NOT exported by tools/approval_enforce.py.
         for forbidden in ("ed25519_sign", "ed25519_public_key_from_seed", "sign_approval_record"):
             self.assertFalse(hasattr(AE, forbidden), f"signing helper {forbidden} must not live in enforcement module")
             self.assertNotIn(forbidden, AE.__all__)

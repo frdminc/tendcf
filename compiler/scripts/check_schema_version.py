@@ -1,10 +1,10 @@
-"""Fail unless nix2cf renders the goal-file version tendcf's schema requires.
+"""Fail unless the tendcf compiler renders the goal-file version tendcf's schema requires.
 
     uv run python scripts/check_schema_version.py TENDCF_DIR
 
-`nix2cf.compile.GOAL_FILE_SCHEMA_VERSION` must equal the `const` of
-`schema_version` in `TENDCF_DIR/schema/goal-file.schema.json`. A tendcf bump
-that nix2cf has not followed otherwise shows up only as a wall of
+`tendcf.compile.GOAL_FILE_SCHEMA_VERSION` must equal the `const` of
+`schema_version` in `TENDCF_DIR/schema/goal-file.schema.json`. A schema bump
+that the compiler has not followed otherwise shows up only as a wall of
 "/schema_version: N was expected" test failures.
 """
 
@@ -14,7 +14,7 @@ import json
 import sys
 from pathlib import Path
 
-from nix2cf.compile import GOAL_FILE_SCHEMA_VERSION
+from tendcf.compile import GOAL_FILE_SCHEMA_VERSION
 
 
 def main(argv: list[str]) -> int:
@@ -29,7 +29,7 @@ def main(argv: list[str]) -> int:
         return 2
     if const != GOAL_FILE_SCHEMA_VERSION:
         print(
-            f"check_schema_version: FAIL: nix2cf renders schema_version {GOAL_FILE_SCHEMA_VERSION} "
+            f"check_schema_version: FAIL: tendcf compiler renders schema_version {GOAL_FILE_SCHEMA_VERSION} "
             f"but {path} requires {const}",
             file=sys.stderr,
         )
