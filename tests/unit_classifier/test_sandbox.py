@@ -331,6 +331,34 @@ class WriteFileModeAndCleanup(unittest.TestCase):
             os.fstat(opened_fds[0])
         self.assertEqual(cm.exception.errno, errno.EBADF)
 
+    def test_restore_file_closes_fd_and_unlinks_temp_when_fdopen_raises(self):
+        real_open = os.open
+        opened_fds = []
+        target = os.path.join(self.d, "restore-fail.service")
+        with open(target, "w") as f:
+            f.write("original\n")
+        os.chmod(target, 0o640)
+
+        def spy_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened_fds.append(fd)
+            return fd
+
+        sb = Sandbox(roots=[self.d], run=None)
+        sb.symlink(target, "/dev/null")
+        with mock.patch("os.open", side_effect=spy_open), mock.patch("os.fdopen", side_effect=OSError("restore fdopen failed")):
+            with self.assertRaisesRegex(CleanupError, "restore fdopen failed"):
+                sb.__exit__(None, None, None)
+
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError) as cm:
+            os.fstat(opened_fds[0])
+        self.assertEqual(cm.exception.errno, errno.EBADF)
+        self.assertFalse(
+            [name for name in os.listdir(self.d) if name.startswith(".tendcf-s1-restore-")],
+            "no restore temp sibling may remain after fdopen failure",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

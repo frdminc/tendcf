@@ -87,8 +87,11 @@ class Sandbox:
             def restore_file():
                 tmp = self._sibling(p)
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                fd_owned = False
                 try:
-                    with os.fdopen(fd, "wb") as f:
+                    f = os.fdopen(fd, "wb")
+                    fd_owned = True
+                    with f:
                         f.write(data)
                         f.flush()
                         # Order matters on Linux: a chown clears setuid/setgid, so the owner is
@@ -99,6 +102,11 @@ class Sandbox:
                     os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
                     os.replace(tmp, p)
                 except BaseException:
+                    if not fd_owned:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
                     _unlink_quiet(tmp)
                     raise
             return restore_file
@@ -129,8 +137,9 @@ class Sandbox:
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         fd_owned = False
         try:
-            with os.fdopen(fd, "w") as f:
-                fd_owned = True
+            f = os.fdopen(fd, "w")
+            fd_owned = True
+            with f:
                 f.write(text)
                 f.flush()
                 os.fchmod(f.fileno(), mode)
