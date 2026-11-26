@@ -248,14 +248,19 @@ def missing_generated(listing, names=("tendcf-s1-gen.service", "tendcf-s1-gen-no
 
 
 def item3_leftovers(existed, dirs=(GEN_ETC, GEN_RUN), out_glob="/run/systemd/generator*"):
-    """After item 3 (and its reloads): no tendcf-s1* file may remain in a generator directory or in
-    the generator output directories, and a generator directory the probe created must be gone.
-    `existed` maps each directory to whether it existed before the probe. Fails the probe
-    otherwise, and records what it found either way. Returns the list of leftovers."""
+    """After item 3 (and its reloads): no tendcf-s1* or .tendcf-s1* file may remain in a
+    generator directory or in the generator output directories, and a generator directory the
+    probe created must be gone. `existed` maps each directory to whether it existed before the
+    probe. Fails the probe otherwise, and records what it found either way. Returns the list of
+    leftovers."""
     left = []
     for d in list(dirs) + sorted(glob.glob(out_glob)):
         if os.path.isdir(d):
-            left += sorted(glob.glob(d + "/tendcf-s1*"))
+            left += [
+                os.path.join(d, name)
+                for name in sorted(os.listdir(d))
+                if name.startswith(("tendcf-s1", ".tendcf-s1"))
+            ]
     left += ["%s (a directory the probe created)" % d for d in dirs if not existed.get(d) and os.path.isdir(d)]
     out("**item 3 leftovers: %s**\n\n```\n%s\n```\n" % ("none" if not left else "FOUND", "\n".join(left)))
     if left:

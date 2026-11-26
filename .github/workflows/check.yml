@@ -2,7 +2,7 @@ name: Check
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'spike/**']
   pull_request:
   workflow_dispatch:
   schedule:
@@ -40,6 +40,18 @@ jobs:
       # reference rather than the 52-finding backlog it used to report.
       - name: Cross-reference lint
         run: bin/xref_lint.py
+
+      # Issue #63 / AGENTS.md standing rule 3 (spike lane hardening): gates PRs
+      # to `master` and checks pushes to `master` and `spike/**` for explicit
+      # `permissions: contents: read` (no writes, no non-contents reads) and no
+      # secrets across `.github/workflows/`. Preventing CI bypass or repo-secret
+      # exposure additionally depends on GitHub repo settings (branch ruleset
+      # requiring `check` on `master`, `default_workflow_permissions: read`, and
+      # zero repo-level secrets or `master`-only Environments).
+      - name: Workflow permissions lint
+        run: |
+          bin/workflow_permissions_lint.py
+          uv run --with pyyaml python -m unittest discover -s tests/ci -v
 
       # The canary goal files (deploy/{linux,darwin}/canary/) are what a live
       # host is first given: schema-valid canonical bytes that pass the
