@@ -3555,6 +3555,289 @@ check "relative command[0]: the reason is reported" \
 check "relative command[0]: nothing was run" \
     bash -c "[ ! -e '$work/rel/ran' ]"
 
+# 8e. Step 2 arglist via getvalues() (issue #56 item 1):
+#     1-element command, spaces/leading-quotes/empty-string/metacharacters/12+
+#     elements in arglist without ArgSplitCommand splitting, multi-interlock
+#     isolation (distinct arg counts, duplicate commands even without -K,
+#     non-zero expect_exit, and one bad interlock leaving other bundles clean).
+json_recorder="$work/argv-json-recorder"
+cat > "$json_recorder" <<'JREC'
+#!/usr/bin/env python3
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+tmp = out.with_suffix(".tmp")
+tmp.write_text(json.dumps(sys.argv[2:]), encoding="utf-8")
+tmp.replace(out)
+JREC
+chmod 700 "$json_recorder"
+
+zero_recorder="$work/zero-recorder"
+zero_count="$work/zero-recorder.count"
+cat > "$zero_recorder" <<EOF
+#!/usr/bin/env python3
+import json, pathlib, sys
+with open("$zero_count", "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\n")
+EOF
+chmod 700 "$zero_recorder"
+
+# 8e-1: 1-element command + multi-arg (spaces, leading quotes, backticks,
+#       shell metacharacters, empty string, 12+ elements) + non-zero expect_exit
+#       + bad-cmd0 sibling in one host_specific.json, run WITHOUT -K to also
+#       prove duplicate-command interlocks both run cleanly.
+rm -f "$zero_count" "$work/rec-meta.json" "$work/rec-12.json"
+python3 - "$work/data/host_specific.json" "$zero_recorder" "$json_recorder" "$work/rec-meta.json" "$work/rec-12.json" <<'PYEOF'
+import json, pathlib, sys
+out_path, zero_rec, jrec, meta_out, twelve_out = sys.argv[1:6]
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "zero-one": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-zero",
+                "defines_class": "zero_one_ok",
+                "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            },
+            "zero-two": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-zero-dup",
+                "defines_class": "zero_two_ok",
+                "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            },
+            "meta-args": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-meta",
+                "defines_class": "meta_args_ok",
+                "pre_action": {
+                    "command": [
+                        jrec,
+                        meta_out,
+                        "a b",
+                        "hello   world",
+                        "'x'",
+                        '"y"',
+                        "`bt`",
+                        ";|&&",
+                        "",
+                        "--flag=k v",
+                    ],
+                    "expect_exit": 0,
+                    "timeout_seconds": 5,
+                },
+                "report": True,
+                "state": "present",
+            },
+            "twelve-args": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-twelve",
+                "defines_class": "twelve_args_ok",
+                "pre_action": {
+                    "command": [jrec, twelve_out, "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
+                    "expect_exit": 0,
+                    "timeout_seconds": 5,
+                },
+                "report": True,
+                "state": "present",
+            },
+            "exit-two": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-exit2",
+                "defines_class": "exit_two_ok",
+                "pre_action": {"command": ["/bin/sh", "-c", "exit 2"], "expect_exit": 2, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            },
+            "bad-sibling": {
+                "blocks": "enclosing-bundle",
+                "bundle": "b-blocked",
+                "defines_class": "bad_sib_ok",
+                "pre_action": {"command": ["true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            },
+        },
+        "tendcf_service": {},
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/arglist-multi.out"
+rm -f "$work"/state/cf_lock.*
+"$cf_agent" -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "arglist multi-interlock: policy completed" policy_completed "$out"
+check "arglist multi-interlock: no CMDB cross-check refusal" no_crosscheck "$out"
+check "arglist multi-interlock: both 1-element duplicate commands ran with 0 args (even without -K)" \
+    python3 - "$zero_count" <<'PYEOF'
+import json, pathlib, sys
+lines = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+assert lines == [[], []], f"expected two 0-arg calls, got {lines!r}"
+PYEOF
+check "arglist multi-interlock: spaces, quotes, backticks, metachars, and empty string preserved verbatim" \
+    python3 - "$work/rec-meta.json" <<'PYEOF'
+import json, pathlib, sys
+got = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+want = ["a b", "hello   world", "'x'", '"y"', "`bt`", ";|&&", "", "--flag=k v"]
+assert got == want, f"got={got!r} want={want!r}"
+PYEOF
+check "arglist multi-interlock: 12+ elements preserve exact numeric order" \
+    python3 - "$work/rec-12.json" <<'PYEOF'
+import json, pathlib, sys
+got = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+want = [str(i) for i in range(12)]
+assert got == want, f"got={got!r} want={want!r}"
+PYEOF
+for ok_bundle in b-zero b-zero-dup b-meta b-twelve b-exit2; do
+    check "arglist multi-interlock: satisfied bundle '$ok_bundle' not refused" \
+        bash -c "! grep -q \"bundle '$ok_bundle' refused\" '$out'"
+done
+check "arglist multi-interlock: bad sibling refused and blocked its bundle only" \
+    grep -q "tendcf: interlock 'bad-sibling' not satisfied, bundle 'b-blocked' refused" "$out"
+
+# 8f. Bad command[0] (space, quotes, backticks, trailing slash, control char)
+#     and malformed command shapes (empty list, missing command, non-string
+#     elements) all fail closed with zero executions and blocked bundle.
+for bad_case in space dquote squote backtick slash root ctrl int_arg obj_arg empty_list missing_cmd; do
+    rm -f "$zero_count"
+    python3 - "$work/data/host_specific.json" "$bad_case" "$zero_recorder" <<'PYEOF'
+import json, pathlib, sys
+out_path, case, zero_rec = sys.argv[1:4]
+cases = {
+    "space": ["/usr/bin/true arg"],
+    "dquote": ['"/usr/bin/true"'],
+    "squote": ["'/usr/bin/true'"],
+    "backtick": ["`/usr/bin/true`"],
+    "slash": ["/usr/bin/"],
+    "root": ["/"],
+    "ctrl": ["/usr/bin/tr\nue"],
+    "int_arg": [zero_rec, 42],
+    "obj_arg": [zero_rec, {"k": "v"}],
+    "empty_list": [],
+    "missing_cmd": None,
+}
+pre = {"expect_exit": 0, "timeout_seconds": 5}
+if cases[case] is not None:
+    pre["command"] = cases[case]
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "bad-chk": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "demo_ok",
+                "pre_action": pre,
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {},
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/arglist-bad-$bad_case.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "bad pre_action ($bad_case): policy completed" policy_completed "$out"
+    check "bad pre_action ($bad_case): bundle refused" \
+        grep -q "tendcf: interlock 'bad-chk' not satisfied, bundle 'demo' refused" "$out"
+    check "bad pre_action ($bad_case): zero command executions" \
+        bash -c "! grep -q 'Executing ' '$out' && [ ! -e '$zero_count' ]"
+done
+
+# 8g. Issue #56 item 2: hostile control characters (\n, \r, \x1b, \t) in
+#     interlock id and bundle name (bracket-free) are sanitized in BOTH
+#     tendcf_interlock_run and tendcf_services_apply R: refusal lines.
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "ilk\nR: INJECTED_ILK\r\x1bX\tid": {
+                "blocks": "enclosing-bundle",
+                "bundle": "bnd\nR: INJECTED_BND\r\x1bX\tname",
+                "defines_class": "ctrl_ok",
+                "pre_action": {"command": ["true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {},
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/interlock-ctrl-id.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "interlock ctrl-char id: policy completed" policy_completed "$out"
+check "interlock ctrl-char id: no CMDB cross-check refusal" no_crosscheck "$out"
+check "interlock ctrl-char id: sanitized R: lines with no raw ESC/CR/TAB or split lines" \
+    python3 - "$out" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+r_lines = [line for line in lines if line.startswith("R:")]
+for line in r_lines:
+    assert "\r" not in line and "\t" not in line and "\x1b" not in line, f"control char in R: line: {line!r}"
+cmd0_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' pre_action command\[0\] is not an absolute path; refused$")
+blk_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' not satisfied, bundle 'bnd\?R:\?INJECTED_BND\?\?(?:u001b)?X\?name' refused$")
+assert any(cmd0_re.match(line) for line in r_lines), f"sanitized command[0] refusal not found in {r_lines!r}"
+assert any(blk_re.match(line) for line in r_lines), f"sanitized bundle refusal not found in {r_lines!r}"
+PYEOF
+
+# 8h. Issue #56 item 2: bracketed ANSI CSI (\x1b[31m) in interlock id fails
+#     closed across ALL services with sanitized R: report and zero bracket errors.
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "ilk\nR: INJECTED_CSI\r\x1b[31m\tid": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "csi_ok",
+                "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {
+            "demo-runit": {
+                "bundle": "other",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/interlock-ctrl-csi.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "interlock bracketed CSI id: policy completed" policy_completed "$out"
+check "interlock bracketed CSI id: no Broken variable expression error" \
+    bash -c "! grep -q 'Broken variable expression' '$out'"
+check "interlock bracketed CSI id: nothing actuated and sibling service refused" \
+    bash -c "! grep -Eq \"Executing|Created file|launchctl|systemctl|tendcf: service 'demo-runit'\" '$out'"
+check "interlock bracketed CSI id: sanitized R: refusal line with no raw ESC or split line" \
+    python3 - "$out" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+r_lines = [line for line in lines if line.startswith("R:")]
+csi_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_CSI\?\?(?:u001b)?\?31m\?id' id contains bracket characters; refusing all service actuation$")
+assert any(csi_re.match(line) for line in r_lines), f"sanitized CSI refusal not found in {r_lines!r}"
+PYEOF
+
 echo "# 9. CMDB cross-check, the agent's real loader"
 cp "$repo/tests/policy/fixtures/interlock-malformed.json" "$work/data/host_specific.json"
 out="$work/xc-malformed.out"
@@ -4211,7 +4494,7 @@ check "probe no verdict: the key is named" \
 check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_action)" no_actuation "$out"
 
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
+    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative arglist-multi arglist-bad-space arglist-bad-dquote arglist-bad-squote arglist-bad-backtick arglist-bad-slash arglist-bad-root arglist-bad-ctrl arglist-bad-int_arg arglist-bad-obj_arg arglist-bad-empty_list arglist-bad-missing_cmd interlock-ctrl-id interlock-ctrl-csi flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-no-augments xc-ctrl-keysec xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \
