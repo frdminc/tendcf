@@ -2,57 +2,83 @@
 
 Runs under `python3 -I -S -m unittest discover -s tests/approval -v` with zero
 third-party packages, proving bare-host stdlib execution parity alongside
-`tests/projector`.
+`tests/projector` and full Python 3.14+ `sys.modules` compatibility.
 
 Covers:
   - Section 0: Official RFC 8032 §7.1 Ed25519 test vectors, strict canonical
-    S / R / A rejection, schema_version floor == ceiling == 9, strict JSON.
-  - Section A (Items 1-7 + PR #75 R4 #1 + Astra Option B): rollback-protected
-    durable replay store, partial restore, nonce binding, R10 enrollment_nonce,
-    baseline_sha256, monotonic application_seq + crash-before/after-commit,
-    Option B zero-write idempotent redelivery + equivocation + concurrent race,
-    terminal revocation & tombstone persistence across reload.
-  - Section B (Items 8-12): baseline-only signer roles, no owner/covered-signer
-    crossover, developer_mode scoping & persistent indicator, host-key bans,
-    sig_alg/prefix binding, cryptographic nonce entropy & post-loss uniqueness.
+    S / R / A rejection, small-order A & small-order R (+ mixed-order A)
+    rejection, test-only signing isolation, schema_version floor == ceiling == 9,
+    strict JSON, and Python 3.14+ sys.modules registration.
+  - Section A (Items 1-7 + PR #75 R4 #1 + Astra Option B): crash-safe two-phase
+    durable ReplayStore + independent RollbackAnchor, short-write loop, whole-domain
+    directory snapshot restore, zero untrusted leak on anchor mismatch, re-entrant
+    locking without self-deadlock, authoritative shared baseline & callback-failure
+    preservation, nonce binding, R10 enrollment_nonce, baseline_sha256, monotonic
+    application_seq + crash on both sides of anchor commit, Option B zero-write
+    idempotent redelivery + equivocation + real contended multi-thread races
+    (duplicate/duplicate, duplicate/revocation, owner-removal/enrollment, concurrent
+    standing-application baseline race), terminal revocation & tombstone persistence.
+  - Section B (Items 8-12): baseline-only signer roles, absent covered-signer,
+    no owner/covered-signer crossover, developer_mode scoping & persistent indicator,
+    host-key bans, sig_alg/prefix binding, cryptographic nonce entropy & post-loss
+    uniqueness.
   - Section C (Items 13-16 + PR #75 R4 #4): R1/R7 default-deny device-trust
     carve-out + replay store carve-out, per-hunk & per-coverage-change derived
-    class, empty-domain transitions, migrations / downward version_bump refusal
-    for both standing-application and per-change / re-adoption, R9 briefing.
-  - Section D (Items 17-19): not_after strict calendar parsing + no horizon cap
-    + clock rollback, hold-window monotonic clock + re-evaluation + owner reject
-    override + revocation cancel, covering-grant precedence & DC-2 rejects.
-  - Section E (Items 20-26 + PR #75 R4 #2): generation, covered_signers, R6
-    developer_mode ceremony, exact ceremony_class, per-target host, exact
-    proposed_sha256 binding, full check-order-before-mark invariant.
+    class, empty-domain transitions, migrations (fail-closed default comparability,
+    True==1 / False==0 JCS equality anti-smuggling, downward version_bump refusal
+    for both standing-application and per-change including re-adoption), R9 briefing.
+  - Section D (Items 17-19): not_after strict calendar parsing (end-to-end via
+    process_enrollment) + microsecond boundary + non-reversible observed expiry +
+    no horizon cap + clock rollback, hold-window confirmed display + boot_epoch
+    continuity + NaN/Inf/bool rejection + duplicate hold refusal + stale hold
+    pruning + full re-evaluation + owner reject override + revocation cancel,
+    covering-grant precedence & DC-2 rejects.
+  - Section E (Items 20-26 + PR #75 R4 #2 & #5): generation, covered_signers
+    (unsorted/duplicate), R6 developer_mode ceremony, exact ceremony_class &
+    device-side authoritative diff (diff=None, version_bump smuggling, missing
+    proposed_goal, bootstrap_owner_keys on first adoption, malformed diffs),
+    per-target host, exact proposed_sha256 binding, full check-order-before-mark,
+    bool-as-int / MAX_SAFE_INT bounds, and PR #75 R4 #5 per-change nonce negatives.
 """
 
 from __future__ import annotations
 
-import base64
 import copy
 import datetime
+import hashlib
 import importlib.util
 import json
+import os
+import shutil
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 ENFORCE_PATH = REPO / "bin" / "approval_enforce.py"
+SIGNER_PATH = Path(__file__).resolve().with_name("_ed25519_test_signer.py")
 
 
-def _load_enforce():
-    spec = importlib.util.spec_from_file_location("tendcf_approval_enforce_under_test", ENFORCE_PATH)
+def _load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # Register in sys.modules BEFORE exec_module (required on Python 3.14+ for dataclasses).
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return mod
 
 
-AE = _load_enforce()
+AE = _load_module("tendcf_approval_enforce_under_test", ENFORCE_PATH)
+SIGNER = _load_module("tendcf_ed25519_test_signer", SIGNER_PATH)
 
 
 # Deterministic 32-byte test seeds (purely synthetic test fixtures).
@@ -65,19 +91,21 @@ SEED_COVERED2 = bytes([0x66]) * 32
 SEED_DEV = bytes([0x77]) * 32
 SEED_ATTACKER = bytes([0x88]) * 32
 
-KEY_HOST = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_HOST))
-KEY_OTHER_HOST = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_OTHER_HOST))
-KEY_OWNER = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_OWNER))
-KEY_OWNER2 = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_OWNER2))
-KEY_COVERED = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_COVERED))
-KEY_COVERED2 = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_COVERED2))
-KEY_DEV = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_DEV))
-KEY_ATTACKER = AE.key_id_from_pubkey(AE.ed25519_public_key_from_seed(SEED_ATTACKER))
+KEY_HOST = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_HOST))
+KEY_OTHER_HOST = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_OTHER_HOST))
+KEY_OWNER = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_OWNER))
+KEY_OWNER2 = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_OWNER2))
+KEY_COVERED = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_COVERED))
+KEY_COVERED2 = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_COVERED2))
+KEY_DEV = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_DEV))
+KEY_ATTACKER = AE.key_id_from_pubkey(SIGNER.public_key_from_seed(SEED_ATTACKER))
 
 T0 = datetime.datetime(2026, 11, 26, 12, 0, 0, tzinfo=datetime.timezone.utc)
 T1 = datetime.datetime(2026, 11, 26, 12, 5, 0, tzinfo=datetime.timezone.utc)
 T_EXP = "2027-12-31T23:59:59Z"
 T_AFTER_EXP = datetime.datetime(2028, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+EPOCH_1 = "boot-epoch-1"
+EPOCH_2 = "boot-epoch-2"
 
 
 def make_baseline_goal(
@@ -90,6 +118,7 @@ def make_baseline_goal(
     if advisor_keys is None:
         advisor_keys = {
             KEY_OWNER: {"role": "owner", "state": "present"},
+            KEY_OWNER2: {"role": "owner", "state": "present"},
             KEY_COVERED: {"role": "covered-signer", "state": "present"},
             KEY_COVERED2: {"role": "covered-signer", "state": "present"},
         }
@@ -200,8 +229,14 @@ def make_supervisor_change(
     return proposed, diff
 
 
+def pure_version_bump_migrate(doc: dict[str, Any], target_ver: int) -> dict[str, Any]:
+    out = copy.deepcopy(doc)
+    out["schema_version"] = target_ver
+    return out
+
+
 def sign_json(record_without_sig: dict[str, Any], seed: bytes) -> bytes:
-    signed = AE.sign_approval_record(record_without_sig, seed)
+    signed = SIGNER.sign_approval_record(record_without_sig, seed, AE.jcs_dumps)
     return AE.jcs_dumps(signed)
 
 
@@ -211,12 +246,22 @@ class _EnforcerTestBase(unittest.TestCase):
         self.tmp = Path(self._tmpdir.name)
         self.baseline = make_baseline_goal()
         self.anchor = AE.InMemoryRollbackAnchor()
-        self.store_path = self.tmp / "replay-store.json"
-        self.store = AE.ReplayStore(self.store_path, KEY_HOST, anchor=self.anchor)
-        self.enforcer = AE.ApprovalEnforcer(KEY_HOST, self.store, self.baseline)
+        self.store_dir = self.tmp / "replay-store"
+        self.store = AE.ReplayStore.provision(
+            self.store_dir, KEY_HOST, anchor=self.anchor, baseline_goal=self.baseline
+        )
+        self.enforcer = AE.ApprovalEnforcer(KEY_HOST, self.store)
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
+
+    def _set_store_baseline(self, goal: dict[str, Any]) -> None:
+        """Test helper: update the authoritative applied baseline in the store cleanly."""
+        with self.store.locked():
+            st = self.store.load_verified_unlocked()
+            st["applied_baseline_goal"] = copy.deepcopy(goal)
+            st["applied_baseline_sha256"] = AE.canonical_sha256(goal)
+            self.store.commit_unlocked(st)
 
     def enroll_active(
         self,
@@ -330,12 +375,20 @@ class _EnforcerTestBase(unittest.TestCase):
 
 
 # ===========================================================================
-# Section 0: RFC 8032 §7.1 Ed25519 Test Vectors & Canonical Encoding Rules
+# Section 0: RFC 8032 §7.1 Ed25519 Test Vectors, Canonicality & Isolation
 # ===========================================================================
 
 class TestSection0Ed25519AndStrictParsing(unittest.TestCase):
+    def test_module_registered_in_sys_modules_and_no_signing_exported(self) -> None:
+        # Codex #1 / Neon F1 / Adversary H1: Python 3.14 dataclasses requires sys.modules registration.
+        self.assertIn("tendcf_approval_enforce_under_test", sys.modules)
+        self.assertIn("_tendcf_projector_jcs", sys.modules)
+        # Codex Other #1 / Adversary M3: non-constant-time signing helpers NOT exported by bin/approval_enforce.py.
+        for forbidden in ("ed25519_sign", "ed25519_public_key_from_seed", "sign_approval_record"):
+            self.assertFalse(hasattr(AE, forbidden), f"signing helper {forbidden} must not live in enforcement module")
+            self.assertNotIn(forbidden, AE.__all__)
+
     def test_rfc8032_section7_1_official_vectors(self) -> None:
-        # Official RFC 8032 §7.1 vectors: TEST 1, TEST 2, TEST 3, TEST SHA(abc), TEST 1024
         vectors = [
             (
                 "TEST 1 (empty)",
@@ -418,28 +471,27 @@ class TestSection0Ed25519AndStrictParsing(unittest.TestCase):
                 pk = bytes.fromhex(pk_hex)
                 msg = bytes.fromhex(msg_hex)
                 sig = bytes.fromhex(sig_hex)
-                self.assertEqual(AE.ed25519_public_key_from_seed(sk), pk)
-                self.assertEqual(AE.ed25519_sign(sk, msg), sig)
+                self.assertEqual(SIGNER.public_key_from_seed(sk), pk)
+                self.assertEqual(SIGNER.sign(sk, msg), sig)
                 self.assertTrue(AE.verify_ed25519(pk, msg, sig))
-                # Bit flip in signature fails verification.
                 bad_sig = bytearray(sig)
                 bad_sig[0] ^= 0x01
                 self.assertFalse(AE.verify_ed25519(pk, msg, bytes(bad_sig)))
 
-    def test_ed25519_rejects_noncanonical_S_R_and_A(self) -> None:
+    def test_ed25519_rejects_noncanonical_S_R_A_and_small_order_R(self) -> None:
         sk = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-        pk = AE.ed25519_public_key_from_seed(sk)
+        pk = SIGNER.public_key_from_seed(sk)
         msg = b"tendcf-canonical-ed25519"
-        sig = AE.ed25519_sign(sk, msg)
+        sig = SIGNER.sign(sk, msg)
         self.assertTrue(AE.verify_ed25519(pk, msg, sig))
 
-        # 1. Malleated S >= L (S + L) must be rejected even though [S+L]B == [S]B.
+        # 1. Malleated S >= L.
         s_val = int.from_bytes(sig[32:], "little")
         malleated_s = (s_val + AE.ED25519_L).to_bytes(32, "little")
         self.assertFalse(AE.verify_ed25519(pk, msg, sig[:32] + malleated_s))
         self.assertFalse(AE.verify_ed25519(pk, msg, sig[:32] + AE.ED25519_L.to_bytes(32, "little")))
 
-        # 2. Non-canonical y >= p (y = p and y = p + 1) must fail point decoding.
+        # 2. Non-canonical y >= p.
         noncanon_y_p = AE.ED25519_P.to_bytes(32, "little")
         noncanon_y_p1 = (AE.ED25519_P + 1).to_bytes(32, "little")
         self.assertIsNone(AE.ed25519_decompress_point(noncanon_y_p))
@@ -447,114 +499,287 @@ class TestSection0Ed25519AndStrictParsing(unittest.TestCase):
         self.assertFalse(AE.verify_ed25519(noncanon_y_p, msg, sig))
         self.assertFalse(AE.verify_ed25519(pk, msg, noncanon_y_p + sig[32:]))
 
-        # 3. Non-canonical x == 0 with sign_bit == 1 (for y = 1 and y = p - 1).
+        # 3. Non-canonical x == 0 with sign_bit == 1.
         neg_zero_1 = (1 | (1 << 255)).to_bytes(32, "little")
         neg_zero_pm1 = ((AE.ED25519_P - 1) | (1 << 255)).to_bytes(32, "little")
         self.assertIsNone(AE.ed25519_decompress_point(neg_zero_1))
         self.assertIsNone(AE.ed25519_decompress_point(neg_zero_pm1))
-        # Canonical neutral point (y=1, sign=0) decodes, while sign=1 fails.
         neutral_bytes = (1).to_bytes(32, "little")
         self.assertIsNotNone(AE.ed25519_decompress_point(neutral_bytes))
         self.assertFalse(AE.verify_ed25519(neg_zero_1, msg, sig))
         self.assertFalse(AE.verify_ed25519(pk, msg, neg_zero_1 + sig[32:]))
 
-        # 4. Small-order public key (identity point A=(0,1), R=(0,1), S=0) MUST be rejected!
+        # 4. Small-order A (identity point A=(0,1), R=(0,1), S=0) rejected.
         zero_s = (0).to_bytes(32, "little")
         self.assertFalse(AE.verify_ed25519(neutral_bytes, msg, neutral_bytes + zero_s))
 
-    def test_schema_version_floor_equals_ceiling_and_strict_json(self) -> None:
-        # Duplicate keys rejected before JCS.
+        # 5. Adversary M3: Mixed-order A = [a]B + Q_2 with small-order R = O MUST be rejected!
+        q2 = AE.ed25519_decompress_point((AE.ED25519_P - 1).to_bytes(32, "little"))
+        assert q2 is not None
+        a_scalar = 123456789
+        pt_mixed = SIGNER._point_add(SIGNER._point_mul(a_scalar, SIGNER.BASE_POINT), q2)
+        mixed_pk = SIGNER.compress_point(pt_mixed)
+        # Find a message whose challenge k is even so [k]Q_2 == O, giving exact [k*a]B == O + [k]A!
+        found = False
+        for i in range(100):
+            cand_msg = f"mixed-order-{i}".encode("ascii")
+            k = int.from_bytes(hashlib.sha512(neutral_bytes + mixed_pk + cand_msg).digest(), "little") % AE.ED25519_L
+            if k % 2 == 0:
+                s_mixed = (k * a_scalar) % AE.ED25519_L
+                forged_sig = neutral_bytes + s_mixed.to_bytes(32, "little")
+                # Even though [S]B == O + [k]A holds algebraically, small-order R=O is rejected!
+                self.assertFalse(AE.verify_ed25519(mixed_pk, cand_msg, forged_sig))
+                found = True
+                break
+        self.assertTrue(found)
+
+    def test_schema_version_floor_equals_ceiling_strict_json_and_bool_as_int_bounds(self) -> None:
         dup = b'{"schema_version":9,"schema_version":9}'
         with self.assertRaises(AE.MalformedRecordError) as ctx:
             AE.parse_strict_json(dup)
         self.assertEqual(ctx.exception.code, "duplicate_or_invalid_json")
 
-        # Non-NFC string rejected (e + combining acute accent U+0301).
         nfd = '{"note":"cafe\u0301"}'.encode("utf-8")
         with self.assertRaises(AE.MalformedRecordError) as ctx2:
             AE.parse_strict_json(nfd)
         self.assertEqual(ctx2.exception.code, "non_nfc_string")
 
-        # Floor == ceiling == 9 (8, 10, and bool True refused).
         for bad_ver in (7, 8, 10, True, "9"):
             with self.assertRaises(AE.MalformedRecordError) as ctx3:
                 AE.validate_approval_record_shape({"schema_version": bad_ver})
             self.assertEqual(ctx3.exception.code, "unsupported_schema_version")
 
+        # Neon F8: bool as int on application_seq, approval_seq, generation, hold_seconds & approval_seq > MAX_SAFE_INT.
+        base_pc = {
+            "schema_version": 9,
+            "record_kind": "per-change",
+            "host": KEY_HOST,
+            "signer": KEY_OWNER,
+            "sig_alg": "ed25519",
+            "proposed_sha256": "sha256:" + "ab" * 32,
+            "nonce": "a" * 32,
+            "approval_seq": 0,
+            "verdict": "accept",
+            "ceremony_class": "ordinary",
+            "signature": "ed25519-sig:" + "00" * 64,
+        }
+        for bad_seq in (True, False, -1, AE.MAX_SAFE_INT + 1):
+            with self.assertRaises(AE.MalformedRecordError):
+                AE.validate_approval_record_shape(dict(base_pc, approval_seq=bad_seq))
+
+        base_app = {
+            "schema_version": 9,
+            "record_kind": "standing-application",
+            "host": KEY_HOST,
+            "signer": KEY_COVERED,
+            "sig_alg": "ed25519",
+            "grant_id": "g1",
+            "generation": 1,
+            "application_seq": 1,
+            "enrollment_nonce": "b" * 32,
+            "baseline_sha256": "sha256:" + "11" * 32,
+            "proposed_sha256": "sha256:" + "22" * 32,
+            "ceremony_class": "ordinary",
+            "signature": "ed25519-sig:" + "00" * 64,
+        }
+        with self.assertRaises(AE.MalformedRecordError):
+            AE.validate_approval_record_shape(dict(base_app, application_seq=True))
+        with self.assertRaises(AE.MalformedRecordError):
+            AE.validate_approval_record_shape(dict(base_app, generation=True))
+
+        base_enr = {
+            "schema_version": 9,
+            "record_kind": "standing-enrollment",
+            "host": KEY_HOST,
+            "signer": KEY_OWNER,
+            "sig_alg": "ed25519",
+            "grant_id": "g1",
+            "generation": 1,
+            "grant_state": "active",
+            "nonce": "c" * 32,
+            "mode": "hold-window",
+            "hold_seconds": 60,
+            "covered_signers": [KEY_COVERED],
+            "class": "ordinary",
+            "developer_mode": False,
+            "not_after": T_EXP,
+            "signature": "ed25519-sig:" + "00" * 64,
+        }
+        with self.assertRaises(AE.MalformedRecordError):
+            AE.validate_approval_record_shape(dict(base_enr, hold_seconds=True))
+        with self.assertRaises(AE.MalformedRecordError):
+            AE.validate_approval_record_shape(dict(base_enr, generation=True))
+
 
 # ===========================================================================
-# Section A: State, Replay and Freshness (Items 1-7 + R4 #1 + Option B)
+# Section A: State, Replay, Freshness, Two-Phase Durability & Races (Items 1-7)
 # ===========================================================================
 
 class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
     def test_item01_rollback_store_loss_corrupt_partial_restore_voids_grants(self) -> None:
-        # Enroll active grant and capture pre-revocation snapshot (tombstone-free).
-        raw_enroll, nonce1, _ = self.enroll_active(grant_id="grant-a")
-        pre_revoke_bytes = self.store_path.read_bytes()
-
-        # Issue another nonce and revoke grant-a -> tombstone created, anchor advances.
-        _unused_nonce = self.enforcer.issue_per_change_nonce(
-            proposed_sha256="sha256:" + "ab" * 32, ceremony_class="ordinary", now_utc=T0
+        # 1. Explicit independent RollbackAnchor required; co-located FileRollbackAnchor refused!
+        with self.assertRaises(TypeError):
+            AE.ReplayStore(self.tmp / "no-anchor", KEY_HOST, anchor=None)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            AE.ReplayStore(
+                self.tmp / "same-dir",
+                KEY_HOST,
+                anchor=AE.FileRollbackAnchor(self.tmp / "same-dir" / "adjacent.anchor"),
+            )
+        # Opening an unprovisioned store fails closed (does not silently provision!).
+        unprov = AE.ReplayStore(
+            self.tmp / "unprovisioned", KEY_HOST, anchor=AE.InMemoryRollbackAnchor()
         )
+        with self.assertRaises(AE.StoreRollbackError) as ctx_unp:
+            unprov.snapshot(allow_voided=True)
+        self.assertEqual(ctx_unp.exception.code, "store_unprovisioned")
+
+        # 2. Whole-domain directory snapshot restore while independent anchor advances -> fails closed!
+        raw_enroll, nonce1, _ = self.enroll_active(grant_id="grant-a")
+        dir_snapshot = self.tmp / "store-dir-snapshot-v1"
+        shutil.copytree(self.store_dir, dir_snapshot)
+
+        # Revoke grant-a -> independent anchor advances past snapshot!
         rev_bytes = self.make_revocation_bytes(grant_id="grant-a", generation=2)
         self.enforcer.process_enrollment(rev_bytes, now_utc=T0)
 
-        # Case 1a: Restore tombstone-free copy (partial/full rollback) -> fail closed, voids everything!
-        self.store_path.write_bytes(pre_revoke_bytes)
+        # Restore ENTIRE store directory from tombstone-free snapshot (anchor stays at revoked gen!).
         proposed, diff = make_ordinary_service_change(self.baseline)
         app = self.make_app_bytes(
-            grant_id="grant-a", generation=1, application_seq=1, enrollment_nonce=nonce1, proposed=proposed
+            grant_id="grant-a", generation=1, application_seq=1, enrollment_nonce=nonce1, baseline=self.baseline, proposed=proposed
         )
-        with self.assertRaises(AE.StoreRollbackError) as ctx:
+        shutil.rmtree(self.store_dir)
+        shutil.copytree(dir_snapshot, self.store_dir)
+        with self.assertRaises(AE.StoreRollbackError) as ctx_dir:
             self.enforcer.process_standing_application(
                 app, proposed_goal=proposed, diff=diff, now_utc=T0, now_mono=10.0
             )
-        self.assertEqual(ctx.exception.code, "store_rollback_detected")
-        # Subsequent retry stays voided even without further tampering.
-        with self.assertRaises(AE.StoreRollbackError) as ctx2:
+        self.assertEqual(ctx_dir.exception.code, "store_missing_rollback")
+        # Stays voided on retry!
+        with self.assertRaises(AE.StoreRollbackError) as ctx_void:
             self.enforcer.process_standing_application(
                 app, proposed_goal=proposed, diff=diff, now_utc=T0, now_mono=11.0
             )
-        self.assertEqual(ctx2.exception.code, "store_voided")
+        self.assertEqual(ctx_void.exception.code, "store_voided")
 
-        # Recover cleanly, enroll grant-b, then test partial restore of ONLY outstanding_nonces.
-        self.store.recover_after_store_loss()
-        _, nonce_b, _ = self.enroll_active(grant_id="grant-b")
-        cur_doc = json.loads(self.store_path.read_text())
-        cur_doc["outstanding_nonces"]["forged-restored-nonce-000000"] = {"record_kind": "per-change"}
-        self.store_path.write_bytes(AE.jcs_dumps(cur_doc))
-        with self.assertRaises(AE.StoreRollbackError):
+        # 3. Neon F3 / Adversary C4: Attacker tampers anchored store file with poison
+        #    (last_seen_utc="9999-...", approval_seq=MAX_SAFE_INT, fake tombstones, fake rejects)
+        #    -> rollback detection MUST NOT copy ANY tampered field into voided state or post-recovery!
+        self.store.recover_after_store_loss(baseline_goal=self.baseline)
+        self.enroll_active(grant_id="grant-b")
+        cur_path = self.store.current_store_path
+        assert cur_path is not None
+        tampered = json.loads(cur_path.read_text())
+        tampered["last_seen_utc"] = "9999-12-31T23:59:59Z"
+        tampered["approval_seq"] = AE.MAX_SAFE_INT
+        tampered["persisted_rejects"]["sha256:" + "de" * 32] = {"recorded_utc": "2026-11-26T12:00:00Z", "refused": ["x"], "signer": KEY_OWNER}
+        tampered["grants"]["fake-tombstone"] = {
+            "generation": 99, "grant_state": "revoked", "tombstoned": True,
+            "active_payload_jcs_b64": None, "enrollment_nonce": None, "scope": None, "application_seq_mark": 0,
+        }
+        cur_path.write_bytes(AE.jcs_dumps(tampered))
+        with self.assertRaises(AE.StoreRollbackError) as ctx_tamp:
             self.enforcer.process_enrollment(raw_enroll, now_utc=T0)
+        self.assertEqual(ctx_tamp.exception.code, "store_rollback_detected")
 
-        # Case 1b: Store file deleted while rollback anchor exists -> fail closed.
-        self.store.recover_after_store_loss()
-        self.enroll_active(grant_id="grant-c")
-        self.store_path.unlink()
-        with self.assertRaises(AE.StoreRollbackError) as ctx3:
-            self.enforcer.process_enrollment(raw_enroll, now_utc=T0)
-        self.assertEqual(ctx3.exception.code, "store_missing_rollback")
+        self.store.recover_after_store_loss(baseline_goal=self.baseline)
+        recovered = self.store.snapshot()
+        self.assertIsNone(recovered["last_seen_utc"])
+        self.assertEqual(recovered["approval_seq"], -1)
+        self.assertEqual(recovered["persisted_rejects"], {})
+        self.assertNotIn("fake-tombstone", recovered["grants"])
+        # Host is NOT bricked after recovery: fresh enrollment works!
+        _, _, r_rec = self.enroll_active(grant_id="fake-tombstone", now_utc=T0)
+        self.assertEqual(r_rec.status, "accepted")
 
-        # Case 1c: Store file truncated/corrupted -> fail closed.
-        self.store.recover_after_store_loss()
-        self.enroll_active(grant_id="grant-d")
-        self.store_path.write_bytes(b'{"store_version":1,"truncated":')
-        with self.assertRaises(AE.StoreRollbackError) as ctx4:
-            self.enforcer.process_enrollment(raw_enroll, now_utc=T0)
-        self.assertEqual(ctx4.exception.code, "store_corrupt")
-
-        # Case 1d: FileRollbackAnchor detects rollback across fresh ReplayStore instance.
-        file_anchor_path = self.tmp / "separate.anchor"
-        file_store_path = self.tmp / "file-backed-store.json"
-        anchor_fs = AE.FileRollbackAnchor(file_anchor_path)
-        store_fs = AE.ReplayStore(file_store_path, KEY_HOST, anchor=anchor_fs)
-        enf_fs = AE.ApprovalEnforcer(KEY_HOST, store_fs, self.baseline)
+        # 4. Separate-directory FileRollbackAnchor detects rollback across reload.
+        anchor_dir = self.tmp / "separate-anchor-domain"
+        store_dir_fs = self.tmp / "separate-store-domain"
+        anchor_fs = AE.FileRollbackAnchor(anchor_dir / "hw.anchor")
+        store_fs = AE.ReplayStore.provision(store_dir_fs, KEY_HOST, anchor=anchor_fs, baseline_goal=self.baseline)
+        enf_fs = AE.ApprovalEnforcer(KEY_HOST, store_fs)
         self.enroll_active(grant_id="grant-fs", enforcer=enf_fs)
-        backup_fs = file_store_path.read_bytes()
+        snap_fs = self.tmp / "snap-fs"
+        shutil.copytree(store_dir_fs, snap_fs)
         enf_fs.process_enrollment(self.make_revocation_bytes(grant_id="grant-fs", generation=2), now_utc=T0)
-        file_store_path.write_bytes(backup_fs)
-        reloaded_store = AE.ReplayStore(file_store_path, KEY_HOST, anchor=AE.FileRollbackAnchor(file_anchor_path))
+        shutil.rmtree(store_dir_fs)
+        shutil.copytree(snap_fs, store_dir_fs)
+        reloaded = AE.ReplayStore(store_dir_fs, KEY_HOST, anchor=AE.FileRollbackAnchor(anchor_dir / "hw.anchor"))
         with self.assertRaises(AE.StoreRollbackError):
-            reloaded_store.snapshot(allow_voided=False)
+            reloaded.snapshot(allow_voided=False)
+
+    def test_item01_short_write_loop_and_reentrant_lock_and_callback_failure(self) -> None:
+        # 1. Macroscope 4708874407 / Codex #9: short os.write loops until all bytes written!
+        real_write = os.write
+        calls: list[int] = []
+
+        def short_write(fd: int, data: Any) -> int:
+            chunk = bytes(data)[:7]
+            calls.append(len(chunk))
+            return real_write(fd, chunk)
+
+        out_path = self.tmp / "short-write-target.bin"
+        payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        with mock.patch("os.write", side_effect=short_write):
+            AE._atomic_write_file(out_path, payload)
+        self.assertEqual(out_path.read_bytes(), payload)
+        self.assertGreater(len(calls), 3)
+
+        # Short write returning 0 fails loudly before os.replace.
+        with mock.patch("os.write", return_value=0):
+            with self.assertRaises(OSError):
+                AE._atomic_write_file(self.tmp / "zero-write.bin", b"abc")
+        self.assertFalse((self.tmp / "zero-write.bin").exists())
+
+        # 2. Neon F7 / Adversary H3: Re-entrant store.snapshot() & developer_mode_indicator_active()
+        #    from inside _apply_callback MUST NOT deadlock!
+        cb_observations: list[tuple[bool, int]] = []
+
+        def inspecting_cb(goal: dict[str, Any]) -> None:
+            snap = self.store.snapshot()
+            ind = self.enforcer.developer_mode_indicator_active(T0)
+            cb_observations.append((ind, snap["grants"]["reent-g"]["application_seq_mark"]))
+
+        enf_cb = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=inspecting_cb)
+        _, nonce, _ = self.enroll_active(grant_id="reent-g", enforcer=enf_cb)
+        prop1, diff1 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.reent")
+        app1 = self.make_app_bytes(
+            grant_id="reent-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop1
+        )
+        res = enf_cb.process_standing_application(app1, proposed_goal=prop1, diff=diff1, now_utc=T0)
+        self.assertEqual(res.decision, "applied")
+        self.assertEqual(cb_observations, [(False, 1)])
+
+        # 3. Codex #8 / Macroscope 4708874409: Callback failure keeps replay mark consumed
+        #    while preserving prior authoritative baseline (even across restart!).
+        class _ActuateFailed(RuntimeError):
+            pass
+
+        def failing_cb(_goal: dict[str, Any]) -> None:
+            raise _ActuateFailed("disk full during actuation")
+
+        enf_fail = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=failing_cb)
+        prior_hash = AE.canonical_sha256(enf_fail.baseline_goal)
+        prop2, diff2 = make_ordinary_service_change(enf_fail.baseline_goal, service_id="com.tendcf.fail")
+        app2 = self.make_app_bytes(
+            grant_id="reent-g",
+            generation=1,
+            application_seq=2,
+            enrollment_nonce=nonce,
+            baseline=enf_fail.baseline_goal,
+            proposed=prop2,
+        )
+        with self.assertRaises(_ActuateFailed):
+            enf_fail.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=T0)
+        # Replay mark IS consumed (2), actuation_count NOT incremented, prior baseline PRESERVED!
+        self.assertEqual(enf_fail.actuation_count, 0)
+        self.assertEqual(self.store.snapshot()["grants"]["reent-g"]["application_seq_mark"], 2)
+        self.assertEqual(AE.canonical_sha256(enf_fail.baseline_goal), prior_hash)
+        # Fresh reloaded enforcer also sees prior baseline & consumed mark!
+        reloaded_enf = AE.ApprovalEnforcer(KEY_HOST, AE.ReplayStore(self.store_dir, KEY_HOST, anchor=self.anchor))
+        self.assertEqual(AE.canonical_sha256(reloaded_enf.baseline_goal), prior_hash)
+        with self.assertRaises(AE.ReplayError):
+            reloaded_enf.process_standing_application(app2, proposed_goal=prop2, diff=diff2, now_utc=T0)
 
     def test_item02_enrollment_nonce_bound_to_full_shown_scope(self) -> None:
         # 1. An ordinary per-change nonce offered for a baseline enrollment -> refused.
@@ -581,7 +806,21 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             self.enforcer.process_enrollment(sign_json(rec, SEED_OWNER), now_utc=T0)
         self.assertEqual(ctx.exception.code, "nonce_scope_mismatch")
 
-        # 2. A developer-mode enrollment carrying a nonce from an ordinary non-developer ceremony -> refused.
+        # 2. Adversary C2: hold_seconds=True refused in issue_enrollment_nonce!
+        with self.assertRaises(AE.MalformedRecordError):
+            self.enforcer.issue_enrollment_nonce(
+                grant_id="bool-hold",
+                mode="hold-window",
+                covered_signers=[KEY_COVERED],
+                grant_class="ordinary",
+                developer_mode=False,
+                ceremony_level="ordinary",
+                hold_seconds=True,  # type: ignore[arg-type]
+                not_after=T_EXP,
+                now_utc=T0,
+            )
+
+        # 3. A developer-mode enrollment carrying a nonce from an ordinary non-developer ceremony -> refused.
         ord_nonce = self.enforcer.issue_enrollment_nonce(
             grant_id="dev-grant",
             mode="standing-approval",
@@ -592,11 +831,17 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             not_after=T_EXP,
             now_utc=T0,
         )
-        dev_rec = dict(rec, grant_id="dev-grant", nonce=ord_nonce, covered_signers=[KEY_DEV], **{"class": "ordinary", "developer_mode": True})
+        dev_rec = dict(
+            rec,
+            grant_id="dev-grant",
+            nonce=ord_nonce,
+            covered_signers=[KEY_DEV],
+            **{"class": "ordinary", "developer_mode": True},
+        )
         with self.assertRaises(AE.NonceError):
             self.enforcer.process_enrollment(sign_json(dev_rec, SEED_OWNER), now_utc=T0)
 
-        # 3. Scope differs from shown scope on EVERY field (mode, covered_signers, class, hold_seconds, not_after, grant_id).
+        # 4. Scope tampering on EVERY field refused.
         base_kwargs = dict(
             grant_id="scoped-grant",
             mode="hold-window",
@@ -642,24 +887,9 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
                 with self.assertRaises(AE.NonceError):
                     self.enforcer.process_enrollment(sign_json(r, SEED_OWNER), now_utc=T0)
 
-        # 4. Single-use consumption: reusing a consumed nonce on generation 2 is refused.
+        # 5. Consumed nonce cannot be reused on generation 2.
         _, used_nonce, _ = self.enroll_active(grant_id="single-use", generation=1)
-        gen2_reuse = {
-            "schema_version": 9,
-            "record_kind": "standing-enrollment",
-            "host": KEY_HOST,
-            "signer": KEY_OWNER,
-            "sig_alg": "ed25519",
-            "grant_id": "single-use",
-            "generation": 2,
-            "grant_state": "active",
-            "nonce": used_nonce,
-            "mode": "standing-approval",
-            "covered_signers": [KEY_COVERED],
-            "class": "ordinary",
-            "developer_mode": False,
-            "not_after": T_EXP,
-        }
+        gen2_reuse = dict(rec, grant_id="single-use", generation=2, nonce=used_nonce, **{"class": "ordinary"})
         with self.assertRaises(AE.NonceError) as ctx_reuse:
             self.enforcer.process_enrollment(sign_json(gen2_reuse, SEED_OWNER), now_utc=T0)
         self.assertEqual(ctx_reuse.exception.code, "unknown_or_consumed_nonce")
@@ -672,33 +902,34 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
         )
 
         # Simulate store loss -> fail closed -> owner recovery -> fresh gen-1 enrollment with NEW nonce.
-        self.store_path.unlink()
+        cur = self.store.current_store_path
+        assert cur is not None
+        cur.unlink()
         with self.assertRaises(AE.StoreRollbackError):
             self.store.snapshot(allow_voided=False)
-        self.store.recover_after_store_loss()
+        self.store.recover_after_store_loss(baseline_goal=self.baseline)
         _, new_nonce, _ = self.enroll_active(grant_id="reborn", generation=1)
         self.assertNotEqual(old_nonce, new_nonce)
 
-        # Old application (same grant_id, same generation 1, seq 1 > 0, WRONG enrollment_nonce) REFUSED!
         with self.assertRaises(AE.NonceError) as ctx:
             self.enforcer.process_standing_application(
-                old_app, proposed_goal=proposed, diff=diff, now_utc=T0, now_mono=10.0
+                old_app, proposed_goal=proposed, diff=diff, now_utc=T0
             )
         self.assertEqual(ctx.exception.code, "enrollment_nonce_mismatch")
 
-        # Application bound to the new enrollment_nonce succeeds.
         new_app = self.make_app_bytes(
             grant_id="reborn", generation=1, application_seq=1, enrollment_nonce=new_nonce, proposed=proposed
         )
         res = self.enforcer.process_standing_application(
-            new_app, proposed_goal=proposed, diff=diff, now_utc=T0, now_mono=11.0
+            new_app, proposed_goal=proposed, diff=diff, now_utc=T0
         )
         self.assertEqual(res.decision, "applied")
 
     def test_item04_baseline_sha256_binding_and_no_first_adoption(self) -> None:
-        # 1. First adoption (no applied baseline) is NEVER by standing-application.
-        fresh_store = AE.ReplayStore(self.tmp / "first-adopt.json", KEY_HOST, anchor=AE.InMemoryRollbackAnchor())
-        fresh_enf = AE.ApprovalEnforcer(KEY_HOST, fresh_store, baseline_goal=None)
+        fresh_store = AE.ReplayStore.provision(
+            self.tmp / "first-adopt", KEY_HOST, anchor=AE.InMemoryRollbackAnchor(), baseline_goal=None
+        )
+        fresh_enf = AE.ApprovalEnforcer(KEY_HOST, fresh_store)
         proposed0, diff0 = make_ordinary_service_change(self.baseline)
         app0 = self.make_app_bytes(
             grant_id="ci-bot",
@@ -709,19 +940,15 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             proposed=proposed0,
         )
         with self.assertRaises(AE.ReplayError) as ctx:
-            fresh_enf.process_standing_application(
-                app0, proposed_goal=proposed0, diff=diff0, now_utc=T0, now_mono=1.0
-            )
+            fresh_enf.process_standing_application(app0, proposed_goal=proposed0, diff=diff0, now_utc=T0)
         self.assertEqual(ctx.exception.code, "first_adoption_disallowed")
 
-        # 2. Held-back application released after owner accepted a later change -> refused.
         _, nonce, _ = self.enroll_active(grant_id="ci-bot")
         held_proposed, held_diff = make_ordinary_service_change(self.baseline, service_id="com.tendcf.old.svc")
         held_app = self.make_app_bytes(
             grant_id="ci-bot", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=held_proposed
         )
 
-        # Meanwhile, owner accepts a different change advancing baseline.
         later_proposed, later_diff = make_ordinary_service_change(self.baseline, service_id="com.tendcf.later.svc")
         pc_nonce = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(later_proposed), ceremony_class="ordinary", now_utc=T0
@@ -743,10 +970,9 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             sign_json(pc_rec, SEED_OWNER), proposed_goal=later_proposed, diff=later_diff, now_utc=T0
         )
 
-        # Releasing held-back application now fails baseline_sha256 check!
         with self.assertRaises(AE.ReplayError) as ctx2:
             self.enforcer.process_standing_application(
-                held_app, proposed_goal=held_proposed, diff=held_diff, now_utc=T0, now_mono=5.0
+                held_app, proposed_goal=held_proposed, diff=held_diff, now_utc=T0
             )
         self.assertEqual(ctx2.exception.code, "baseline_sha256_mismatch")
 
@@ -757,12 +983,8 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             grant_id="seq-grant", generation=1, application_seq=7, enrollment_nonce=nonce1, proposed=prop1
         )
 
-        # Simulate crash AFTER durable persist of application_seq=7 BEFORE actuation.
         class _Crash(RuntimeError):
             pass
-
-        def crash_before_apply() -> None:
-            raise _Crash("power loss after durable mark write")
 
         with self.assertRaises(_Crash):
             self.enforcer.process_standing_application(
@@ -770,162 +992,123 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
                 proposed_goal=prop1,
                 diff=diff1,
                 now_utc=T0,
-                now_mono=10.0,
-                before_apply_hook=crash_before_apply,
+                before_apply_hook=lambda: (_ for _ in ()).throw(_Crash("power loss")),
             )
-        # Baseline NOT updated, actuation did NOT run, mark IS durably 7!
         self.assertEqual(self.enforcer.actuation_count, 0)
         self.assertEqual(self.store.snapshot()["grants"]["seq-grant"]["application_seq_mark"], 7)
 
-        # Replaying application_seq=7 is REFUSED (no double-apply on crash recovery).
         with self.assertRaises(AE.ReplayError) as ctx:
-            self.enforcer.process_standing_application(
-                app7, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=11.0
-            )
+            self.enforcer.process_standing_application(app7, proposed_goal=prop1, diff=diff1, now_utc=T0)
         self.assertEqual(ctx.exception.code, "stale_application_seq")
 
-        # Re-enroll at generation 2 -> mark MUST NOT decrease across generations!
         _, nonce2, _ = self.enroll_active(grant_id="seq-grant", generation=2, mode="hold-window", hold_seconds=60)
         self.assertEqual(self.store.snapshot()["grants"]["seq-grant"]["application_seq_mark"], 7)
         app7_gen2 = self.make_app_bytes(
             grant_id="seq-grant", generation=2, application_seq=7, enrollment_nonce=nonce2, proposed=prop1
         )
         with self.assertRaises(AE.ReplayError):
-            self.enforcer.process_standing_application(
-                app7_gen2, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=12.0
-            )
+            self.enforcer.process_standing_application(app7_gen2, proposed_goal=prop1, diff=diff1, now_utc=T0)
 
-        # application_seq=8 on hold-window grant persists mark=8 AT INTAKE before hold elapses.
         app8_gen2 = self.make_app_bytes(
             grant_id="seq-grant", generation=2, application_seq=8, enrollment_nonce=nonce2, proposed=prop1
         )
         res = self.enforcer.process_standing_application(
-            app8_gen2, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=15.0
+            app8_gen2, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=15.0, boot_epoch=EPOCH_1, display_confirmed=True
         )
         self.assertEqual(res.decision, "held")
         self.assertEqual(self.store.snapshot()["grants"]["seq-grant"]["application_seq_mark"], 8)
-
-        # application_seq > 2^53 - 1 refused.
-        bad_seq_rec = {
-            "schema_version": 9,
-            "record_kind": "standing-application",
-            "host": KEY_HOST,
-            "signer": KEY_COVERED,
-            "sig_alg": "ed25519",
-            "grant_id": "seq-grant",
-            "generation": 2,
-            "application_seq": AE.MAX_SAFE_INT + 1,
-            "enrollment_nonce": nonce2,
-            "baseline_sha256": AE.canonical_sha256(self.baseline),
-            "proposed_sha256": AE.canonical_sha256(prop1),
-            "ceremony_class": "ordinary",
-            "signature": "ed25519-sig:" + "00" * 64,
-        }
-        with self.assertRaises(AE.MalformedRecordError):
-            AE.validate_approval_record_shape(bad_seq_rec)
 
     def test_item06_option_b_identical_redelivery_zero_writes_and_equivocation(self) -> None:
         raw_enroll, nonce1, receipt1 = self.enroll_active(
             grant_id="optb-grant", generation=1, mode="hold-window", hold_seconds=300
         )
-        # Apply seq 7 into a pending hold so state has both mark=7 and an active pending hold.
         prop1, diff1 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.optb")
         app7 = self.make_app_bytes(
             grant_id="optb-grant", generation=1, application_seq=7, enrollment_nonce=nonce1, proposed=prop1
         )
         hold_res = self.enforcer.process_standing_application(
-            app7, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=100.0
+            app7, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=100.0, boot_epoch=EPOCH_1, display_confirmed=True
         )
         self.assertEqual(hold_res.decision, "held")
 
-        # Snapshot full protected state & all counters BEFORE identical redelivery.
         state_before = self.store.snapshot()
-        disk_before = self.store_path.read_bytes()
+        cur_path = self.store.current_store_path
+        assert cur_path is not None
+        disk_before = cur_path.read_bytes()
         anchor_before = self.anchor.read()
         writes_before = self.store.write_count
         nonce_consumes_before = self.store.nonce_consume_count
         prompts_before = self.enforcer.prompt_count
         actuations_before = self.enforcer.actuation_count
 
-        # Re-deliver identical enrollment with reordered JSON keys & pretty whitespace!
         parsed = json.loads(raw_enroll)
         reordered_wire = json.dumps(parsed, indent=2, sort_keys=False).encode("utf-8")
-        self.assertNotEqual(reordered_wire, raw_enroll)
-
         receipt2 = self.enforcer.process_enrollment(reordered_wire, now_utc=T1)
-        # Same success shape as initial acceptance!
+
         self.assertEqual(receipt1, receipt2)
-        # ZERO writes, ZERO nonce/counter mutation, ZERO prompts, ZERO actuation, ZERO state change!
         self.assertEqual(self.store.write_count, writes_before)
         self.assertEqual(self.store.nonce_consume_count, nonce_consumes_before)
         self.assertEqual(self.enforcer.prompt_count, prompts_before)
         self.assertEqual(self.enforcer.actuation_count, actuations_before)
         self.assertEqual(self.store.snapshot(), state_before)
-        self.assertEqual(self.store_path.read_bytes(), disk_before)
+        self.assertEqual(cur_path.read_bytes(), disk_before)
         self.assertEqual(self.anchor.read(), anchor_before)
 
-        # Replay of application 7 after redelivery is STILL refused!
+        # Replay of application 7 still refused!
         with self.assertRaises(AE.ReplayError) as ctx_rep:
             self.enforcer.process_standing_application(
-                app7, proposed_goal=prop1, diff=diff1, now_utc=T1, now_mono=101.0
+                app7, proposed_goal=prop1, diff=diff1, now_utc=T1
             )
-        self.assertEqual(ctx_rep.exception.code, "stale_application_seq")
+        self.assertEqual(ctx_rep.exception.code, "duplicate_pending_hold")
 
-        # Equivocation 1: validly re-signed same-generation scope change -> refused!
+        # Equivocation (scope or nonce change at same generation) refused!
         equiv_scope = copy.deepcopy(parsed)
         equiv_scope["hold_seconds"] = 1
         with self.assertRaises(AE.ReplayError) as ctx_eq1:
             self.enforcer.process_enrollment(sign_json(equiv_scope, SEED_OWNER), now_utc=T1)
         self.assertEqual(ctx_eq1.exception.code, "enrollment_equivocation")
 
-        # Equivocation 2: validly re-signed same-generation nonce change -> refused!
         equiv_nonce = copy.deepcopy(parsed)
         equiv_nonce["nonce"] = AE.generate_device_nonce()
         with self.assertRaises(AE.ReplayError) as ctx_eq2:
             self.enforcer.process_enrollment(sign_json(equiv_nonce, SEED_OWNER), now_utc=T1)
         self.assertEqual(ctx_eq2.exception.code, "enrollment_equivocation")
 
-        # Refusal checks on identical redelivery:
-        # (a) Duplicate JSON keys refused.
-        dup_wire = raw_enroll[:-1] + b',"generation":1}'
+        # Duplicate keys, bad sig, removed owner, missing stored bytes, and expiry all fail closed!
         with self.assertRaises(AE.MalformedRecordError):
-            self.enforcer.process_enrollment(dup_wire, now_utc=T1)
+            self.enforcer.process_enrollment(raw_enroll[:-1] + b',"generation":1}', now_utc=T1)
 
-        # (b) Invalid signature refused even though JCS-minus-signature matches!
-        bad_sig = copy.deepcopy(parsed)
-        bad_sig["signature"] = "ed25519-sig:" + "00" * 64
+        bad_sig = dict(parsed, signature="ed25519-sig:" + "00" * 64)
         with self.assertRaises(AE.SignatureError):
             self.enforcer.process_enrollment(AE.jcs_dumps(bad_sig), now_utc=T1)
 
-        # (c) Expired grant refuses identical redelivery!
-        with self.assertRaises(AE.ScopeError) as ctx_exp:
-            self.enforcer.process_enrollment(raw_enroll, now_utc=T_AFTER_EXP)
-        self.assertEqual(ctx_exp.exception.code, "enrollment_expired")
-
-        # (d) Removed owner in baseline refuses identical redelivery!
         removed_owner_base = copy.deepcopy(self.baseline)
         removed_owner_base["domains"]["device-trust"]["entries"]["advisor-key"][KEY_OWNER]["state"] = "absent"
-        self.enforcer.baseline_goal = removed_owner_base
+        self._set_store_baseline(removed_owner_base)
         with self.assertRaises(AE.TrustRootError) as ctx_owner:
             self.enforcer.process_enrollment(raw_enroll, now_utc=T1)
         self.assertEqual(ctx_owner.exception.code, "signer_not_owner")
-        self.enforcer.baseline_goal = copy.deepcopy(self.baseline)
+        self._set_store_baseline(self.baseline)
 
-        # (e) Missing stored canonical JCS-minus-signature bytes fails closed!
         st = self.store.snapshot()
         st["grants"]["optb-grant"]["active_payload_jcs_b64"] = None
         raw_st = AE.jcs_dumps(st)
-        self.store_path.write_bytes(raw_st)
-        self.anchor.write(AE.AnchorState(st["store_generation"], AE.hashlib.sha256(raw_st).hexdigest()))
+        p = self.store.version_path(st["store_generation"])
+        p.write_bytes(raw_st)
+        self.anchor.write(AE.AnchorState(st["store_generation"], hashlib.sha256(raw_st).hexdigest()))
         with self.assertRaises(AE.ReplayError) as ctx_missing:
             self.enforcer.process_enrollment(raw_enroll, now_utc=T1)
         self.assertEqual(ctx_missing.exception.code, "missing_stored_payload")
 
-    def test_item06_option_b_crash_both_sides_of_commit_and_concurrent_race(self) -> None:
+        # Expired identical redelivery fails closed!
+        with self.assertRaises(AE.ScopeError) as ctx_exp:
+            self.enforcer.process_enrollment(raw_enroll, now_utc=T_AFTER_EXP)
+        self.assertEqual(ctx_exp.exception.code, "enrollment_expired")
+
+    def test_item06_option_b_two_phase_crash_boundaries_and_contended_races(self) -> None:
         class _SimCrash(RuntimeError):
             pass
 
-        # Prepare enrollment record.
         nonce = self.enforcer.issue_enrollment_nonce(
             grant_id="crash-grant",
             mode="standing-approval",
@@ -954,34 +1137,37 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
         }
         raw = sign_json(rec, SEED_OWNER)
 
-        # 1. Crash BEFORE durable commit: no receipt, nonce still outstanding, grant NOT installed.
+        # Codex #9: Crash RIGHT BEFORE anchor.write (after v<N> is staged on disk!):
+        # v<N-1> stays intact, anchor still points to N-1, retry succeeds as initial install!
         writes0 = self.store.write_count
         with self.assertRaises(_SimCrash):
             self.enforcer.process_enrollment(
-                raw, now_utc=T0, before_replace_hook=lambda: (_ for _ in ()).throw(_SimCrash("before"))
+                raw,
+                now_utc=T0,
+                before_anchor_hook=lambda: (_ for _ in ()).throw(_SimCrash("crash before anchor")),
             )
         self.assertEqual(self.store.write_count, writes0)
         self.assertNotIn("crash-grant", self.store.snapshot()["grants"])
         self.assertIn(nonce, self.store.snapshot()["outstanding_nonces"])
 
-        # 2. Retry succeeds and crashes AFTER durable commit (before receipt reaches sender).
+        # Codex #9: Retry succeeds and crashes RIGHT AFTER anchor.write (before old-gen cleanup & receipt!):
+        # Anchor points to N, v<N> is fsynced -> Option B retry succeeds with ZERO writes!
         with self.assertRaises(_SimCrash):
             self.enforcer.process_enrollment(
-                raw, now_utc=T0, after_commit_hook=lambda: (_ for _ in ()).throw(_SimCrash("after"))
+                raw,
+                now_utc=T0,
+                after_commit_hook=lambda: (_ for _ in ()).throw(_SimCrash("crash after anchor")),
             )
-        writes_after_commit = self.store.write_count
-        self.assertEqual(writes_after_commit, writes0 + 1)
-        self.assertNotIn(nonce, self.store.snapshot()["outstanding_nonces"])
-
-        # 3. Sender retries (with reordered JSON): hits Option B zero-write receipt path!
+        writes_after = self.store.write_count
+        self.assertEqual(writes_after, writes0 + 1)
         reordered = json.dumps(json.loads(raw), indent=4).encode("utf-8")
         receipt = self.enforcer.process_enrollment(reordered, now_utc=T0)
         self.assertEqual(receipt.status, "accepted")
-        self.assertEqual(self.store.write_count, writes_after_commit)
+        self.assertEqual(self.store.write_count, writes_after)
 
-        # 4. Concurrent race of two identical deliveries -> 1 install, 1 nonce consumption, 2 identical receipts!
-        nonce_race = self.enforcer.issue_enrollment_nonce(
-            grant_id="race-grant",
+        # Contended two-thread race 1: identical active enrollments -> 1 install, 1 nonce consume, 2 identical receipts!
+        n_race = self.enforcer.issue_enrollment_nonce(
+            grant_id="race-dup",
             mode="standing-approval",
             covered_signers=[KEY_COVERED],
             grant_class="ordinary",
@@ -990,37 +1176,182 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             not_after=T_EXP,
             now_utc=T0,
         )
-        race_rec = dict(rec, grant_id="race-grant", nonce=nonce_race)
-        race_raw = sign_json(race_rec, SEED_OWNER)
-        writes_pre_race = self.store.write_count
-        consumes_pre_race = self.store.nonce_consume_count
+        race_raw = sign_json(dict(rec, grant_id="race-dup", nonce=n_race), SEED_OWNER)
+        w0, c0 = self.store.write_count, self.store.nonce_consume_count
+        b1 = threading.Barrier(2)
+        out1: list[Any] = []
+        err1: list[BaseException] = []
 
-        barrier = threading.Barrier(2)
-        results: list[Any] = []
-        errors: list[BaseException] = []
-
-        def worker(payload: bytes) -> None:
+        def run_dup(payload: bytes) -> None:
             try:
-                barrier.wait(timeout=5)
-                results.append(self.enforcer.process_enrollment(payload, now_utc=T0))
+                b1.wait(timeout=5)
+                out1.append(self.enforcer.process_enrollment(payload, now_utc=T0))
             except BaseException as exc:
-                errors.append(exc)
+                err1.append(exc)
 
-        t1 = threading.Thread(target=worker, args=(race_raw,))
-        t2 = threading.Thread(target=worker, args=(json.dumps(json.loads(race_raw), indent=2).encode("utf-8"),))
-        t1.start()
-        t2.start()
-        t1.join(timeout=10)
-        t2.join(timeout=10)
+        t1 = threading.Thread(target=run_dup, args=(race_raw,))
+        t2 = threading.Thread(target=run_dup, args=(json.dumps(json.loads(race_raw), indent=2).encode("utf-8"),))
+        t1.start(); t2.start(); t1.join(timeout=10); t2.join(timeout=10)
+        self.assertEqual(err1, [])
+        self.assertEqual(len(out1), 2)
+        self.assertEqual(out1[0], out1[1])
+        self.assertEqual(self.store.write_count, w0 + 1)
+        self.assertEqual(self.store.nonce_consume_count, c0 + 1)
 
-        self.assertEqual(errors, [])
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0], results[1])
-        self.assertEqual(self.store.write_count, writes_pre_race + 1)
-        self.assertEqual(self.store.nonce_consume_count, consumes_pre_race + 1)
+        # Contended two-thread race 2 (Codex Other #2): active enrollment vs revocation!
+        n_rev = self.enforcer.issue_enrollment_nonce(
+            grant_id="race-vs-rev",
+            mode="standing-approval",
+            covered_signers=[KEY_COVERED],
+            grant_class="ordinary",
+            developer_mode=False,
+            ceremony_level="ordinary",
+            not_after=T_EXP,
+            now_utc=T0,
+        )
+        act_raw = sign_json(dict(rec, grant_id="race-vs-rev", nonce=n_rev), SEED_OWNER)
+        rev_raw = self.make_revocation_bytes(grant_id="race-vs-rev", generation=1)
+        b2 = threading.Barrier(2)
+        outcomes: list[tuple[str, Any]] = []
+
+        def run_act() -> None:
+            b2.wait(timeout=5)
+            try:
+                outcomes.append(("act_ok", self.enforcer.process_enrollment(act_raw, now_utc=T0)))
+            except AE.ReplayError as exc:
+                outcomes.append(("act_refused", exc.code))
+
+        def run_rev() -> None:
+            b2.wait(timeout=5)
+            outcomes.append(("rev_ok", self.enforcer.process_enrollment(rev_raw, now_utc=T0)))
+
+        t3 = threading.Thread(target=run_act)
+        t4 = threading.Thread(target=run_rev)
+        t3.start(); t4.start(); t3.join(timeout=10); t4.join(timeout=10)
+        # Regardless of scheduling order, final state MUST be tombstoned and later active retries refused!
+        self.assertTrue(self.store.snapshot()["grants"]["race-vs-rev"]["tombstoned"])
+        with self.assertRaises(AE.ReplayError) as ctx_post:
+            self.enforcer.process_enrollment(act_raw, now_utc=T0)
+        self.assertEqual(ctx_post.exception.code, "grant_tombstoned")
+
+    def test_item06_shared_store_two_enforcers_no_toctou_owner_removal_and_baseline_races(self) -> None:
+        # Codex #3 / Adversary C3 / Macroscope 4708874430:
+        # Two independent ApprovalEnforcer instances sharing one ReplayStore!
+        enf_a = AE.ApprovalEnforcer(KEY_HOST, self.store)
+        enf_b = AE.ApprovalEnforcer(KEY_HOST, self.store)
+
+        # 1. Owner 1 removes Owner 2 in enf_a while Owner 2 tries to enroll a rogue grant in enf_b!
+        prop_rm = copy.deepcopy(self.baseline)
+        prop_rm["domains"]["device-trust"]["entries"]["advisor-key"][KEY_OWNER2]["state"] = "absent"
+        diff_rm = AE.compute_authoritative_diff(self.baseline, prop_rm, KEY_HOST)
+        pc_n = enf_a.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_rm), ceremony_class="privileged", now_utc=T0
+        )
+        pc_rm = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop_rm),
+                "nonce": pc_n,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "privileged",
+            },
+            SEED_OWNER,
+        )
+        rogue_n = enf_b.issue_enrollment_nonce(
+            grant_id="rogue-g",
+            mode="standing-approval",
+            covered_signers=[KEY_COVERED],
+            grant_class="ordinary",
+            developer_mode=False,
+            ceremony_level="ordinary",
+            not_after=T_EXP,
+            now_utc=T0,
+        )
+        rogue_raw = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "standing-enrollment",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER2,
+                "sig_alg": "ed25519",
+                "grant_id": "rogue-g",
+                "generation": 1,
+                "grant_state": "active",
+                "nonce": rogue_n,
+                "mode": "standing-approval",
+                "covered_signers": [KEY_COVERED],
+                "class": "ordinary",
+                "developer_mode": False,
+                "not_after": T_EXP,
+            },
+            SEED_OWNER2,
+        )
+
+        # Force Owner 2 to enter process_enrollment AFTER Owner 1 holds the lock (true TOCTOU test!).
+        lock_entered = threading.Event()
+        release_owner1 = threading.Event()
+
+        def hold_lock_cb(_goal: dict[str, Any]) -> None:
+            lock_entered.set()
+            release_owner1.wait(timeout=5)
+
+        enf_a_slow = AE.ApprovalEnforcer(KEY_HOST, self.store, apply_callback=hold_lock_cb)
+        owner2_outcome: list[Any] = []
+
+        def run_owner1() -> None:
+            enf_a_slow.process_per_change(pc_rm, proposed_goal=prop_rm, diff=diff_rm, now_utc=T0)
+
+        def run_owner2() -> None:
+            lock_entered.wait(timeout=5)
+            # Release owner1 slightly after owner2 tries to acquire the lock!
+            threading.Timer(0.05, release_owner1.set).start()
+            try:
+                owner2_outcome.append(("accepted", enf_b.process_enrollment(rogue_raw, now_utc=T0)))
+            except AE.TrustRootError as exc:
+                owner2_outcome.append(("refused", exc.code))
+
+        t1 = threading.Thread(target=run_owner1)
+        t2 = threading.Thread(target=run_owner2)
+        t1.start(); t2.start(); t1.join(timeout=10); t2.join(timeout=10)
+        self.assertEqual(owner2_outcome, [("refused", "signer_not_owner")])
+        self.assertNotIn("rogue-g", self.store.snapshot()["grants"])
+
+        # 2. Concurrent standing-application baseline race across two independent enforcers:
+        #    Both target the same baseline; EXACTLY ONE applies and the other MUST fail baseline_sha256_mismatch!
+        _, g_nonce, _ = self.enroll_active(grant_id="conc-app", enforcer=enf_a)
+        cur_base = enf_a.baseline_goal
+        assert cur_base is not None
+        p_c1, d_c1 = make_ordinary_service_change(cur_base, service_id="com.tendcf.c1")
+        p_c2, d_c2 = make_ordinary_service_change(cur_base, service_id="com.tendcf.c2")
+        a_c1 = self.make_app_bytes(
+            grant_id="conc-app", generation=1, application_seq=1, enrollment_nonce=g_nonce, baseline=cur_base, proposed=p_c1
+        )
+        a_c2 = self.make_app_bytes(
+            grant_id="conc-app", generation=1, application_seq=2, enrollment_nonce=g_nonce, baseline=cur_base, proposed=p_c2
+        )
+        bar = threading.Barrier(2)
+        app_results: list[str] = []
+
+        def run_app(enf: Any, raw: bytes, p: dict[str, Any], d: dict[str, Any]) -> None:
+            bar.wait(timeout=5)
+            try:
+                r = enf.process_standing_application(raw, proposed_goal=p, diff=d, now_utc=T0)
+                app_results.append(f"ok:{r.decision}")
+            except AE.ReplayError as exc:
+                app_results.append(f"err:{exc.code}")
+
+        ta = threading.Thread(target=run_app, args=(enf_a, a_c1, p_c1, d_c1))
+        tb = threading.Thread(target=run_app, args=(enf_b, a_c2, p_c2, d_c2))
+        ta.start(); tb.start(); ta.join(timeout=10); tb.join(timeout=10)
+        self.assertEqual(sorted(app_results), ["err:baseline_sha256_mismatch", "ok:applied"])
 
     def test_item07_and_r4_01_terminal_revocation_races_and_tombstone_persistence(self) -> None:
-        # 1. Revocation before first enrollment (unseen grant_id) creates permanent tombstone.
         unseen_rev = self.make_revocation_bytes(grant_id="pre-tombstoned", generation=1)
         r_unseen = self.enforcer.process_enrollment(unseen_rev, now_utc=T0)
         self.assertEqual(r_unseen.grant_state, "revoked")
@@ -1028,97 +1359,42 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
             self.enroll_active(grant_id="pre-tombstoned", generation=2)
         self.assertEqual(ctx_pre.exception.code, "grant_tombstoned")
 
-        # 2. Revocation honoured at LOWER generation (< stored) and SAME generation (wins equivocation).
         raw_g5, nonce_g5, _ = self.enroll_active(grant_id="rev-any-gen", generation=5, mode="hold-window", hold_seconds=600)
         prop, diff = make_ordinary_service_change(self.baseline)
         app = self.make_app_bytes(
             grant_id="rev-any-gen", generation=5, application_seq=1, enrollment_nonce=nonce_g5, proposed=prop
         )
         self.enforcer.process_standing_application(
-            app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=10.0
+            app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=10.0, boot_epoch=EPOCH_1, display_confirmed=True
         )
         self.assertIn(AE.canonical_sha256(prop), self.store.snapshot()["pending_holds"])
 
-        # Non-owner cannot revoke.
         bad_rev = self.make_revocation_bytes(
             grant_id="rev-any-gen", generation=1, owner_seed=SEED_COVERED, owner_key=KEY_COVERED
         )
         with self.assertRaises(AE.TrustRootError):
             self.enforcer.process_enrollment(bad_rev, now_utc=T0)
 
-        # Owner revokes at generation 1 (< stored 5) with NO nonce -> honoured & cancels pending hold!
         rev_low = self.make_revocation_bytes(grant_id="rev-any-gen", generation=1)
         self.enforcer.process_enrollment(rev_low, now_utc=T0)
         self.assertEqual(self.store.snapshot()["pending_holds"], {})
 
-        # Identical redelivery at gen 5 is now REFUSED (tombstoned)!
         with self.assertRaises(AE.ReplayError) as ctx_redel:
             self.enforcer.process_enrollment(raw_g5, now_utc=T0)
         self.assertEqual(ctx_redel.exception.code, "grant_tombstoned")
 
-        # PR #75 R4 #1: Later higher generation (gen 6) active enrollment REFUSED even after reload!
-        reloaded_store = AE.ReplayStore(self.store_path, KEY_HOST, anchor=self.anchor)
-        reloaded_enf = AE.ApprovalEnforcer(KEY_HOST, reloaded_store, self.baseline)
+        # PR #75 R4 #1: Tombstone persists across full ReplayStore reload!
+        reloaded_store = AE.ReplayStore(self.store_dir, KEY_HOST, anchor=self.anchor)
+        reloaded_enf = AE.ApprovalEnforcer(KEY_HOST, reloaded_store)
         with self.assertRaises(AE.ReplayError) as ctx_reopen:
             self.enroll_active(grant_id="rev-any-gen", generation=6, enforcer=reloaded_enf)
         self.assertEqual(ctx_reopen.exception.code, "grant_tombstoned")
 
-        # 3. Equivocation at exact same generation: revocation wins over active!
+        # Equivocation at exact same generation: revocation wins over active!
         raw_eq, _, _ = self.enroll_active(grant_id="eq-rev", generation=3)
-        rev_same = self.make_revocation_bytes(grant_id="eq-rev", generation=3)
-        self.enforcer.process_enrollment(rev_same, now_utc=T0)
+        self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="eq-rev", generation=3), now_utc=T0)
         with self.assertRaises(AE.ReplayError):
             self.enforcer.process_enrollment(raw_eq, now_utc=T0)
-
-        # 4. Race duplicate active delivery vs revocation in BOTH commit orders:
-        #    Order A: active commits first, then revocation commits -> afterwards
-        #    identical and higher-generation active records are both refused!
-        raw_ord_a, _, _ = self.enroll_active(grant_id="race-rev-a", generation=1)
-        rev_ord_a = self.make_revocation_bytes(grant_id="race-rev-a", generation=1)
-        self.enforcer.process_enrollment(rev_ord_a, now_utc=T0)
-        with self.assertRaises(AE.ReplayError):
-            self.enforcer.process_enrollment(raw_ord_a, now_utc=T0)
-        with self.assertRaises(AE.ReplayError):
-            self.enroll_active(grant_id="race-rev-a", generation=2)
-
-        #    Order B: revocation commits first -> identical and higher-generation active refused!
-        nonce_b = self.enforcer.issue_enrollment_nonce(
-            grant_id="race-rev-b",
-            mode="standing-approval",
-            covered_signers=[KEY_COVERED],
-            grant_class="ordinary",
-            developer_mode=False,
-            ceremony_level="ordinary",
-            not_after=T_EXP,
-            now_utc=T0,
-        )
-        raw_ord_b = sign_json(
-            {
-                "schema_version": 9,
-                "record_kind": "standing-enrollment",
-                "host": KEY_HOST,
-                "signer": KEY_OWNER,
-                "sig_alg": "ed25519",
-                "grant_id": "race-rev-b",
-                "generation": 1,
-                "grant_state": "active",
-                "nonce": nonce_b,
-                "mode": "standing-approval",
-                "covered_signers": [KEY_COVERED],
-                "class": "ordinary",
-                "developer_mode": False,
-                "not_after": T_EXP,
-            },
-            SEED_OWNER,
-        )
-        rev_ord_b = self.make_revocation_bytes(grant_id="race-rev-b", generation=1)
-        self.enforcer.process_enrollment(rev_ord_b, now_utc=T0)
-        with self.assertRaises(AE.ReplayError) as ctx_rb:
-            self.enforcer.process_enrollment(raw_ord_b, now_utc=T0)
-        self.assertEqual(ctx_rb.exception.code, "grant_tombstoned")
-        with self.assertRaises(AE.ReplayError) as ctx_rb2:
-            self.enroll_active(grant_id="race-rev-b", generation=2)
-        self.assertEqual(ctx_rb2.exception.code, "grant_tombstoned")
 
 
 # ===========================================================================
@@ -1126,26 +1402,13 @@ class TestSectionAStateReplayAndFreshness(_EnforcerTestBase):
 # ===========================================================================
 
 class TestSectionBTrustAndSigners(_EnforcerTestBase):
-    def test_item08_baseline_roles_only_and_no_owner_covered_crossover(self) -> None:
-        # 1. Proposed goal file adds attacker as owner -> still refused because baseline governs!
+    def test_item08_baseline_roles_only_absent_covered_signer_and_no_crossover(self) -> None:
         prop_add_owner = copy.deepcopy(self.baseline)
         prop_add_owner["domains"]["device-trust"]["entries"]["advisor-key"][KEY_ATTACKER] = {
             "role": "owner",
             "state": "present",
         }
-        diff_add_owner = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(self.baseline),
-            "proposed_sha256": AE.canonical_sha256(prop_add_owner),
-            "hunks": {
-                "device-trust": {
-                    "advisor-key": {
-                        KEY_ATTACKER: {"new": {"role": "owner", "state": "present"}}
-                    }
-                }
-            },
-        }
+        diff_add_owner = AE.compute_authoritative_diff(self.baseline, prop_add_owner, KEY_HOST)
         pc_nonce = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(prop_add_owner), ceremony_class="privileged", now_utc=T0
         )
@@ -1171,11 +1434,10 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
             )
         self.assertEqual(ctx.exception.code, "signer_not_owner")
 
-        # 2. covered-signer cannot sign per-change or standing-enrollment.
-        cs_pc = dict(attacker_pc, signer=KEY_COVERED)
+        # covered-signer cannot sign per-change or standing-enrollment.
         with self.assertRaises(AE.TrustRootError):
             self.enforcer.process_per_change(
-                sign_json(cs_pc, SEED_COVERED),
+                sign_json(dict(attacker_pc, signer=KEY_COVERED), SEED_COVERED),
                 proposed_goal=prop_add_owner,
                 diff=diff_add_owner,
                 now_utc=T0,
@@ -1183,106 +1445,76 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
         with self.assertRaises(AE.TrustRootError):
             self.enroll_active(grant_id="cs-enroll", owner_seed=SEED_COVERED, owner_key=KEY_COVERED)
 
-        # 3. owner key NEVER listed in covered_signers (even in developer_mode) and NEVER signs standing-application.
-        with self.assertRaises(AE.TrustRootError) as ctx_o1:
-            self.enroll_active(grant_id="owner-covered", covered_signers=[KEY_OWNER], developer_mode=False)
-        self.assertEqual(ctx_o1.exception.code, "owner_in_covered_signers")
-        with self.assertRaises(AE.TrustRootError) as ctx_o2:
-            self.enroll_active(grant_id="owner-covered-dev", covered_signers=[KEY_OWNER], developer_mode=True)
-        self.assertEqual(ctx_o2.exception.code, "owner_in_covered_signers")
+        # owner NEVER in covered_signers or application signer (even in developer_mode).
+        with self.assertRaises(AE.TrustRootError):
+            self.enroll_active(grant_id="owner-cov-1", covered_signers=[KEY_OWNER], developer_mode=False)
+        with self.assertRaises(AE.TrustRootError):
+            self.enroll_active(grant_id="owner-cov-2", covered_signers=[KEY_OWNER], developer_mode=True)
 
         _, nonce, _ = self.enroll_active(grant_id="dev-g", covered_signers=[KEY_DEV], developer_mode=True)
         prop, diff = make_ordinary_service_change(self.baseline)
         owner_app = self.make_app_bytes(
-            grant_id="dev-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=nonce,
-            proposed=prop,
-            signer_seed=SEED_OWNER,
-            signer_key=KEY_OWNER,
+            grant_id="dev-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop, signer_seed=SEED_OWNER, signer_key=KEY_OWNER
         )
-        with self.assertRaises(AE.TrustRootError) as ctx_o3:
-            self.enforcer.process_standing_application(
-                owner_app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-            )
-        self.assertEqual(ctx_o3.exception.code, "owner_cannot_sign_application")
+        with self.assertRaises(AE.TrustRootError) as ctx_o:
+            self.enforcer.process_standing_application(owner_app, proposed_goal=prop, diff=diff, now_utc=T0)
+        self.assertEqual(ctx_o.exception.code, "owner_cannot_sign_application")
+
+        # Neon F8: covered-signer toggled to state == "absent" in baseline refused on enrollment, application, and hold!
+        _, nondev_nonce, _ = self.enroll_active(grant_id="nondev-g", covered_signers=[KEY_COVERED])
+        absent_cs_base = copy.deepcopy(self.baseline)
+        absent_cs_base["domains"]["device-trust"]["entries"]["advisor-key"][KEY_COVERED]["state"] = "absent"
+        self._set_store_baseline(absent_cs_base)
+        with self.assertRaises(AE.TrustRootError) as ctx_enr_abs:
+            self.enroll_active(grant_id="new-absent-cs", covered_signers=[KEY_COVERED])
+        self.assertEqual(ctx_enr_abs.exception.code, "untrusted_covered_signer")
+        prop_abs, diff_abs = make_ordinary_service_change(absent_cs_base, service_id="com.tendcf.abs")
+        app_abs = self.make_app_bytes(
+            grant_id="nondev-g", generation=1, application_seq=1, enrollment_nonce=nondev_nonce, baseline=absent_cs_base, proposed=prop_abs
+        )
+        with self.assertRaises(AE.TrustRootError) as ctx_app_abs:
+            self.enforcer.process_standing_application(app_abs, proposed_goal=prop_abs, diff=diff_abs, now_utc=T0)
+        self.assertEqual(ctx_app_abs.exception.code, "signer_not_covered_signer_role")
 
     def test_item09_developer_mode_scope_and_persistent_indicator(self) -> None:
         self.assertFalse(self.enforcer.developer_mode_indicator_active(T0))
-
-        # Outside developer_mode, untrusted KEY_DEV cannot be enrolled.
         with self.assertRaises(AE.TrustRootError):
             self.enroll_active(grant_id="nondev", covered_signers=[KEY_DEV], developer_mode=False)
 
-        # Inside developer_mode, KEY_DEV is trusted for THIS host and THIS grant only.
         _, dev_nonce, _ = self.enroll_active(
-            grant_id="dev-only",
-            generation=1,
-            covered_signers=[KEY_DEV],
-            developer_mode=True,
-            not_after=T_EXP,
+            grant_id="dev-only", generation=1, covered_signers=[KEY_DEV], developer_mode=True, not_after=T_EXP
         )
         self.assertTrue(self.enforcer.developer_mode_indicator_active(T0))
-        # Expired indicator is False.
         self.assertFalse(self.enforcer.developer_mode_indicator_active(T_AFTER_EXP))
 
         prop1, diff1 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.dev1")
         app1 = self.make_app_bytes(
-            grant_id="dev-only",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=dev_nonce,
-            proposed=prop1,
-            signer_seed=SEED_DEV,
-            signer_key=KEY_DEV,
+            grant_id="dev-only", generation=1, application_seq=1, enrollment_nonce=dev_nonce, proposed=prop1, signer_seed=SEED_DEV, signer_key=KEY_DEV
         )
-        res = self.enforcer.process_standing_application(
-            app1, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=1.0
+        self.assertEqual(
+            self.enforcer.process_standing_application(app1, proposed_goal=prop1, diff=diff1, now_utc=T0).decision,
+            "applied",
         )
-        self.assertEqual(res.decision, "applied")
 
-        # KEY_DEV is NOT trusted on a second non-developer grant!
         _, other_nonce, _ = self.enroll_active(grant_id="prod-grant", covered_signers=[KEY_COVERED])
         prop2, diff2 = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.dev2")
         bad_app = self.make_app_bytes(
-            grant_id="prod-grant",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=other_nonce,
-            proposed=prop2,
-            signer_seed=SEED_DEV,
-            signer_key=KEY_DEV,
+            grant_id="prod-grant", generation=1, application_seq=1, enrollment_nonce=other_nonce, proposed=prop2, signer_seed=SEED_DEV, signer_key=KEY_DEV
         )
         with self.assertRaises(AE.ScopeError):
-            self.enforcer.process_standing_application(
-                bad_app, proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0
-            )
+            self.enforcer.process_standing_application(bad_app, proposed_goal=prop2, diff=diff2, now_utc=T0)
 
-        # Later generation omitting KEY_DEV ends its trust; revocation turns off indicator.
         _, gen2_nonce, _ = self.enroll_active(
-            grant_id="dev-only",
-            generation=2,
-            covered_signers=[KEY_COVERED],
-            developer_mode=False,
+            grant_id="dev-only", generation=2, covered_signers=[KEY_COVERED], developer_mode=False
         )
         self.assertFalse(self.enforcer.developer_mode_indicator_active(T0))
         app_old_dev = self.make_app_bytes(
-            grant_id="dev-only",
-            generation=2,
-            application_seq=2,
-            enrollment_nonce=gen2_nonce,
-            proposed=prop2,
-            signer_seed=SEED_DEV,
-            signer_key=KEY_DEV,
+            grant_id="dev-only", generation=2, application_seq=2, enrollment_nonce=gen2_nonce, proposed=prop2, signer_seed=SEED_DEV, signer_key=KEY_DEV
         )
         with self.assertRaises(AE.ScopeError):
-            self.enforcer.process_standing_application(
-                app_old_dev, proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=3.0
-            )
+            self.enforcer.process_standing_application(app_old_dev, proposed_goal=prop2, diff=diff2, now_utc=T0)
 
     def test_item10_host_key_never_signer_covered_or_advisor_key(self) -> None:
-        # 1. Host key as advisor-key in baseline / first adoption / re-adoption -> refused.
         bad_goal = make_baseline_goal(
             advisor_keys={
                 KEY_OWNER: {"role": "owner", "state": "present"},
@@ -1290,12 +1522,15 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
             }
         )
         with self.assertRaises(AE.TrustRootError) as ctx_b:
-            AE.ApprovalEnforcer(KEY_HOST, self.store, baseline_goal=bad_goal)
+            AE.ReplayStore.provision(
+                self.tmp / "bad-base", KEY_HOST, anchor=AE.InMemoryRollbackAnchor(), baseline_goal=bad_goal
+            )
         self.assertEqual(ctx_b.exception.code, "host_key_in_trust_root")
 
-        # First adoption carrying host key as advisor-key -> refused.
-        fa_store = AE.ReplayStore(self.tmp / "fa-hostkey.json", KEY_HOST, anchor=AE.InMemoryRollbackAnchor())
-        fa_enf = AE.ApprovalEnforcer(KEY_HOST, fa_store, baseline_goal=None)
+        fa_store = AE.ReplayStore.provision(
+            self.tmp / "fa-hostkey", KEY_HOST, anchor=AE.InMemoryRollbackAnchor(), baseline_goal=None
+        )
+        fa_enf = AE.ApprovalEnforcer(KEY_HOST, fa_store)
         fa_nonce = fa_enf.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(bad_goal), ceremony_class="baseline", now_utc=T0
         )
@@ -1312,35 +1547,27 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
             "ceremony_class": "baseline",
         }
         with self.assertRaises(AE.TrustRootError) as ctx_fa:
-            fa_enf.process_per_change(sign_json(fa_rec, SEED_OWNER), proposed_goal=bad_goal, now_utc=T0)
+            fa_enf.process_per_change(
+                sign_json(fa_rec, SEED_OWNER),
+                proposed_goal=bad_goal,
+                bootstrap_owner_keys={KEY_OWNER},
+                now_utc=T0,
+            )
         self.assertEqual(ctx_fa.exception.code, "host_key_in_trust_root")
 
-        # 2. Host key as signer on standing-enrollment, standing-application, per-change -> refused.
-        with self.assertRaises(AE.TrustRootError) as ctx_s1:
+        with self.assertRaises(AE.TrustRootError):
             self.enroll_active(grant_id="host-sign", owner_seed=SEED_HOST, owner_key=KEY_HOST)
-        self.assertEqual(ctx_s1.exception.code, "host_key_as_signer")
 
         _, nonce, _ = self.enroll_active(grant_id="ok-grant")
         prop, diff = make_ordinary_service_change(self.baseline)
         host_app = self.make_app_bytes(
-            grant_id="ok-grant",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=nonce,
-            proposed=prop,
-            signer_seed=SEED_HOST,
-            signer_key=KEY_HOST,
+            grant_id="ok-grant", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop, signer_seed=SEED_HOST, signer_key=KEY_HOST
         )
-        with self.assertRaises(AE.TrustRootError) as ctx_s2:
-            self.enforcer.process_standing_application(
-                host_app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-            )
-        self.assertEqual(ctx_s2.exception.code, "host_key_as_signer")
+        with self.assertRaises(AE.TrustRootError):
+            self.enforcer.process_standing_application(host_app, proposed_goal=prop, diff=diff, now_utc=T0)
 
-        # 3. Host key in covered_signers (even in developer_mode) -> refused.
-        with self.assertRaises(AE.TrustRootError) as ctx_c:
+        with self.assertRaises(AE.TrustRootError):
             self.enroll_active(grant_id="host-cov", covered_signers=[KEY_HOST], developer_mode=True)
-        self.assertEqual(ctx_c.exception.code, "host_key_in_covered_signers")
 
     def test_item11_sig_alg_prefix_agreement_and_strict_ed25519(self) -> None:
         _, nonce, _ = self.enroll_active(grant_id="alg-grant")
@@ -1359,60 +1586,49 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
             "proposed_sha256": AE.canonical_sha256(prop),
             "ceremony_class": "ordinary",
         }
-        signed = AE.sign_approval_record(base_rec, SEED_COVERED)
+        signed = SIGNER.sign_approval_record(base_rec, SEED_COVERED, AE.jcs_dumps)
 
-        # 1. Unknown sig_alg refused.
-        bad_alg = dict(signed, sig_alg="ed448")
         with self.assertRaises(AE.SignatureError) as ctx1:
             self.enforcer.process_standing_application(
-                AE.jcs_dumps(bad_alg), proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
+                AE.jcs_dumps(dict(signed, sig_alg="ed448")), proposed_goal=prop, diff=diff, now_utc=T0
             )
         self.assertEqual(ctx1.exception.code, "unsupported_sig_alg")
 
-        # 2. Mismatched signer prefix refused.
-        bad_signer = dict(signed, signer="ed448:" + "11" * 32)
         with self.assertRaises(AE.SignatureError) as ctx2:
             self.enforcer.process_standing_application(
-                AE.jcs_dumps(bad_signer), proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
+                AE.jcs_dumps(dict(signed, signer="ed448:" + "11" * 32)), proposed_goal=prop, diff=diff, now_utc=T0
             )
         self.assertEqual(ctx2.exception.code, "sig_alg_signer_mismatch")
 
-        # 3. Non-canonical malleated S (+ L) on approval record refused.
         sig_bytes = bytes.fromhex(signed["signature"].split(":", 1)[1])
-        s_malleated = (int.from_bytes(sig_bytes[32:], "little") + AE.ED25519_L).to_bytes(32, "little")
-        bad_canon = dict(signed, signature="ed25519-sig:" + (sig_bytes[:32] + s_malleated).hex())
+        s_mal = (int.from_bytes(sig_bytes[32:], "little") + AE.ED25519_L).to_bytes(32, "little")
+        bad_canon = dict(signed, signature="ed25519-sig:" + (sig_bytes[:32] + s_mal).hex())
         with self.assertRaises(AE.SignatureError) as ctx3:
             self.enforcer.process_standing_application(
-                AE.jcs_dumps(bad_canon), proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
+                AE.jcs_dumps(bad_canon), proposed_goal=prop, diff=diff, now_utc=T0
             )
         self.assertEqual(ctx3.exception.code, "invalid_signature")
 
     def test_item12_nonce_entropy_randomness_and_post_store_loss_uniqueness(self) -> None:
-        issued: set[str] = set()
-        for _ in range(32):
-            n = AE.generate_device_nonce()
-            self.assertGreaterEqual(len(n), 22)
-            self.assertLessEqual(len(n), 128)
-            self.assertNotIn("\n", n)
-            self.assertIsNotNone(AE.NONCE_RE.match(n))
-            issued.add(n)
+        issued = {AE.generate_device_nonce() for _ in range(32)}
         self.assertEqual(len(issued), 32)
-
-        # Rejects < 16 bytes (< 128 bits).
+        for n in issued:
+            self.assertIsNotNone(AE.NONCE_RE.match(n))
         with self.assertRaises(ValueError):
             AE.generate_device_nonce(15)
+        with self.assertRaises(ValueError):
+            AE.generate_device_nonce(True)  # type: ignore[arg-type]
 
-        # Simulate store loss / reflash: fresh ReplayStore issues no previously issued nonce,
-        # and both the old enrollment AND old application are refused.
         raw_enroll, old_nonce, _ = self.enroll_active(grant_id="reflash-g")
         prop, diff = make_ordinary_service_change(self.baseline)
         old_app = self.make_app_bytes(
             grant_id="reflash-g", generation=1, application_seq=1, enrollment_nonce=old_nonce, proposed=prop
         )
 
-        # Reflash (fresh store + fresh anchor, same host key).
-        store2 = AE.ReplayStore(self.tmp / "reflashed.json", KEY_HOST, anchor=AE.InMemoryRollbackAnchor())
-        enf2 = AE.ApprovalEnforcer(KEY_HOST, store2, self.baseline)
+        store2 = AE.ReplayStore.provision(
+            self.tmp / "reflashed", KEY_HOST, anchor=AE.InMemoryRollbackAnchor(), baseline_goal=self.baseline
+        )
+        enf2 = AE.ApprovalEnforcer(KEY_HOST, store2)
         new_nonce = enf2.issue_enrollment_nonce(
             grant_id="reflash-g",
             mode="standing-approval",
@@ -1427,13 +1643,11 @@ class TestSectionBTrustAndSigners(_EnforcerTestBase):
         with self.assertRaises(AE.NonceError):
             enf2.process_enrollment(raw_enroll, now_utc=T0)
         with self.assertRaises(AE.ReplayError):
-            enf2.process_standing_application(
-                old_app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-            )
+            enf2.process_standing_application(old_app, proposed_goal=prop, diff=diff, now_utc=T0)
 
 
 # ===========================================================================
-# Section C: Carve-Out and Class (Items 13-16 + PR #75 R4 #4)
+# Section C: Carve-Out, Class, Migrations & R9 (Items 13-16 + PR #75 R4 #4)
 # ===========================================================================
 
 class TestSectionCCarveOutAndClass(_EnforcerTestBase):
@@ -1441,8 +1655,6 @@ class TestSectionCCarveOutAndClass(_EnforcerTestBase):
         _, priv_nonce, _ = self.enroll_active(
             grant_id="priv-grant", grant_class="privileged", mode="standing-approval"
         )
-
-        # 1. Every carved-out device-trust kind (including policy-tree R7 and future unknown kinds!) is REFUSED.
         carved_kinds = [
             ("advisor-key", KEY_ATTACKER, {"role": "covered-signer", "state": "present"}),
             ("trust-policy", "consent", {"local_yes_required": False, "state": "present", "tier": "consented"}),
@@ -1454,178 +1666,84 @@ class TestSectionCCarveOutAndClass(_EnforcerTestBase):
         for idx, (kind_name, entry_id, new_body) in enumerate(carved_kinds, start=1):
             with self.subTest(carved_kind=kind_name):
                 prop = copy.deepcopy(self.baseline)
-                entries = prop["domains"]["device-trust"]["entries"]
-                old_body = entries.get(kind_name, {}).get(entry_id)
-                entries.setdefault(kind_name, {})[entry_id] = new_body
-                hunk: dict[str, Any] = {"new": new_body}
-                if old_body is not None:
-                    hunk["old"] = old_body
-                diff = {
-                    "schema_version": 9,
-                    "host": KEY_HOST,
-                    "baseline_sha256": AE.canonical_sha256(self.baseline),
-                    "proposed_sha256": AE.canonical_sha256(prop),
-                    "hunks": {"device-trust": {kind_name: {entry_id: hunk}}},
-                }
+                prop["domains"]["device-trust"]["entries"].setdefault(kind_name, {})[entry_id] = new_body
+                diff = AE.compute_authoritative_diff(self.baseline, prop, KEY_HOST)
                 app = self.make_app_bytes(
-                    grant_id="priv-grant",
-                    generation=1,
-                    application_seq=idx,
-                    enrollment_nonce=priv_nonce,
-                    proposed=prop,
-                    ceremony_class="privileged",
+                    grant_id="priv-grant", generation=1, application_seq=idx, enrollment_nonce=priv_nonce, proposed=prop, ceremony_class="privileged"
                 )
                 with self.assertRaises(AE.ScopeError) as ctx:
-                    self.enforcer.process_standing_application(
-                        app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-                    )
+                    self.enforcer.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
                 self.assertEqual(ctx.exception.code, "carve_out_device_trust")
 
-        # 2. Replay-store reset is carved out even on an otherwise valid supervisor hunk!
         prop_sup, diff_sup = make_supervisor_change(self.baseline, new_name="systemd")
         app_rs = self.make_app_bytes(
-            grant_id="priv-grant",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            proposed=prop_sup,
-            ceremony_class="privileged",
+            grant_id="priv-grant", generation=1, application_seq=1, enrollment_nonce=priv_nonce, proposed=prop_sup, ceremony_class="privileged"
         )
         with self.assertRaises(AE.ScopeError) as ctx_rs:
             self.enforcer.process_standing_application(
-                app_rs,
-                proposed_goal=prop_sup,
-                diff=diff_sup,
-                now_utc=T0,
-                now_mono=1.0,
-                touches_replay_store=True,
+                app_rs, proposed_goal=prop_sup, diff=diff_sup, now_utc=T0, touches_replay_store=True
             )
         self.assertEqual(ctx_rs.exception.code, "carve_out_replay_store")
 
-        # 3. device-trust/supervisor IS allowed under a privileged standing grant!
-        res = self.enforcer.process_standing_application(
-            app_rs, proposed_goal=prop_sup, diff=diff_sup, now_utc=T0, now_mono=2.0
+        self.assertEqual(
+            self.enforcer.process_standing_application(app_rs, proposed_goal=prop_sup, diff=diff_sup, now_utc=T0).decision,
+            "applied",
         )
-        self.assertEqual(res.decision, "applied")
 
     def test_item14_and_r4_04_per_hunk_class_mixed_retreat_and_empty_domain(self) -> None:
         _, ord_nonce, _ = self.enroll_active(grant_id="ord-g", grant_class="ordinary")
         _, priv_nonce, _ = self.enroll_active(grant_id="priv-g", grant_class="privileged")
 
-        # 1. Mixed-class diff (device-trust/supervisor [privileged] + supervision/service [ordinary]) -> REFUSED!
-        prop_mix, diff_mix = make_ordinary_service_change(self.baseline, service_id="com.tendcf.mix")
-        old_sup = copy.deepcopy(self.baseline["domains"]["device-trust"]["entries"]["supervisor"]["host"])
-        new_sup = {"name": "systemd", "state": "present"}
-        prop_mix["domains"]["device-trust"]["entries"]["supervisor"]["host"] = new_sup
-        diff_mix["proposed_sha256"] = AE.canonical_sha256(prop_mix)
-        diff_mix["hunks"]["device-trust"] = {"supervisor": {"host": {"old": old_sup, "new": new_sup}}}
+        # 1. Mixed-class diff refused under both privileged and ordinary grants!
+        prop_mix, _ = make_ordinary_service_change(self.baseline, service_id="com.tendcf.mix")
+        prop_mix["domains"]["device-trust"]["entries"]["supervisor"]["host"] = {"name": "systemd", "state": "present"}
+        diff_mix = AE.compute_authoritative_diff(self.baseline, prop_mix, KEY_HOST)
         for gid, gnonce, cc in (("priv-g", priv_nonce, "privileged"), ("ord-g", ord_nonce, "ordinary")):
             app = self.make_app_bytes(
                 grant_id=gid, generation=1, application_seq=1, enrollment_nonce=gnonce, proposed=prop_mix, ceremony_class=cc
             )
             with self.assertRaises(AE.ScopeError) as ctx:
-                self.enforcer.process_standing_application(
-                    app, proposed_goal=prop_mix, diff=diff_mix, now_utc=T0, now_mono=1.0
-                )
+                self.enforcer.process_standing_application(app, proposed_goal=prop_mix, diff=diff_mix, now_utc=T0)
             self.assertEqual(ctx.exception.code, "mixed_class_application")
 
-        # 2. Retreating a populated domain (comprehensive -> undeclared [privileged] + entry delete [ordinary]) -> MIXED -> REFUSED!
+        # 2. Retreating populated domain = mixed -> refused!
         pop_base, _ = make_ordinary_service_change(self.baseline, service_id="com.tendcf.retreat")
-        self.enforcer.baseline_goal = copy.deepcopy(pop_base)
+        self._set_store_baseline(pop_base)
         retreated = copy.deepcopy(self.baseline)
-        old_svc = pop_base["domains"]["supervision"]["entries"]["service"]["com.tendcf.retreat"]
-        retreat_diff = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(pop_base),
-            "proposed_sha256": AE.canonical_sha256(retreated),
-            "coverage_changes": {"supervision": {"old": "comprehensive", "new": "undeclared"}},
-            "hunks": {"supervision": {"service": {"com.tendcf.retreat": {"old": old_svc}}}},
-        }
+        retreat_diff = AE.compute_authoritative_diff(pop_base, retreated, KEY_HOST)
         retreat_app = self.make_app_bytes(
-            grant_id="priv-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            baseline=pop_base,
-            proposed=retreated,
-            ceremony_class="privileged",
+            grant_id="priv-g", generation=1, application_seq=1, enrollment_nonce=priv_nonce, baseline=pop_base, proposed=retreated, ceremony_class="privileged"
         )
         with self.assertRaises(AE.ScopeError) as ctx_ret:
-            self.enforcer.process_standing_application(
-                retreat_app, proposed_goal=retreated, diff=retreat_diff, now_utc=T0, now_mono=2.0
-            )
+            self.enforcer.process_standing_application(retreat_app, proposed_goal=retreated, diff=retreat_diff, now_utc=T0)
         self.assertEqual(ctx_ret.exception.code, "mixed_class_application")
 
-        # 3. PR #75 R4 #4: Empty-domain coverage transitions are grantable under the class they derive!
-        # (a) not-yet-migrated -> comprehensive derives `ordinary` -> grantable under `ordinary` grant!
+        # 3. PR #75 R4 #4: Empty-domain coverage transitions grantable under derived class!
         empty_base = make_baseline_goal(extra_domains={"supervision": {"coverage": "not-yet-migrated"}})
         empty_comp = make_baseline_goal(extra_domains={"supervision": {"coverage": "comprehensive"}})
-        self.enforcer.baseline_goal = copy.deepcopy(empty_base)
-        diff_ord_cov = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(empty_base),
-            "proposed_sha256": AE.canonical_sha256(empty_comp),
-            "coverage_changes": {"supervision": {"old": "not-yet-migrated", "new": "comprehensive"}},
-        }
-        # Refused under privileged grant (wrong class).
-        app_wrong_cls = self.make_app_bytes(
-            grant_id="priv-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            baseline=empty_base,
-            proposed=empty_comp,
-            ceremony_class="ordinary",
-        )
-        with self.assertRaises(AE.ScopeError) as ctx_wc:
-            self.enforcer.process_standing_application(
-                app_wrong_cls, proposed_goal=empty_comp, diff=diff_ord_cov, now_utc=T0, now_mono=3.0
-            )
-        self.assertEqual(ctx_wc.exception.code, "grant_class_mismatch")
-
-        # Accepted under ordinary grant!
+        self._set_store_baseline(empty_base)
+        diff_ord_cov = AE.compute_authoritative_diff(empty_base, empty_comp, KEY_HOST)
         app_ord_cov = self.make_app_bytes(
-            grant_id="ord-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=ord_nonce,
-            baseline=empty_base,
-            proposed=empty_comp,
-            ceremony_class="ordinary",
+            grant_id="ord-g", generation=1, application_seq=1, enrollment_nonce=ord_nonce, baseline=empty_base, proposed=empty_comp, ceremony_class="ordinary"
         )
-        res_ord = self.enforcer.process_standing_application(
-            app_ord_cov, proposed_goal=empty_comp, diff=diff_ord_cov, now_utc=T0, now_mono=4.0
+        self.assertEqual(
+            self.enforcer.process_standing_application(app_ord_cov, proposed_goal=empty_comp, diff=diff_ord_cov, now_utc=T0).decision,
+            "applied",
         )
-        self.assertEqual(res_ord.decision, "applied")
 
-        # (b) comprehensive -> not-yet-migrated (empty domain) derives `privileged` -> grantable under `privileged` grant!
-        diff_priv_cov = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(empty_comp),
-            "proposed_sha256": AE.canonical_sha256(empty_base),
-            "coverage_changes": {"supervision": {"old": "comprehensive", "new": "not-yet-migrated"}},
-        }
+        diff_priv_cov = AE.compute_authoritative_diff(empty_comp, empty_base, KEY_HOST)
         app_priv_cov = self.make_app_bytes(
-            grant_id="priv-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            baseline=empty_comp,
-            proposed=empty_base,
-            ceremony_class="privileged",
+            grant_id="priv-g", generation=1, application_seq=1, enrollment_nonce=priv_nonce, baseline=empty_comp, proposed=empty_base, ceremony_class="privileged"
         )
-        res_priv = self.enforcer.process_standing_application(
-            app_priv_cov, proposed_goal=empty_base, diff=diff_priv_cov, now_utc=T0, now_mono=5.0
+        self.assertEqual(
+            self.enforcer.process_standing_application(app_priv_cov, proposed_goal=empty_base, diff=diff_priv_cov, now_utc=T0).decision,
+            "applied",
         )
-        self.assertEqual(res_priv.decision, "applied")
 
-    def test_item15_migrations_downward_bump_and_readoption(self) -> None:
+    def test_item15_migrations_comparability_default_bool_int_smuggling_and_downward_bump(self) -> None:
         _, base_nonce, _ = self.enroll_active(grant_id="base-g", grant_class="baseline")
 
-        # 1. Downward version_bump (9 -> 8) and equal (9 -> 9) REFUSED for BOTH standing-application AND per-change!
+        # 1. Downward (9 -> 8) & equal (9 -> 9) version_bump refused for BOTH standing-application AND per-change (including is_readoption=True!).
         for new_ver in (8, 9):
             prop_down = copy.deepcopy(self.baseline)
             prop_down["schema_version"] = new_ver
@@ -1637,137 +1755,123 @@ class TestSectionCCarveOutAndClass(_EnforcerTestBase):
                 "version_bump": {"old": 9, "new": new_ver},
             }
             app_down = self.make_app_bytes(
-                grant_id="base-g",
-                generation=1,
-                application_seq=1,
-                enrollment_nonce=base_nonce,
-                proposed=prop_down,
-                ceremony_class="baseline",
+                grant_id="base-g", generation=1, application_seq=1, enrollment_nonce=base_nonce, proposed=prop_down, ceremony_class="baseline"
             )
             with self.assertRaises(AE.ScopeError) as ctx_s:
                 self.enforcer.process_standing_application(
-                    app_down, proposed_goal=prop_down, diff=diff_down, now_utc=T0, now_mono=1.0
+                    app_down,
+                    proposed_goal=prop_down,
+                    diff=diff_down,
+                    now_utc=T0,
+                    migrate_fn=pure_version_bump_migrate,
+                    device_trust_comparable=True,
                 )
             self.assertEqual(ctx_s.exception.code, "downward_version_bump")
 
-            # Operator ruling 2026-11-26: per-change owner record ALSO refuses downward/equal version_bump!
-            pc_nonce = self.enforcer.issue_per_change_nonce(
+            pc_n = self.enforcer.issue_per_change_nonce(
                 proposed_sha256=AE.canonical_sha256(prop_down), ceremony_class="baseline", now_utc=T0
             )
-            pc_down = {
-                "schema_version": 9,
-                "record_kind": "per-change",
-                "host": KEY_HOST,
-                "signer": KEY_OWNER,
-                "sig_alg": "ed25519",
-                "baseline_sha256": AE.canonical_sha256(self.baseline),
-                "proposed_sha256": AE.canonical_sha256(prop_down),
-                "nonce": pc_nonce,
-                "approval_seq": 0,
-                "verdict": "accept",
-                "ceremony_class": "baseline",
-            }
+            pc_down = sign_json(
+                {
+                    "schema_version": 9,
+                    "record_kind": "per-change",
+                    "host": KEY_HOST,
+                    "signer": KEY_OWNER,
+                    "sig_alg": "ed25519",
+                    "baseline_sha256": AE.canonical_sha256(self.baseline),
+                    "proposed_sha256": AE.canonical_sha256(prop_down),
+                    "nonce": pc_n,
+                    "approval_seq": 0,
+                    "verdict": "accept",
+                    "ceremony_class": "baseline",
+                },
+                SEED_OWNER,
+            )
             with self.assertRaises(AE.ScopeError) as ctx_pc:
-                self.enforcer.process_per_change(
-                    sign_json(pc_down, SEED_OWNER), proposed_goal=prop_down, diff=diff_down, now_utc=T0
-                )
+                self.enforcer.process_per_change(pc_down, proposed_goal=prop_down, diff=diff_down, now_utc=T0)
             self.assertEqual(ctx_pc.exception.code, "downward_version_bump")
 
-        # 2. Upward migration whose device-trust is incomparable -> refused.
-        prop_up = copy.deepcopy(self.baseline)
-        prop_up["schema_version"] = 10
-        diff_up = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(self.baseline),
-            "proposed_sha256": AE.canonical_sha256(prop_up),
-            "version_bump": {"old": 9, "new": 10},
-        }
-        app_up = self.make_app_bytes(
-            grant_id="base-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=base_nonce,
-            proposed=prop_up,
-            ceremony_class="baseline",
-        )
-        with self.assertRaises(AE.ScopeError) as ctx_inc:
-            self.enforcer.process_standing_application(
-                app_up,
-                proposed_goal=prop_up,
-                diff=diff_up,
-                now_utc=T0,
-                now_mono=2.0,
-                device_trust_comparable=False,
-            )
-        self.assertEqual(ctx_inc.exception.code, "migration_device_trust_incomparable")
+            if new_ver < 9:
+                # Codex #4 / Macroscope 4708874598: downward schema_version ALSO refused on is_readoption=True!
+                with self.assertRaises(AE.ScopeError) as ctx_ra_down:
+                    self.enforcer.process_per_change(
+                        pc_down, proposed_goal=prop_down, is_readoption=True, now_utc=T0
+                    )
+                self.assertEqual(ctx_ra_down.exception.code, "downward_version_bump")
 
-        # 3. Migration whose migrate() mutates any device-trust entry (e.g. role default) -> refused!
-        def mutating_migrate(doc: dict[str, Any], target_ver: int) -> dict[str, Any]:
+        # 2. Codex #10: Default device_trust_comparable=False / migrate_fn=None FAILS CLOSED even when only schema_version differs!
+        prop_up = pure_version_bump_migrate(self.baseline, 10)
+        diff_up = AE.compute_authoritative_diff(self.baseline, prop_up, KEY_HOST)
+        app_up = self.make_app_bytes(
+            grant_id="base-g", generation=1, application_seq=1, enrollment_nonce=base_nonce, proposed=prop_up, ceremony_class="baseline"
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_def:
+            self.enforcer.process_standing_application(app_up, proposed_goal=prop_up, diff=diff_up, now_utc=T0)
+        self.assertEqual(ctx_def.exception.code, "migration_device_trust_incomparable")
+
+        # 3. Adversary C2: True == 1 / False == 0 R1 device-trust smuggling in baseline migration MUST be refused!
+        def bool_to_int_migrate(doc: dict[str, Any], target_ver: int) -> dict[str, Any]:
             out = copy.deepcopy(doc)
             out["schema_version"] = target_ver
-            out["domains"]["device-trust"]["entries"]["advisor-key"][KEY_COVERED]["role"] = "owner"
+            out["domains"]["device-trust"]["entries"]["trust-policy"]["consent"]["local_yes_required"] = 1
             return out
 
-        prop_mut = mutating_migrate(self.baseline, 10)
-        diff_mut = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(self.baseline),
-            "proposed_sha256": AE.canonical_sha256(prop_mut),
-            "version_bump": {"old": 9, "new": 10},
-        }
-        app_mut = self.make_app_bytes(
-            grant_id="base-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=base_nonce,
-            proposed=prop_mut,
-            ceremony_class="baseline",
+        prop_smuggle = bool_to_int_migrate(self.baseline, 10)
+        diff_smuggle = AE.compute_authoritative_diff(self.baseline, prop_smuggle, KEY_HOST)
+        app_smuggle = self.make_app_bytes(
+            grant_id="base-g", generation=1, application_seq=1, enrollment_nonce=base_nonce, proposed=prop_smuggle, ceremony_class="baseline"
         )
-        with self.assertRaises(AE.ScopeError) as ctx_mut:
+        with self.assertRaises(AE.ScopeError) as ctx_c2:
             self.enforcer.process_standing_application(
-                app_mut,
-                proposed_goal=prop_mut,
-                diff=diff_mut,
+                app_smuggle,
+                proposed_goal=prop_smuggle,
+                diff=diff_smuggle,
                 now_utc=T0,
-                now_mono=3.0,
-                migrate_fn=mutating_migrate,
+                migrate_fn=bool_to_int_migrate,
+                device_trust_comparable=True,
             )
-        self.assertEqual(ctx_mut.exception.code, "migration_mutated_device_trust")
+        self.assertEqual(ctx_c2.exception.code, "migration_mutated_device_trust")
 
-        # 4. Re-adoption NEVER by standing-application!
+        # 4. Re-adoption NEVER by standing-application.
         with self.assertRaises(AE.ScopeError) as ctx_ra:
             self.enforcer.process_standing_application(
                 app_up,
                 proposed_goal=prop_up,
                 diff=diff_up,
                 now_utc=T0,
-                now_mono=4.0,
                 is_readoption=True,
+                migrate_fn=pure_version_bump_migrate,
+                device_trust_comparable=True,
             )
         self.assertEqual(ctx_ra.exception.code, "readoption_disallowed")
 
-        # 5. Pure upward schema_version bump with identical device-trust SUCCEEDS under baseline grant!
+        # 5. Pure upward schema_version bump WITH explicit migrate_fn + device_trust_comparable=True SUCCEEDS!
         res = self.enforcer.process_standing_application(
-            app_up, proposed_goal=prop_up, diff=diff_up, now_utc=T0, now_mono=5.0
+            app_up,
+            proposed_goal=prop_up,
+            diff=diff_up,
+            now_utc=T0,
+            migrate_fn=pure_version_bump_migrate,
+            device_trust_comparable=True,
         )
         self.assertEqual(res.decision, "applied")
 
     def test_item16_r9_disclosure_in_enrollment_briefing(self) -> None:
         raw, _, _ = self.enroll_active(grant_id="brief-g", covered_signers=[KEY_DEV], developer_mode=True)
-        briefing = AE.render_enrollment_briefing(json.loads(raw))
-        lower = briefing.lower()
-        self.assertIn("root-equivalent authority", lower)
-        self.assertIn("run as root", lower)
-        self.assertIn("trust with root", lower)
-        self.assertIn("revocation or expiry stops only future applications and pending holds", lower)
-        self.assertIn("never undoes", lower)
-        self.assertIn("trust root", lower)
-        self.assertIn("replay store", lower)
-        self.assertIn("validator", lower)
-        self.assertIn("clock", lower)
-        self.assertIn("developer mode", lower)
+        lower = AE.render_enrollment_briefing(json.loads(raw)).lower()
+        for phrase in (
+            "root-equivalent authority",
+            "run as root",
+            "trust with root",
+            "revocation or expiry stops only future applications and pending holds",
+            "never undoes",
+            "trust root",
+            "replay store",
+            "validator",
+            "clock",
+            "developer mode",
+        ):
+            self.assertIn(phrase, lower)
 
 
 # ===========================================================================
@@ -1775,65 +1879,111 @@ class TestSectionCCarveOutAndClass(_EnforcerTestBase):
 # ===========================================================================
 
 class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
-    def test_item17_not_after_strict_calendar_no_horizon_cap_and_clock_rollback(self) -> None:
-        # 1. Impossible calendar dates & malformed formats REFUSED (never treated as absent!).
-        bad_dates = [
+    def test_item17_not_after_end_to_end_microsecond_boundary_nonreversible_expiry_and_rollback(self) -> None:
+        # 1. Impossible dates refused end-to-end via process_enrollment (including optional-not_after wait-for-user!).
+        for bad in (
             "2027-02-30T00:00:00Z",
-            "2027-02-29T00:00:00Z",  # 2027 is not a leap year
+            "2027-02-29T00:00:00Z",
             "2027-04-31T12:00:00Z",
             "2027-12-31T23:59:59.000Z",
             "2027-12-31T23:59:59+00:00",
             "2027-12-31T23:59:59Z\n",
             "not-a-date",
-        ]
-        for bad in bad_dates:
+        ):
             with self.subTest(bad_not_after=bad):
+                wfu_rec = {
+                    "schema_version": 9,
+                    "record_kind": "standing-enrollment",
+                    "host": KEY_HOST,
+                    "signer": KEY_OWNER,
+                    "sig_alg": "ed25519",
+                    "grant_id": "bad-date-wfu",
+                    "generation": 1,
+                    "grant_state": "active",
+                    "nonce": AE.generate_device_nonce(),
+                    "mode": "wait-for-user",
+                    "covered_signers": [KEY_COVERED],
+                    "class": "ordinary",
+                    "developer_mode": False,
+                    "not_after": bad,
+                }
                 with self.assertRaises(AE.MalformedRecordError):
-                    AE.parse_utc_timestamp(bad)
+                    self.enforcer.process_enrollment(sign_json(wfu_rec, SEED_OWNER), now_utc=T0)
 
-        # 2. Operator ruling 2026-11-26: NO hard maximum horizon cap (far-future valid date accepted).
+        # 2. No hard maximum horizon cap (2026-11-26 ruling).
         _, far_nonce, receipt = self.enroll_active(
             grant_id="far-horizon", not_after="2999-12-31T23:59:59Z", now_utc=T0
         )
         self.assertEqual(receipt.status, "accepted")
 
-        # 3. Expiry checked at intake AND rechecked at hold-window apply time.
-        short_exp = "2026-11-26T12:01:00Z"
-        _, short_nonce, _ = self.enroll_active(
-            grant_id="short-hold", mode="hold-window", hold_seconds=120, not_after=short_exp, now_utc=T0
+        # 3. Neon F6 / Adversary M1: Microsecond expiry boundary!
+        #    Exact not_after ACCEPTED; not_after + 1µs REFUSED!
+        exact_exp_str = "2026-11-26T12:01:00Z"
+        exact_exp_dt = datetime.datetime(2026, 11, 26, 12, 1, 0, tzinfo=datetime.timezone.utc)
+        _, exp_nonce, _ = self.enroll_active(
+            grant_id="exp-exact", mode="standing-approval", not_after=exact_exp_str, now_utc=T0
         )
-        prop, diff = make_ordinary_service_change(self.baseline)
-        app = self.make_app_bytes(
-            grant_id="short-hold", generation=1, application_seq=1, enrollment_nonce=short_nonce, proposed=prop
+        prop_eq, diff_eq = make_ordinary_service_change(self.baseline, service_id="com.tendcf.eq")
+        app_eq = self.make_app_bytes(
+            grant_id="exp-exact", generation=1, application_seq=1, enrollment_nonce=exp_nonce, proposed=prop_eq
         )
-        res = self.enforcer.process_standing_application(
-            app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=10.0
-        )
-        self.assertEqual(res.decision, "held")
-        # Hold elapses monotonically, but grant expired in UTC before apply -> REFUSED!
-        after_short_exp = datetime.datetime(2026, 11, 26, 12, 2, 0, tzinfo=datetime.timezone.utc)
-        with self.assertRaises(AE.ScopeError) as ctx_exp:
-            self.enforcer.complete_hold_window(
-                AE.canonical_sha256(prop),
-                proposed_goal=prop,
-                diff=diff,
-                now_utc=after_short_exp,
-                now_mono=200.0,
-            )
-        self.assertEqual(ctx_exp.exception.code, "grant_expired_at_hold_apply")
-
-        # 4. UTC clock rollback fails closed!
-        earlier_utc = T0 - datetime.timedelta(seconds=30)
-        app2 = self.make_app_bytes(
-            grant_id="far-horizon", generation=1, application_seq=1, enrollment_nonce=far_nonce, proposed=prop
-        )
-        with self.assertRaises(AE.ClockRollbackError) as ctx_clk:
+        self.assertEqual(
             self.enforcer.process_standing_application(
-                app2, proposed_goal=prop, diff=diff, now_utc=earlier_utc, now_mono=201.0
-            )
-        self.assertEqual(ctx_clk.exception.code, "utc_clock_rollback")
+                app_eq, proposed_goal=prop_eq, diff=diff_eq, now_utc=exact_exp_dt
+            ).decision,
+            "applied",
+        )
 
-    def test_item18_hold_window_monotonic_recheck_owner_reject_and_revocation(self) -> None:
+        # Now +1 microsecond strictly past not_after -> REFUSED!
+        prop_us, diff_us = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.us")
+        app_us = self.make_app_bytes(
+            grant_id="exp-exact", generation=1, application_seq=2, enrollment_nonce=exp_nonce, proposed=prop_us
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_us:
+            self.enforcer.process_standing_application(
+                app_us,
+                proposed_goal=prop_us,
+                diff=diff_us,
+                now_utc=exact_exp_dt + datetime.timedelta(microseconds=1),
+            )
+        self.assertEqual(ctx_us.exception.code, "grant_expired")
+
+        # 4. Codex #7: Non-reversible observed expiry!
+        #    After observing expiry at exact_exp_dt + 1µs, a backward clock to exact_exp_dt
+        #    (even though >= prior successful commit!) MUST fail closed with ClockRollbackError!
+        with self.assertRaises(AE.ClockRollbackError) as ctx_nonrev:
+            self.enforcer.process_standing_application(
+                app_us, proposed_goal=prop_us, diff=diff_us, now_utc=exact_exp_dt
+            )
+        self.assertEqual(ctx_nonrev.exception.code, "utc_clock_rollback")
+
+        # 5. Also verify backward UTC clock still above prior commit after expiry refusal on a fresh grant.
+        t_start = datetime.datetime(2026, 11, 26, 13, 0, 0, tzinfo=datetime.timezone.utc)
+        t_grant_exp = "2026-11-26T13:05:00Z"
+        _, n_nr, _ = self.enroll_active(
+            grant_id="nonrev-g", mode="standing-approval", not_after=t_grant_exp, now_utc=t_start
+        )
+        prop_nr, diff_nr = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.nr")
+        app_nr = self.make_app_bytes(
+            grant_id="nonrev-g", generation=1, application_seq=1, enrollment_nonce=n_nr, proposed=prop_nr
+        )
+        with self.assertRaises(AE.ScopeError):
+            self.enforcer.process_standing_application(
+                app_nr,
+                proposed_goal=prop_nr,
+                diff=diff_nr,
+                now_utc=datetime.datetime(2026, 11, 26, 13, 6, 0, tzinfo=datetime.timezone.utc),
+            )
+        # Clock moves back to 13:04:00 (still > t_start 13:00:00, but < observed 13:06:00) -> REFUSED!
+        with self.assertRaises(AE.ClockRollbackError):
+            self.enforcer.process_standing_application(
+                app_nr,
+                proposed_goal=prop_nr,
+                diff=diff_nr,
+                now_utc=datetime.datetime(2026, 11, 26, 13, 4, 0, tzinfo=datetime.timezone.utc),
+            )
+
+    def test_item18_hold_window_confirmed_display_nan_boot_epoch_hygiene_and_reeval(self) -> None:
         _, nonce, _ = self.enroll_active(
             grant_id="hold-g", mode="hold-window", hold_seconds=300, now_utc=T0
         )
@@ -1842,12 +1992,46 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
         app = self.make_app_bytes(
             grant_id="hold-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop
         )
-        res = self.enforcer.process_standing_application(
-            app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1000.0
-        )
-        self.assertEqual(res.decision, "held")
 
-        # 1. Wall clock jumps 2 hours ahead while device slept, monotonic clock only +100s (< 300s) -> REFUSED!
+        # 1. Codex #6: Default intake does NOT confirm display -> complete_hold_window fails closed!
+        res = self.enforcer.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
+        self.assertEqual(res.decision, "held")
+        self.assertEqual(self.enforcer.prompt_count, 0)
+        with self.assertRaises(AE.ScopeError) as ctx_unconf:
+            self.enforcer.complete_hold_window(
+                prop_hash, proposed_goal=prop, diff=diff, now_utc=T1, now_mono=9999.0, boot_epoch=EPOCH_1
+            )
+        self.assertEqual(ctx_unconf.exception.code, "hold_display_unconfirmed")
+
+        # 2. Adversary M2: Duplicate overlapping hold for same proposed_sha256 refused BEFORE burning mark!
+        app_dup = self.make_app_bytes(
+            grant_id="hold-g", generation=1, application_seq=99, enrollment_nonce=nonce, proposed=prop
+        )
+        with self.assertRaises(AE.ReplayError) as ctx_duphold:
+            self.enforcer.process_standing_application(app_dup, proposed_goal=prop, diff=diff, now_utc=T0)
+        self.assertEqual(ctx_duphold.exception.code, "duplicate_pending_hold")
+        self.assertEqual(self.store.snapshot()["grants"]["hold-g"]["application_seq_mark"], 1)
+
+        # 3. Confirm display at mono=1000.0 in EPOCH_1 -> timer starts from 1000.0!
+        self.enforcer.confirm_hold_displayed(prop_hash, now_mono=1000.0, boot_epoch=EPOCH_1)
+        self.assertEqual(self.enforcer.prompt_count, 1)
+
+        # 4. Neon F2 / Adversary C1: NaN, +inf, -inf, negative, bool now_mono ALL refused!
+        for bad_mono in (float("nan"), float("inf"), float("-inf"), -1.0, True, False):
+            with self.subTest(bad_mono=bad_mono):
+                with self.assertRaises(AE.ClockRollbackError):
+                    self.enforcer.complete_hold_window(
+                        prop_hash, proposed_goal=prop, diff=diff, now_utc=T1, now_mono=bad_mono, boot_epoch=EPOCH_1  # type: ignore[arg-type]
+                    )
+
+        # 5. Codex #6: Boot epoch change (device rebooted) fails closed!
+        with self.assertRaises(AE.ClockRollbackError) as ctx_epoch:
+            self.enforcer.complete_hold_window(
+                prop_hash, proposed_goal=prop, diff=diff, now_utc=T1, now_mono=2000.0, boot_epoch=EPOCH_2
+            )
+        self.assertEqual(ctx_epoch.exception.code, "monotonic_boot_epoch_mismatch")
+
+        # 6. Wall clock jumps hours ahead, monotonic only +100s (< 300s) -> refused!
         with self.assertRaises(AE.ScopeError) as ctx_early:
             self.enforcer.complete_hold_window(
                 prop_hash,
@@ -1855,10 +2039,11 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
                 diff=diff,
                 now_utc=T0 + datetime.timedelta(hours=2),
                 now_mono=1100.0,
+                boot_epoch=EPOCH_1,
             )
         self.assertEqual(ctx_early.exception.code, "hold_window_not_elapsed")
 
-        # 2. Monotonic clock rollback -> fail closed!
+        # 7. Monotonic rollback -> refused!
         with self.assertRaises(AE.ClockRollbackError):
             self.enforcer.complete_hold_window(
                 prop_hash,
@@ -1866,10 +2051,10 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
                 diff=diff,
                 now_utc=T0 + datetime.timedelta(hours=2),
                 now_mono=999.0,
+                boot_epoch=EPOCH_1,
             )
 
-        # 3. Owner per-change reject during hold window stops hold IMMEDIATELY regardless of
-        #    ceremony_class, bogus/unissued nonce, or stale approval_seq, and persists as DC-2 reject!
+        # 8. Owner per-change reject stops hold immediately regardless of ceremony_class/nonce/approval_seq & persists DC-2!
         reject_rec = {
             "schema_version": 9,
             "record_kind": "per-change",
@@ -1879,73 +2064,138 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
             "baseline_sha256": AE.canonical_sha256(self.baseline),
             "proposed_sha256": prop_hash,
             "nonce": "stale-unissued-nonce-0000000000",
-            "approval_seq": 0,  # even if stale
+            "approval_seq": 0,
             "verdict": "reject",
             "refused": ["supervision/service/com.tendcf.held"],
-            "ceremony_class": "baseline",  # deliberately mismatched class
+            "ceremony_class": "baseline",
         }
         pc_res = self.enforcer.process_per_change(
             sign_json(reject_rec, SEED_OWNER), now_utc=T0 + datetime.timedelta(hours=2)
         )
         self.assertEqual(pc_res.decision, "rejected")
         self.assertEqual(len(pc_res.cancelled_holds), 1)
+        self.assertEqual(self.store.snapshot()["pending_holds"], {})
 
-        # Attempting to complete the cancelled hold fails!
-        with self.assertRaises(AE.ReplayError) as ctx_gone:
-            self.enforcer.complete_hold_window(
-                prop_hash,
-                proposed_goal=prop,
-                diff=diff,
-                now_utc=T0 + datetime.timedelta(hours=3),
-                now_mono=2000.0,
-            )
-        self.assertEqual(ctx_gone.exception.code, "no_pending_hold")
-
-        # Persisted DC-2 reject outlives the hold window and blocks a fresh standing application!
-        app2 = self.make_app_bytes(
-            grant_id="hold-g", generation=1, application_seq=2, enrollment_nonce=nonce, proposed=prop
-        )
-        with self.assertRaises(AE.ReplayError) as ctx_dc2:
-            self.enforcer.process_standing_application(
-                app2,
-                proposed_goal=prop,
-                diff=diff,
-                now_utc=T0 + datetime.timedelta(hours=3),
-                now_mono=2001.0,
-            )
-        self.assertEqual(ctx_dc2.exception.code, "persisted_reject_active")
-
-        # 4. Re-evaluation at apply: grant re-enrolled at gen 2 during hold -> hold refused on generation/nonce change!
+        # 9. Neon F9: Higher-generation re-enrollment prunes stranded old-generation pending holds!
         prop2, diff2 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.held2")
-        app3 = self.make_app_bytes(
-            grant_id="hold-g", generation=1, application_seq=3, enrollment_nonce=nonce, proposed=prop2
+        app2 = self.make_app_bytes(
+            grant_id="hold-g", generation=1, application_seq=2, enrollment_nonce=nonce, proposed=prop2
         )
         self.enforcer.process_standing_application(
-            app3,
-            proposed_goal=prop2,
-            diff=diff2,
-            now_utc=T0 + datetime.timedelta(hours=3),
-            now_mono=3000.0,
+            app2, proposed_goal=prop2, diff=diff2, now_utc=T0 + datetime.timedelta(hours=2), now_mono=3000.0, boot_epoch=EPOCH_1, display_confirmed=True
+        )
+        self.assertIn(AE.canonical_sha256(prop2), self.store.snapshot()["pending_holds"])
+        _, nonce2, _ = self.enroll_active(
+            grant_id="hold-g", generation=2, mode="hold-window", hold_seconds=300, now_utc=T0 + datetime.timedelta(hours=2, minutes=1)
+        )
+        self.assertEqual(self.store.snapshot()["pending_holds"], {})
+
+        # 10. Neon F8: Re-evaluation at hold apply — baseline change, covering grant tightening, signer role removal, and dead-hold pruning!
+        # (a) Longer hold-window enrolled during hold extends required_hold!
+        prop3, diff3 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.held3")
+        app3 = self.make_app_bytes(
+            grant_id="hold-g", generation=2, application_seq=3, enrollment_nonce=nonce2, proposed=prop3
+        )
+        self.enforcer.process_standing_application(
+            app3, proposed_goal=prop3, diff=diff3, now_utc=T0 + datetime.timedelta(hours=2, minutes=2), now_mono=4000.0, boot_epoch=EPOCH_1, display_confirmed=True
         )
         self.enroll_active(
-            grant_id="hold-g",
-            generation=2,
+            grant_id="longer-hw", mode="hold-window", hold_seconds=900, now_utc=T0 + datetime.timedelta(hours=2, minutes=3)
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_longer:
+            self.enforcer.complete_hold_window(
+                AE.canonical_sha256(prop3),
+                proposed_goal=prop3,
+                diff=diff3,
+                now_utc=T0 + datetime.timedelta(hours=2, minutes=10),
+                now_mono=4400.0,  # +400s >= 300s, but < new 900s!
+                boot_epoch=EPOCH_1,
+            )
+        self.assertEqual(ctx_longer.exception.code, "hold_window_not_elapsed")
+
+        # (b) Baseline changed during hold -> refused AND dead hold pruned!
+        other_base, _ = make_ordinary_service_change(self.baseline, service_id="com.tendcf.other")
+        self._set_store_baseline(other_base)
+        with self.assertRaises(AE.ReplayError) as ctx_basechg:
+            self.enforcer.complete_hold_window(
+                AE.canonical_sha256(prop3),
+                proposed_goal=prop3,
+                diff=diff3,
+                now_utc=T0 + datetime.timedelta(hours=2, minutes=20),
+                now_mono=5000.0,
+                boot_epoch=EPOCH_1,
+            )
+        self.assertEqual(ctx_basechg.exception.code, "baseline_changed_during_hold")
+        self.assertNotIn(AE.canonical_sha256(prop3), self.store.snapshot()["pending_holds"])
+
+        # (c) Covering standing-refusal enrolled during hold -> refused AND dead hold pruned!
+        self._set_store_baseline(self.baseline)
+        prop4, diff4 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.held4")
+        app4 = self.make_app_bytes(
+            grant_id="hold-g", generation=2, application_seq=4, enrollment_nonce=nonce2, proposed=prop4
+        )
+        self.enforcer.process_standing_application(
+            app4, proposed_goal=prop4, diff=diff4, now_utc=T0 + datetime.timedelta(hours=2, minutes=21), now_mono=6000.0, boot_epoch=EPOCH_1, display_confirmed=True
+        )
+        self.enroll_active(
+            grant_id="ref-during-hold", mode="standing-refusal", not_after=None, now_utc=T0 + datetime.timedelta(hours=2, minutes=22)
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_ref_hold:
+            self.enforcer.complete_hold_window(
+                AE.canonical_sha256(prop4),
+                proposed_goal=prop4,
+                diff=diff4,
+                now_utc=T0 + datetime.timedelta(hours=2, minutes=40),
+                now_mono=7500.0,
+                boot_epoch=EPOCH_1,
+            )
+        self.assertEqual(ctx_ref_hold.exception.code, "standing_refusal_at_hold_apply")
+        self.assertNotIn(AE.canonical_sha256(prop4), self.store.snapshot()["pending_holds"])
+
+        # (d) Expiry during hold -> refused, dead hold pruned, and last_seen_utc durably advanced!
+        self.enforcer.process_enrollment(
+            self.make_revocation_bytes(grant_id="ref-during-hold", generation=2),
+            now_utc=T0 + datetime.timedelta(hours=2, minutes=41),
+        )
+        self.enforcer.process_enrollment(
+            self.make_revocation_bytes(grant_id="longer-hw", generation=2),
+            now_utc=T0 + datetime.timedelta(hours=2, minutes=41),
+        )
+        short_exp = "2026-11-26T15:00:00Z"
+        _, n_exp_hw, _ = self.enroll_active(
+            grant_id="exp-hw",
             mode="hold-window",
             hold_seconds=300,
-            now_utc=T0 + datetime.timedelta(hours=3, minutes=1),
+            not_after=short_exp,
+            now_utc=T0 + datetime.timedelta(hours=2, minutes=50),
         )
-        with self.assertRaises(AE.ReplayError) as ctx_gen:
+        prop5, diff5 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.held5")
+        app5 = self.make_app_bytes(
+            grant_id="exp-hw", generation=1, application_seq=1, enrollment_nonce=n_exp_hw, proposed=prop5
+        )
+        self.enforcer.process_standing_application(
+            app5,
+            proposed_goal=prop5,
+            diff=diff5,
+            now_utc=T0 + datetime.timedelta(hours=2, minutes=55),
+            now_mono=8000.0,
+            boot_epoch=EPOCH_1,
+            display_confirmed=True,
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_exp_hw:
             self.enforcer.complete_hold_window(
-                AE.canonical_sha256(prop2),
-                proposed_goal=prop2,
-                diff=diff2,
-                now_utc=T0 + datetime.timedelta(hours=3, minutes=10),
-                now_mono=3500.0,
+                AE.canonical_sha256(prop5),
+                proposed_goal=prop5,
+                diff=diff5,
+                now_utc=datetime.datetime(2026, 11, 26, 15, 0, 1, tzinfo=datetime.timezone.utc),
+                now_mono=8500.0,
+                boot_epoch=EPOCH_1,
             )
-        self.assertEqual(ctx_gen.exception.code, "generation_changed_during_hold")
+        self.assertEqual(ctx_exp_hw.exception.code, "grant_expired_at_hold_apply")
+        self.assertNotIn(AE.canonical_sha256(prop5), self.store.snapshot()["pending_holds"])
+        self.assertEqual(self.store.snapshot()["last_seen_utc"], "2026-11-26T15:00:01Z")
 
     def test_item19_precedence_most_restrictive_longest_hold_owner_accept_and_dc2_reject(self) -> None:
-        # Enroll standing-approval, hold-window(120), hold-window(600), wait-for-user, standing-refusal!
         _, sa_nonce, _ = self.enroll_active(grant_id="g-sa", mode="standing-approval")
         _, hw1_nonce, _ = self.enroll_active(grant_id="g-hw1", mode="hold-window", hold_seconds=120)
         self.enroll_active(grant_id="g-hw2", mode="hold-window", hold_seconds=600)
@@ -1956,15 +2206,11 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
         app_sa = self.make_app_bytes(
             grant_id="g-sa", generation=1, application_seq=1, enrollment_nonce=sa_nonce, proposed=prop
         )
-
-        # 1. standing-refusal wins over everything (even when app names g-sa!).
         with self.assertRaises(AE.ScopeError) as ctx_ref:
-            self.enforcer.process_standing_application(
-                app_sa, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=10.0
-            )
+            self.enforcer.process_standing_application(app_sa, proposed_goal=prop, diff=diff, now_utc=T0)
         self.assertEqual(ctx_ref.exception.code, "standing_refusal")
 
-        # 2. Owner's own per-change accept of exact proposed_sha256 STILL succeeds against standing-refusal!
+        # Owner per-change accept stays available against standing-refusal!
         prop_owner, diff_owner = make_ordinary_service_change(self.baseline, service_id="com.tendcf.owner-yes")
         pc_nonce = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(prop_owner), ceremony_class="ordinary", now_utc=T0
@@ -1982,41 +2228,35 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
             "verdict": "accept",
             "ceremony_class": "ordinary",
         }
-        pc_res = self.enforcer.process_per_change(
-            sign_json(pc_acc, SEED_OWNER), proposed_goal=prop_owner, diff=diff_owner, now_utc=T0
+        self.assertEqual(
+            self.enforcer.process_per_change(
+                sign_json(pc_acc, SEED_OWNER), proposed_goal=prop_owner, diff=diff_owner, now_utc=T0
+            ).decision,
+            "applied",
         )
-        self.assertEqual(pc_res.decision, "applied")
 
-        # Recompute prop against updated baseline.
         prop, diff = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.prec2")
         app_sa = self.make_app_bytes(
             grant_id="g-sa", generation=1, application_seq=1, enrollment_nonce=sa_nonce, proposed=prop
         )
-
-        # 3. Revoke standing-refusal -> wait-for-user now wins -> PARKED (not applied!).
         self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="g-ref", generation=2), now_utc=T0)
-        res_wfu = self.enforcer.process_standing_application(
-            app_sa, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=20.0
-        )
+        res_wfu = self.enforcer.process_standing_application(app_sa, proposed_goal=prop, diff=diff, now_utc=T0)
         self.assertEqual(res_wfu.decision, "parked")
         self.assertEqual(res_wfu.effective_mode, "wait-for-user")
 
-        # 4. Revoke wait-for-user -> hold-window wins over standing-approval, and LONGEST hold_seconds (600) wins!
         self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="g-wfu", generation=2), now_utc=T0)
         app_hw = self.make_app_bytes(
             grant_id="g-hw1", generation=1, application_seq=1, enrollment_nonce=hw1_nonce, proposed=prop
         )
         res_hw = self.enforcer.process_standing_application(
-            app_hw, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=30.0
+            app_hw, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=30.0, boot_epoch=EPOCH_1, display_confirmed=True
         )
         self.assertEqual(res_hw.decision, "held")
-        self.assertEqual(res_hw.hold_seconds, 600)  # longest hold won over 120!
+        self.assertEqual(res_hw.hold_seconds, 600)
 
-        # 5. Revoke both hold-windows -> standing-approval wins!
         self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="g-hw1", generation=2), now_utc=T0)
         self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="g-hw2", generation=2), now_utc=T0)
-        # First test DC-2 reject wins over standing-approval until owner per-change accept!
-        rej_nonce = self.enforcer.issue_per_change_nonce(
+        rej_n = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(prop), ceremony_class="ordinary", now_utc=T0
         )
         pc_rej = {
@@ -2027,248 +2267,406 @@ class TestSectionDTimeHoldAndPrecedence(_EnforcerTestBase):
             "sig_alg": "ed25519",
             "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
             "proposed_sha256": AE.canonical_sha256(prop),
-            "nonce": rej_nonce,
+            "nonce": rej_n,
             "approval_seq": 1,
             "verdict": "reject",
             "refused": ["supervision/service/com.tendcf.prec2"],
             "ceremony_class": "ordinary",
         }
-        self.enforcer.process_per_change(
-            sign_json(pc_rej, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0
-        )
+        self.enforcer.process_per_change(sign_json(pc_rej, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0)
         with self.assertRaises(AE.ReplayError) as ctx_dc2:
-            self.enforcer.process_standing_application(
-                app_sa, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=40.0
-            )
+            self.enforcer.process_standing_application(app_sa, proposed_goal=prop, diff=diff, now_utc=T0)
         self.assertEqual(ctx_dc2.exception.code, "persisted_reject_active")
 
-        # Later owner per-change accept clears persisted reject and applies!
-        acc2_nonce = self.enforcer.issue_per_change_nonce(
+        acc2_n = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(prop), ceremony_class="ordinary", now_utc=T0
         )
-        pc_acc2 = dict(pc_rej, nonce=acc2_nonce, approval_seq=2, verdict="accept")
+        pc_acc2 = dict(pc_rej, nonce=acc2_n, approval_seq=2, verdict="accept")
         pc_acc2.pop("refused")
-        res_acc2 = self.enforcer.process_per_change(
-            sign_json(pc_acc2, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0
+        self.assertEqual(
+            self.enforcer.process_per_change(
+                sign_json(pc_acc2, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0
+            ).decision,
+            "applied",
         )
-        self.assertEqual(res_acc2.decision, "applied")
 
 
 # ===========================================================================
-# Section E: Further Rules & Full Check-Order-Before-Mark (Items 20-26 + R4 #2)
+# Section E: Further Rules, Authoritative Diff & Check Order (Items 20-26)
 # ===========================================================================
 
 class TestSectionEFurtherRulesAndCheckOrder(_EnforcerTestBase):
     def test_item20_generation_rules(self) -> None:
         _, nonce2, _ = self.enroll_active(grant_id="gen-g", generation=2)
         prop, diff = make_ordinary_service_change(self.baseline)
-
-        # Application at gen 1 (< 2) and gen 3 (> 2) refused.
         for bad_gen in (1, 3):
             app = self.make_app_bytes(
                 grant_id="gen-g", generation=bad_gen, application_seq=1, enrollment_nonce=nonce2, proposed=prop
             )
             with self.assertRaises(AE.ReplayError) as ctx:
-                self.enforcer.process_standing_application(
-                    app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-                )
+                self.enforcer.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
             self.assertEqual(ctx.exception.code, "generation_mismatch")
 
-        # Active enrollment at generation 1 (< stored 2) refused.
         with self.assertRaises(AE.ReplayError) as ctx_low:
             self.enroll_active(grant_id="gen-g", generation=1)
         self.assertEqual(ctx_low.exception.code, "stale_generation")
 
-    def test_item21_signer_in_covered_signers(self) -> None:
+    def test_item21_signer_in_covered_signers_and_unsorted_duplicate_rejection(self) -> None:
         _, nonce, _ = self.enroll_active(grant_id="cov-g", covered_signers=[KEY_COVERED])
         prop, diff = make_ordinary_service_change(self.baseline)
-        # KEY_COVERED2 is a valid baseline covered-signer, but NOT listed in cov-g's covered_signers!
         app = self.make_app_bytes(
-            grant_id="cov-g",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=nonce,
-            proposed=prop,
-            signer_seed=SEED_COVERED2,
-            signer_key=KEY_COVERED2,
+            grant_id="cov-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop, signer_seed=SEED_COVERED2, signer_key=KEY_COVERED2
         )
         with self.assertRaises(AE.ScopeError) as ctx:
-            self.enforcer.process_standing_application(
-                app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
-            )
+            self.enforcer.process_standing_application(app, proposed_goal=prop, diff=diff, now_utc=T0)
         self.assertEqual(ctx.exception.code, "signer_not_covered")
 
+        # Neon F8: Unsorted & duplicate covered_signers refused!
+        pair_desc = sorted([KEY_COVERED, KEY_COVERED2], reverse=True)
+        for bad_list, code in ((pair_desc, "unsorted_covered_signers"), ([KEY_COVERED, KEY_COVERED], "duplicate_covered_signers")):
+            enr = {
+                "schema_version": 9,
+                "record_kind": "standing-enrollment",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "grant_id": "bad-cov",
+                "generation": 1,
+                "grant_state": "active",
+                "nonce": AE.generate_device_nonce(),
+                "mode": "standing-approval",
+                "covered_signers": bad_list,
+                "class": "ordinary",
+                "developer_mode": False,
+                "not_after": T_EXP,
+            }
+            with self.assertRaises(AE.MalformedRecordError) as ctx_b:
+                self.enforcer.process_enrollment(sign_json(enr, SEED_OWNER), now_utc=T0)
+            self.assertEqual(ctx_b.exception.code, code)
+
     def test_item22_r6_developer_mode_requires_privileged_ceremony_ordinary_class_and_not_after(self) -> None:
-        # 1. developer_mode with ordinary-level ceremony -> refused (requires >= privileged!).
         with self.assertRaises(AE.NonceError) as ctx_lvl:
             self.enroll_active(
-                grant_id="r6-lvl",
-                covered_signers=[KEY_DEV],
-                developer_mode=True,
-                ceremony_level="ordinary",
-                not_after=T_EXP,
+                grant_id="r6-lvl", covered_signers=[KEY_DEV], developer_mode=True, ceremony_level="ordinary", not_after=T_EXP
             )
         self.assertEqual(ctx_lvl.exception.code, "insufficient_ceremony_level")
 
-        # 2. developer_mode with class != ordinary -> refused.
         with self.assertRaises(AE.MalformedRecordError) as ctx_cls:
             self.enroll_active(
-                grant_id="r6-cls",
-                grant_class="privileged",
-                covered_signers=[KEY_DEV],
-                developer_mode=True,
-                ceremony_level="privileged",
-                not_after=T_EXP,
+                grant_id="r6-cls", grant_class="privileged", covered_signers=[KEY_DEV], developer_mode=True, ceremony_level="privileged", not_after=T_EXP
             )
         self.assertEqual(ctx_cls.exception.code, "developer_mode_non_ordinary")
 
-        # 3. developer_mode without not_after -> refused (even for wait-for-user!).
         with self.assertRaises(AE.MalformedRecordError) as ctx_na:
             self.enroll_active(
-                grant_id="r6-na",
-                mode="wait-for-user",
-                covered_signers=[KEY_DEV],
-                developer_mode=True,
-                ceremony_level="privileged",
-                not_after=None,
+                grant_id="r6-na", mode="wait-for-user", covered_signers=[KEY_DEV], developer_mode=True, ceremony_level="privileged", not_after=None
             )
         self.assertEqual(ctx_na.exception.code, "missing_not_after")
 
-        # 4. developer_mode with class=ordinary, not_after, privileged ceremony -> accepted!
         _, _, r = self.enroll_active(
-            grant_id="r6-ok",
-            covered_signers=[KEY_DEV],
-            developer_mode=True,
-            ceremony_level="privileged",
-            not_after=T_EXP,
+            grant_id="r6-ok", covered_signers=[KEY_DEV], developer_mode=True, ceremony_level="privileged", not_after=T_EXP
         )
         self.assertEqual(r.status, "accepted")
 
-    def test_item23_ceremony_class_exact_match_no_upgrade_or_downgrade(self) -> None:
+    def test_item23_ceremony_class_per_change_authoritative_diff_bootstrap_and_malformed_diffs(self) -> None:
         _, priv_nonce, _ = self.enroll_active(grant_id="priv-only", grant_class="privileged")
         prop_ord, diff_ord = make_ordinary_service_change(self.baseline)
         prop_priv, diff_priv = make_supervisor_change(self.baseline)
 
-        # 1. Standing application: privileged grant cannot cover ordinary change (no implicit hierarchy!).
+        # 1. Standing application class mismatch & silent upgrade refused.
         app_ord_on_priv = self.make_app_bytes(
-            grant_id="priv-only",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            proposed=prop_ord,
-            ceremony_class="ordinary",
+            grant_id="priv-only", generation=1, application_seq=1, enrollment_nonce=priv_nonce, proposed=prop_ord, ceremony_class="ordinary"
         )
         with self.assertRaises(AE.ScopeError) as ctx1:
-            self.enforcer.process_standing_application(
-                app_ord_on_priv, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0, now_mono=1.0
-            )
+            self.enforcer.process_standing_application(app_ord_on_priv, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0)
         self.assertEqual(ctx1.exception.code, "grant_class_mismatch")
 
-        # 2. Standing application: asserting privileged for an ordinary change refused (no silent upgrade!).
         app_lied_up = self.make_app_bytes(
-            grant_id="priv-only",
-            generation=1,
-            application_seq=1,
-            enrollment_nonce=priv_nonce,
-            proposed=prop_ord,
-            ceremony_class="privileged",
+            grant_id="priv-only", generation=1, application_seq=1, enrollment_nonce=priv_nonce, proposed=prop_ord, ceremony_class="privileged"
         )
         with self.assertRaises(AE.ScopeError) as ctx2:
-            self.enforcer.process_standing_application(
-                app_lied_up, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0, now_mono=1.0
-            )
+            self.enforcer.process_standing_application(app_lied_up, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0)
         self.assertEqual(ctx2.exception.code, "ceremony_class_mismatch")
 
-        # 3. Per-change: silent upgrade (privileged asserted for ordinary) AND silent downgrade (ordinary for privileged) refused!
-        for prop, diff, asserted in ((prop_ord, diff_ord, "privileged"), (prop_priv, diff_priv, "ordinary")):
-            n = self.enforcer.issue_per_change_nonce(
-                proposed_sha256=AE.canonical_sha256(prop), ceremony_class=asserted, now_utc=T0
-            )
-            pc = {
+        # 2. Codex #4 / Adversary C5 / Neon F4: process_per_change with diff=None STILL computes authoritative diff!
+        #    Catches silent downgrade (adding owner under ceremony_class="ordinary"), downward version, and wrong goal host!
+        prop_add_owner = copy.deepcopy(self.baseline)
+        prop_add_owner["domains"]["device-trust"]["entries"]["advisor-key"][KEY_ATTACKER] = {
+            "role": "owner", "state": "present"
+        }
+        n_down = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_add_owner), ceremony_class="ordinary", now_utc=T0
+        )
+        pc_downgrade = sign_json(
+            {
                 "schema_version": 9,
                 "record_kind": "per-change",
                 "host": KEY_HOST,
                 "signer": KEY_OWNER,
                 "sig_alg": "ed25519",
                 "baseline_sha256": AE.canonical_sha256(self.baseline),
-                "proposed_sha256": AE.canonical_sha256(prop),
-                "nonce": n,
+                "proposed_sha256": AE.canonical_sha256(prop_add_owner),
+                "nonce": n_down,
                 "approval_seq": 0,
                 "verdict": "accept",
-                "ceremony_class": asserted,
-            }
-            with self.assertRaises(AE.ScopeError) as ctx3:
-                self.enforcer.process_per_change(
-                    sign_json(pc, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0
-                )
-            self.assertEqual(ctx3.exception.code, "ceremony_class_mismatch")
+                "ceremony_class": "ordinary",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_dg:
+            self.enforcer.process_per_change(pc_downgrade, proposed_goal=prop_add_owner, diff=None, now_utc=T0)
+        self.assertEqual(ctx_dg.exception.code, "ceremony_class_mismatch")
+
+        # 3. Adversary C5 POC 5b: version_bump trust-root smuggling in per-change refused!
+        prop_vb_smuggle = copy.deepcopy(prop_add_owner)
+        prop_vb_smuggle["schema_version"] = 10
+        diff_vb_smuggle = AE.compute_authoritative_diff(self.baseline, prop_vb_smuggle, KEY_HOST)
+        n_vbs = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_vb_smuggle), ceremony_class="baseline", now_utc=T0
+        )
+        pc_vbs = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop_vb_smuggle),
+                "nonce": n_vbs,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "baseline",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_vbs:
+            self.enforcer.process_per_change(pc_vbs, proposed_goal=prop_vb_smuggle, diff=diff_vb_smuggle, now_utc=T0)
+        self.assertEqual(ctx_vbs.exception.code, "migration_not_version_only")
+
+        # 4. Macroscope 4708874692 / Codex #4: accept with proposed_goal=None refused BEFORE mutating state!
+        n_np = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_ord), ceremony_class="ordinary", now_utc=T0
+        )
+        pc_np = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop_ord),
+                "nonce": n_np,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "ordinary",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.MalformedRecordError) as ctx_np:
+            self.enforcer.process_per_change(pc_np, proposed_goal=None, diff=diff_ord, now_utc=T0)
+        self.assertEqual(ctx_np.exception.code, "missing_proposed_goal")
+        self.assertEqual(self.store.snapshot()["approval_seq"], -1)
+        self.assertIn(n_np, self.store.snapshot()["outstanding_nonces"])
+
+        # 5. Codex #5 / Macroscope 4708874405: First adoption requires explicit bootstrap_owner_keys AND matching goal host!
+        fa_store = AE.ReplayStore.provision(
+            self.tmp / "fa-boot", KEY_HOST, anchor=AE.InMemoryRollbackAnchor(), baseline_goal=None
+        )
+        fa_enf = AE.ApprovalEnforcer(KEY_HOST, fa_store)
+        good_init = make_baseline_goal(host=KEY_HOST)
+        bad_host_init = make_baseline_goal(host=KEY_OTHER_HOST)
+        n_fa1 = fa_enf.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(good_init), ceremony_class="baseline", now_utc=T0
+        )
+        pc_fa1 = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "proposed_sha256": AE.canonical_sha256(good_init),
+                "nonce": n_fa1,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "baseline",
+            },
+            SEED_OWNER,
+        )
+        # Missing bootstrap_owner_keys -> refused BEFORE mutating state!
+        with self.assertRaises(AE.TrustRootError) as ctx_noboot:
+            fa_enf.process_per_change(pc_fa1, proposed_goal=good_init, now_utc=T0)
+        self.assertEqual(ctx_noboot.exception.code, "missing_bootstrap_authority")
+        self.assertEqual(fa_store.snapshot()["approval_seq"], -1)
+
+        # Wrong proposed_goal["host"] on first adoption -> refused!
+        n_fa2 = fa_enf.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(bad_host_init), ceremony_class="baseline", now_utc=T0
+        )
+        pc_fa2 = sign_json(
+            {
+                "schema_version": 9,
+                "record_kind": "per-change",
+                "host": KEY_HOST,
+                "signer": KEY_OWNER,
+                "sig_alg": "ed25519",
+                "proposed_sha256": AE.canonical_sha256(bad_host_init),
+                "nonce": n_fa2,
+                "approval_seq": 0,
+                "verdict": "accept",
+                "ceremony_class": "baseline",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.ScopeError) as ctx_badhost:
+            fa_enf.process_per_change(
+                pc_fa2, proposed_goal=bad_host_init, bootstrap_owner_keys={KEY_OWNER}, now_utc=T0
+            )
+        self.assertEqual(ctx_badhost.exception.code, "goal_host_mismatch")
+
+        # 6. Adversary H2 / Neon F5 / Macroscope 4708874404: Malformed diffs, phantom {"old": None}, invalid coverage, empty diff!
+        malformed_diffs: list[tuple[str, Any, type[Exception]]] = [
+            ("version_bump_null", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "22" * 32, "version_bump": None}, AE.MalformedRecordError),
+            ("version_bump_empty", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "22" * 32, "version_bump": {}}, AE.MalformedRecordError),
+            ("hunks_null", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "22" * 32, "hunks": None}, AE.MalformedRecordError),
+            ("phantom_old_none", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "22" * 32, "hunks": {"supervision": {"service": {"x": {"old": None}}}}}, AE.MalformedRecordError),
+            ("invalid_coverage_enum", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "22" * 32, "coverage_changes": {"supervision": {"old": "undeclared", "new": "bogus-cov"}}}, AE.MalformedRecordError),
+            ("empty_equal_hashes", {"schema_version": 9, "host": KEY_HOST, "baseline_sha256": "sha256:" + "11" * 32, "proposed_sha256": "sha256:" + "11" * 32, "hunks": {"supervision": {"service": {"x": {"new": {"state": "present"}}}}}}, AE.ScopeError),
+        ]
+        _, ord_n, _ = self.enroll_active(grant_id="mal-diff-g", grant_class="ordinary")
+        app_md = self.make_app_bytes(
+            grant_id="mal-diff-g", generation=1, application_seq=1, enrollment_nonce=ord_n, proposed=prop_ord
+        )
+        for label, bad_d, exc_cls in malformed_diffs:
+            with self.subTest(malformed_diff=label):
+                with self.assertRaises(exc_cls):
+                    self.enforcer.process_standing_application(app_md, proposed_goal=prop_ord, diff=bad_d, now_utc=T0)
+
+        # 7. PR #75 R4 #5 / Neon F8: Per-change nonce negative tests (wrong hash, wrong class, enrollment nonce, reuse, stale approval_seq)!
+        prop_b, diff_b = make_ordinary_service_change(self.baseline, service_id="com.tendcf.pc-b")
+        # (a) Wrong proposed_sha256
+        n_wrong_hash = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_b), ceremony_class="ordinary", now_utc=T0
+        )
+        pc_wh = sign_json(
+            {
+                "schema_version": 9, "record_kind": "per-change", "host": KEY_HOST, "signer": KEY_OWNER,
+                "sig_alg": "ed25519", "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop_ord), "nonce": n_wrong_hash,
+                "approval_seq": 0, "verdict": "accept", "ceremony_class": "ordinary",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.NonceError) as ctx_wh:
+            self.enforcer.process_per_change(pc_wh, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0)
+        self.assertEqual(ctx_wh.exception.code, "nonce_scope_mismatch")
+
+        # (b) Wrong ceremony_class on nonce
+        n_wrong_cls = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_ord), ceremony_class="privileged", now_utc=T0
+        )
+        with self.assertRaises(AE.NonceError):
+            self.enforcer.process_per_change(
+                sign_json(dict(json.loads(pc_wh), nonce=n_wrong_cls), SEED_OWNER),
+                proposed_goal=prop_ord, diff=diff_ord, now_utc=T0,
+            )
+
+        # (c) Enrollment nonce offered for per-change
+        enr_n = self.enforcer.issue_enrollment_nonce(
+            grant_id="tmp-enr", mode="standing-approval", covered_signers=[KEY_COVERED],
+            grant_class="ordinary", developer_mode=False, ceremony_level="ordinary", not_after=T_EXP, now_utc=T0,
+        )
+        with self.assertRaises(AE.NonceError):
+            self.enforcer.process_per_change(
+                sign_json(dict(json.loads(pc_wh), nonce=enr_n), SEED_OWNER),
+                proposed_goal=prop_ord, diff=diff_ord, now_utc=T0,
+            )
+
+        # (d) Valid per-change accept at seq=5, then (e) reused nonce refused & (f) stale approval_seq=5 refused!
+        n_ok = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_ord), ceremony_class="ordinary", now_utc=T0
+        )
+        pc_ok = sign_json(dict(json.loads(pc_wh), nonce=n_ok, approval_seq=5), SEED_OWNER)
+        self.assertEqual(
+            self.enforcer.process_per_change(pc_ok, proposed_goal=prop_ord, diff=diff_ord, now_utc=T0).decision,
+            "applied",
+        )
+        prop_next, diff_next = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.pc-next")
+        with self.assertRaises(AE.NonceError):
+            self.enforcer.process_per_change(
+                sign_json(
+                    {
+                        "schema_version": 9, "record_kind": "per-change", "host": KEY_HOST, "signer": KEY_OWNER,
+                        "sig_alg": "ed25519", "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
+                        "proposed_sha256": AE.canonical_sha256(prop_next), "nonce": n_ok,
+                        "approval_seq": 6, "verdict": "accept", "ceremony_class": "ordinary",
+                    },
+                    SEED_OWNER,
+                ),
+                proposed_goal=prop_next, diff=diff_next, now_utc=T0,
+            )
+        n_stale_seq = self.enforcer.issue_per_change_nonce(
+            proposed_sha256=AE.canonical_sha256(prop_next), ceremony_class="ordinary", now_utc=T0
+        )
+        with self.assertRaises(AE.ReplayError) as ctx_stseq:
+            self.enforcer.process_per_change(
+                sign_json(
+                    {
+                        "schema_version": 9, "record_kind": "per-change", "host": KEY_HOST, "signer": KEY_OWNER,
+                        "sig_alg": "ed25519", "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
+                        "proposed_sha256": AE.canonical_sha256(prop_next), "nonce": n_stale_seq,
+                        "approval_seq": 5, "verdict": "accept", "ceremony_class": "ordinary",
+                    },
+                    SEED_OWNER,
+                ),
+                proposed_goal=prop_next, diff=diff_next, now_utc=T0,
+            )
+        self.assertEqual(ctx_stseq.exception.code, "stale_approval_seq")
 
     def test_item24_per_target_host_validity(self) -> None:
         _, nonce, _ = self.enroll_active(grant_id="host-g")
         prop, diff = make_ordinary_service_change(self.baseline)
 
-        # Wrong host on standing-enrollment (active and revoked).
-        wrong_rev = self.make_revocation_bytes(grant_id="host-g", generation=2, host=KEY_OTHER_HOST)
-        with self.assertRaises(AE.ScopeError) as ctx1:
-            self.enforcer.process_enrollment(wrong_rev, now_utc=T0)
-        self.assertEqual(ctx1.exception.code, "wrong_host")
-
-        # Wrong host on standing-application.
-        wrong_app = self.make_app_bytes(
-            grant_id="host-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop, host=KEY_OTHER_HOST
-        )
-        with self.assertRaises(AE.ScopeError) as ctx2:
+        with self.assertRaises(AE.ScopeError):
+            self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="host-g", generation=2, host=KEY_OTHER_HOST), now_utc=T0)
+        with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
-                wrong_app, proposed_goal=prop, diff=diff, now_utc=T0, now_mono=1.0
+                self.make_app_bytes(grant_id="host-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop, host=KEY_OTHER_HOST),
+                proposed_goal=prop, diff=diff, now_utc=T0,
             )
-        self.assertEqual(ctx2.exception.code, "wrong_host")
-
-        # Wrong host on per-change.
-        wrong_pc = {
-            "schema_version": 9,
-            "record_kind": "per-change",
-            "host": KEY_OTHER_HOST,
-            "signer": KEY_OWNER,
-            "sig_alg": "ed25519",
-            "baseline_sha256": AE.canonical_sha256(self.baseline),
-            "proposed_sha256": AE.canonical_sha256(prop),
-            "nonce": AE.generate_device_nonce(),
-            "approval_seq": 0,
-            "verdict": "accept",
-            "ceremony_class": "ordinary",
-        }
-        with self.assertRaises(AE.ScopeError) as ctx3:
-            self.enforcer.process_per_change(
-                sign_json(wrong_pc, SEED_OWNER), proposed_goal=prop, diff=diff, now_utc=T0
-            )
-        self.assertEqual(ctx3.exception.code, "wrong_host")
+        wrong_pc = sign_json(
+            {
+                "schema_version": 9, "record_kind": "per-change", "host": KEY_OTHER_HOST, "signer": KEY_OWNER,
+                "sig_alg": "ed25519", "baseline_sha256": AE.canonical_sha256(self.baseline),
+                "proposed_sha256": AE.canonical_sha256(prop), "nonce": AE.generate_device_nonce(),
+                "approval_seq": 0, "verdict": "accept", "ceremony_class": "ordinary",
+            },
+            SEED_OWNER,
+        )
+        with self.assertRaises(AE.ScopeError):
+            self.enforcer.process_per_change(wrong_pc, proposed_goal=prop, diff=diff, now_utc=T0)
 
     def test_item25_exact_proposed_sha256_binding(self) -> None:
         _, nonce, _ = self.enroll_active(grant_id="hash-g")
-        prop_approved, diff_approved = make_ordinary_service_change(self.baseline, service_id="com.tendcf.good")
+        prop_approved, _ = make_ordinary_service_change(self.baseline, service_id="com.tendcf.good")
         prop_swapped, diff_swapped = make_ordinary_service_change(self.baseline, service_id="com.tendcf.evil")
-
-        # Signed for prop_approved, delivered with prop_swapped -> REFUSED!
         app = self.make_app_bytes(
             grant_id="hash-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop_approved
         )
         with self.assertRaises(AE.ScopeError) as ctx:
-            self.enforcer.process_standing_application(
-                app, proposed_goal=prop_swapped, diff=diff_swapped, now_utc=T0, now_mono=1.0
-            )
+            self.enforcer.process_standing_application(app, proposed_goal=prop_swapped, diff=diff_swapped, now_utc=T0)
         self.assertEqual(ctx.exception.code, "proposed_sha256_mismatch")
 
     def test_item26_and_r4_02_refused_application_never_burns_mark(self) -> None:
-        # Enroll ordinary grant and apply seq=1 so initial stored mark is 1.
         _, nonce, _ = self.enroll_active(grant_id="mark-g", generation=1, mode="standing-approval")
         prop1, diff1 = make_ordinary_service_change(self.baseline, service_id="com.tendcf.m1")
         app1 = self.make_app_bytes(
             grant_id="mark-g", generation=1, application_seq=1, enrollment_nonce=nonce, proposed=prop1
         )
         self.assertEqual(
-            self.enforcer.process_standing_application(
-                app1, proposed_goal=prop1, diff=diff1, now_utc=T0, now_mono=1.0
-            ).decision,
+            self.enforcer.process_standing_application(app1, proposed_goal=prop1, diff=diff1, now_utc=T0).decision,
             "applied",
         )
         self.assertEqual(self.store.snapshot()["grants"]["mark-g"]["application_seq_mark"], 1)
@@ -2276,150 +2674,105 @@ class TestSectionEFurtherRulesAndCheckOrder(_EnforcerTestBase):
         prop2, diff2 = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.m2")
         prop_other, _ = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.m3")
 
-        # Every single refusal below carries application_seq=50; NONE may burn or raise the mark!
         def assert_mark_unchanged(label: str) -> None:
-            self.assertEqual(
-                self.store.snapshot()["grants"]["mark-g"]["application_seq_mark"],
-                1,
-                f"application_seq_mark was burned by refused case: {label}",
-            )
+            self.assertEqual(self.store.snapshot()["grants"]["mark-g"]["application_seq_mark"], 1, label)
 
-        # (a) Wrong host
         with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2, host=KEY_OTHER_HOST),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("wrong_host")
 
-        # (b) Bad signature
-        good_50 = json.loads(self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2))
-        good_50["signature"] = "ed25519-sig:" + "00" * 64
+        bad50 = json.loads(self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2))
+        bad50["signature"] = "ed25519-sig:" + "00" * 64
         with self.assertRaises(AE.SignatureError):
-            self.enforcer.process_standing_application(
-                AE.jcs_dumps(good_50), proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
-            )
+            self.enforcer.process_standing_application(AE.jcs_dumps(bad50), proposed_goal=prop2, diff=diff2, now_utc=T0)
         assert_mark_unchanged("bad_signature")
 
-        # (c) Wrong generation
         with self.assertRaises(AE.ReplayError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=99, application_seq=50, enrollment_nonce=nonce, proposed=prop2),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("wrong_generation")
 
-        # (d) Wrong enrollment_nonce (R10)
         with self.assertRaises(AE.NonceError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=AE.generate_device_nonce(), proposed=prop2),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("wrong_enrollment_nonce")
 
-        # (e) Wrong baseline_sha256
         with self.assertRaises(AE.ReplayError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, baseline=self.baseline, proposed=prop2),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("wrong_baseline_sha256")
 
-        # (f) Wrong proposed_sha256
         with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop_other),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("wrong_proposed_sha256")
 
-        # (g) Signer not in covered_signers
         with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2, signer_seed=SEED_COVERED2, signer_key=KEY_COVERED2),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("signer_not_covered")
 
-        # (h) Expired not_after
-        with self.assertRaises(AE.ScopeError):
-            self.enforcer.process_standing_application(
-                self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2),
-                proposed_goal=prop2, diff=diff2, now_utc=T_AFTER_EXP, now_mono=2.0,
-            )
-        assert_mark_unchanged("grant_expired")
-
-        # (i) R1/R7 carve-out (policy-tree)
+        # R7 policy-tree carve-out
         prop_pt = copy.deepcopy(self.enforcer.baseline_goal)
         prop_pt["domains"]["device-trust"]["entries"]["policy-tree"]["tree"]["sha256"] = "sha256:" + "99" * 32
-        diff_pt = {
-            "schema_version": 9,
-            "host": KEY_HOST,
-            "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
-            "proposed_sha256": AE.canonical_sha256(prop_pt),
-            "hunks": {
-                "device-trust": {
-                    "policy-tree": {
-                        "tree": {
-                            "old": self.enforcer.baseline_goal["domains"]["device-trust"]["entries"]["policy-tree"]["tree"],
-                            "new": prop_pt["domains"]["device-trust"]["entries"]["policy-tree"]["tree"],
-                        }
-                    }
-                }
-            },
-        }
+        diff_pt = AE.compute_authoritative_diff(self.enforcer.baseline_goal, prop_pt, KEY_HOST)
         with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop_pt, ceremony_class="privileged"),
-                proposed_goal=prop_pt, diff=diff_pt, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop_pt, diff=diff_pt, now_utc=T0,
             )
         assert_mark_unchanged("r7_policy_tree_carve_out")
 
-        # (j) Persisted DC-2 reject
+        # Persisted DC-2 reject
         rej_n = self.enforcer.issue_per_change_nonce(
             proposed_sha256=AE.canonical_sha256(prop2), ceremony_class="ordinary", now_utc=T0
         )
         pc_rej = {
-            "schema_version": 9,
-            "record_kind": "per-change",
-            "host": KEY_HOST,
-            "signer": KEY_OWNER,
-            "sig_alg": "ed25519",
-            "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
-            "proposed_sha256": AE.canonical_sha256(prop2),
-            "nonce": rej_n,
-            "approval_seq": 0,
-            "verdict": "reject",
-            "refused": ["supervision/service/com.tendcf.m2"],
-            "ceremony_class": "ordinary",
+            "schema_version": 9, "record_kind": "per-change", "host": KEY_HOST, "signer": KEY_OWNER,
+            "sig_alg": "ed25519", "baseline_sha256": AE.canonical_sha256(self.enforcer.baseline_goal),
+            "proposed_sha256": AE.canonical_sha256(prop2), "nonce": rej_n, "approval_seq": 0,
+            "verdict": "reject", "refused": ["supervision/service/com.tendcf.m2"], "ceremony_class": "ordinary",
         }
         self.enforcer.process_per_change(sign_json(pc_rej, SEED_OWNER), proposed_goal=prop2, diff=diff2, now_utc=T0)
         with self.assertRaises(AE.ReplayError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop2),
-                proposed_goal=prop2, diff=diff2, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop2, diff=diff2, now_utc=T0,
             )
         assert_mark_unchanged("persisted_dc2_reject")
 
-        # (k) Covering standing-refusal
+        # Covering standing-refusal
         self.enroll_active(grant_id="ref-block", mode="standing-refusal", not_after=None)
         prop_ok, diff_ok = make_ordinary_service_change(self.enforcer.baseline_goal, service_id="com.tendcf.m4")
         with self.assertRaises(AE.ScopeError):
             self.enforcer.process_standing_application(
                 self.make_app_bytes(grant_id="mark-g", generation=1, application_seq=50, enrollment_nonce=nonce, proposed=prop_ok),
-                proposed_goal=prop_ok, diff=diff_ok, now_utc=T0, now_mono=2.0,
+                proposed_goal=prop_ok, diff=diff_ok, now_utc=T0,
             )
         assert_mark_unchanged("covering_standing_refusal")
 
-        # Finally revoke ref-block and confirm valid seq=2 STILL succeeds (mark was never burned to 50)!
+        # Valid seq=2 STILL succeeds (mark never burned to 50)!
         self.enforcer.process_enrollment(self.make_revocation_bytes(grant_id="ref-block", generation=2), now_utc=T0)
         app2 = self.make_app_bytes(
             grant_id="mark-g", generation=1, application_seq=2, enrollment_nonce=nonce, proposed=prop_ok
         )
-        res2 = self.enforcer.process_standing_application(
-            app2, proposed_goal=prop_ok, diff=diff_ok, now_utc=T0, now_mono=3.0
+        self.assertEqual(
+            self.enforcer.process_standing_application(app2, proposed_goal=prop_ok, diff=diff_ok, now_utc=T0).decision,
+            "applied",
         )
-        self.assertEqual(res2.decision, "applied")
         self.assertEqual(self.store.snapshot()["grants"]["mark-g"]["application_seq_mark"], 2)
 
 

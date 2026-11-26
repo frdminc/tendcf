@@ -5,22 +5,27 @@ Runs under `python3 -I -S` with zero third-party packages, matching
 `bin/projector.py`'s bare-host stdlib guarantee.
 
 Implements:
-  - Strict JSON parsing (duplicate-key rejection, NaN/Infinity rejection, NFC check)
-    and RFC 8785 JCS canonicalization reused directly from `bin/projector.py`.
-  - Pure-stdlib RFC 8032 Ed25519 verification (and signing helper) with strict
-    canonical encodings (`0 <= S < L`, canonical public key `A` and `R` with
-    `y < p` and `(x == 0 && sign == 1)` rejected, exact equation `[S]B == R + [k]A`).
-  - Rollback-protected durable `ReplayStore` with atomic file writes
-    (`mkstemp` + `fsync` + `os.replace` + dir `fsync`), advisory file + thread
-    locking, and a pluggable `RollbackAnchor` storing `(store_generation, store_sha256)`
-    outside the store file.
-  - Full enforcement semantics for `per-change`, `standing-enrollment` (active &
-    terminal revocation), and `standing-application` covering all 26 items in
-    frdminc/tendcf#76, PR #75 R4 items 1-5, Astra Option B (identical active
-    enrollment redelivery with zero writes/side effects), and the 2026-11-26
-    operator rulings (Item 6 Option B, Item 15 downward version_bump refusal for
-    both standing-application and per-change, Item 17 no horizon cap with strict
-    calendar parsing and clock-rollback fail-closed).
+  - Strict JSON parsing (duplicate-key rejection, NaN/Infinity rejection, NFC check),
+    type-preserving JCS equality (`jcs_equal`), and RFC 8785 JCS canonicalization
+    reused directly from `bin/projector.py`.
+  - Pure-stdlib RFC 8032 Ed25519 public-input verification with strict canonical
+    encodings (`0 <= S < L`, canonical public key `A` and `R` with `y < p` and
+    `(x == 0 && sign == 1)` rejected, small-order `A` and small-order `R` rejected,
+    exact cofactorless equation `[S]B == R + [k]A`). Non-constant-time signing
+    helpers live exclusively in `tests/approval/_ed25519_test_signer.py`.
+  - Crash-safe two-phase durable `ReplayStore` storing generation-versioned
+    immutable state files (`replay-store.v<gen>.json`) written via full-loop
+    `os.write` + `fsync` + `os.replace` + dir `fsync` BEFORE advancing an
+    explicit, independently protected `RollbackAnchor` storing
+    `(store_generation, store_sha256)`, with re-entrant thread + advisory `flock`
+    locking and authoritative persisted applied baseline.
+  - Device-side authoritative goal-diff computation (`compute_authoritative_diff`),
+    strict diff validation, confirmed hold-window display with monotonic clock
+    validation and boot-epoch binding, microsecond-accurate non-reversible expiry
+    tracking, and full enforcement for `per-change`, `standing-enrollment`
+    (active, Option B zero-write redelivery, and terminal revocation), and
+    `standing-application` covering all 26 items of frdminc/tendcf#76,
+    PR #75 R4 #1-#5, and the 2026-11-26 operator rulings.
 """
 
 from __future__ import annotations
@@ -34,14 +39,16 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import os
 import re
+import sys
 import tempfile
 import threading
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Collection, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +61,14 @@ def _load_projector_module() -> Any:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load projector module at {proj_path}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # Register in sys.modules BEFORE exec_module (required on Python 3.14+ for
+    # annotations / dataclasses lookup; clean up on failure).
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return mod
 
 
@@ -86,15 +100,26 @@ MODE_RESTRICTIVENESS: dict[str, int] = {
 VERDICTS = frozenset({"accept", "reject", "withdraw"})
 GRANT_STATES = frozenset({"active", "revoked"})
 
+GOAL_COVERAGE_VALUES = frozenset(
+    {"comprehensive", "not-yet-migrated", "deliberately-unmanaged"}
+)
+DIFF_COVERAGE_VALUES = GOAL_COVERAGE_VALUES | frozenset({"undeclared"})
+
 KEY_ID_RE = re.compile(r"^ed25519:[0-9a-f]{64}\Z")
 ED25519_SIG_RE = re.compile(r"^ed25519-sig:[0-9a-f]{128}\Z")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+RAW_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
 GRANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 NONCE_RE = re.compile(r"^[!-~]{22,128}\Z")
 UTC_TS_RE = re.compile(
     r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
     r"T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])Z\Z"
 )
+INTERNAL_UTC_TS_RE = re.compile(
+    r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+    r"T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])(?:\.([0-9]{6}))?Z\Z"
+)
+STORE_VERSION_FILE_RE = re.compile(r"^replay-store\.v([0-9]+)\.json\Z")
 
 _COMMON_KEYS = frozenset(
     {"schema_version", "record_kind", "host", "signer", "sig_alg", "signature"}
@@ -136,6 +161,17 @@ _APPLICATION_ALLOWED = _COMMON_KEYS | frozenset(
         "ceremony_class",
     }
 )
+_DIFF_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "host",
+        "baseline_sha256",
+        "proposed_sha256",
+        "version_bump",
+        "hunks",
+        "coverage_changes",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +193,7 @@ class StoreRollbackError(EnforcementError):
 
 
 class ClockRollbackError(EnforcementError):
-    """UTC or monotonic clock moved backward (fail closed)."""
+    """UTC or monotonic clock moved backward, non-finite, or crossed boot epoch."""
 
 
 class MalformedRecordError(EnforcementError):
@@ -218,7 +254,7 @@ class PerChangeResult:
 
 
 # ---------------------------------------------------------------------------
-# Strict JSON parsing, NFC validation, and JCS canonicalization
+# Strict JSON parsing, NFC validation, and JCS canonicalization / equality
 # ---------------------------------------------------------------------------
 
 def _reject_json_constant(token: str) -> Any:
@@ -283,6 +319,14 @@ def jcs_dumps(obj: Any) -> bytes:
         raise MalformedRecordError("jcs_unrepresentable", str(exc)) from exc
 
 
+def jcs_equal(a: Any, b: Any) -> bool:
+    """Type-preserving JSON equality via canonical RFC 8785 JCS bytes.
+
+    Unlike Python `==`, this never aliases `True == 1` or `False == 0`.
+    """
+    return hmac.compare_digest(jcs_dumps(a), jcs_dumps(b))
+
+
 def canonical_sha256(doc: Any) -> str:
     """Return `sha256:<64 hex>` digest of the RFC 8785 JCS canonical bytes of `doc`."""
     return "sha256:" + hashlib.sha256(jcs_dumps(doc)).hexdigest()
@@ -303,7 +347,7 @@ def _is_exact_bool(value: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Pure-stdlib RFC 8032 Ed25519 with strict canonical encodings (Item 11)
+# Pure-stdlib RFC 8032 Ed25519 Verification (public inputs only, Item 11)
 # ---------------------------------------------------------------------------
 
 ED25519_P = 2**255 - 19
@@ -358,15 +402,6 @@ def ed25519_decompress_point(encoded: bytes) -> _Point | None:
     return (x, y, 1, (x * y) % ED25519_P)
 
 
-def ed25519_compress_point(pt: _Point) -> bytes:
-    """Encode a point into 32 little-endian canonical bytes (RFC 8032 §5.1.2)."""
-    z_inv = pow(pt[2], ED25519_P - 2, ED25519_P)
-    x = (pt[0] * z_inv) % ED25519_P
-    y = (pt[1] * z_inv) % ED25519_P
-    encoded = y | ((x & 1) << 255)
-    return encoded.to_bytes(32, "little")
-
-
 def _point_add(p1: _Point, p2: _Point) -> _Point:
     """RFC 8032 §5.1.4 unified extended-coordinate addition for a = -1."""
     x1, y1, z1, t1 = p1
@@ -388,6 +423,7 @@ def _point_add(p1: _Point, p2: _Point) -> _Point:
 
 
 def _point_mul(scalar: int, pt: _Point) -> _Point:
+    """Scalar multiplication over public inputs (verification only)."""
     acc = _NEUTRAL_POINT
     cur = pt
     k = scalar
@@ -413,52 +449,16 @@ assert _BASE_X is not None
 _BASE_POINT: _Point = (_BASE_X, _BASE_Y, 1, (_BASE_X * _BASE_Y) % ED25519_P)
 
 
-def ed25519_public_key_from_seed(seed: bytes) -> bytes:
-    """Derive 32-byte Ed25519 public key from 32-byte secret seed (RFC 8032 §5.1.5)."""
-    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
-        raise ValueError("Ed25519 seed must be 32 bytes")
-    digest = hashlib.sha512(seed).digest()
-    a_bytes = bytearray(digest[:32])
-    a_bytes[0] &= 248
-    a_bytes[31] &= 127
-    a_bytes[31] |= 64
-    a = int.from_bytes(a_bytes, "little")
-    return ed25519_compress_point(_point_mul(a, _BASE_POINT))
-
-
-def ed25519_sign(seed: bytes, msg_bytes: bytes) -> bytes:
-    """Produce a 64-byte RFC 8032 pure Ed25519 signature (RFC 8032 §5.1.6)."""
-    if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
-        raise ValueError("Ed25519 seed must be 32 bytes")
-    if not isinstance(msg_bytes, (bytes, bytearray)):
-        raise ValueError("message must be bytes")
-    digest = hashlib.sha512(seed).digest()
-    a_bytes = bytearray(digest[:32])
-    a_bytes[0] &= 248
-    a_bytes[31] &= 127
-    a_bytes[31] |= 64
-    a = int.from_bytes(a_bytes, "little")
-    prefix = digest[32:]
-    pub = ed25519_compress_point(_point_mul(a, _BASE_POINT))
-
-    r = int.from_bytes(hashlib.sha512(prefix + msg_bytes).digest(), "little") % ED25519_L
-    r_bytes = ed25519_compress_point(_point_mul(r, _BASE_POINT))
-    k = (
-        int.from_bytes(hashlib.sha512(r_bytes + pub + msg_bytes).digest(), "little")
-        % ED25519_L
-    )
-    s = (r + k * a) % ED25519_L
-    return r_bytes + s.to_bytes(32, "little")
-
-
 def verify_ed25519(pubkey_bytes: bytes, msg_bytes: bytes, sig_bytes: bytes) -> bool:
     """Strictly verify RFC 8032 pure Ed25519 signature with canonical encodings.
 
-    Enforces:
+    Enforces (aligned with libsodium / `ed25519-dalek::verify_strict`):
       - `len(pubkey_bytes) == 32`, `len(sig_bytes) == 64`
       - `0 <= S < L` (non-malleable scalar)
       - Canonical public key `A` (`y < p`, reject `x == 0 && sign == 1`)
+      - Reject small-order public key `A` (`[8]A == O`)
       - Canonical `R` (`y < p`, reject `x == 0 && sign == 1`)
+      - Reject small-order `R` (`[8]R == O`)
       - Exact cofactorless equation `[S]B == R + [k]A`
     """
     if (
@@ -478,12 +478,13 @@ def verify_ed25519(pubkey_bytes: bytes, msg_bytes: bytes, sig_bytes: bytes) -> b
     pt_a = ed25519_decompress_point(bytes(pubkey_bytes))
     if pt_a is None:
         return False
-    # Reject small-order public keys (order dividing 8, including the identity
-    # point (0, 1) which would otherwise satisfy [0]B == O + [k]O for any msg).
     if _point_equal(_point_mul(8, pt_a), _NEUTRAL_POINT):
         return False
+
     pt_r = ed25519_decompress_point(r_bytes)
     if pt_r is None:
+        return False
+    if _point_equal(_point_mul(8, pt_r), _NEUTRAL_POINT):
         return False
 
     k = (
@@ -504,16 +505,6 @@ def key_id_from_pubkey(pubkey_bytes: bytes) -> str:
     return "ed25519:" + pubkey_bytes.hex()
 
 
-def sign_approval_record(record_without_sig: dict[str, Any], seed: bytes) -> dict[str, Any]:
-    """Return a copy of `record_without_sig` signed under pure Ed25519 over JCS bytes."""
-    unsigned = {k: copy.deepcopy(v) for k, v in record_without_sig.items() if k != "signature"}
-    payload = jcs_dumps(unsigned)
-    sig = ed25519_sign(seed, payload)
-    signed = dict(unsigned)
-    signed["signature"] = "ed25519-sig:" + sig.hex()
-    return signed
-
-
 def verify_record_signature(record: dict[str, Any]) -> None:
     """Verify X-trust-06 algorithm binding and strict canonical pure Ed25519 signature."""
     sig_alg = record.get("sig_alg")
@@ -525,7 +516,6 @@ def verify_record_signature(record: dict[str, Any]) -> None:
     if not isinstance(signer, str) or not isinstance(signature, str):
         raise SignatureError("malformed_signature_fields", "signer and signature must be strings")
 
-    # Enforce strict sig_alg <-> signer prefix <-> signature prefix agreement (Item 11).
     if sig_alg == "ed25519":
         if not KEY_ID_RE.match(signer):
             raise SignatureError(
@@ -550,7 +540,7 @@ def verify_record_signature(record: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Strict UTC timestamp parsing (Item 17 — no horizon cap, strict calendar)
+# Strict UTC timestamp & monotonic clock helpers (Items 17 & 18)
 # ---------------------------------------------------------------------------
 
 def parse_utc_timestamp(value: Any, *, field: str = "not_after") -> datetime.datetime:
@@ -580,21 +570,73 @@ def parse_utc_timestamp(value: Any, *, field: str = "not_after") -> datetime.dat
         ) from exc
 
 
+def _parse_internal_utc_timestamp(value: Any, *, field: str = "last_seen_utc") -> datetime.datetime:
+    """Parse internal store UTC timestamps preserving optional 6-digit microseconds."""
+    if not isinstance(value, str):
+        raise MalformedRecordError("invalid_timestamp", f"{field} must be a string")
+    match = INTERNAL_UTC_TS_RE.match(value)
+    if match is None:
+        raise MalformedRecordError(
+            "invalid_timestamp_format",
+            f"{field} {value!r} is not a valid internal UTC timestamp",
+        )
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    micro = int(match.group(7)) if match.group(7) is not None else 0
+    try:
+        return datetime.datetime(
+            year, month, day, hour, minute, second, micro, tzinfo=datetime.timezone.utc
+        )
+    except ValueError as exc:
+        raise MalformedRecordError(
+            "impossible_calendar_date",
+            f"{field} {value!r} is not a valid calendar date: {exc}",
+        ) from exc
+
+
 def format_utc_timestamp(dt: datetime.datetime) -> str:
+    """Format UTC datetime preserving microsecond precision when non-zero."""
     if dt.tzinfo is None:
         raise ValueError("datetime must be timezone-aware UTC")
     utc = dt.astimezone(datetime.timezone.utc)
+    if utc.microsecond:
+        return utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     return utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _coerce_utc(now_utc: datetime.datetime | str) -> datetime.datetime:
+    """Coerce UTC observation without truncating microseconds."""
     if isinstance(now_utc, str):
-        return parse_utc_timestamp(now_utc, field="now_utc")
+        return _parse_internal_utc_timestamp(now_utc, field="now_utc")
     if isinstance(now_utc, datetime.datetime):
         if now_utc.tzinfo is None:
             raise ValueError("now_utc must be timezone-aware")
-        return now_utc.astimezone(datetime.timezone.utc).replace(microsecond=0)
+        return now_utc.astimezone(datetime.timezone.utc)
     raise TypeError("now_utc must be a timezone-aware datetime or UTC ISO string")
+
+
+def _coerce_mono(now_mono: Any) -> float:
+    """Validate finite, non-negative, non-boolean monotonic timestamp (Item 18)."""
+    if isinstance(now_mono, bool) or not isinstance(now_mono, (int, float)):
+        raise ClockRollbackError(
+            "invalid_monotonic_time",
+            f"now_mono must be a finite non-negative number, got {type(now_mono).__name__}",
+        )
+    val = float(now_mono)
+    if not math.isfinite(val) or val < 0.0:
+        raise ClockRollbackError(
+            "invalid_monotonic_time",
+            f"now_mono must be finite and >= 0, got {now_mono!r}",
+        )
+    return val
+
+
+def _validate_boot_epoch(boot_epoch: Any) -> str:
+    if not isinstance(boot_epoch, str) or not boot_epoch or "\n" in boot_epoch:
+        raise ClockRollbackError(
+            "invalid_boot_epoch",
+            "boot_epoch must be a non-empty single-line string",
+        )
+    return boot_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -632,10 +674,6 @@ def validate_approval_record_shape(record: Any) -> dict[str, Any]:
         raise MalformedRecordError("invalid_sig_alg", "sig_alg must be a non-empty string")
     if not isinstance(record["signature"], str) or not record["signature"]:
         raise MalformedRecordError("invalid_signature_str", "signature must be a non-empty string")
-
-    # Note: sig_alg / signer / signature prefix agreement is checked in
-    # verify_record_signature() so algorithm mismatches raise SignatureError
-    # cleanly as Item 11 requires.
 
     if kind == "per-change":
         extra = set(record) - _PER_CHANGE_ALLOWED
@@ -817,7 +855,7 @@ def validate_approval_record_shape(record: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Rollback-protected durable ReplayStore & RollbackAnchor (Item 1, R3)
+# Crash-safe two-phase durable ReplayStore & independent RollbackAnchor (Item 1)
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
@@ -827,7 +865,7 @@ class AnchorState:
 
 
 class RollbackAnchor:
-    """Abstract monotonic anchor stored outside the replay store file."""
+    """Abstract monotonic anchor stored outside the replay store rollback domain."""
 
     def read(self) -> AnchorState | None:
         raise NotImplementedError
@@ -855,12 +893,18 @@ def _atomic_write_file(
     *,
     before_replace_hook: Callable[[], None] | None = None,
 ) -> None:
+    """Atomically write all bytes via short-write loop + fsync + os.replace + dir fsync."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.tmp-")
     tmp_path = Path(tmp_name)
     try:
         try:
-            os.write(fd, data)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -881,7 +925,7 @@ def _atomic_write_file(
 
 
 class FileRollbackAnchor(RollbackAnchor):
-    """Separate file-backed monotonic rollback anchor."""
+    """File-backed monotonic rollback anchor for simulation (separate rollback domain)."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -897,8 +941,12 @@ class FileRollbackAnchor(RollbackAnchor):
             ) from exc
         if (
             not isinstance(doc, dict)
+            or set(doc) != {"store_generation", "store_sha256"}
             or not _is_exact_int(doc.get("store_generation"))
+            or doc["store_generation"] < 0
+            or doc["store_generation"] > MAX_SAFE_INT
             or not isinstance(doc.get("store_sha256"), str)
+            or not RAW_SHA256_HEX_RE.match(doc["store_sha256"])
         ):
             raise StoreRollbackError("anchor_corrupt", "rollback anchor has invalid shape")
         return AnchorState(
@@ -907,6 +955,14 @@ class FileRollbackAnchor(RollbackAnchor):
         )
 
     def write(self, state: AnchorState) -> None:
+        if (
+            not _is_exact_int(state.store_generation)
+            or state.store_generation < 0
+            or state.store_generation > MAX_SAFE_INT
+            or not isinstance(state.store_sha256, str)
+            or not RAW_SHA256_HEX_RE.match(state.store_sha256)
+        ):
+            raise ValueError("invalid AnchorState")
         payload = jcs_dumps(
             {
                 "store_generation": state.store_generation,
@@ -916,15 +972,24 @@ class FileRollbackAnchor(RollbackAnchor):
         _atomic_write_file(self.path, payload)
 
 
-def _fresh_store_state(host: str, *, store_generation: int = 0) -> dict[str, Any]:
+def _fresh_store_state(
+    host: str,
+    *,
+    store_generation: int = 0,
+    applied_baseline_goal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base_copy = copy.deepcopy(applied_baseline_goal) if applied_baseline_goal is not None else None
+    base_sha = canonical_sha256(base_copy) if base_copy is not None else None
     return {
-        "store_version": 1,
+        "store_version": 2,
         "host": host,
         "store_generation": store_generation,
         "voided": False,
         "void_reason": None,
         "approval_seq": -1,
         "last_seen_utc": None,
+        "applied_baseline_goal": base_copy,
+        "applied_baseline_sha256": base_sha,
         "persisted_rejects": {},
         "outstanding_nonces": {},
         "grants": {},
@@ -943,25 +1008,59 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
         "void_reason",
         "approval_seq",
         "last_seen_utc",
+        "applied_baseline_goal",
+        "applied_baseline_sha256",
         "persisted_rejects",
         "outstanding_nonces",
         "grants",
         "pending_holds",
     }
-    if not required.issubset(doc):
+    if set(doc) != required:
         raise StoreRollbackError(
-            "store_corrupt", f"replay store missing keys: {sorted(required - set(doc))}"
+            "store_corrupt",
+            f"replay store keys mismatch: missing={sorted(required - set(doc))}, extra={sorted(set(doc) - required)}",
         )
-    if doc["store_version"] != 1:
-        raise StoreRollbackError("store_corrupt", f"unsupported store_version {doc['store_version']!r}")
+    if not _is_exact_int(doc["store_version"]) or doc["store_version"] != 2:
+        raise StoreRollbackError(
+            "store_corrupt", f"unsupported store_version {doc['store_version']!r}"
+        )
     if doc["host"] != expected_host:
         raise StoreRollbackError("store_host_mismatch", "replay store belongs to a different host")
-    if not _is_exact_int(doc["store_generation"]) or doc["store_generation"] < 0:
+    if (
+        not _is_exact_int(doc["store_generation"])
+        or doc["store_generation"] < 0
+        or doc["store_generation"] > MAX_SAFE_INT
+    ):
         raise StoreRollbackError("store_corrupt", "invalid store_generation")
     if not _is_exact_bool(doc["voided"]):
         raise StoreRollbackError("store_corrupt", "invalid voided flag")
-    if not _is_exact_int(doc["approval_seq"]) or doc["approval_seq"] < -1:
+    if doc["void_reason"] is not None and not isinstance(doc["void_reason"], str):
+        raise StoreRollbackError("store_corrupt", "invalid void_reason")
+    if (
+        not _is_exact_int(doc["approval_seq"])
+        or doc["approval_seq"] < -1
+        or doc["approval_seq"] > MAX_SAFE_INT
+    ):
         raise StoreRollbackError("store_corrupt", "invalid approval_seq")
+    if doc["last_seen_utc"] is not None:
+        try:
+            _parse_internal_utc_timestamp(doc["last_seen_utc"], field="last_seen_utc")
+        except MalformedRecordError as exc:
+            raise StoreRollbackError("store_corrupt", f"invalid last_seen_utc: {exc}") from exc
+    base_goal = doc["applied_baseline_goal"]
+    base_sha = doc["applied_baseline_sha256"]
+    if base_goal is None:
+        if base_sha is not None:
+            raise StoreRollbackError(
+                "store_corrupt", "applied_baseline_sha256 set without applied_baseline_goal"
+            )
+    else:
+        if not isinstance(base_goal, dict) or not isinstance(base_sha, str) or not SHA256_RE.match(base_sha):
+            raise StoreRollbackError("store_corrupt", "invalid applied_baseline_goal/sha256")
+        if not hmac.compare_digest(canonical_sha256(base_goal), base_sha):
+            raise StoreRollbackError(
+                "store_corrupt", "applied_baseline_sha256 does not match applied_baseline_goal"
+            )
     for dict_key in ("persisted_rejects", "outstanding_nonces", "grants", "pending_holds"):
         if not isinstance(doc[dict_key], dict):
             raise StoreRollbackError("store_corrupt", f"store field {dict_key!r} is not an object")
@@ -969,118 +1068,191 @@ def _validate_store_shape(doc: Any, expected_host: str) -> dict[str, Any]:
 
 
 class ReplayStore:
-    """Serialized, rollback-protected, atomically persisted replay store per host."""
+    """Serialized, crash-safe, two-phase rollback-protected replay store per host.
+
+    Requires an explicit `anchor: RollbackAnchor` from an independent rollback
+    domain (no default adjacent file in `store_dir`). Use `ReplayStore.provision()`
+    to initialize a brand-new store; opening an unprovisioned or missing store
+    fails closed.
+    """
 
     def __init__(
         self,
-        store_path: Path | str,
+        store_dir: Path | str,
         host: str,
-        anchor: RollbackAnchor | None = None,
+        *,
+        anchor: RollbackAnchor,
     ) -> None:
         if not isinstance(host, str) or not KEY_ID_RE.match(host):
             raise ValueError(f"invalid host key_id: {host!r}")
-        self.store_path = Path(store_path)
-        self.lock_path = Path(str(self.store_path) + ".lock")
+        if not isinstance(anchor, RollbackAnchor):
+            raise TypeError(
+                "ReplayStore requires an explicit RollbackAnchor from an independent rollback domain"
+            )
+        self.store_dir = Path(store_dir)
+        if isinstance(anchor, FileRollbackAnchor):
+            try:
+                anchor_parent = anchor.path.resolve().parent
+                store_resolved = self.store_dir.resolve()
+                if anchor_parent == store_resolved:
+                    raise ValueError(
+                        "FileRollbackAnchor must live outside store_dir (separate rollback domain)"
+                    )
+            except OSError:
+                pass
+        self.lock_path = self.store_dir / "replay-store.lock"
         self.host = host
-        self.anchor: RollbackAnchor = (
-            anchor if anchor is not None else FileRollbackAnchor(str(self.store_path) + ".anchor")
-        )
+        self.anchor = anchor
         self._thread_lock = threading.RLock()
+        self._lock_depth: int = 0
+        self._lock_fd: int | None = None
         self.write_count: int = 0
         self.nonce_consume_count: int = 0
         self._seen_nonces_memory: set[str] = set()
 
-        # Initialize fresh store if neither store file nor anchor exists.
-        with self.locked():
-            anchor_state = self.anchor.read()
-            if not self.store_path.exists() and anchor_state is None:
-                initial = _fresh_store_state(self.host, store_generation=0)
-                self._commit_unlocked(initial, count_write=False)
+    @classmethod
+    def provision(
+        cls,
+        store_dir: Path | str,
+        host: str,
+        *,
+        anchor: RollbackAnchor,
+        baseline_goal: dict[str, Any] | None = None,
+    ) -> "ReplayStore":
+        """Explicitly provision a brand-new replay store and anchor."""
+        store = cls(store_dir, host, anchor=anchor)
+        if baseline_goal is not None:
+            validate_goal_file_basics(baseline_goal, host)
+        with store.locked():
+            if store.anchor.read() is not None:
+                raise StoreRollbackError(
+                    "already_provisioned",
+                    "cannot provision store while rollback anchor already exists",
+                )
+            if store._list_version_files():
+                raise StoreRollbackError(
+                    "already_provisioned",
+                    "cannot provision store while versioned store files already exist",
+                )
+            initial = _fresh_store_state(
+                host, store_generation=0, applied_baseline_goal=baseline_goal
+            )
+            store._two_phase_commit_unlocked(initial, count_write=False)
+        return store
+
+    def version_path(self, generation: int) -> Path:
+        return self.store_dir / f"replay-store.v{generation}.json"
+
+    def _list_version_files(self) -> list[Path]:
+        if not self.store_dir.exists():
+            return []
+        out: list[Path] = []
+        for entry in self.store_dir.iterdir():
+            if entry.is_file() and STORE_VERSION_FILE_RE.match(entry.name):
+                out.append(entry)
+        return sorted(out)
+
+    @property
+    def current_store_path(self) -> Path | None:
+        anchor_state = self.anchor.read()
+        if anchor_state is None:
+            return None
+        return self.version_path(anchor_state.store_generation)
 
     @contextmanager
     def locked(self) -> Iterator[None]:
-        """Acquire both in-process RLock and cross-process advisory flock."""
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        """Re-entrant in-process RLock + cross-process advisory flock (zero self-deadlock)."""
+        self.store_dir.mkdir(parents=True, exist_ok=True)
         with self._thread_lock:
-            lock_fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if self._lock_depth == 0:
+                lock_fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
                 try:
-                    yield
-                finally:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(lock_fd)
+                    raise
+                self._lock_fd = lock_fd
+            self._lock_depth += 1
+            try:
+                yield
             finally:
-                os.close(lock_fd)
+                self._lock_depth -= 1
+                if self._lock_depth == 0:
+                    fd = self._lock_fd
+                    self._lock_fd = None
+                    if fd is not None:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
 
     def _fail_closed_void_unlocked(
         self,
         reason: str,
         *,
         anchor_gen: int = 0,
-        existing_doc: dict[str, Any] | None = None,
     ) -> None:
-        """Void all standing grants, pending holds, and outstanding nonces on rollback/loss.
+        """Void all standing grants, holds, and nonces from a clean state.
 
-        Preserves any tombstones, persisted_rejects, approval_seq, and last_seen_utc
-        that could still be read safely, and persists the voided state with an
-        incremented generation so restarts stay fail-closed until explicit recovery.
+        SECURITY (Neon F3 / Adversary C4): NEVER copies any field from an
+        unauthenticated / SHA-256-failed store file into the voided state or
+        anchor. Starts strictly from a clean `_fresh_store_state` at
+        `anchor_gen + 1` with `voided = True`.
         """
-        next_gen = max(
-            anchor_gen,
-            existing_doc["store_generation"]
-            if isinstance(existing_doc, dict) and _is_exact_int(existing_doc.get("store_generation"))
-            else 0,
-        ) + 1
+        next_gen = max(0, anchor_gen) + 1
         voided_state = _fresh_store_state(self.host, store_generation=next_gen)
         voided_state["voided"] = True
         voided_state["void_reason"] = reason
-        if isinstance(existing_doc, dict):
-            if _is_exact_int(existing_doc.get("approval_seq")):
-                voided_state["approval_seq"] = existing_doc["approval_seq"]
-            if isinstance(existing_doc.get("last_seen_utc"), str):
-                voided_state["last_seen_utc"] = existing_doc["last_seen_utc"]
-            if isinstance(existing_doc.get("persisted_rejects"), dict):
-                voided_state["persisted_rejects"] = copy.deepcopy(existing_doc["persisted_rejects"])
-            if isinstance(existing_doc.get("grants"), dict):
-                # Never delete tombstones (Item 1 / Item 7).
-                for gid, g in existing_doc["grants"].items():
-                    if isinstance(g, dict) and g.get("tombstoned") is True:
-                        voided_state["grants"][gid] = copy.deepcopy(g)
-        self._commit_unlocked(voided_state, count_write=True)
+        self._two_phase_commit_unlocked(voided_state, count_write=True)
 
     def load_verified_unlocked(self, *, allow_voided: bool = False) -> dict[str, Any]:
-        """Load store and verify against RollbackAnchor; fail closed on any discrepancy."""
+        """Load the anchored store generation and verify exact SHA-256; fail closed on mismatch."""
         anchor_state = self.anchor.read()
-        if not self.store_path.exists():
-            if anchor_state is not None:
+        if anchor_state is None:
+            if self._list_version_files():
                 self._fail_closed_void_unlocked(
-                    "store file missing while rollback anchor exists",
-                    anchor_gen=anchor_state.store_generation,
+                    "rollback anchor missing while store files exist", anchor_gen=0
                 )
                 raise StoreRollbackError(
-                    "store_missing_rollback",
-                    "replay store missing while rollback anchor exists; all standing grants voided",
+                    "anchor_missing",
+                    "rollback anchor missing while store exists; all standing grants voided",
                 )
             raise StoreRollbackError(
-                "store_uninitialized", "replay store and anchor both missing"
+                "store_unprovisioned",
+                "replay store is not provisioned (missing both anchor and store files)",
             )
 
-        if anchor_state is None:
-            self._fail_closed_void_unlocked("rollback anchor missing for existing store")
+        target_path = self.version_path(anchor_state.store_generation)
+        if not target_path.exists():
+            self._fail_closed_void_unlocked(
+                "store file missing for anchored generation (store loss or directory rollback)",
+                anchor_gen=anchor_state.store_generation,
+            )
             raise StoreRollbackError(
-                "anchor_missing",
-                "rollback anchor missing while store exists; all standing grants voided",
+                "store_missing_rollback",
+                "anchored replay store file missing; all standing grants and nonces voided",
             )
 
         try:
-            raw = self.store_path.read_bytes()
+            raw = target_path.read_bytes()
         except OSError as exc:
             self._fail_closed_void_unlocked(
                 f"store unreadable: {exc}", anchor_gen=anchor_state.store_generation
             )
             raise StoreRollbackError("store_unreadable", str(exc)) from exc
 
+        # Authenticate bytes BEFORE parsing or trusting any field!
         actual_sha = hashlib.sha256(raw).hexdigest()
+        if not hmac.compare_digest(actual_sha, anchor_state.store_sha256):
+            self._fail_closed_void_unlocked(
+                "store digest mismatch vs rollback anchor",
+                anchor_gen=anchor_state.store_generation,
+            )
+            raise StoreRollbackError(
+                "store_rollback_detected",
+                "replay store digest does not match rollback anchor; all standing grants and nonces voided",
+            )
+
         try:
             doc = parse_strict_json(raw)
             doc = _validate_store_shape(doc, self.host)
@@ -1089,21 +1261,17 @@ class ReplayStore:
                 f"store corrupt: {exc}", anchor_gen=anchor_state.store_generation
             )
             raise StoreRollbackError(
-                "store_corrupt", f"replay store corrupted/truncated: {exc}"
+                "store_corrupt", f"replay store corrupted/invalid: {exc}"
             ) from exc
 
-        if (
-            doc["store_generation"] != anchor_state.store_generation
-            or actual_sha != anchor_state.store_sha256
-        ):
+        if doc["store_generation"] != anchor_state.store_generation:
             self._fail_closed_void_unlocked(
-                "rollback or partial restore detected (anchor mismatch)",
+                "store generation mismatch vs rollback anchor",
                 anchor_gen=anchor_state.store_generation,
-                existing_doc=doc,
             )
             raise StoreRollbackError(
                 "store_rollback_detected",
-                "replay store does not match rollback anchor; all standing grants and nonces voided",
+                "replay store generation does not match rollback anchor; all standing grants voided",
             )
 
         if doc["voided"] and not allow_voided:
@@ -1114,34 +1282,60 @@ class ReplayStore:
 
         return doc
 
-    def _commit_unlocked(
+    def _cleanup_old_generations_unlocked(self, keep_generation: int) -> None:
+        keep_name = self.version_path(keep_generation).name
+        for path in self._list_version_files():
+            if path.name != keep_name:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _two_phase_commit_unlocked(
         self,
         state: dict[str, Any],
         *,
         before_replace_hook: Callable[[], None] | None = None,
+        before_anchor_hook: Callable[[], None] | None = None,
         after_commit_hook: Callable[[], None] | None = None,
         count_write: bool = True,
     ) -> None:
+        """Crash-safe two-phase commit:
+
+        Phase 1: Atomically write & fsync immutable `replay-store.v<gen>.json`
+                 (leaving `v<gen-1>` completely untouched).
+        Phase 2: Advance independent `RollbackAnchor` to `(gen, sha256)` — this
+                 is the single atomic commit point.
+        Cleanup: Best-effort unlink of older `v<old>.json` files.
+        """
         raw = jcs_dumps(state)
         digest = hashlib.sha256(raw).hexdigest()
-        _atomic_write_file(self.store_path, raw, before_replace_hook=before_replace_hook)
-        self.anchor.write(AnchorState(store_generation=state["store_generation"], store_sha256=digest))
+        gen = state["store_generation"]
+        target = self.version_path(gen)
+
+        _atomic_write_file(target, raw, before_replace_hook=before_replace_hook)
+        if before_anchor_hook is not None:
+            before_anchor_hook()
+        self.anchor.write(AnchorState(store_generation=gen, store_sha256=digest))
         if count_write:
             self.write_count += 1
         if after_commit_hook is not None:
             after_commit_hook()
+        self._cleanup_old_generations_unlocked(gen)
 
     def commit_unlocked(
         self,
         state: dict[str, Any],
         *,
         before_replace_hook: Callable[[], None] | None = None,
+        before_anchor_hook: Callable[[], None] | None = None,
         after_commit_hook: Callable[[], None] | None = None,
     ) -> None:
         state["store_generation"] = state["store_generation"] + 1
-        self._commit_unlocked(
+        self._two_phase_commit_unlocked(
             state,
             before_replace_hook=before_replace_hook,
+            before_anchor_hook=before_anchor_hook,
             after_commit_hook=after_commit_hook,
             count_write=True,
         )
@@ -1151,29 +1345,36 @@ class ReplayStore:
         with self.locked():
             return copy.deepcopy(self.load_verified_unlocked(allow_voided=allow_voided))
 
-    def recover_after_store_loss(self) -> None:
+    def recover_after_store_loss(
+        self,
+        *,
+        baseline_goal: dict[str, Any] | None = None,
+    ) -> None:
         """Owner-initiated recovery after rollback/store-loss voiding.
 
-        Clears the `voided` flag while keeping all standing grants empty, all
-        old nonces cleared, and preserving any surviving tombstones and DC-2
-        rejects. Subsequent enrollments require fresh owner ceremonies with
-        fresh 128-bit+ OS-random nonces.
+        Clears `voided`, leaves all standing grants empty and all old nonces
+        cleared, and restores the authoritative applied baseline supplied by the
+        owner recovery ceremony (if provided).
         """
+        if baseline_goal is not None:
+            validate_goal_file_basics(baseline_goal, self.host)
         with self.locked():
             state = self.load_verified_unlocked(allow_voided=True)
             state["voided"] = False
             state["void_reason"] = None
             state["outstanding_nonces"] = {}
             state["pending_holds"] = {}
-            # Retain tombstones only; active grants were already voided.
             state["grants"] = {
                 gid: g for gid, g in state["grants"].items() if g.get("tombstoned") is True
             }
+            if baseline_goal is not None:
+                state["applied_baseline_goal"] = copy.deepcopy(baseline_goal)
+                state["applied_baseline_sha256"] = canonical_sha256(baseline_goal)
             self.commit_unlocked(state)
 
 
 # ---------------------------------------------------------------------------
-# Diff derivation, carve-out, migration, and trust-root helpers
+# Goal-file validation, authoritative diff computation, carve-out & migrations
 # ---------------------------------------------------------------------------
 
 def validate_trust_root_no_host_key(goal_file: dict[str, Any], host: str) -> None:
@@ -1195,6 +1396,58 @@ def validate_trust_root_no_host_key(goal_file: dict[str, Any], host: str) -> Non
             "host_key_in_trust_root",
             "device's own host key must never appear as a device-trust advisor-key (Item 10)",
         )
+
+
+def validate_goal_file_basics(goal_file: Any, host: str) -> None:
+    """Validate goal-file host, schema_version, domain coverages, and Item 10 trust-root ban."""
+    if not isinstance(goal_file, dict):
+        raise MalformedRecordError("invalid_goal_file", "goal file must be a JSON object")
+    if goal_file.get("host") != host:
+        raise ScopeError(
+            "goal_host_mismatch",
+            f"goal file host {goal_file.get('host')!r} != device host {host!r}",
+        )
+    sv = goal_file.get("schema_version")
+    if not _is_exact_int(sv) or sv < 1 or sv > MAX_SAFE_INT:
+        raise MalformedRecordError(
+            "invalid_goal_schema_version", f"invalid goal schema_version {sv!r}"
+        )
+    domains = goal_file.get("domains")
+    if not isinstance(domains, dict):
+        raise MalformedRecordError("invalid_goal_domains", "goal file domains must be an object")
+    for dom_name, dom_obj in domains.items():
+        if not isinstance(dom_name, str) or not isinstance(dom_obj, dict):
+            raise MalformedRecordError("invalid_goal_domain", f"domain {dom_name!r} must be an object")
+        cov = dom_obj.get("coverage")
+        if not isinstance(cov, str) or cov not in GOAL_COVERAGE_VALUES:
+            raise MalformedRecordError(
+                "invalid_coverage_value",
+                f"domain {dom_name!r} has invalid coverage {cov!r}",
+            )
+        entries = dom_obj.get("entries")
+        if entries is not None:
+            if not isinstance(entries, dict):
+                raise MalformedRecordError(
+                    "invalid_domain_entries", f"domain {dom_name!r} entries must be an object"
+                )
+            if cov == "deliberately-unmanaged" and entries:
+                raise MalformedRecordError(
+                    "entries_in_unmanaged_domain",
+                    f"deliberately-unmanaged domain {dom_name!r} must not contain entries",
+                )
+            for kind_name, ids in entries.items():
+                if not isinstance(kind_name, str) or not isinstance(ids, dict):
+                    raise MalformedRecordError(
+                        "invalid_kind_bucket",
+                        f"domain {dom_name!r} kind {kind_name!r} must be an object",
+                    )
+                for eid, body in ids.items():
+                    if not isinstance(eid, str) or not isinstance(body, dict):
+                        raise MalformedRecordError(
+                            "invalid_entry_body",
+                            f"{dom_name}/{kind_name}/{eid} must be a JSON object",
+                        )
+    validate_trust_root_no_host_key(goal_file, host)
 
 
 def extract_baseline_roles(baseline_goal: dict[str, Any], host: str) -> dict[str, str]:
@@ -1227,7 +1480,17 @@ def derive_hunk_class(domain: str, kind: str) -> str:
 
 
 def derive_coverage_change_class(old: str, new: str) -> str:
-    """Derive ceremony class for a single domain coverage transition (§4.3)."""
+    """Derive ceremony class for a single validated domain coverage transition (§4.3)."""
+    if (
+        not isinstance(old, str)
+        or not isinstance(new, str)
+        or old not in DIFF_COVERAGE_VALUES
+        or new not in DIFF_COVERAGE_VALUES
+    ):
+        raise MalformedRecordError(
+            "invalid_coverage_value",
+            f"coverage transition ({old!r} -> {new!r}) outside closed enum",
+        )
     if "deliberately-unmanaged" in (old, new):
         return "privileged"
     if old == "comprehensive" and new != "comprehensive":
@@ -1235,78 +1498,257 @@ def derive_coverage_change_class(old: str, new: str) -> str:
     return "ordinary"
 
 
-def analyze_diff_classes(diff: dict[str, Any]) -> tuple[str, set[str]]:
-    """Return `(overall_derived_class, per_item_classes)` for `diff`.
+def compute_authoritative_diff(
+    baseline_goal: dict[str, Any],
+    proposed_goal: dict[str, Any],
+    host: str,
+) -> dict[str, Any]:
+    """Compute the authoritative device-side goal diff between baseline and proposed."""
+    validate_goal_file_basics(baseline_goal, host)
+    validate_goal_file_basics(proposed_goal, host)
 
-    Also validates structural invariants: `version_bump` forbids `hunks` and
-    `coverage_changes`, non-migration diffs must have at least one hunk or
-    coverage change, and downward/equal `version_bump` (`new <= old`) is
-    refused unconditionally (2026-11-26 operator ruling, Item 15).
+    base_hash = canonical_sha256(baseline_goal)
+    prop_hash = canonical_sha256(proposed_goal)
+    if hmac.compare_digest(base_hash, prop_hash):
+        raise ScopeError("empty_diff", "baseline and proposed goal files are identical")
+
+    old_ver = baseline_goal["schema_version"]
+    new_ver = proposed_goal["schema_version"]
+    if new_ver < old_ver:
+        raise ScopeError(
+            "downward_version_bump",
+            f"refusing downward schema_version {old_ver} -> {new_ver}",
+        )
+    if new_ver > old_ver:
+        return {
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+            "host": host,
+            "baseline_sha256": base_hash,
+            "proposed_sha256": prop_hash,
+            "version_bump": {"old": old_ver, "new": new_ver},
+        }
+
+    # Same schema_version: reject any top-level header difference outside `domains`.
+    base_extra = {k: v for k, v in baseline_goal.items() if k != "domains"}
+    prop_extra = {k: v for k, v in proposed_goal.items() if k != "domains"}
+    if not jcs_equal(base_extra, prop_extra):
+        raise ScopeError(
+            "unsupported_header_change",
+            "goal files differ in header fields outside schema_version and domains",
+        )
+
+    base_domains: dict[str, Any] = baseline_goal["domains"]
+    prop_domains: dict[str, Any] = proposed_goal["domains"]
+
+    coverage_changes: dict[str, dict[str, str]] = {}
+    hunks: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+
+    for dom_name in sorted(set(base_domains) | set(prop_domains)):
+        old_dom = base_domains.get(dom_name)
+        new_dom = prop_domains.get(dom_name)
+        old_cov = old_dom["coverage"] if old_dom is not None else "undeclared"
+        new_cov = new_dom["coverage"] if new_dom is not None else "undeclared"
+        if old_cov != new_cov:
+            coverage_changes[dom_name] = {"old": old_cov, "new": new_cov}
+
+        # Reject domain-level keys outside {"coverage", "entries"} that changed.
+        if old_dom is not None and new_dom is not None:
+            od_meta = {k: v for k, v in old_dom.items() if k not in ("coverage", "entries")}
+            nd_meta = {k: v for k, v in new_dom.items() if k not in ("coverage", "entries")}
+            if not jcs_equal(od_meta, nd_meta):
+                raise ScopeError(
+                    "unsupported_domain_change",
+                    f"domain {dom_name!r} differs in non-entry metadata",
+                )
+
+        old_entries = (old_dom or {}).get("entries") or {}
+        new_entries = (new_dom or {}).get("entries") or {}
+        dom_hunks: dict[str, dict[str, dict[str, Any]]] = {}
+        for kind_name in sorted(set(old_entries) | set(new_entries)):
+            old_bucket = old_entries.get(kind_name) or {}
+            new_bucket = new_entries.get(kind_name) or {}
+            kind_hunks: dict[str, dict[str, Any]] = {}
+            for eid in sorted(set(old_bucket) | set(new_bucket)):
+                in_old = eid in old_bucket
+                in_new = eid in new_bucket
+                if in_old and in_new:
+                    if not jcs_equal(old_bucket[eid], new_bucket[eid]):
+                        kind_hunks[eid] = {
+                            "old": copy.deepcopy(old_bucket[eid]),
+                            "new": copy.deepcopy(new_bucket[eid]),
+                        }
+                elif in_new:
+                    kind_hunks[eid] = {"new": copy.deepcopy(new_bucket[eid])}
+                else:
+                    kind_hunks[eid] = {"old": copy.deepcopy(old_bucket[eid])}
+            if kind_hunks:
+                dom_hunks[kind_name] = kind_hunks
+        if dom_hunks:
+            hunks[dom_name] = dom_hunks
+
+    diff: dict[str, Any] = {
+        "schema_version": SUPPORTED_SCHEMA_VERSION,
+        "host": host,
+        "baseline_sha256": base_hash,
+        "proposed_sha256": prop_hash,
+    }
+    if coverage_changes:
+        diff["coverage_changes"] = coverage_changes
+    if hunks:
+        diff["hunks"] = hunks
+    if not coverage_changes and not hunks:
+        raise ScopeError("empty_diff", "no representable diff between baseline and proposed")
+    return diff
+
+
+def analyze_diff_classes(diff: dict[str, Any]) -> tuple[str, set[str]]:
+    """Validate `diff` strictly and return `(overall_derived_class, per_item_classes)`.
+
+    Always run BEFORE `verify_diff_matches_goals()` so malformed diffs raise
+    `MalformedRecordError` rather than `KeyError`/`TypeError`. Enforces:
+      - closed top-level keys, `schema_version == 9`, valid `host` and hashes,
+        `baseline_sha256 != proposed_sha256`
+      - non-null `version_bump`, `hunks`, `coverage_changes`
+      - `version_bump` mutually exclusive with `hunks` and `coverage_changes`
+      - downward/equal `version_bump` (`new <= old`) refused unconditionally
+        (operator ruling 2026-11-26, Item 15)
+      - closed coverage enum on `coverage_changes`
+      - object-only `old`/`new` on every hunk, `set(hunk) <= {"old", "new"}`,
+        no no-op hunks under `jcs_equal`
     """
     if not isinstance(diff, dict):
         raise MalformedRecordError("invalid_diff", "goal diff must be an object")
 
+    extra_keys = set(diff) - _DIFF_ALLOWED_KEYS
+    if extra_keys:
+        raise MalformedRecordError("unexpected_diff_fields", f"unexpected diff keys: {sorted(extra_keys)}")
+
+    sv = diff.get("schema_version")
+    if not _is_exact_int(sv) or sv != SUPPORTED_SCHEMA_VERSION:
+        raise MalformedRecordError(
+            "invalid_diff_schema_version",
+            f"diff schema_version must be {SUPPORTED_SCHEMA_VERSION}, got {sv!r}",
+        )
+    if not isinstance(diff.get("host"), str) or not KEY_ID_RE.match(diff["host"]):
+        raise MalformedRecordError("invalid_diff_host", "diff host must be a valid key_id")
+    if not isinstance(diff.get("baseline_sha256"), str) or not SHA256_RE.match(
+        diff["baseline_sha256"]
+    ):
+        raise MalformedRecordError("invalid_diff_baseline_sha256", "invalid diff baseline_sha256")
+    if not isinstance(diff.get("proposed_sha256"), str) or not SHA256_RE.match(
+        diff["proposed_sha256"]
+    ):
+        raise MalformedRecordError("invalid_diff_proposed_sha256", "invalid diff proposed_sha256")
+
     has_bump = "version_bump" in diff
-    hunks = diff.get("hunks")
-    cov = diff.get("coverage_changes")
+    has_hunks = "hunks" in diff
+    has_cov = "coverage_changes" in diff
 
     if has_bump:
-        if hunks is not None or cov is not None:
+        if has_hunks or has_cov:
             raise ScopeError(
                 "migration_not_empty",
                 "version_bump diff must carry neither hunks nor coverage_changes",
             )
         bump = diff["version_bump"]
-        if not isinstance(bump, dict):
-            raise MalformedRecordError("invalid_version_bump", "version_bump must be an object")
-        old_v, new_v = bump.get("old"), bump.get("new")
-        if not _is_exact_int(old_v) or not _is_exact_int(new_v) or old_v < 1 or new_v < 1:
-            raise MalformedRecordError("invalid_version_bump", "version_bump old/new must be positive ints")
-        # Operator ruling 2026-11-26 (Item 15): refuse downward or equal bump for BOTH
-        # standing-application and per-change owner records (fail-closed anti-downgrade).
+        if not isinstance(bump, dict) or set(bump) != {"old", "new"}:
+            raise MalformedRecordError(
+                "invalid_version_bump", "version_bump must be an object with exact keys old, new"
+            )
+        old_v, new_v = bump["old"], bump["new"]
+        if (
+            not _is_exact_int(old_v)
+            or not _is_exact_int(new_v)
+            or old_v < 1
+            or new_v < 1
+            or old_v > MAX_SAFE_INT
+            or new_v > MAX_SAFE_INT
+        ):
+            raise MalformedRecordError(
+                "invalid_version_bump", "version_bump old/new must be positive safe ints"
+            )
         if new_v <= old_v:
             raise ScopeError(
                 "downward_version_bump",
                 f"refusing version_bump with new ({new_v}) <= old ({old_v})",
             )
+        if hmac.compare_digest(diff["baseline_sha256"], diff["proposed_sha256"]):
+            raise ScopeError("empty_diff", "diff baseline_sha256 equals proposed_sha256")
         return "baseline", {"baseline"}
 
+    if hmac.compare_digest(diff["baseline_sha256"], diff["proposed_sha256"]):
+        raise ScopeError("empty_diff", "diff baseline_sha256 equals proposed_sha256")
+
     per_item: set[str] = set()
-    if hunks is not None:
+    if has_hunks:
+        hunks = diff["hunks"]
         if not isinstance(hunks, dict) or not hunks:
             raise MalformedRecordError("invalid_hunks", "hunks must be a non-empty object")
         for domain_name, kinds in hunks.items():
-            if not isinstance(kinds, dict) or not kinds:
-                raise MalformedRecordError("invalid_hunks", f"hunks/{domain_name} must be non-empty")
+            if not isinstance(domain_name, str) or not isinstance(kinds, dict) or not kinds:
+                raise MalformedRecordError("invalid_hunks", f"hunks/{domain_name!r} must be non-empty object")
             for kind_name, ids in kinds.items():
-                if not isinstance(ids, dict) or not ids:
+                if not isinstance(kind_name, str) or not isinstance(ids, dict) or not ids:
                     raise MalformedRecordError(
-                        "invalid_hunks", f"hunks/{domain_name}/{kind_name} must be non-empty"
+                        "invalid_hunks", f"hunks/{domain_name}/{kind_name!r} must be non-empty object"
                     )
-                for _entry_id, hunk in ids.items():
-                    if not isinstance(hunk, dict) or ("old" not in hunk and "new" not in hunk):
-                        raise MalformedRecordError("invalid_hunk", "hunk must have old and/or new")
+                for entry_id, hunk in ids.items():
+                    if (
+                        not isinstance(entry_id, str)
+                        or not isinstance(hunk, dict)
+                        or not hunk
+                        or not set(hunk).issubset({"old", "new"})
+                    ):
+                        raise MalformedRecordError(
+                            "invalid_hunk",
+                            f"hunk {domain_name}/{kind_name}/{entry_id!r} must have non-empty subset of old/new",
+                        )
+                    if "old" in hunk and not isinstance(hunk["old"], dict):
+                        raise MalformedRecordError(
+                            "invalid_hunk_old",
+                            f"hunk {domain_name}/{kind_name}/{entry_id} old must be a JSON object",
+                        )
+                    if "new" in hunk and not isinstance(hunk["new"], dict):
+                        raise MalformedRecordError(
+                            "invalid_hunk_new",
+                            f"hunk {domain_name}/{kind_name}/{entry_id} new must be a JSON object",
+                        )
+                    if "old" in hunk and "new" in hunk and jcs_equal(hunk["old"], hunk["new"]):
+                        raise ScopeError(
+                            "noop_hunk",
+                            f"hunk {domain_name}/{kind_name}/{entry_id} has identical old and new",
+                        )
                     per_item.add(derive_hunk_class(domain_name, kind_name))
 
-    if cov is not None:
+    if has_cov:
+        cov = diff["coverage_changes"]
         if not isinstance(cov, dict) or not cov:
             raise MalformedRecordError(
                 "invalid_coverage_changes", "coverage_changes must be a non-empty object"
             )
         for domain_name, change in cov.items():
-            if not isinstance(change, dict) or "old" not in change or "new" not in change:
+            if (
+                not isinstance(domain_name, str)
+                or not isinstance(change, dict)
+                or set(change) != {"old", "new"}
+            ):
                 raise MalformedRecordError(
-                    "invalid_coverage_change", f"coverage_changes/{domain_name} missing old/new"
+                    "invalid_coverage_change",
+                    f"coverage_changes/{domain_name!r} must have exact keys old, new",
                 )
-            if change["old"] == change["new"]:
+            old_c, new_c = change["old"], change["new"]
+            cls = derive_coverage_change_class(old_c, new_c)
+            if old_c == new_c:
                 raise ScopeError(
                     "noop_coverage_change",
                     f"coverage_changes/{domain_name} states identical old and new",
                 )
-            per_item.add(derive_coverage_change_class(change["old"], change["new"]))
+            per_item.add(cls)
 
     if not per_item:
-        raise MalformedRecordError("empty_diff", "goal diff has no version_bump, hunks, or coverage_changes")
+        raise MalformedRecordError(
+            "empty_diff", "goal diff has no version_bump, hunks, or coverage_changes"
+        )
 
     overall = "privileged" if "privileged" in per_item else "ordinary"
     return overall, per_item
@@ -1339,43 +1781,11 @@ def check_standing_carve_out(
                 )
 
 
-def verify_diff_matches_goals(
+def _apply_validated_diff_to_baseline(
     baseline_goal: dict[str, Any],
-    proposed_goal: dict[str, Any],
     diff: dict[str, Any],
-    host: str,
-) -> None:
-    """Verify diff host, hashes, and that applying diff to baseline reproduces proposed."""
-    if diff.get("host") != host:
-        raise ScopeError("diff_host_mismatch", "diff host does not match device host")
-    if baseline_goal.get("host") != host:
-        raise ScopeError("baseline_host_mismatch", "baseline goal host does not match device host")
-    if proposed_goal.get("host") != host:
-        raise ScopeError("proposed_host_mismatch", "proposed goal host does not match device host")
-
-    actual_base_hash = canonical_sha256(baseline_goal)
-    actual_prop_hash = canonical_sha256(proposed_goal)
-    if diff.get("baseline_sha256") != actual_base_hash:
-        raise ReplayError("diff_baseline_hash_mismatch", "diff baseline_sha256 != baseline hash")
-    if diff.get("proposed_sha256") != actual_prop_hash:
-        raise ScopeError("diff_proposed_hash_mismatch", "diff proposed_sha256 != proposed hash")
-
-    if "version_bump" in diff:
-        bump = diff["version_bump"]
-        if baseline_goal.get("schema_version") != bump["old"]:
-            raise ScopeError(
-                "version_bump_old_mismatch",
-                "baseline schema_version does not match version_bump.old",
-            )
-        if proposed_goal.get("schema_version") != bump["new"]:
-            raise ScopeError(
-                "version_bump_new_mismatch",
-                "proposed schema_version does not match version_bump.new",
-            )
-        return
-
-    # Non-migration diff: apply hunks & coverage changes to baseline and verify
-    # exact canonical match with proposed_goal (stops lying `old` downgrade!).
+) -> dict[str, Any]:
+    """Apply a pre-validated non-migration diff to `baseline_goal` and return resulting goal."""
     result = copy.deepcopy(baseline_goal)
     baseline_domains = baseline_goal.get("domains") or {}
     domains = result.setdefault("domains", {})
@@ -1386,10 +1796,8 @@ def verify_diff_matches_goals(
         for kind_name, ids in kinds.items():
             bucket = entries.setdefault(kind_name, {})
             for entry_id, hunk in ids.items():
-                if "old" in hunk and "new" in hunk and hunk["old"] == hunk["new"]:
-                    raise ScopeError("noop_hunk", f"hunk {domain_name}/{kind_name}/{entry_id} is a no-op")
                 if "old" in hunk:
-                    if bucket.get(entry_id) != hunk["old"]:
+                    if entry_id not in bucket or not jcs_equal(bucket[entry_id], hunk["old"]):
                         raise ScopeError(
                             "hunk_old_mismatch",
                             f"hunk {domain_name}/{kind_name}/{entry_id} old != baseline entry",
@@ -1427,7 +1835,61 @@ def verify_diff_matches_goals(
             dom_obj = domains.setdefault(domain_name, {})
             dom_obj["coverage"] = change["new"]
 
-    if canonical_sha256(result) != actual_prop_hash:
+    # Post-apply domain invariants (matching schema_lint.py:2527-2534):
+    for domain_name, dom_obj in domains.items():
+        cov = dom_obj.get("coverage")
+        if not isinstance(cov, str) or cov not in GOAL_COVERAGE_VALUES:
+            raise ScopeError(
+                "domain_missing_coverage",
+                f"domain {domain_name!r} lacks valid coverage after applying diff",
+            )
+        if cov == "deliberately-unmanaged" and dom_obj.get("entries"):
+            raise ScopeError(
+                "entries_in_unmanaged_domain",
+                f"deliberately-unmanaged domain {domain_name!r} retains entries after applying diff",
+            )
+
+    return result
+
+
+def verify_diff_matches_goals(
+    baseline_goal: dict[str, Any],
+    proposed_goal: dict[str, Any],
+    diff: dict[str, Any],
+    host: str,
+) -> None:
+    """Validate `diff` structurally, verify host/hashes, and prove exact application to baseline."""
+    # Always run structural validation BEFORE traversing diff!
+    analyze_diff_classes(diff)
+    validate_goal_file_basics(baseline_goal, host)
+    validate_goal_file_basics(proposed_goal, host)
+
+    if diff["host"] != host:
+        raise ScopeError("diff_host_mismatch", "diff host does not match device host")
+
+    actual_base_hash = canonical_sha256(baseline_goal)
+    actual_prop_hash = canonical_sha256(proposed_goal)
+    if not hmac.compare_digest(diff["baseline_sha256"], actual_base_hash):
+        raise ReplayError("diff_baseline_hash_mismatch", "diff baseline_sha256 != baseline hash")
+    if not hmac.compare_digest(diff["proposed_sha256"], actual_prop_hash):
+        raise ScopeError("diff_proposed_hash_mismatch", "diff proposed_sha256 != proposed hash")
+
+    if "version_bump" in diff:
+        bump = diff["version_bump"]
+        if baseline_goal["schema_version"] != bump["old"]:
+            raise ScopeError(
+                "version_bump_old_mismatch",
+                "baseline schema_version does not match version_bump.old",
+            )
+        if proposed_goal["schema_version"] != bump["new"]:
+            raise ScopeError(
+                "version_bump_new_mismatch",
+                "proposed schema_version does not match version_bump.new",
+            )
+        return
+
+    applied = _apply_validated_diff_to_baseline(baseline_goal, diff)
+    if not hmac.compare_digest(canonical_sha256(applied), actual_prop_hash):
         raise ScopeError(
             "diff_apply_mismatch",
             "applying diff to baseline does not reproduce proposed goal file",
@@ -1439,13 +1901,18 @@ def check_standing_migration_invariants(
     proposed_goal: dict[str, Any],
     *,
     migrate_fn: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
-    device_trust_comparable: bool = True,
+    device_trust_comparable: bool = False,
 ) -> None:
-    """Enforce Item 15 on `baseline`-class standing-application migrations."""
-    if not device_trust_comparable:
+    """Enforce Item 15 on `baseline`-class standing-application migrations.
+
+    Fail-closed default (Codex #10): requires BOTH explicit
+    `device_trust_comparable=True` AND a recognized `migrate_fn` proving
+    type-preserving JCS equality of `device-trust` under one schema.
+    """
+    if not device_trust_comparable or migrate_fn is None:
         raise ScopeError(
             "migration_device_trust_incomparable",
-            "cannot compare device-trust of baseline and proposal under one schema (Item 15)",
+            "baseline standing migration requires explicit migrate_fn and device_trust_comparable=True (Item 15)",
         )
 
     base_dt = (baseline_goal.get("domains") or {}).get(TRUST_DOMAIN)
@@ -1457,42 +1924,30 @@ def check_standing_migration_invariants(
         )
 
     target_version = proposed_goal.get("schema_version")
-    if migrate_fn is not None:
-        try:
-            migrated = migrate_fn(copy.deepcopy(baseline_goal), target_version)
-        except Exception as exc:
-            raise ScopeError(
-                "migration_failed",
-                f"migrate() failed; cannot verify device-trust preservation: {exc}",
-            ) from exc
-        if not isinstance(migrated, dict):
-            raise ScopeError("migration_failed", "migrate() did not return a goal-file object")
-        mig_dt = (migrated.get("domains") or {}).get(TRUST_DOMAIN)
-        # Item 15: a migration whose migrate() changes ANY device-trust entry
-        # (a role default included) is never by standing application.
-        if mig_dt != base_dt or mig_dt != prop_dt:
-            raise ScopeError(
-                "migration_mutated_device_trust",
-                "migration alters device-trust content (including defaults); requires per-change owner record",
-            )
-        if canonical_sha256(migrated) != canonical_sha256(proposed_goal):
-            raise ScopeError(
-                "migration_content_mismatch",
-                "proposed goal file differs from migrated baseline",
-            )
-    else:
-        if base_dt != prop_dt:
-            raise ScopeError(
-                "migration_mutated_device_trust",
-                "proposed device-trust differs from baseline device-trust during migration",
-            )
-        base_body = {k: v for k, v in baseline_goal.items() if k != "schema_version"}
-        prop_body = {k: v for k, v in proposed_goal.items() if k != "schema_version"}
-        if base_body != prop_body:
-            raise ScopeError(
-                "migration_not_version_only",
-                "migration alters fields beyond schema_version; requires per-change owner record",
-            )
+    try:
+        migrated = migrate_fn(copy.deepcopy(baseline_goal), target_version)
+    except Exception as exc:
+        raise ScopeError(
+            "migration_failed",
+            f"migrate() failed; cannot verify device-trust preservation: {exc}",
+        ) from exc
+    if not isinstance(migrated, dict):
+        raise ScopeError("migration_failed", "migrate() did not return a goal-file object")
+    mig_dt = (migrated.get("domains") or {}).get(TRUST_DOMAIN)
+    if not isinstance(mig_dt, dict):
+        raise ScopeError("migration_failed", "migrated goal file lacks device-trust")
+
+    # Type-preserving JCS equality prevents Python True==1 / False==0 smuggling (Adversary C2)!
+    if not jcs_equal(mig_dt, base_dt) or not jcs_equal(mig_dt, prop_dt):
+        raise ScopeError(
+            "migration_mutated_device_trust",
+            "migration alters device-trust content (including defaults/types); requires per-change owner record",
+        )
+    if not hmac.compare_digest(canonical_sha256(migrated), canonical_sha256(proposed_goal)):
+        raise ScopeError(
+            "migration_content_mismatch",
+            "proposed goal file differs from migrated baseline",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1550,11 +2005,10 @@ def generate_device_nonce(num_bytes: int = 24) -> str:
     """Generate a cryptographic random device nonce with >= 128 bits of entropy.
 
     Uses `os.urandom` exclusively (never a counter, never derived from replay
-    store state). Default 24 bytes = 192 bits -> 32 printable ASCII chars
-    (unpadded base64url, matching `^[!-~]{22,128}\\Z`).
+    store state). Default 24 bytes = 192 bits -> 32 printable ASCII chars.
     """
-    if num_bytes < 16:
-        raise ValueError("device nonce requires at least 16 bytes (128 bits) of entropy")
+    if not _is_exact_int(num_bytes) or num_bytes < 16:
+        raise ValueError("device nonce requires an exact integer >= 16 bytes (128 bits)")
     token = base64.urlsafe_b64encode(os.urandom(num_bytes)).rstrip(b"=").decode("ascii")
     if not NONCE_RE.match(token):
         raise RuntimeError("generated nonce failed schema alphabet check")
@@ -1562,17 +2016,21 @@ def generate_device_nonce(num_bytes: int = 24) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ApprovalEnforcer — complete stateful reference enforcement engine
+# ApprovalEnforcer — complete serialized stateful enforcement engine
 # ---------------------------------------------------------------------------
 
 class ApprovalEnforcer:
-    """Reference enforcement engine for tendcf v9 consent records on one host."""
+    """Reference enforcement engine for tendcf v9 consent records on one host.
+
+    Reads and updates the authoritative applied baseline strictly through the
+    rollback-protected `ReplayStore` under `self.store.locked()` so independent
+    instances sharing one store never diverge or suffer pre-lock TOCTOU races.
+    """
 
     def __init__(
         self,
         host: str,
         store: ReplayStore,
-        baseline_goal: dict[str, Any] | None = None,
         *,
         apply_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
@@ -1580,26 +2038,24 @@ class ApprovalEnforcer:
             raise ValueError(f"invalid host key_id: {host!r}")
         if store.host != host:
             raise ValueError("ReplayStore host does not match ApprovalEnforcer host")
-        if baseline_goal is not None:
-            validate_trust_root_no_host_key(baseline_goal, host)
-            if baseline_goal.get("host") != host:
-                raise ValueError("baseline_goal host does not match ApprovalEnforcer host")
         self.host = host
         self.store = store
-        self.baseline_goal: dict[str, Any] | None = (
-            copy.deepcopy(baseline_goal) if baseline_goal is not None else None
-        )
         self._apply_callback = apply_callback
         # Diagnostic counters (used by tests to assert Option B zero side effects).
         self.prompt_count: int = 0
         self.actuation_count: int = 0
+
+    @property
+    def baseline_goal(self) -> dict[str, Any] | None:
+        """Authoritative applied baseline goal file read from the protected store."""
+        return self.store.snapshot(allow_voided=True)["applied_baseline_goal"]
 
     def _check_utc_clock_monotonic(
         self, state: dict[str, Any], now_dt: datetime.datetime
     ) -> None:
         last_str = state.get("last_seen_utc")
         if last_str is not None:
-            last_dt = parse_utc_timestamp(last_str, field="last_seen_utc")
+            last_dt = _parse_internal_utc_timestamp(last_str, field="last_seen_utc")
             if now_dt < last_dt:
                 raise ClockRollbackError(
                     "utc_clock_rollback",
@@ -1616,11 +2072,46 @@ class ApprovalEnforcer:
         expiry_dt = parse_utc_timestamp(not_after_str, field="not_after")
         return now_dt > expiry_dt
 
+    def _record_observed_expiry_unlocked(
+        self, state: dict[str, Any], now_dt: datetime.datetime
+    ) -> None:
+        """Durably advance `last_seen_utc` on expiry refusal so expiry cannot reverse (Codex #7)."""
+        self._advance_utc_clock(state, now_dt)
+        self.store.commit_unlocked(state)
+
     def _required_enrollment_ceremony_rank(self, grant_class: str, developer_mode: bool) -> int:
         base = CEREMONY_RANK[grant_class]
         if developer_mode:
             return max(base, CEREMONY_RANK["privileged"])
         return base
+
+    def _actuate_and_publish_baseline_unlocked(
+        self,
+        state: dict[str, Any],
+        proposed_goal: dict[str, Any],
+        proposed_sha256: str,
+        *,
+        before_apply_hook: Callable[[], None] | None = None,
+    ) -> None:
+        """Actuate `proposed_goal` and publish baseline ONLY after callback confirmation (Codex #8).
+
+        Caller has ALREADY durably committed the pre-actuation replay reservation
+        (consumed `application_seq` / `approval_seq` / nonce) before invoking
+        this method. If `before_apply_hook` or `_apply_callback` raises, the
+        replay mark stays consumed (fail-closed) while the authoritative applied
+        baseline remains the prior baseline.
+        """
+        if before_apply_hook is not None:
+            before_apply_hook()
+        if self._apply_callback is not None:
+            self._apply_callback(copy.deepcopy(proposed_goal))
+
+        # Confirmed actuation: publish new authoritative baseline & prune any stale hold.
+        state["applied_baseline_goal"] = copy.deepcopy(proposed_goal)
+        state["applied_baseline_sha256"] = proposed_sha256
+        state["pending_holds"].pop(proposed_sha256, None)
+        self.store.commit_unlocked(state)
+        self.actuation_count += 1
 
     # ------------------------------------------------------------------
     # Ceremony nonce issuance (Items 2, 12, 22, PR #75 R4 #3 & #5)
@@ -1652,6 +2143,27 @@ class ApprovalEnforcer:
             )
         if not _is_exact_bool(developer_mode):
             raise MalformedRecordError("invalid_developer_mode", "developer_mode must be bool")
+        if mode == "hold-window":
+            if not _is_exact_int(hold_seconds) or hold_seconds < 1 or hold_seconds > MAX_SAFE_INT:
+                raise MalformedRecordError(
+                    "invalid_hold_seconds",
+                    "hold-window requires exact integer hold_seconds in 1..2^53-1",
+                )
+        elif hold_seconds is not None:
+            raise MalformedRecordError(
+                "unexpected_hold_seconds", "hold_seconds is only allowed for hold-window"
+            )
+        if (
+            not isinstance(covered_signers, list)
+            or not covered_signers
+            or not all(isinstance(k, str) and KEY_ID_RE.match(k) for k in covered_signers)
+            or len(set(covered_signers)) != len(covered_signers)
+            or covered_signers != sorted(covered_signers)
+        ):
+            raise MalformedRecordError(
+                "invalid_covered_signers",
+                "covered_signers must be a non-empty ascending unique list of key_ids",
+            )
         if not_after is not None:
             parse_utc_timestamp(not_after, field="not_after")
 
@@ -1734,7 +2246,7 @@ class ApprovalEnforcer:
             return False
 
     # ------------------------------------------------------------------
-    # Standing enrollment & terminal revocation (Items 1, 2, 6, 7, 8, 9, 10, 11, 20, 22)
+    # Standing enrollment & terminal revocation (Items 1, 2, 6, 7, 8-11, 20, 22)
     # ------------------------------------------------------------------
 
     def process_enrollment(
@@ -1743,10 +2255,12 @@ class ApprovalEnforcer:
         *,
         now_utc: datetime.datetime | str,
         before_replace_hook: Callable[[], None] | None = None,
+        before_anchor_hook: Callable[[], None] | None = None,
         after_commit_hook: Callable[[], None] | None = None,
     ) -> EnrollmentReceipt:
         """Process a `standing-enrollment` (active enrollment, Option B redelivery, or revocation)."""
         now_dt = _coerce_utc(now_utc)
+        # Stateless checks outside lock: strict parse, schema shape, host, host!=signer, signature.
         doc = parse_strict_json(raw_record)
         record = validate_approval_record_shape(doc)
         if record["record_kind"] != "standing-enrollment":
@@ -1754,44 +2268,39 @@ class ApprovalEnforcer:
                 "wrong_record_kind",
                 f"expected standing-enrollment, got {record['record_kind']!r}",
             )
-
-        # Item 24: per-target host binding.
         if record["host"] != self.host:
             raise ScopeError("wrong_host", f"record host {record['host']!r} != {self.host!r}")
-
-        # Item 10: host key never signs.
         if record["signer"] == self.host:
             raise TrustRootError("host_key_as_signer", "device host key may never sign records")
-
-        # Item 11: sig_alg/prefix binding & strict canonical RFC 8032 Ed25519 verification.
         verify_record_signature(record)
-
-        # Item 8: baseline owner role verification (never proposed).
-        if self.baseline_goal is None:
-            raise TrustRootError(
-                "no_applied_baseline",
-                "standing-enrollment requires an applied baseline trust root",
-            )
-        roles = extract_baseline_roles(self.baseline_goal, self.host)
-        if roles.get(record["signer"]) != "owner":
-            raise TrustRootError(
-                "signer_not_owner",
-                f"standing-enrollment requires baseline owner role; got {roles.get(record['signer'])!r}",
-            )
 
         grant_id = record["grant_id"]
         generation = record["generation"]
         grant_state = record["grant_state"]
 
-        # Serialized decision under lock against revocations, redeliveries, and store integrity.
+        # ALL stateful checks (store integrity, clock, baseline roles, revocations,
+        # Option B equality, nonce consumption) run strictly inside self.store.locked()!
         with self.store.locked():
             state = self.store.load_verified_unlocked()
             self._check_utc_clock_monotonic(state, now_dt)
 
+            baseline_goal = state["applied_baseline_goal"]
+            if baseline_goal is None:
+                raise TrustRootError(
+                    "no_applied_baseline",
+                    "standing-enrollment requires an applied baseline trust root",
+                )
+            roles = extract_baseline_roles(baseline_goal, self.host)
+            if roles.get(record["signer"]) != "owner":
+                raise TrustRootError(
+                    "signer_not_owner",
+                    f"standing-enrollment requires baseline owner role; got {roles.get(record['signer'])!r}",
+                )
+
             if grant_state == "revoked":
-                # Item 7 + PR #75 R4 #1:
-                # Honoured at ANY generation, wins equivocation, accepted for unseen grant_id,
-                # owner signature only, nonce-less, ends any pending hold, terminal forever.
+                # Item 7 + PR #75 R4 #1: terminal revocation at ANY generation,
+                # wins equivocation, accepted for unseen grant_id, owner sig only,
+                # nonce-less, ends any pending hold.
                 existing = state["grants"].get(grant_id)
                 prev_mark = existing["application_seq_mark"] if existing else 0
                 prev_gen = existing["generation"] if existing else 0
@@ -1804,19 +2313,16 @@ class ApprovalEnforcer:
                     "scope": None,
                     "application_seq_mark": prev_mark,
                 }
-                # Cancel any pending holds belonging to this grant immediately.
-                cancelled = [
-                    prop_hash
-                    for prop_hash, hold in state["pending_holds"].items()
-                    if hold.get("grant_id") == grant_id
-                ]
-                for prop_hash in cancelled:
+                for prop_hash in [
+                    h for h, hold in state["pending_holds"].items() if hold.get("grant_id") == grant_id
+                ]:
                     del state["pending_holds"][prop_hash]
 
                 self._advance_utc_clock(state, now_dt)
                 self.store.commit_unlocked(
                     state,
                     before_replace_hook=before_replace_hook,
+                    before_anchor_hook=before_anchor_hook,
                     after_commit_hook=after_commit_hook,
                 )
                 return EnrollmentReceipt(
@@ -1827,9 +2333,9 @@ class ApprovalEnforcer:
                     grant_state="revoked",
                 )
 
-            # Active enrollment checks.
-            # Refuse expired enrollment (Item 17).
+            # Active enrollment: check expiry (durably advance last_seen_utc so expiry cannot reverse).
             if self._is_expired(record.get("not_after"), now_dt):
+                self._record_observed_expiry_unlocked(state, now_dt)
                 raise ScopeError("enrollment_expired", "active enrollment is already expired")
 
             existing = state["grants"].get(grant_id)
@@ -1846,9 +2352,8 @@ class ApprovalEnforcer:
             incoming_payload_bytes = signing_payload_bytes(record)
 
             # Item 6 (Astra Option B, operator ruling 2026-11-26):
-            # Identical redelivery at generation == stored returns identical receipt
-            # with ZERO writes, ZERO nonce/counter mutation, ZERO prompts, ZERO actuation,
-            # and ZERO changes to pending holds or application_seq.
+            # Verified identical redelivery at generation == stored returns identical
+            # receipt with ZERO writes, ZERO mutations, ZERO prompts, ZERO actuation.
             if existing is not None and generation == existing["generation"]:
                 if existing.get("grant_state") != "active":
                     raise ReplayError(
@@ -1857,7 +2362,6 @@ class ApprovalEnforcer:
                     )
                 stored_b64 = existing.get("active_payload_jcs_b64")
                 if not isinstance(stored_b64, str) or not stored_b64:
-                    # Missing equality evidence MUST fail closed (Astra Option B §2).
                     raise ReplayError(
                         "missing_stored_payload",
                         "stored canonical enrollment bytes missing; failing closed on equal generation",
@@ -1871,7 +2375,6 @@ class ApprovalEnforcer:
                     ) from exc
 
                 if hmac.compare_digest(incoming_payload_bytes, stored_payload_bytes):
-                    # Exact verified match! Perform ZERO writes and return identical receipt shape.
                     return EnrollmentReceipt(
                         status="accepted",
                         host=self.host,
@@ -1884,14 +2387,14 @@ class ApprovalEnforcer:
                     f"conflicting active enrollment bytes at stored generation {generation}",
                 )
 
-            # Item 20: Stale generation (< stored) is refused.
+            # Item 20: stale generation (< stored) refused.
             if existing is not None and generation < existing["generation"]:
                 raise ReplayError(
                     "stale_generation",
                     f"active enrollment generation {generation} <= stored {existing['generation']}",
                 )
 
-            # Validate covered_signers trust rules (Items 8, 9, 10).
+            # Validate covered_signers trust rules against current baseline inside lock.
             dev_mode = record["developer_mode"]
             for cs in record["covered_signers"]:
                 if cs == self.host:
@@ -1911,8 +2414,6 @@ class ApprovalEnforcer:
                     )
 
             # Item 2 & Item 22 (R3, R6, PR #75 R4 #3):
-            # New or higher-generation active enrollment requires an outstanding,
-            # single-use ceremony nonce bound to the FULL shown scope.
             nonce = record["nonce"]
             matched_nonce_key: str | None = None
             for k in state["outstanding_nonces"]:
@@ -1932,7 +2433,7 @@ class ApprovalEnforcer:
                     "nonce was not issued for a standing-enrollment on this host",
                 )
 
-            # Verify full shown scope matches record verbatim.
+            # Compare full shown scope via type-preserving JCS equality (prevents True == 1).
             expected_scope = {
                 "grant_id": grant_id,
                 "mode": record["mode"],
@@ -1943,13 +2444,12 @@ class ApprovalEnforcer:
                 "not_after": record.get("not_after"),
             }
             for field_name, field_val in expected_scope.items():
-                if bound.get(field_name) != field_val:
+                if not jcs_equal(bound.get(field_name), field_val):
                     raise NonceError(
                         "nonce_scope_mismatch",
                         f"enrollment {field_name!r} does not match ceremony-shown scope",
                     )
 
-            # Verify ceremony level satisfies class and R6 developer_mode >= privileged.
             ceremony_level = bound.get("ceremony_level")
             if ceremony_level not in CEREMONY_RANK:
                 raise NonceError("invalid_ceremony_level", "missing ceremony level on nonce")
@@ -1961,9 +2461,15 @@ class ApprovalEnforcer:
                     f"developer_mode={dev_mode}",
                 )
 
-            # Atomic install: consume nonce once, preserve application_seq_mark across generations.
+            # Atomic install: consume nonce once, preserve application_seq_mark across generations,
+            # and prune stranded old-generation pending holds belonging to this grant_id (Neon F9).
             del state["outstanding_nonces"][matched_nonce_key]
             prev_mark = existing["application_seq_mark"] if existing else 0
+            for prop_hash in [
+                h for h, hold in state["pending_holds"].items() if hold.get("grant_id") == grant_id
+            ]:
+                del state["pending_holds"][prop_hash]
+
             state["grants"][grant_id] = {
                 "generation": generation,
                 "grant_state": "active",
@@ -1985,6 +2491,7 @@ class ApprovalEnforcer:
             self.store.commit_unlocked(
                 state,
                 before_replace_hook=before_replace_hook,
+                before_anchor_hook=before_anchor_hook,
                 after_commit_hook=after_commit_hook,
             )
             self.store.nonce_consume_count += 1
@@ -2010,12 +2517,7 @@ class ApprovalEnforcer:
         now_dt: datetime.datetime,
         roles: dict[str, str],
     ) -> tuple[str, int | None]:
-        """Evaluate every active, unexpired grant covering `(signer, derived_class)`.
-
-        Returns `(effective_mode, effective_hold_seconds)` where most restrictive
-        wins: `standing-refusal` > `wait-for-user` > `hold-window` (longest
-        `hold_seconds`) > `standing-approval`.
-        """
+        """Evaluate every active, unexpired grant covering `(signer, derived_class)`."""
         winning_mode: str | None = None
         winning_rank = 0
         longest_hold: int | None = None
@@ -2033,7 +2535,6 @@ class ApprovalEnforcer:
             mode = scope.get("mode")
             if mode not in MODE_RESTRICTIVENESS:
                 continue
-            # Non-developer apply modes require signer to still hold baseline covered-signer role.
             if not scope.get("developer_mode") and mode in ("standing-approval", "hold-window"):
                 if roles.get(signer) != "covered-signer":
                     continue
@@ -2052,7 +2553,7 @@ class ApprovalEnforcer:
         return winning_mode, longest_hold
 
     # ------------------------------------------------------------------
-    # Standing application intake & hold-window completion (Items 3-5, 8-26)
+    # Standing application intake, hold display confirm & hold completion
     # ------------------------------------------------------------------
 
     def process_standing_application(
@@ -2060,24 +2561,41 @@ class ApprovalEnforcer:
         raw_record: bytes | str,
         *,
         proposed_goal: dict[str, Any],
-        diff: dict[str, Any],
+        diff: dict[str, Any] | None = None,
         now_utc: datetime.datetime | str,
-        now_mono: float,
+        now_mono: float | None = None,
+        boot_epoch: str | None = None,
+        display_confirmed: bool = False,
         is_readoption: bool = False,
         touches_replay_store: bool = False,
         migrate_fn: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
-        device_trust_comparable: bool = True,
+        device_trust_comparable: bool = False,
         before_replace_hook: Callable[[], None] | None = None,
+        before_anchor_hook: Callable[[], None] | None = None,
         before_apply_hook: Callable[[], None] | None = None,
     ) -> ApplicationResult:
         """Validate and execute/hold/park a `standing-application`.
 
-        Item 26 + PR #75 R4 #2: EVERY check MUST pass BEFORE `application_seq`
-        is persisted, so a refused application never burns or raises the mark.
-        Item 5: `application_seq` is durably persisted BEFORE actuation (or
-        before starting the hold window).
+        Item 26 + PR #75 R4 #2: EVERY check passes BEFORE `application_seq` is
+        persisted. All baseline/role/diff/store checks run strictly inside
+        `self.store.locked()` (zero TOCTOU).
         """
         now_dt = _coerce_utc(now_utc)
+        if now_mono is not None:
+            validated_mono: float | None = _coerce_mono(now_mono)
+        else:
+            validated_mono = None
+        if display_confirmed:
+            if validated_mono is None:
+                raise ClockRollbackError(
+                    "missing_monotonic_time",
+                    "display_confirmed=True requires finite non-negative now_mono",
+                )
+            validated_epoch: str | None = _validate_boot_epoch(boot_epoch)
+        else:
+            validated_epoch = _validate_boot_epoch(boot_epoch) if boot_epoch is not None else None
+
+        # Pure stateless checks outside lock.
         doc = parse_strict_json(raw_record)
         record = validate_approval_record_shape(doc)
         if record["record_kind"] != "standing-application":
@@ -2085,38 +2603,19 @@ class ApprovalEnforcer:
                 "wrong_record_kind",
                 f"expected standing-application, got {record['record_kind']!r}",
             )
-
-        # Item 24: per-target host binding.
         if record["host"] != self.host:
             raise ScopeError("wrong_host", f"record host {record['host']!r} != {self.host!r}")
-
-        # Item 10: host key never signs and never appears in proposed trust root.
         if record["signer"] == self.host:
             raise TrustRootError("host_key_as_signer", "device host key may never sign records")
-        validate_trust_root_no_host_key(proposed_goal, self.host)
-
-        # Item 11: sig_alg/prefix binding & strict canonical RFC 8032 Ed25519 verification.
+        validate_goal_file_basics(proposed_goal, self.host)
         verify_record_signature(record)
 
-        # Item 4 & Item 15: first adoption and re-adoption are NEVER by standing application.
-        if self.baseline_goal is None:
-            raise ReplayError(
-                "first_adoption_disallowed",
-                "first adoption is never permitted via standing-application (Item 4)",
-            )
         if is_readoption:
             raise ScopeError(
                 "readoption_disallowed",
                 "re-adoption is never permitted via standing-application (Item 15)",
             )
 
-        # Item 4 & Item 25: exact baseline_sha256 and proposed_sha256 binding.
-        current_baseline_hash = canonical_sha256(self.baseline_goal)
-        if not hmac.compare_digest(record["baseline_sha256"], current_baseline_hash):
-            raise ReplayError(
-                "baseline_sha256_mismatch",
-                "application baseline_sha256 does not match currently applied baseline (Item 4)",
-            )
         actual_proposed_hash = canonical_sha256(proposed_goal)
         if not hmac.compare_digest(record["proposed_sha256"], actual_proposed_hash):
             raise ScopeError(
@@ -2124,77 +2623,95 @@ class ApprovalEnforcer:
                 "application proposed_sha256 does not match proposed goal file (Item 25)",
             )
 
-        # Verify diff integrity against baseline and proposed goal files.
-        verify_diff_matches_goals(self.baseline_goal, proposed_goal, diff, self.host)
-
-        # Item 13 (R1/R7): default-deny carve-out over device-trust and replay store.
-        check_standing_carve_out(diff, touches_replay_store=touches_replay_store)
-
-        # Item 14 + PR #75 R4 #4 + Item 15 + Item 23:
-        # Derive per-item classes; standing application refuses mixed-class diffs!
-        overall_class, per_item_classes = analyze_diff_classes(diff)
-        if len(per_item_classes) != 1:
-            raise ScopeError(
-                "mixed_class_application",
-                f"standing-application refuses mixed-class diff: {sorted(per_item_classes)}",
-            )
-        derived_class = next(iter(per_item_classes))
-        assert derived_class == overall_class
-
-        if record["ceremony_class"] != derived_class:
-            raise ScopeError(
-                "ceremony_class_mismatch",
-                f"asserted ceremony_class {record['ceremony_class']!r} != derived {derived_class!r}",
-            )
-
-        # Item 15: baseline migration checks.
-        if "version_bump" in diff:
-            check_standing_migration_invariants(
-                self.baseline_goal,
-                proposed_goal,
-                migrate_fn=migrate_fn,
-                device_trust_comparable=device_trust_comparable,
-            )
-
-        # Item 8: baseline trust root roles (NEVER proposed!).
-        roles = extract_baseline_roles(self.baseline_goal, self.host)
         signer = record["signer"]
-        if roles.get(signer) == "owner":
-            raise TrustRootError(
-                "owner_cannot_sign_application",
-                "an owner key may never sign a standing-application (even in developer mode)",
-            )
-
         grant_id = record["grant_id"]
         generation = record["generation"]
         app_seq = record["application_seq"]
 
+        # ALL stateful checks run atomically inside self.store.locked().
         with self.store.locked():
             state = self.store.load_verified_unlocked()
             self._check_utc_clock_monotonic(state, now_dt)
 
-            # Item 19: Persisted DC-2 reject of proposed_sha256 wins over every grant!
+            baseline_goal = state["applied_baseline_goal"]
+            if baseline_goal is None:
+                raise ReplayError(
+                    "first_adoption_disallowed",
+                    "first adoption is never permitted via standing-application (Item 4)",
+                )
+            current_baseline_hash = state["applied_baseline_sha256"]
+            assert current_baseline_hash is not None
+            if not hmac.compare_digest(record["baseline_sha256"], current_baseline_hash):
+                raise ReplayError(
+                    "baseline_sha256_mismatch",
+                    "application baseline_sha256 does not match currently applied baseline (Item 4)",
+                )
+
+            # Validate caller-supplied preview diff (if any) BEFORE traversal, and verify
+            # exact JCS match against the device-computed authoritative diff!
+            if diff is not None:
+                analyze_diff_classes(diff)
+                verify_diff_matches_goals(baseline_goal, proposed_goal, diff, self.host)
+            auth_diff = compute_authoritative_diff(baseline_goal, proposed_goal, self.host)
+            if diff is not None and not jcs_equal(diff, auth_diff):
+                raise ScopeError(
+                    "diff_authoritative_mismatch",
+                    "caller diff does not match device-computed authoritative diff",
+                )
+
+            # Item 13 (R1/R7): default-deny carve-out over device-trust and replay store.
+            check_standing_carve_out(auth_diff, touches_replay_store=touches_replay_store)
+
+            # Item 14 + PR #75 R4 #4 + Item 15 + Item 23:
+            overall_class, per_item_classes = analyze_diff_classes(auth_diff)
+            if len(per_item_classes) != 1:
+                raise ScopeError(
+                    "mixed_class_application",
+                    f"standing-application refuses mixed-class diff: {sorted(per_item_classes)}",
+                )
+            derived_class = next(iter(per_item_classes))
+            assert derived_class == overall_class
+            if record["ceremony_class"] != derived_class:
+                raise ScopeError(
+                    "ceremony_class_mismatch",
+                    f"asserted ceremony_class {record['ceremony_class']!r} != derived {derived_class!r}",
+                )
+
+            if "version_bump" in auth_diff:
+                check_standing_migration_invariants(
+                    baseline_goal,
+                    proposed_goal,
+                    migrate_fn=migrate_fn,
+                    device_trust_comparable=device_trust_comparable,
+                )
+
+            # Item 8: baseline trust root roles inside lock.
+            roles = extract_baseline_roles(baseline_goal, self.host)
+            if roles.get(signer) == "owner":
+                raise TrustRootError(
+                    "owner_cannot_sign_application",
+                    "an owner key may never sign a standing-application (even in developer mode)",
+                )
+
+            # Item 19: persisted DC-2 reject wins over every grant!
             if actual_proposed_hash in state["persisted_rejects"]:
                 raise ReplayError(
                     "persisted_reject_active",
                     "proposed_sha256 has a persisted DC-2 owner reject (wins over all grants)",
                 )
 
-            # Lookup named grant.
             grant = state["grants"].get(grant_id)
             if grant is None:
                 raise ReplayError("unknown_grant", f"grant_id {grant_id!r} is not enrolled")
             if grant.get("tombstoned") is True or grant.get("grant_state") != "active":
                 raise ReplayError("grant_revoked", f"grant_id {grant_id!r} is revoked/inactive")
 
-            # Item 20: generation must equal stored active generation.
             if generation != grant["generation"]:
                 raise ReplayError(
                     "generation_mismatch",
                     f"application generation {generation} != stored active {grant['generation']}",
                 )
 
-            # Item 3 (R10): enrollment_nonce must match stored active enrollment's nonce.
             stored_enonce = grant.get("enrollment_nonce")
             if not isinstance(stored_enonce, str) or not hmac.compare_digest(
                 record["enrollment_nonce"].encode("utf-8"), stored_enonce.encode("utf-8")
@@ -2205,32 +2722,29 @@ class ApprovalEnforcer:
                 )
 
             scope = grant["scope"]
-            # Item 17: not_after expiry check at intake.
+            # Item 17 + Codex #7: record observed expiry durably so backward UTC clock cannot reverse it!
             if self._is_expired(scope.get("not_after"), now_dt):
+                self._record_observed_expiry_unlocked(state, now_dt)
                 raise ScopeError("grant_expired", f"grant_id {grant_id!r} has expired")
 
-            # Item 23: grant class must equal derived class.
             if scope["class"] != derived_class:
                 raise ScopeError(
                     "grant_class_mismatch",
                     f"grant class {scope['class']!r} != derived class {derived_class!r}",
                 )
 
-            # Item 21: signer must be a member of stored grant's covered_signers.
             if signer not in scope["covered_signers"]:
                 raise ScopeError(
                     "signer_not_covered",
                     f"signer {signer!r} is not in grant {grant_id!r}'s covered_signers",
                 )
 
-            # Item 8 & Item 9: outside developer_mode, signer must be baseline covered-signer.
             if not scope["developer_mode"] and roles.get(signer) != "covered-signer":
                 raise TrustRootError(
                     "signer_not_covered_signer_role",
                     f"signer {signer!r} is not a baseline covered-signer (non-developer grant)",
                 )
 
-            # Item 19: evaluate covering precedence across ALL active unexpired grants BEFORE mark!
             effective_mode, effective_hold_seconds = self._resolve_covering_precedence(
                 state,
                 signer=signer,
@@ -2245,7 +2759,14 @@ class ApprovalEnforcer:
                     "a covering active standing-refusal grant refuses this change",
                 )
 
-            # Item 5: application_seq must exceed stored mark (checked AFTER every other check, Item 26!).
+            # Adversary M2: refuse overwriting an existing pending hold BEFORE burning mark!
+            if effective_mode == "hold-window" and actual_proposed_hash in state["pending_holds"]:
+                raise ReplayError(
+                    "duplicate_pending_hold",
+                    "a pending hold already exists for this proposed_sha256",
+                )
+
+            # Item 5 & Item 26: check application_seq AFTER every other check!
             stored_mark = grant["application_seq_mark"]
             if app_seq <= stored_mark:
                 raise ReplayError(
@@ -2254,7 +2775,6 @@ class ApprovalEnforcer:
                 )
 
             if effective_mode == "wait-for-user":
-                # Parked for owner per-change answer; never applied by standing grant.
                 return ApplicationResult(
                     decision="parked",
                     host=self.host,
@@ -2281,12 +2801,19 @@ class ApprovalEnforcer:
                     "ceremony_class": derived_class,
                     "baseline_sha256": current_baseline_hash,
                     "proposed_sha256": actual_proposed_hash,
-                    "first_shown_mono": float(now_mono),
+                    "displayed": bool(display_confirmed),
+                    "first_shown_mono": validated_mono if display_confirmed else None,
+                    "boot_epoch": validated_epoch if display_confirmed else None,
                     "hold_seconds": effective_hold_seconds,
                     "application_seq": app_seq,
                 }
-                self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
-                self.prompt_count += 1
+                self.store.commit_unlocked(
+                    state,
+                    before_replace_hook=before_replace_hook,
+                    before_anchor_hook=before_anchor_hook,
+                )
+                if display_confirmed:
+                    self.prompt_count += 1
                 return ApplicationResult(
                     decision="held",
                     host=self.host,
@@ -2300,11 +2827,19 @@ class ApprovalEnforcer:
                 )
 
             # effective_mode == "standing-approval":
-            # Persist mark durably BEFORE applying change.
-            self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
-            if before_apply_hook is not None:
-                before_apply_hook()
-            self._actuate_goal_file(proposed_goal)
+            # Phase A: durably persist replay reservation BEFORE actuation.
+            self.store.commit_unlocked(
+                state,
+                before_replace_hook=before_replace_hook,
+                before_anchor_hook=before_anchor_hook,
+            )
+            # Phase B & C: invoke callback and publish new authoritative baseline ONLY on success.
+            self._actuate_and_publish_baseline_unlocked(
+                state,
+                proposed_goal,
+                actual_proposed_hash,
+                before_apply_hook=before_apply_hook,
+            )
             return ApplicationResult(
                 decision="applied",
                 host=self.host,
@@ -2315,22 +2850,54 @@ class ApprovalEnforcer:
                 effective_mode="standing-approval",
             )
 
+    def confirm_hold_displayed(
+        self,
+        proposed_sha256: str,
+        *,
+        now_mono: float,
+        boot_epoch: str,
+    ) -> None:
+        """Record trusted UI display confirmation to start a hold window's monotonic timer (Codex #6)."""
+        mono = _coerce_mono(now_mono)
+        epoch = _validate_boot_epoch(boot_epoch)
+        with self.store.locked():
+            state = self.store.load_verified_unlocked()
+            hold = state["pending_holds"].get(proposed_sha256)
+            if hold is None:
+                raise ReplayError(
+                    "no_pending_hold",
+                    f"no pending hold exists for {proposed_sha256!r}",
+                )
+            if hold.get("displayed") is True:
+                raise ReplayError(
+                    "hold_already_displayed",
+                    f"hold for {proposed_sha256!r} already confirmed displayed",
+                )
+            hold["displayed"] = True
+            hold["first_shown_mono"] = mono
+            hold["boot_epoch"] = epoch
+            self.store.commit_unlocked(state)
+            self.prompt_count += 1
+
     def complete_hold_window(
         self,
         proposed_sha256: str,
         *,
         proposed_goal: dict[str, Any],
-        diff: dict[str, Any],
+        diff: dict[str, Any] | None = None,
         now_utc: datetime.datetime | str,
         now_mono: float,
+        boot_epoch: str,
         touches_replay_store: bool = False,
         migrate_fn: Callable[[dict[str, Any], int], dict[str, Any]] | None = None,
-        device_trust_comparable: bool = True,
+        device_trust_comparable: bool = False,
         before_apply_hook: Callable[[], None] | None = None,
     ) -> ApplicationResult:
-        """Complete a pending hold window after monotonic elapsed time, re-evaluating EVERY check."""
+        """Complete a confirmed hold window after monotonic elapsed time, re-evaluating EVERY check."""
         now_dt = _coerce_utc(now_utc)
-        validate_trust_root_no_host_key(proposed_goal, self.host)
+        mono = _coerce_mono(now_mono)
+        epoch = _validate_boot_epoch(boot_epoch)
+        validate_goal_file_basics(proposed_goal, self.host)
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
@@ -2343,48 +2910,79 @@ class ApprovalEnforcer:
                     f"no pending hold exists for {proposed_sha256!r} (cancelled, revoked, or absent)",
                 )
 
-            # Item 18: monotonic clock check (does not advance while off/asleep).
-            first_shown = float(hold["first_shown_mono"])
-            if float(now_mono) < first_shown:
-                raise ClockRollbackError(
-                    "monotonic_clock_rollback",
-                    f"monotonic clock moved backward: {now_mono} < {first_shown}",
-                )
-
-            # Re-evaluate EVERY check at apply time (Item 17 & Item 18):
-            if proposed_sha256 in state["persisted_rejects"]:
-                del state["pending_holds"][proposed_sha256]
+            def prune_dead_hold_and_commit() -> None:
+                state["pending_holds"].pop(proposed_sha256, None)
                 self._advance_utc_clock(state, now_dt)
                 self.store.commit_unlocked(state)
+
+            # Codex #6: display MUST be confirmed before hold can ever complete!
+            if (
+                hold.get("displayed") is not True
+                or hold.get("first_shown_mono") is None
+                or hold.get("boot_epoch") is None
+            ):
+                raise ScopeError(
+                    "hold_display_unconfirmed",
+                    "hold window cannot complete before trusted UI display confirmation",
+                )
+
+            # Codex #6: monotonic clock MUST belong to the same boot/clock epoch!
+            if hold["boot_epoch"] != epoch:
+                raise ClockRollbackError(
+                    "monotonic_boot_epoch_mismatch",
+                    f"boot_epoch changed during hold ({hold['boot_epoch']!r} -> {epoch!r}); re-show required",
+                )
+
+            first_shown = _coerce_mono(hold["first_shown_mono"])
+            if mono < first_shown:
+                raise ClockRollbackError(
+                    "monotonic_clock_rollback",
+                    f"monotonic clock moved backward: {mono} < {first_shown}",
+                )
+
+            # Re-evaluate EVERY check at apply time (Items 17 & 18):
+            if proposed_sha256 in state["persisted_rejects"]:
+                prune_dead_hold_and_commit()
                 raise ReplayError(
                     "persisted_reject_active",
                     "pending hold stopped by persisted DC-2 reject",
                 )
 
-            if self.baseline_goal is None:
+            baseline_goal = state["applied_baseline_goal"]
+            current_baseline_hash = state["applied_baseline_sha256"]
+            if baseline_goal is None or current_baseline_hash is None:
+                prune_dead_hold_and_commit()
                 raise ReplayError("no_applied_baseline", "no applied baseline for hold completion")
-            current_baseline_hash = canonical_sha256(self.baseline_goal)
-            if hold["baseline_sha256"] != current_baseline_hash:
+            if not hmac.compare_digest(hold["baseline_sha256"], current_baseline_hash):
+                prune_dead_hold_and_commit()
                 raise ReplayError(
                     "baseline_changed_during_hold",
                     "applied baseline changed while change was held (Item 4 / Item 18)",
                 )
 
             actual_prop_hash = canonical_sha256(proposed_goal)
-            if actual_prop_hash != proposed_sha256:
+            if not hmac.compare_digest(actual_prop_hash, proposed_sha256):
                 raise ScopeError(
                     "proposed_sha256_mismatch",
                     "proposed goal file does not match held proposed_sha256 (Item 25)",
                 )
 
-            verify_diff_matches_goals(self.baseline_goal, proposed_goal, diff, self.host)
-            check_standing_carve_out(diff, touches_replay_store=touches_replay_store)
-            overall_class, per_item_classes = analyze_diff_classes(diff)
+            if diff is not None:
+                analyze_diff_classes(diff)
+                verify_diff_matches_goals(baseline_goal, proposed_goal, diff, self.host)
+            auth_diff = compute_authoritative_diff(baseline_goal, proposed_goal, self.host)
+            if diff is not None and not jcs_equal(diff, auth_diff):
+                raise ScopeError(
+                    "diff_authoritative_mismatch",
+                    "caller diff does not match device-computed authoritative diff",
+                )
+            check_standing_carve_out(auth_diff, touches_replay_store=touches_replay_store)
+            overall_class, per_item_classes = analyze_diff_classes(auth_diff)
             if len(per_item_classes) != 1 or overall_class != hold["ceremony_class"]:
                 raise ScopeError("class_mismatch_at_hold_apply", "diff class no longer matches hold")
-            if "version_bump" in diff:
+            if "version_bump" in auth_diff:
                 check_standing_migration_invariants(
-                    self.baseline_goal,
+                    baseline_goal,
                     proposed_goal,
                     migrate_fn=migrate_fn,
                     device_trust_comparable=device_trust_comparable,
@@ -2393,11 +2991,13 @@ class ApprovalEnforcer:
             grant_id = hold["grant_id"]
             grant = state["grants"].get(grant_id)
             if grant is None or grant.get("tombstoned") or grant.get("grant_state") != "active":
+                prune_dead_hold_and_commit()
                 raise ReplayError(
                     "grant_inactive_at_hold_apply",
                     f"grant {grant_id!r} is no longer active at hold completion",
                 )
             if grant["generation"] != hold["generation"]:
+                prune_dead_hold_and_commit()
                 raise ReplayError(
                     "generation_changed_during_hold",
                     "grant generation changed while change was held",
@@ -2406,31 +3006,36 @@ class ApprovalEnforcer:
                 str(grant.get("enrollment_nonce") or "").encode("utf-8"),
                 str(hold["enrollment_nonce"]).encode("utf-8"),
             ):
+                prune_dead_hold_and_commit()
                 raise NonceError(
                     "enrollment_nonce_changed_during_hold",
                     "grant enrollment_nonce changed while change was held (R10 / Item 18)",
                 )
 
             scope = grant["scope"]
+            # Codex #7: prune dead hold AND durably record observed post-expiry UTC!
             if self._is_expired(scope.get("not_after"), now_dt):
+                prune_dead_hold_and_commit()
                 raise ScopeError(
                     "grant_expired_at_hold_apply",
                     f"grant {grant_id!r} expired before hold completion (Item 17)",
                 )
 
-            roles = extract_baseline_roles(self.baseline_goal, self.host)
+            roles = extract_baseline_roles(baseline_goal, self.host)
             signer = hold["signer"]
             if roles.get(signer) == "owner":
+                prune_dead_hold_and_commit()
                 raise TrustRootError("owner_cannot_sign_application", "signer became owner")
             if signer not in scope["covered_signers"]:
+                prune_dead_hold_and_commit()
                 raise ScopeError("signer_removed_from_grant", "signer no longer covered")
             if not scope["developer_mode"] and roles.get(signer) != "covered-signer":
+                prune_dead_hold_and_commit()
                 raise TrustRootError(
                     "signer_role_revoked_during_hold",
                     "signer lost baseline covered-signer role during hold",
                 )
 
-            # Re-evaluate covering set precedence at apply time.
             effective_mode, effective_hold_seconds = self._resolve_covering_precedence(
                 state,
                 signer=signer,
@@ -2439,6 +3044,7 @@ class ApprovalEnforcer:
                 roles=roles,
             )
             if effective_mode == "standing-refusal":
+                prune_dead_hold_and_commit()
                 raise ScopeError(
                     "standing_refusal_at_hold_apply",
                     "a covering standing-refusal grant now refuses this held change",
@@ -2458,21 +3064,26 @@ class ApprovalEnforcer:
                 int(hold["hold_seconds"]),
                 int(effective_hold_seconds) if effective_hold_seconds is not None else 0,
             )
-            elapsed = float(now_mono) - first_shown
-            if elapsed < required_hold:
+            elapsed = mono - first_shown
+            # Defense in depth against NaN: require `elapsed >= required_hold` explicitly!
+            if not (elapsed >= required_hold):
                 raise ScopeError(
                     "hold_window_not_elapsed",
                     f"hold window elapsed {elapsed:.3f}s < required {required_hold}s",
                 )
 
-            # Remove pending hold durably before actuating.
+            # Phase A: remove pending hold & record UTC durably BEFORE actuating.
             del state["pending_holds"][proposed_sha256]
             self._advance_utc_clock(state, now_dt)
             self.store.commit_unlocked(state)
 
-            if before_apply_hook is not None:
-                before_apply_hook()
-            self._actuate_goal_file(proposed_goal)
+            # Phase B & C: actuate & publish new baseline only on callback success.
+            self._actuate_and_publish_baseline_unlocked(
+                state,
+                proposed_goal,
+                proposed_sha256,
+                before_apply_hook=before_apply_hook,
+            )
             return ApplicationResult(
                 decision="applied",
                 host=self.host,
@@ -2496,21 +3107,31 @@ class ApprovalEnforcer:
         proposed_goal: dict[str, Any] | None = None,
         diff: dict[str, Any] | None = None,
         now_utc: datetime.datetime | str,
-        bootstrap_owner_keys: set[str] | None = None,
+        bootstrap_owner_keys: Collection[str] | None = None,
         is_readoption: bool = False,
         before_replace_hook: Callable[[], None] | None = None,
+        before_anchor_hook: Callable[[], None] | None = None,
+        before_apply_hook: Callable[[], None] | None = None,
     ) -> PerChangeResult:
         """Process an owner `per-change` approval/reject/withdraw record.
 
-        Special hold-window reject rule (Item 18): during a pending hold for
-        `proposed_sha256`, an owner-signed `per-change` `reject` naming
-        `(host, proposed_sha256)` stops the hold IMMEDIATELY and persists as a
-        DC-2 reject regardless of `ceremony_class`, `nonce`, or `approval_seq`.
-
-        Downward `version_bump` rule (Item 15, 2026-11-26 operator ruling):
-        `new <= old` is refused for `per-change` owner records too.
+        Hardened invariants:
+          - All baseline/role/diff/store checks run strictly inside `self.store.locked()`.
+          - `verdict == "accept"` ALWAYS requires `proposed_goal is not None`.
+          - First adoption (`baseline_goal is None`) requires an explicit non-empty
+            `bootstrap_owner_keys` authority (never trusts proposed goal alone).
+          - Every adoption/accept checks `proposed_goal["host"] == self.host`,
+            `validate_trust_root_no_host_key`, and anti-downgrade `new >= old`
+            (and `new > old` on migrations, 2026-11-26 ruling Item 15).
+          - Never falls back to `record["ceremony_class"]`; derives class
+            authoritatively from `(baseline_goal, proposed_goal)` or verified `diff`.
+          - Narrow hold-window override reject (Item 18): owner `per-change` `reject`
+            naming `(host, proposed_sha256)` stops a pending hold immediately and
+            persists as a DC-2 reject regardless of `ceremony_class`, `nonce`, or
+            `approval_seq`.
         """
         now_dt = _coerce_utc(now_utc)
+        # Pure stateless checks outside lock.
         doc = parse_strict_json(raw_record)
         record = validate_approval_record_shape(doc)
         if record["record_kind"] != "per-change":
@@ -2518,62 +3139,70 @@ class ApprovalEnforcer:
                 "wrong_record_kind",
                 f"expected per-change, got {record['record_kind']!r}",
             )
-
-        # Item 24: per-target host binding.
         if record["host"] != self.host:
             raise ScopeError("wrong_host", f"record host {record['host']!r} != {self.host!r}")
-
-        # Item 10: host key never signs, and never appears in proposed/baseline trust root.
         if record["signer"] == self.host:
             raise TrustRootError("host_key_as_signer", "device host key may never sign records")
         if proposed_goal is not None:
-            validate_trust_root_no_host_key(proposed_goal, self.host)
-
-        # Item 11: sig_alg/prefix binding & strict canonical RFC 8032 Ed25519 verification.
+            validate_goal_file_basics(proposed_goal, self.host)
         verify_record_signature(record)
-
-        # Item 8: owner role verification against currently applied baseline (or bootstrap on first adoption).
-        is_first_adoption = self.baseline_goal is None
-        if is_first_adoption:
-            if proposed_goal is None:
-                raise MalformedRecordError(
-                    "missing_proposed_goal", "first adoption requires proposed_goal"
-                )
-            if "baseline_sha256" in record:
-                raise ScopeError(
-                    "unexpected_baseline_sha256",
-                    "first adoption has no prior baseline_sha256",
-                )
-            proposed_roles = extract_baseline_roles(proposed_goal, self.host)
-            allowed_owners = (
-                bootstrap_owner_keys
-                if bootstrap_owner_keys is not None
-                else {k for k, r in proposed_roles.items() if r == "owner"}
-            )
-            if record["signer"] not in allowed_owners or proposed_roles.get(record["signer"]) != "owner":
-                raise TrustRootError(
-                    "signer_not_owner",
-                    "first adoption requires an owner key present in the initial trust root",
-                )
-        else:
-            assert self.baseline_goal is not None
-            roles = extract_baseline_roles(self.baseline_goal, self.host)
-            if roles.get(record["signer"]) != "owner":
-                raise TrustRootError(
-                    "signer_not_owner",
-                    f"per-change record requires baseline owner role; got {roles.get(record['signer'])!r}",
-                )
 
         proposed_sha256 = record["proposed_sha256"]
         verdict = record["verdict"]
+
+        # Codex #4 / Neon F4 / Macroscope 4708874692: accept requires proposed_goal BEFORE state mutation!
+        if verdict == "accept" and proposed_goal is None:
+            raise MalformedRecordError(
+                "missing_proposed_goal", "per-change verdict 'accept' requires proposed_goal"
+            )
 
         with self.store.locked():
             state = self.store.load_verified_unlocked()
             self._check_utc_clock_monotonic(state, now_dt)
 
-            # Item 18: Hold-window override reject!
-            # Stops pending hold for (host, proposed_sha256) immediately regardless
-            # of ceremony_class, nonce, or approval_seq, and persists as DC-2 reject.
+            baseline_goal = state["applied_baseline_goal"]
+            is_first_adoption = baseline_goal is None
+
+            # Item 8 & Codex #5: owner role check strictly inside lock!
+            if is_first_adoption:
+                if proposed_goal is None:
+                    raise MalformedRecordError(
+                        "missing_proposed_goal", "first adoption requires proposed_goal"
+                    )
+                if "baseline_sha256" in record:
+                    raise ScopeError(
+                        "unexpected_baseline_sha256",
+                        "first adoption has no prior baseline_sha256",
+                    )
+                if not bootstrap_owner_keys:
+                    raise TrustRootError(
+                        "missing_bootstrap_authority",
+                        "first adoption requires independently established bootstrap_owner_keys",
+                    )
+                boot_set = set(bootstrap_owner_keys)
+                if self.host in boot_set:
+                    raise TrustRootError(
+                        "host_key_in_trust_root",
+                        "device host key may never be a bootstrap owner (Item 10)",
+                    )
+                proposed_roles = extract_baseline_roles(proposed_goal, self.host)
+                if (
+                    record["signer"] not in boot_set
+                    or proposed_roles.get(record["signer"]) != "owner"
+                ):
+                    raise TrustRootError(
+                        "signer_not_owner",
+                        "first adoption signer must be an authorized bootstrap owner present as owner in proposed trust root",
+                    )
+            else:
+                roles = extract_baseline_roles(baseline_goal, self.host)
+                if roles.get(record["signer"]) != "owner":
+                    raise TrustRootError(
+                        "signer_not_owner",
+                        f"per-change record requires baseline owner role; got {roles.get(record['signer'])!r}",
+                    )
+
+            # Narrow Item 18 hold-window override reject!
             if verdict == "reject" and proposed_sha256 in state["pending_holds"]:
                 hold = state["pending_holds"].pop(proposed_sha256)
                 state["persisted_rejects"][proposed_sha256] = {
@@ -2582,7 +3211,11 @@ class ApprovalEnforcer:
                     "signer": record["signer"],
                 }
                 self._advance_utc_clock(state, now_dt)
-                self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
+                self.store.commit_unlocked(
+                    state,
+                    before_replace_hook=before_replace_hook,
+                    before_anchor_hook=before_anchor_hook,
+                )
                 return PerChangeResult(
                     decision="rejected",
                     host=self.host,
@@ -2591,7 +3224,7 @@ class ApprovalEnforcer:
                     cancelled_holds=(hold["hold_id"],),
                 )
 
-            # Standard DC-2 per-change checks (all must pass BEFORE persisting approval_seq!).
+            # Standard DC-2 per-change checks (ALL pass BEFORE persisting approval_seq!).
             if proposed_goal is not None:
                 actual_prop_hash = canonical_sha256(proposed_goal)
                 if not hmac.compare_digest(proposed_sha256, actual_prop_hash):
@@ -2600,28 +3233,87 @@ class ApprovalEnforcer:
                         "per-change proposed_sha256 does not match proposed goal file (Item 25)",
                     )
 
-            if is_first_adoption or is_readoption:
+            if is_first_adoption:
                 derived_class = "baseline"
-            else:
-                assert self.baseline_goal is not None
+            elif is_readoption:
+                assert baseline_goal is not None
                 if "baseline_sha256" not in record:
                     raise ScopeError(
                         "missing_baseline_sha256",
-                        "non-first-adoption per-change record requires baseline_sha256",
+                        "re-adoption over an existing baseline requires baseline_sha256",
                     )
-                current_base_hash = canonical_sha256(self.baseline_goal)
+                current_base_hash = state["applied_baseline_sha256"]
+                assert current_base_hash is not None
                 if not hmac.compare_digest(record["baseline_sha256"], current_base_hash):
                     raise ReplayError(
                         "baseline_sha256_mismatch",
                         "per-change baseline_sha256 does not match applied baseline",
                     )
-                if diff is not None:
-                    if proposed_goal is not None:
-                        verify_diff_matches_goals(self.baseline_goal, proposed_goal, diff, self.host)
-                    # Note: analyze_diff_classes enforces Item 15 downward version_bump refusal!
-                    derived_class, _ = analyze_diff_classes(diff)
+                if proposed_goal is not None:
+                    # Enforce anti-downgrade even on re-adoption (Codex #4 / Macroscope 4708874598).
+                    if proposed_goal["schema_version"] < baseline_goal["schema_version"]:
+                        raise ScopeError(
+                            "downward_version_bump",
+                            f"refusing downward schema_version {baseline_goal['schema_version']} -> "
+                            f"{proposed_goal['schema_version']} during re-adoption",
+                        )
+                derived_class = "baseline"
+            else:
+                assert baseline_goal is not None
+                if "baseline_sha256" not in record:
+                    raise ScopeError(
+                        "missing_baseline_sha256",
+                        "non-first-adoption per-change record requires baseline_sha256",
+                    )
+                current_base_hash = state["applied_baseline_sha256"]
+                assert current_base_hash is not None
+                if not hmac.compare_digest(record["baseline_sha256"], current_base_hash):
+                    raise ReplayError(
+                        "baseline_sha256_mismatch",
+                        "per-change baseline_sha256 does not match applied baseline",
+                    )
+
+                if proposed_goal is not None:
+                    if diff is not None:
+                        analyze_diff_classes(diff)
+                        verify_diff_matches_goals(baseline_goal, proposed_goal, diff, self.host)
+                    auth_diff = compute_authoritative_diff(baseline_goal, proposed_goal, self.host)
+                    if diff is not None and not jcs_equal(diff, auth_diff):
+                        raise ScopeError(
+                            "diff_authoritative_mismatch",
+                            "caller diff does not match device-computed authoritative diff",
+                        )
+                    # Adversary C5: version_bump alone must differ in schema_version ONLY!
+                    if "version_bump" in auth_diff:
+                        base_body = {k: v for k, v in baseline_goal.items() if k != "schema_version"}
+                        prop_body = {k: v for k, v in proposed_goal.items() if k != "schema_version"}
+                        if not jcs_equal(base_body, prop_body):
+                            raise ScopeError(
+                                "migration_not_version_only",
+                                "version_bump alters content beyond schema_version; requires is_readoption=True",
+                            )
+                    derived_class, _ = analyze_diff_classes(auth_diff)
                 else:
-                    derived_class = record["ceremony_class"]
+                    # reject / withdraw without proposed_goal: MUST supply verified diff (never trust record!).
+                    if diff is None:
+                        raise MalformedRecordError(
+                            "missing_diff_or_proposal",
+                            "non-hold per-change record requires proposed_goal or verified diff to derive ceremony_class",
+                        )
+                    derived_class, _ = analyze_diff_classes(diff)
+                    if diff["host"] != self.host:
+                        raise ScopeError("diff_host_mismatch", "diff host does not match device host")
+                    if not hmac.compare_digest(diff["baseline_sha256"], current_base_hash):
+                        raise ReplayError("diff_baseline_hash_mismatch", "diff baseline_sha256 != baseline hash")
+                    if not hmac.compare_digest(diff["proposed_sha256"], proposed_sha256):
+                        raise ScopeError("diff_proposed_hash_mismatch", "diff proposed_sha256 != record proposed_sha256")
+                    if "version_bump" not in diff:
+                        applied = _apply_validated_diff_to_baseline(baseline_goal, diff)
+                        if not hmac.compare_digest(canonical_sha256(applied), proposed_sha256):
+                            raise ScopeError(
+                                "diff_apply_mismatch",
+                                "applying diff to baseline does not match record proposed_sha256",
+                            )
 
             # Item 23: asserted ceremony_class must equal derived class exactly.
             if record["ceremony_class"] != derived_class:
@@ -2630,7 +3322,7 @@ class ApprovalEnforcer:
                     f"asserted ceremony_class {record['ceremony_class']!r} != derived {derived_class!r}",
                 )
 
-            # Nonce check (single-use, bound to host + proposed_sha256 + ceremony_class).
+            # PR #75 R4 #5: per-change nonce bound to (host, proposed_sha256, ceremony_class).
             nonce = record["nonce"]
             matched_nonce_key: str | None = None
             for k in state["outstanding_nonces"]:
@@ -2654,7 +3346,7 @@ class ApprovalEnforcer:
                     "per-change nonce does not match (host, proposed_sha256, ceremony_class)",
                 )
 
-            # DC-2 monotonic approval_seq check (after all other checks!).
+            # DC-2 monotonic approval_seq check (AFTER every other check!).
             seq = record["approval_seq"]
             if seq <= state["approval_seq"]:
                 raise ReplayError(
@@ -2662,7 +3354,7 @@ class ApprovalEnforcer:
                     f"approval_seq {seq} <= stored {state['approval_seq']}",
                 )
 
-            # Consume nonce & persist approval_seq durably before side effects.
+            # Consume nonce & persist approval_seq durably BEFORE actuation.
             del state["outstanding_nonces"][matched_nonce_key]
             state["approval_seq"] = seq
             cancelled_holds: list[str] = []
@@ -2676,7 +3368,11 @@ class ApprovalEnforcer:
                     "signer": record["signer"],
                 }
                 self._advance_utc_clock(state, now_dt)
-                self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
+                self.store.commit_unlocked(
+                    state,
+                    before_replace_hook=before_replace_hook,
+                    before_anchor_hook=before_anchor_hook,
+                )
                 self.store.nonce_consume_count += 1
                 return PerChangeResult(
                     decision="rejected",
@@ -2688,7 +3384,11 @@ class ApprovalEnforcer:
 
             if verdict == "withdraw":
                 self._advance_utc_clock(state, now_dt)
-                self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
+                self.store.commit_unlocked(
+                    state,
+                    before_replace_hook=before_replace_hook,
+                    before_anchor_hook=before_anchor_hook,
+                )
                 self.store.nonce_consume_count += 1
                 return PerChangeResult(
                     decision="withdrawn",
@@ -2698,17 +3398,26 @@ class ApprovalEnforcer:
                 )
 
             # verdict == "accept":
-            # Owner per-change accept stays available against standing-refusal / wait-for-user
-            # and clears any prior persisted reject of this exact proposed_sha256 (Item 19).
+            assert proposed_goal is not None
             state["persisted_rejects"].pop(proposed_sha256, None)
             if proposed_sha256 in state["pending_holds"]:
                 cancelled_holds.append(state["pending_holds"].pop(proposed_sha256)["hold_id"])
             self._advance_utc_clock(state, now_dt)
-            self.store.commit_unlocked(state, before_replace_hook=before_replace_hook)
+            # Phase A: commit replay reservation BEFORE actuation.
+            self.store.commit_unlocked(
+                state,
+                before_replace_hook=before_replace_hook,
+                before_anchor_hook=before_anchor_hook,
+            )
             self.store.nonce_consume_count += 1
 
-            if proposed_goal is not None:
-                self._actuate_goal_file(proposed_goal)
+            # Phase B & C: actuate & publish confirmed baseline only on callback success.
+            self._actuate_and_publish_baseline_unlocked(
+                state,
+                proposed_goal,
+                proposed_sha256,
+                before_apply_hook=before_apply_hook,
+            )
             return PerChangeResult(
                 decision="applied",
                 host=self.host,
@@ -2716,12 +3425,6 @@ class ApprovalEnforcer:
                 approval_seq=seq,
                 cancelled_holds=tuple(cancelled_holds),
             )
-
-    def _actuate_goal_file(self, proposed_goal: dict[str, Any]) -> None:
-        self.baseline_goal = copy.deepcopy(proposed_goal)
-        self.actuation_count += 1
-        if self._apply_callback is not None:
-            self._apply_callback(copy.deepcopy(proposed_goal))
 
 
 __all__ = [
@@ -2732,12 +3435,14 @@ __all__ = [
     "CEREMONY_CLASSES",
     "CEREMONY_RANK",
     "ClockRollbackError",
+    "DIFF_COVERAGE_VALUES",
     "ED25519_D",
     "ED25519_L",
     "ED25519_P",
     "EnforcementError",
     "EnrollmentReceipt",
     "FileRollbackAnchor",
+    "GOAL_COVERAGE_VALUES",
     "InMemoryRollbackAnchor",
     "MAX_SAFE_INT",
     "MalformedRecordError",
@@ -2756,23 +3461,22 @@ __all__ = [
     "canonical_sha256",
     "check_standing_carve_out",
     "check_standing_migration_invariants",
+    "compute_authoritative_diff",
     "derive_coverage_change_class",
     "derive_hunk_class",
-    "ed25519_compress_point",
     "ed25519_decompress_point",
-    "ed25519_public_key_from_seed",
-    "ed25519_sign",
     "extract_baseline_roles",
     "format_utc_timestamp",
     "generate_device_nonce",
     "jcs_dumps",
+    "jcs_equal",
     "key_id_from_pubkey",
     "parse_strict_json",
     "parse_utc_timestamp",
     "render_enrollment_briefing",
-    "sign_approval_record",
     "signing_payload_bytes",
     "validate_approval_record_shape",
+    "validate_goal_file_basics",
     "validate_trust_root_no_host_key",
     "verify_diff_matches_goals",
     "verify_ed25519",
