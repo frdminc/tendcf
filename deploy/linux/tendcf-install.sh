@@ -372,6 +372,8 @@ resolve_projector_src() {
             projector_src="$here/bin/projector.py"
         elif [ -e "$here/../../tools/projector.py" ] || [ -L "$here/../../tools/projector.py" ]; then
             projector_src="$here/../../tools/projector.py"
+        elif [ -e "$here/../../bin/projector.py" ] || [ -L "$here/../../bin/projector.py" ]; then
+            projector_src="$here/../../bin/projector.py"
         else
             die "projector.py not found (use --projector-src FILE)"
         fi

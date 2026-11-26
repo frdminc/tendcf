@@ -28,6 +28,7 @@ Hardening enforced before launching `nix-instantiate`:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import stat
@@ -125,12 +126,16 @@ def _resolve_recipe_paths(
     if not raw_file.strip() or "\x00" in raw_file:
         raise NixEvalError("Nix recipe path must not be empty or contain NUL bytes")
     candidate = Path(raw_file)
+    if ".." in candidate.parts:
+        raise NixEvalError(f"Nix recipe path must not contain '..' traversal segments: {candidate}")
 
     if recipe_dir is not None:
         raw_dir = recipe_dir if isinstance(recipe_dir, str) else str(recipe_dir)
         if not raw_dir.strip() or "\x00" in raw_dir:
             raise NixEvalError("recipe_dir must not be empty or contain NUL bytes")
         dir_candidate = Path(raw_dir)
+        if ".." in dir_candidate.parts:
+            raise NixEvalError(f"recipe_dir must not contain '..' traversal segments: {dir_candidate}")
         try:
             st_dir = os.lstat(dir_candidate)
         except OSError as exc:
@@ -197,8 +202,8 @@ def eval_nix_file(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     """Evaluate `file_path` under restricted `nix-instantiate` and return parsed JSON."""
-    if timeout <= 0:
-        raise NixEvalError(f"timeout must be positive, got {timeout!r}")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise NixEvalError(f"timeout must be a positive finite number, got {timeout!r}")
 
     base_env = dict(os.environ if env is None else env)
     exe = nix_instantiate if nix_instantiate is not None else shutil.which(

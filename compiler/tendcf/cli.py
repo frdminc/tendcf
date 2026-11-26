@@ -79,6 +79,18 @@ def _tendcf_dir(arg: str | None) -> Path | None:
     return Path(raw).expanduser() if raw else _in_tree_tendcf()
 
 
+def _resolve_dev_plugin_root(tendcf: Path | None) -> Path | None:
+    """In dev mode, honor an explicit checkout that carries `plugins/`; else fall back to in-tree."""
+    if tendcf is not None:
+        plugins_entry = tendcf / "plugins"
+        if plugins_entry.exists() or plugins_entry.is_symlink():
+            return tendcf
+    in_tree = _in_tree_tendcf()
+    if in_tree is not None:
+        return in_tree
+    return tendcf
+
+
 def load_projector(tendcf: Path) -> Any:
     """Import tendcf's reference projector (`tools/projector.py`) with full containment checks.
 
@@ -213,6 +225,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
         plugin_root = tendcf
     else:
         tendcf = _tendcf_dir(args.tendcf)
+        plugin_root = _resolve_dev_plugin_root(tendcf)
 
     if args.output is not None and overrides and not args.allow_tainted:
         print(
@@ -458,7 +471,11 @@ def cmd_eval_nix(args: argparse.Namespace) -> int:
         print("tendcf: ERROR: --recipe-dir must not be empty or contain NUL bytes", file=sys.stderr)
         return 2
     try:
-        nix_plugin = load_plugin("frontend", "nix")
+        nix_plugin = load_plugin(
+            "frontend",
+            "nix",
+            tendcf_root=_resolve_dev_plugin_root(_tendcf_dir(None)),
+        )
     except PluginError as exc:
         print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2

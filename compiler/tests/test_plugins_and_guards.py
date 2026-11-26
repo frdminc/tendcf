@@ -230,6 +230,41 @@ def test_non_in_tree_package_runs_version_and_refuses_check_releasable_cleanly(t
     assert rel.returncode == 1
     assert b"REFUSED:" in rel.stderr and b"Traceback" not in rel.stderr
 
+    # Codex P2: in dev mode outside a checkout, explicit --tendcf or TENDCF_DIR
+    # supplies both schemas and verified plugins cleanly!
+    dev_flag = subprocess.run(
+        [sys.executable, "-m", "tendcf.cli", *_compile_args(SITE, "--tendcf", str(TENDCF_ROOT))],
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert dev_flag.returncode == 0, dev_flag.stderr.decode()
+
+    dev_env = subprocess.run(
+        [sys.executable, "-m", "tendcf.cli", *_compile_args(SITE)],
+        cwd=tmp_path,
+        capture_output=True,
+        env=dict(env, TENDCF_DIR=str(TENDCF_ROOT)),
+        check=False,
+    )
+    assert dev_env.returncode == 0, dev_env.stderr.decode()
+
+    # Symlinked plugins/ inside explicit --tendcf still fails closed!
+    bad_checkout = tmp_path / "bad-checkout"
+    bad_checkout.mkdir()
+    shutil.copytree(TENDCF_ROOT / "schema", bad_checkout / "schema")
+    (bad_checkout / "plugins").symlink_to(TENDCF_ROOT / "plugins")
+    bad_dev = subprocess.run(
+        [sys.executable, "-m", "tendcf.cli", *_compile_args(SITE, "--tendcf", str(bad_checkout))],
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert bad_dev.returncode == 2
+    assert b"real non-symlink directory" in bad_dev.stderr
+
 
 def test_clear_plugin_cache_preserves_sitemodel_error_identity(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -426,7 +461,15 @@ def test_nix_frontend_h1_hardening_empty_dir_delimiters_symlinks_and_timeout(tmp
     with pytest.raises(nix_plugin.NixEvalError, match="duplicate JSON key"):
         nix_plugin.eval_nix_file(real_file, nix_instantiate=str(dup_nix))
 
-    # 8. Timeout converts cleanly to NixEvalError.
+    # 8. Timeout converts cleanly to NixEvalError; NaN/bool/non-positive timeouts refused.
+    for bad_timeout in (0, -1.0, float("nan"), float("inf"), True):
+        with pytest.raises(nix_plugin.NixEvalError, match="positive finite number"):
+            nix_plugin.eval_nix_file(real_file, nix_instantiate=str(never_run), timeout=bad_timeout)  # type: ignore[arg-type]
+
+    # 9. '..' traversal segments in recipe path or recipe_dir refused before resolving.
+    with pytest.raises(nix_plugin.NixEvalError, match="traversal segments"):
+        nix_plugin.eval_nix_file(sym_dir / ".." / "real-recipe" / "site.nix", nix_instantiate=str(never_run))
+
     slow_nix = tmp_path / "slow-nix"
     slow_nix.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(5)\n", encoding="utf-8")
     slow_nix.chmod(stat.S_IRWXU)
