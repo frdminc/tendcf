@@ -1830,8 +1830,8 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(doc, separators=(",", ":"), sort
 PYEOF
     : > "$launchctl_log"
     "$cf_agent" -K -I -f "$work/inputs/launchd-harness.cf" >"$work/launchd-sys-bad-runas.out" 2>&1 || true
-    check "launchd system mode invalid run_as: refused and reported" \
-        grep -q "tendcf: service 'com.tendcf.canary.main' refused: system-domain service run_as 'Bad User!' is missing or invalid" "$work/launchd-sys-bad-runas.out"
+    check "launchd system mode invalid run_as: refused and reported (sanitized)" \
+        grep -q "tendcf: service 'com.tendcf.canary.main' refused: system-domain service run_as 'Bad?User?' is missing or invalid" "$work/launchd-sys-bad-runas.out"
     check "launchd system mode invalid run_as: no plist written" test ! -e "$canary_sys_p"
     check "launchd system mode invalid run_as: zero launchctl calls" test ! -s "$launchctl_log"
 
@@ -3526,7 +3526,7 @@ argv_case() {  # argv_case NAME ELEMENT...  (writes the fixture, runs cf-agent, 
     check "$name: exit 0 satisfied the interlock" \
         bash -c "! grep -q \"bundle 'demo' refused\" '$out'"
     check "$name: no reason line for an absolute command[0]" \
-        bash -c "! grep -q 'is not an absolute path' '$out'"
+        bash -c "! grep -q 'is not a normalized printable-ASCII absolute path' '$out'"
 }
 argv_case alphabet 'a,b=c:d@e+f' '--k=v,w:/p@h+1._-' '-' 'A0z9' '/x/y'
 bt="$(printf '\140')"
@@ -3551,7 +3551,7 @@ cf_agent_abs="$(cd "$(dirname "$cf_agent")" && pwd)/$(basename "$cf_agent")"
 check "relative command[0]: interlock refused" \
     grep -q "tendcf: interlock 'demo-check' not satisfied, bundle 'demo' refused" "$out"
 check "relative command[0]: the reason is reported" \
-    grep -q "^R: tendcf: interlock 'demo-check' pre_action command\\[0\\] is not an absolute path; refused" "$out"
+    grep -q "^R: tendcf: interlock 'demo-check' pre_action command\\[0\\] is not a normalized printable-ASCII absolute path without whitespace, quotes, or backslashes; refused" "$out"
 check "relative command[0]: nothing was run" \
     bash -c "[ ! -e '$work/rel/ran' ]"
 
@@ -3560,14 +3560,14 @@ check "relative command[0]: nothing was run" \
 #     elements in arglist without ArgSplitCommand splitting, multi-interlock
 #     isolation (distinct arg counts, duplicate commands even without -K,
 #     non-zero expect_exit, and one bad interlock leaving other bundles clean).
+#     Appends one JSON line per invocation so every test asserts exact call count.
 json_recorder="$work/argv-json-recorder"
 cat > "$json_recorder" <<'JREC'
 #!/usr/bin/env python3
 import json, pathlib, sys
 out = pathlib.Path(sys.argv[1])
-tmp = out.with_suffix(".tmp")
-tmp.write_text(json.dumps(sys.argv[2:]), encoding="utf-8")
-tmp.replace(out)
+with open(out, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv[2:]) + "\n")
 JREC
 chmod 700 "$json_recorder"
 
@@ -3676,31 +3676,34 @@ import json, pathlib, sys
 lines = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
 assert lines == [[], []], f"expected two 0-arg calls, got {lines!r}"
 PYEOF
-check "arglist multi-interlock: spaces, quotes, backticks, metachars, and empty string preserved verbatim" \
+check "arglist multi-interlock: spaces, quotes, backticks, metachars, and empty string preserved verbatim (1 call)" \
     python3 - "$work/rec-meta.json" <<'PYEOF'
 import json, pathlib, sys
-got = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-want = ["a b", "hello   world", "'x'", '"y"', "`bt`", ";|&&", "", "--flag=k v"]
-assert got == want, f"got={got!r} want={want!r}"
+lines = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+want = [["a b", "hello   world", "'x'", '"y"', "`bt`", ";|&&", "", "--flag=k v"]]
+assert lines == want, f"got={lines!r} want={want!r}"
 PYEOF
-check "arglist multi-interlock: 12+ elements preserve exact numeric order" \
+check "arglist multi-interlock: 12+ elements preserve exact numeric order (1 call)" \
     python3 - "$work/rec-12.json" <<'PYEOF'
 import json, pathlib, sys
-got = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-want = [str(i) for i in range(12)]
-assert got == want, f"got={got!r} want={want!r}"
+lines = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+want = [[str(i) for i in range(12)]]
+assert lines == want, f"got={lines!r} want={want!r}"
 PYEOF
 for ok_bundle in b-zero b-zero-dup b-meta b-twelve b-exit2; do
     check "arglist multi-interlock: satisfied bundle '$ok_bundle' not refused" \
         bash -c "! grep -q \"bundle '$ok_bundle' refused\" '$out'"
 done
-check "arglist multi-interlock: bad sibling refused and blocked its bundle only" \
+check "arglist multi-interlock: bad sibling refused by tendcf_interlock_run" \
+    grep -q "^R: tendcf: interlock 'bad-sibling' pre_action command\\[0\\] is not a normalized printable-ASCII absolute path without whitespace, quotes, or backslashes; refused$" "$out"
+check "arglist multi-interlock: bad sibling blocked its bundle only" \
     grep -q "tendcf: interlock 'bad-sibling' not satisfied, bundle 'b-blocked' refused" "$out"
 
-# 8f. Bad command[0] (space, quotes, backticks, trailing slash, control char)
-#     and malformed command shapes (empty list, missing command, non-string
-#     elements) all fail closed with zero executions and blocked bundle.
-for bad_case in space dquote squote backtick slash root ctrl int_arg obj_arg empty_list missing_cmd; do
+# 8f. Bad command[0] (space, quotes, backticks, trailing slash, root, control
+#     char, backslash, `.`/`..` segments, non-ASCII) and malformed command
+#     shapes (empty list, missing command, scalar string, non-string elements)
+#     all fail closed with zero executions, accurate reason, and blocked bundle.
+for bad_case in space dquote squote backtick slash root ctrl backslash dotdot dot nonascii int_arg obj_arg empty_list missing_cmd scalar_cmd; do
     rm -f "$zero_count"
     python3 - "$work/data/host_specific.json" "$bad_case" "$zero_recorder" <<'PYEOF'
 import json, pathlib, sys
@@ -3713,10 +3716,15 @@ cases = {
     "slash": ["/usr/bin/"],
     "root": ["/"],
     "ctrl": ["/usr/bin/tr\nue"],
+    "backslash": ["/usr/bin/tr\\\\ue"],
+    "dotdot": ["/usr/bin/../bin/true"],
+    "dot": ["/usr/bin/./true"],
+    "nonascii": ["/usr/bin/\u00a0true"],
     "int_arg": [zero_rec, 42],
     "obj_arg": [zero_rec, {"k": "v"}],
     "empty_list": [],
     "missing_cmd": None,
+    "scalar_cmd": "/usr/bin/true",
 }
 pre = {"expect_exit": 0, "timeout_seconds": 5}
 if cases[case] is not None:
@@ -3745,11 +3753,23 @@ PYEOF
         grep -q "tendcf: interlock 'bad-chk' not satisfied, bundle 'demo' refused" "$out"
     check "bad pre_action ($bad_case): zero command executions" \
         bash -c "! grep -q 'Executing ' '$out' && [ ! -e '$zero_count' ]"
+    case "$bad_case" in
+        int_arg|obj_arg|empty_list|missing_cmd|scalar_cmd)
+            check "bad pre_action ($bad_case): accurate command-shape refusal line" \
+                grep -q "^R: tendcf: interlock 'bad-chk' pre_action command is missing or not a non-empty array of strings; refused$" "$out"
+            ;;
+        *)
+            check "bad pre_action ($bad_case): accurate command[0] refusal line" \
+                grep -q "^R: tendcf: interlock 'bad-chk' pre_action command\\[0\\] is not a normalized printable-ASCII absolute path without whitespace, quotes, or backslashes; refused$" "$out"
+            ;;
+    esac
 done
 
-# 8g. Issue #56 item 2: hostile control characters (\n, \r, \x1b, \t) in
-#     interlock id and bundle name (bracket-free) are sanitized in BOTH
-#     tendcf_interlock_run and tendcf_services_apply R: refusal lines.
+# 8g. Issue #56 item 2 + R1 C2: hostile control characters (\n, \r, \x1b, \t)
+#     in bracket-free interlock id are sanitized in BOTH tendcf_interlock_run
+#     and tendcf_services_apply R: refusal lines (8g-1); hostile control
+#     characters in interlock bundle fail closed across all service actuation
+#     with sanitized R: report (8g-2).
 python3 - "$work/data/host_specific.json" <<'PYEOF'
 import json, pathlib, sys
 doc = {
@@ -3757,7 +3777,7 @@ doc = {
         "tendcf_interlock": {
             "ilk\nR: INJECTED_ILK\r\x1bX\tid": {
                 "blocks": "enclosing-bundle",
-                "bundle": "bnd\nR: INJECTED_BND\r\x1bX\tname",
+                "bundle": "demo",
                 "defines_class": "ctrl_ok",
                 "pre_action": {"command": ["true"], "expect_exit": 0, "timeout_seconds": 5},
                 "report": True,
@@ -3783,14 +3803,16 @@ assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: li
 r_lines = [line for line in lines if line.startswith("R:")]
 for line in r_lines:
     assert "\r" not in line and "\t" not in line and "\x1b" not in line, f"control char in R: line: {line!r}"
-cmd0_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' pre_action command\[0\] is not an absolute path; refused$")
-blk_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' not satisfied, bundle 'bnd\?R:\?INJECTED_BND\?\?(?:u001b)?X\?name' refused$")
+cmd0_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' pre_action command\[0\] is not a normalized printable-ASCII absolute path without whitespace, quotes, or backslashes; refused$")
+blk_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_ILK\?\?(?:u001b)?X\?id' not satisfied, bundle 'demo' refused$")
 assert any(cmd0_re.match(line) for line in r_lines), f"sanitized command[0] refusal not found in {r_lines!r}"
 assert any(blk_re.match(line) for line in r_lines), f"sanitized bundle refusal not found in {r_lines!r}"
 PYEOF
 
-# 8h. Issue #56 item 2: bracketed ANSI CSI (\x1b[31m) in interlock id fails
-#     closed across ALL services with sanitized R: report and zero bracket errors.
+# 8h. Issue #56 item 2 + R1 L2 + Codex NB2: bracketed ANSI CSI (\x1b[31m) in
+#     interlock id fails closed across ALL services with sanitized R: report,
+#     zero bracket errors, and zero LaunchAgents creation (with positive control
+#     on Darwin proving the service would otherwise actuate).
 python3 - "$work/data/host_specific.json" <<'PYEOF'
 import json, pathlib, sys
 doc = {
@@ -3834,9 +3856,451 @@ assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
 lines = raw.decode("utf-8", errors="replace").splitlines()
 assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
 r_lines = [line for line in lines if line.startswith("R:")]
-csi_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_CSI\?\?(?:u001b)?\?31m\?id' id contains bracket characters; refusing all service actuation$")
+csi_re = re.compile(r"^R: tendcf: interlock 'ilk\?R:\?INJECTED_CSI\?\?(?:u001b)?\?31m\?id' id is empty, too long \(>128 chars\), or contains bracket characters; refusing all service actuation$")
 assert any(csi_re.match(line) for line in r_lines), f"sanitized CSI refusal not found in {r_lines!r}"
 PYEOF
+
+# 8i. R1 C1 / Codex #1: colliding interlock IDs under canonify() (`a-b` vs `a.b`,
+#     `a-b` vs `a_b`), >128-char interlock id, and empty `""` interlock id all
+#     fail closed with zero executions, refusal report, and zero service actuation.
+for col_case in col_fail col_invalid id_129 id_empty; do
+    rm -f "$zero_count"
+    python3 - "$work/data/host_specific.json" "$col_case" "$zero_recorder" <<'PYEOF'
+import json, pathlib, sys
+out_path, case, zero_rec = sys.argv[1:4]
+if case == "col_fail":
+    ilks = {
+        "a-b": {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "ab_ok", "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+        "a.b": {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "ab2_ok", "pre_action": {"command": ["/usr/bin/false"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+    }
+elif case == "col_invalid":
+    ilks = {
+        "a-b": {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "ab_ok", "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+        "a_b": {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "ab2_ok", "pre_action": {"command": ["true"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+    }
+elif case == "id_129":
+    ilks = {
+        "i" * 129: {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "l_ok", "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+    }
+else:
+    ilks = {
+        "": {"blocks": "enclosing-bundle", "bundle": "demo", "defines_class": "e_ok", "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"},
+    }
+doc = {
+    "vars": {
+        "tendcf_interlock": ilks,
+        "tendcf_service": {
+            "demo-runit": {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/ilk-c1-$col_case.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "interlock C1 ($col_case): policy completed" policy_completed "$out"
+    check "interlock C1 ($col_case): zero command executions and no sibling service processed" \
+        bash -c "! grep -Eq \"Executing |tendcf: service 'demo-runit'\" '$out' && [ ! -e '$zero_count' ]"
+    case "$col_case" in
+        col_*)
+            check "interlock C1 ($col_case): collision refusal reported" \
+                grep -q "^R: tendcf: interlock actuation refused: two or more interlock ids collide under canonify(); refusing all service actuation until ids are canonically unique$" "$out"
+            ;;
+        *)
+            check "interlock C1 ($col_case): malformed id refusal reported" \
+                grep -q "id is empty, too long (>128 chars), or contains bracket characters; refusing all service actuation$" "$out"
+            ;;
+    esac
+done
+
+# 8j. R1 C2 / Codex #1: interlock bundle length (>= 1006 / > 128 chars),
+#     missing, empty, array, integer, or control-char bundle fails closed across
+#     all service actuation with zero executions and sanitized R: report.
+for bcase in len_1010 len_129 missing empty array int ctrl; do
+    rm -f "$zero_count"
+    python3 - "$work/data/host_specific.json" "$bcase" "$zero_recorder" <<'PYEOF'
+import json, pathlib, sys
+out_path, case, zero_rec = sys.argv[1:4]
+ilk = {
+    "blocks": "enclosing-bundle",
+    "defines_class": "b_ok",
+    "pre_action": {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5},
+    "report": True,
+    "state": "present",
+}
+if case == "len_1010":
+    ilk["bundle"] = "b" * 1010
+elif case == "len_129":
+    ilk["bundle"] = "b" * 129
+elif case == "empty":
+    ilk["bundle"] = ""
+elif case == "array":
+    ilk["bundle"] = ["demo"]
+elif case == "int":
+    ilk["bundle"] = 42
+elif case == "ctrl":
+    ilk["bundle"] = "bnd\nR: INJECTED_BND\r\x1bX\tname"
+doc = {
+    "vars": {
+        "tendcf_interlock": {"bad-bundle-ilk": ilk},
+        "tendcf_service": {
+            "demo-runit": {
+                "bundle": "other",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/ilk-c2-$bcase.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "interlock C2 bundle ($bcase): policy completed" policy_completed "$out"
+    check "interlock C2 bundle ($bcase): zero executions and no sibling service processed" \
+        bash -c "! grep -Eq \"Executing |tendcf: service 'demo-runit'\" '$out' && [ ! -e '$zero_count' ]"
+    check "interlock C2 bundle ($bcase): malformed bundle refusal reported cleanly" \
+        python3 - "$out" <<'PYEOF'
+import pathlib, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+want = "R: tendcf: interlock 'bad-bundle-ilk' bundle is missing, non-string, or invalid ([A-Za-z0-9._:@/-]{1,128}); refusing all service actuation"
+assert want in lines, f"expected {want!r} in {[l for l in lines if l.startswith('R:')]!r}"
+PYEOF
+done
+
+# 8k. R1 H1 / Codex #3: strict JSON integer type and range validation for
+#     timeout_seconds (1..3600) and expect_exit (0..255), including upper-bound
+#     positive control (3600 / 255), spoofed string/command payloads, containers,
+#     floats, 32-bit/64-bit overflows, and >64-bit integers with zero abort.
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "meta-max": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "meta_max_ok",
+                "pre_action": {"command": ["/bin/sh", "-c", "exit 255"], "expect_exit": 255, "timeout_seconds": 3600},
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {},
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/ilk-meta-bound-ok.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "interlock meta boundary (3600/255): policy completed" policy_completed "$out"
+check "interlock meta boundary (3600/255): no CMDB cross-check refusal" no_crosscheck "$out"
+check "interlock meta boundary (3600/255): interlock satisfied and bundle not refused" \
+    bash -c "! grep -q \"bundle 'demo' refused\" '$out' && ! grep -q 'timeout_seconds (integer 1..3600)' '$out'"
+
+for mcase in to_0 to_3601 to_u32max to_i64max to_huge_str to_arr to_str_spoof to_neg to_float to_missing ex_str_spoof ex_neg ex_256 ex_arr ex_float ex_missing; do
+    rm -f "$zero_count"
+    python3 - "$work/data/host_specific.json" "$mcase" "$zero_recorder" <<'PYEOF'
+import json, pathlib, sys
+out_path, case, zero_rec = sys.argv[1:4]
+pre = {"command": [zero_rec], "expect_exit": 0, "timeout_seconds": 5}
+if case == "to_0":
+    pre["timeout_seconds"] = 0
+elif case == "to_3601":
+    pre["timeout_seconds"] = 3601
+elif case == "to_u32max":
+    pre["timeout_seconds"] = 4294967295
+elif case == "to_i64max":
+    pre["timeout_seconds"] = 9223372036854775807
+elif case == "to_huge_str":
+    pre["timeout_seconds"] = "99999999999999999999"
+elif case == "to_arr":
+    pre["timeout_seconds"] = [5]
+elif case == "to_str_spoof":
+    pre["command"] = [zero_rec, '\n  "timeout_seconds": 5,\n']
+    pre["timeout_seconds"] = "5"
+elif case == "to_neg":
+    pre["timeout_seconds"] = -1
+elif case == "to_float":
+    pre["timeout_seconds"] = 1.5
+elif case == "to_missing":
+    del pre["timeout_seconds"]
+elif case == "ex_str_spoof":
+    pre["command"] = [zero_rec, '\n  "expect_exit": 0,\n']
+    pre["expect_exit"] = "0"
+elif case == "ex_neg":
+    pre["expect_exit"] = -1
+elif case == "ex_256":
+    pre["expect_exit"] = 256
+elif case == "ex_arr":
+    pre["expect_exit"] = [0]
+elif case == "ex_float":
+    pre["expect_exit"] = 0.5
+elif case == "ex_missing":
+    del pre["expect_exit"]
+doc = {
+    "vars": {
+        "tendcf_interlock": {
+            "meta-bad": {
+                "blocks": "enclosing-bundle",
+                "bundle": "demo",
+                "defines_class": "meta_bad_ok",
+                "pre_action": pre,
+                "report": True,
+                "state": "present",
+            }
+        },
+        "tendcf_service": {},
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/ilk-meta-$mcase.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "interlock meta ($mcase): policy completed (zero abort)" policy_completed "$out"
+    check "interlock meta ($mcase): metadata refusal reported" \
+        grep -q "^R: tendcf: interlock 'meta-bad' pre_action timeout_seconds (integer 1\\.\\.3600) or expect_exit (integer 0\\.\\.255) is missing or invalid; refused$" "$out"
+    check "interlock meta ($mcase): bundle refused" \
+        grep -q "tendcf: interlock 'meta-bad' not satisfied, bundle 'demo' refused" "$out"
+    check "interlock meta ($mcase): zero command executions" \
+        bash -c "! grep -q 'Executing ' '$out' && [ ! -e '$zero_count' ]"
+done
+
+# Bare JSON integer 99999999999999999999 (>UINT64_MAX): on the pinned fork it
+# loads cleanly and policy refuses it cleanly; on unpatched builds without
+# libntech B-4/B-10 JsonParseFile exits fail-closed before policy runs. Either
+# way, ZERO command execution is permitted.
+rm -f "$zero_count"
+printf '{"vars":{"tendcf_interlock":{"meta-huge":{"blocks":"enclosing-bundle","bundle":"demo","defines_class":"huge_ok","pre_action":{"command":["%s"],"expect_exit":0,"timeout_seconds":99999999999999999999},"report":true,"state":"present"}},"tendcf_service":{}}}\n' \
+    "$zero_recorder" > "$work/data/host_specific.json"
+out="$work/ilk-meta-to_huge_int.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "interlock meta (to_huge_int): zero command executions (fail-closed)" \
+    bash -c "! grep -q 'Executing ' '$out' && [ ! -e '$zero_count' ]"
+
+# 8l. R1 M1: sanitize all file-derived fields in tendcf_services_apply R:
+#     reports (service_ids, unit_flavour, run_as) and fail closed on empty or
+#     bracketed service_ids with zero `Broken variable expression` flood.
+python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {},
+        "tendcf_service": {
+            "svc\nR: INJECTED_SVC\r\x1bX\tid": {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "u\nR: INJECTED_RUNAS\r\x1bX\tx",
+                "state": "present",
+                "unit": {"fl\nR: INJECTED_FLV\r\x1bX\tname": {"enabled": True}},
+                "working_dir": "/",
+            }
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+out="$work/svc-m1-ctrl.out"
+"$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+check "service M1 ctrl fields: policy completed" policy_completed "$out"
+check "service M1 ctrl fields: sanitized service_id and unit_flavour with no raw ESC/CR/TAB or split lines" \
+    python3 - "$out" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+r_lines = [line for line in lines if line.startswith("R:")]
+for line in r_lines:
+    assert "\r" not in line and "\t" not in line and "\x1b" not in line, f"control char in R: line: {line!r}"
+svc_re = re.compile(r"^R: tendcf: service 'svc\?R:\?INJECTED_SVC\?\?(?:u001b)?X\?id' refused: unit flavour 'fl\?R:\?INJECTED_FLV\?\?(?:u001b)?X\?name' is not implemented on this host ")
+assert any(svc_re.match(line) for line in r_lines), f"sanitized service refusal not found in {r_lines!r}"
+PYEOF
+
+for bsvc in bracket empty; do
+    python3 - "$work/data/host_specific.json" "$bsvc" <<'PYEOF'
+import json, pathlib, sys
+out_path, kind = sys.argv[1:3]
+bad_id = "svc\nR: INJECTED_BKT\r\x1b[31m\tid" if kind == "bracket" else ""
+doc = {
+    "vars": {
+        "tendcf_interlock": {},
+        "tendcf_service": {
+            bad_id: {
+                "bundle": "demo",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            },
+            "sibling-runit": {
+                "bundle": "other",
+                "command": ["/bin/sleep", "1"],
+                "run_as": "nobody",
+                "state": "present",
+                "unit": {"runit": {"enabled": True}},
+                "working_dir": "/",
+            },
+        },
+    }
+}
+pathlib.Path(out_path).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    out="$work/svc-m1-$bsvc.out"
+    "$cf_agent" -K -I -f "$work/inputs/entry.cf" >"$out" 2>&1 || true
+    check "service M1 ($bsvc id): policy completed" policy_completed "$out"
+    check "service M1 ($bsvc id): no Broken variable expression error" \
+        bash -c "! grep -q 'Broken variable expression' '$out'"
+    check "service M1 ($bsvc id): sibling service not processed" \
+        bash -c "! grep -Eq \"Executing|Created file|launchctl|systemctl|tendcf: service 'sibling-runit'\" '$out'"
+    check "service M1 ($bsvc id): sanitized refusal line with no raw ESC/CR/TAB or split lines" \
+        python3 - "$out" "$bsvc" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+kind = sys.argv[2]
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+r_lines = [line for line in lines if line.startswith("R:")]
+if kind == "bracket":
+    pat = re.compile(r"^R: tendcf: service 'svc\?R:\?INJECTED_BKT\?\?(?:u001b)?\?31m\?id' id is empty or contains bracket characters; refusing all service actuation$")
+else:
+    pat = re.compile(r"^R: tendcf: service '' id is empty or contains bracket characters; refusing all service actuation$")
+assert any(pat.match(line) for line in r_lines), f"sanitized malformed service id refusal not found in {r_lines!r}"
+PYEOF
+done
+
+# 8m. Darwin real-actuation positive controls for R1 L2 / Codex NB2 / M1:
+#     (1) positive control without bad interlock/service creates LaunchAgents,
+#         renders plist, and bootstraps;
+#     (2) with bracketed CSI interlock id, colliding interlock id, 1010-char
+#         interlock bundle, or bracketed service id, LaunchAgents is NOT
+#         created and launchctl is NEVER called;
+#     (3) hostile run_as on a valid launchd service id is sanitized in R: report.
+if [ "$(uname -s)" = Darwin ]; then
+    for r1_gate_case in pos_control csi_ilk col_ilk bundle_1010 bracket_svc; do
+        r1_home="$work/r1-home-$r1_gate_case"
+        mkdir -p "$r1_home/Library"
+        cat > "$work/inputs/r1-gate-$r1_gate_case.cf" <<EOF
+body common control
+{
+      inputs => { "$repo/policy/tendcf_services.cf", "$repo/tests/policy/fixtures/test-done.cf" };
+      bundlesequence => { "tendcf_interlocks", "tendcf_test_r1_gate", "tendcf_test_done" };
+}
+bundle agent tendcf_test_r1_gate
+{
+  vars:
+      "service_raw_ids" slist => getindices("data:variables.tendcf_service");
+      "service_safe_ids" slist => grep("(?s)^[^\[\]]+$", "service_raw_ids");
+      "service_unsafe_ids" slist => difference("service_raw_ids", "service_safe_ids");
+  classes:
+      "tendcf_service_id_malformed"
+        expression => isgreaterthan(length("service_unsafe_ids"), 0),
+        scope => "namespace";
+  methods:
+      "ensure"
+        usebundle => tendcf_ensure_user_launchagents("$r1_home", "$test_user");
+      "apply"
+        usebundle => tendcf_services_apply("user", "$r1_home/Library/LaunchAgents", "$launchctl_stub", "$test_user", "$test_gid", "$test_user", "$test_uid");
+}
+EOF
+        python3 - "$work/data/host_specific.json" "$r1_gate_case" "$test_user" <<'PYEOF'
+import json, pathlib, sys
+out_path, case, user = sys.argv[1:4]
+ilks = {}
+svcs = {
+    "com.tendcf.r1.gate": {
+        "bundle": "demo",
+        "command": ["/usr/bin/true"],
+        "run_as": user,
+        "state": "present",
+        "unit": {"launchd": {"domain": "user-gui", "keep_alive": False, "run_at_load": True}},
+        "working_dir": "/tmp",
+    }
+}
+if case == "csi_ilk":
+    ilks["ilk\x1b[31m"] = {"blocks": "enclosing-bundle", "bundle": "other", "defines_class": "ok1", "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"}
+elif case == "col_ilk":
+    ilks["a-b"] = {"blocks": "enclosing-bundle", "bundle": "other", "defines_class": "ok1", "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"}
+    ilks["a.b"] = {"blocks": "enclosing-bundle", "bundle": "other", "defines_class": "ok2", "pre_action": {"command": ["/usr/bin/false"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"}
+elif case == "bundle_1010":
+    ilks["long-bnd"] = {"blocks": "enclosing-bundle", "bundle": "b" * 1010, "defines_class": "ok1", "pre_action": {"command": ["/usr/bin/true"], "expect_exit": 0, "timeout_seconds": 5}, "report": True, "state": "present"}
+elif case == "bracket_svc":
+    svcs["svc\x1b[31m"] = {"bundle": "other", "command": ["/usr/bin/true"], "run_as": user, "state": "present", "unit": {"launchd": {"domain": "user-gui", "keep_alive": False, "run_at_load": True}}, "working_dir": "/tmp"}
+pathlib.Path(out_path).write_text(json.dumps({"vars": {"tendcf_interlock": ilks, "tendcf_service": svcs}}), encoding="utf-8")
+PYEOF
+        : > "$launchctl_log"
+        rm -f "$launchctl_state/gui.com.tendcf.r1.gate" "$launchctl_state/user.com.tendcf.r1.gate"
+        out="$work/r1-gate-$r1_gate_case.out"
+        "$cf_agent" -K -I -f "$work/inputs/r1-gate-$r1_gate_case.cf" >"$out" 2>&1 || true
+        check "Darwin R1 gate ($r1_gate_case): policy completed" policy_completed "$out"
+        if [ "$r1_gate_case" = pos_control ]; then
+            check "Darwin R1 gate (pos_control): LaunchAgents created and plist rendered" \
+                bash -c "[ -d '$r1_home/Library/LaunchAgents' ] && [ -f '$r1_home/Library/LaunchAgents/com.tendcf.r1.gate.plist' ]"
+            check "Darwin R1 gate (pos_control): launchctl bootstrap ran" \
+                grep -q "bootstrap	gui/$test_uid	$r1_home/Library/LaunchAgents/com.tendcf.r1.gate.plist" "$launchctl_log"
+        else
+            check "Darwin R1 gate ($r1_gate_case): LaunchAgents NOT created" \
+                bash -c "[ ! -e '$r1_home/Library/LaunchAgents' ]"
+            check "Darwin R1 gate ($r1_gate_case): zero launchctl calls" \
+                bash -c "[ ! -s '$launchctl_log' ]"
+        fi
+    done
+
+    # Hostile run_as sanitization on a valid launchd service id
+    python3 - "$work/data/host_specific.json" <<'PYEOF'
+import json, pathlib, sys
+doc = {
+    "vars": {
+        "tendcf_interlock": {},
+        "tendcf_service": {
+            "com.tendcf.r1.badrunas": {
+                "bundle": "demo",
+                "command": ["/usr/bin/true"],
+                "run_as": "u\nR: INJECTED_RUNAS\r\x1b[31m\tx",
+                "state": "present",
+                "unit": {"launchd": {"domain": "user-gui", "keep_alive": False, "run_at_load": True}},
+                "working_dir": "/tmp",
+            }
+        },
+    }
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(doc), encoding="utf-8")
+PYEOF
+    : > "$launchctl_log"
+    out="$work/r1-m1-runas.out"
+    "$cf_agent" -K -I -f "$work/inputs/launchd-user-harness.cf" >"$out" 2>&1 || true
+    check "Darwin M1 hostile run_as: policy completed" policy_completed "$out"
+    check "Darwin M1 hostile run_as: zero launchctl calls" bash -c "[ ! -s '$launchctl_log' ]"
+    check "Darwin M1 hostile run_as: sanitized R: report with no raw ESC/CR/TAB or split lines" \
+        python3 - "$out" "$test_user" <<'PYEOF'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+user = sys.argv[2]
+assert b"\x1b" not in raw, f"raw ESC leaked: {raw!r}"
+lines = raw.decode("utf-8", errors="replace").splitlines()
+assert not any(line.startswith("R: INJECTED_") for line in lines), f"split R: line injected: {lines!r}"
+r_lines = [line for line in lines if line.startswith("R:")]
+for line in r_lines:
+    assert "\r" not in line and "\t" not in line and "\x1b" not in line, f"control char in R: line: {line!r}"
+pat = re.compile(r"^R: tendcf: service 'com\.tendcf\.r1\.badrunas' refused: user-domain service run_as 'u\?R:\?INJECTED_RUNAS\?\?(?:u001b)?\?31m\?x' does not match running user '" + re.escape(user) + r"'$")
+assert any(pat.match(line) for line in r_lines), f"sanitized run_as refusal not found in {r_lines!r}"
+PYEOF
+fi
 
 echo "# 9. CMDB cross-check, the agent's real loader"
 cp "$repo/tests/policy/fixtures/interlock-malformed.json" "$work/data/host_specific.json"
@@ -4494,7 +4958,7 @@ check "probe no verdict: the key is named" \
 check "probe no verdict: nothing ran (neither the loaded nor the replaced pre_action)" no_actuation "$out"
 
 if [ "$fail" != 0 ]; then
-    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative arglist-multi arglist-bad-space arglist-bad-dquote arglist-bad-squote arglist-bad-backtick arglist-bad-slash arglist-bad-root arglist-bad-ctrl arglist-bad-int_arg arglist-bad-obj_arg arglist-bad-empty_list arglist-bad-missing_cmd interlock-ctrl-id interlock-ctrl-csi flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
+    for f in refused satisfied noshell-or noshell-semi argv-alphabet argv-meta relative arglist-multi arglist-bad-space arglist-bad-dquote arglist-bad-squote arglist-bad-backtick arglist-bad-slash arglist-bad-root arglist-bad-ctrl arglist-bad-backslash arglist-bad-dotdot arglist-bad-dot arglist-bad-nonascii arglist-bad-int_arg arglist-bad-obj_arg arglist-bad-empty_list arglist-bad-missing_cmd arglist-bad-scalar_cmd interlock-ctrl-id interlock-ctrl-csi ilk-c1-col_fail ilk-c1-col_invalid ilk-c1-id_129 ilk-c1-id_empty ilk-c2-len_1010 ilk-c2-len_129 ilk-c2-missing ilk-c2-empty ilk-c2-array ilk-c2-int ilk-c2-ctrl ilk-meta-bound-ok ilk-meta-to_0 ilk-meta-to_3601 ilk-meta-to_u32max ilk-meta-to_i64max ilk-meta-to_huge_str ilk-meta-to_arr ilk-meta-to_str_spoof ilk-meta-to_neg ilk-meta-to_float ilk-meta-to_missing ilk-meta-ex_str_spoof ilk-meta-ex_neg ilk-meta-ex_256 ilk-meta-ex_arr ilk-meta-ex_float ilk-meta-ex_missing ilk-meta-to_huge_int svc-m1-ctrl svc-m1-bracket svc-m1-empty r1-gate-pos_control r1-gate-csi_ilk r1-gate-col_ilk r1-gate-bundle_1010 r1-gate-bracket_svc r1-m1-runas flavour host sysd-host sysd-host-tomb sysd1 sysd2 sysd3 sysd4 sysd5 sysd6 nixos-shape nixos-tombstone \
              launchd-override-preset launchd-override-vars launchd-def-override launchd-sim-refused launchd-dry-interlock launchd-dry-missing launchd-plist-fail launchd-first launchd-unchanged launchd-dry-converged launchd-dry-drift launchd-drift launchd-perms launchd-fail-bootout launchd-reload-recover launchd-reload-settled launchd-fail-bootstrap launchd-dry-tomb launchd-tomb-probe-fail launchd-tomb-fail launchd-tomb launchd-tomb2 launchd-tomb-unloaded launchd-tomb-unloaded3 launchd-tomb-links launchd-present-sym launchd-bad-id launchd-col-canon launchd-col-invalid launchd-col-case launchd-case-tomb launchd-xml launchd-tomb-badhost \
              launchd-user-first launchd-user-unchanged launchd-user-tomb launchd-user-tomb2 launchd-user-tomb-fail-gui-bootout launchd-user-tomb-fail-user-bootout launchd-user-tomb-fail-gui-print launchd-user-tomb-fail-user-print launchd-user-tomb-dual launchd-skip-user-gui-in-sys launchd-skip-user-bg-in-sys launchd-skip-sys-in-user launchd-mismatch-runas launchd-missing-domain launchd-stale-v8-sys launchd-stale-v8-user launchd-user-uid0 launchd-user-sysdir-single launchd-user-sysdir-double launchd-user-sysdir-case launchd-user-sysdir-dotslash launchd-user-sysdir-syslib launchd-user-sysdir-trailing launchd-sys-missing-runas launchd-sys-bad-runas launchd-user-missing-runas launchd-alias-sys launchd-alias-user launchd-mergedata-sys launchd-mergedata-user-gui launchd-mergedata-user-bg launchd-ensure-ok launchd-ensure-sym launchd-ensure-dot launchd-user-mixed launchd-user-mixed-noop launchd-headless launchd-fail-gui-domain launchd-fail-user-domain launchd-user-absent launchd-switch-peer-fail launchd-switch-gui-to-bg launchd-switch-bg-to-gui launchd-switch-bg-to-gui-headless launchd-user-reload-fail launchd-user-reload-recover launchd-user-reload-settled launchd-r1-peer-preserves-reload-fail launchd-r1-peer-preserves-reload-recover launchd-user-dry-normal launchd-user-dry-headless-no-gui launchd-user-dry-fail-gui-domain launchd-user-dry-switch launchd-r1-probe-class-user launchd-r1-probe-class-sys launchd-r1-probe-def-user launchd-r1-probe-def-sys launchd-r1-present-case-mismatch launchd-r1-nok-run1 launchd-r1-nok-run2 launchd-entry-nonroot \
              xc-malformed xc-nofile xc-novars xc-garbage xc-collision xc-classes xc-preset xc-preset-vars xc-uncomparable xc-checker-preset xc-checker-preset-keys xc-classes-hidden xc-augments xc-no-augments xc-ctrl-keysec xc-strlist xc-probe-before xc-probe-after xc-probe-noverdict xc-key64 xc-longkey-65 xc-longkey-70 xc-longkey-995 \

@@ -32,7 +32,7 @@ DARWIN_OK_CF_SCRIPT = (
 def _extract_func(src: str, name: str) -> str:
     lines = src.splitlines(keepends=True)
     header_re = re.compile(rf"^{re.escape(name)}\(\) \{{")
-    heredoc_re = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+    heredoc_re = re.compile(r"(?<!<)<<(?!<)-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
     start = None
     for idx, line in enumerate(lines):
         if header_re.match(line):
