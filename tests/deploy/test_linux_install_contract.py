@@ -265,9 +265,9 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
         self.assertIn("flock -x 9", put_code)
         self.assertIn(".host_specific.new.XXXXXX", put_code)
         self.assertIn(".host_specific.prev.XXXXXX", put_code)
-        self.assertIn('"$py" -I -S "$installed_projector" --check "$staged_data" 9>&-', put_code)
+        self.assertIn('"$py" -I -S "$installed_projector" --check "$staged_data" 8>&- 9>&-', put_code)
 
-        idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data" 9>&-')
+        idx_gate1 = put_code.find('"$installed_projector" --check "$staged_data" 8>&- 9>&-')
         idx_gate2 = put_code.find('validate_cmdb_workdir "$stage_wd"')
         idx_bytes = put_code.find('data_bytes="$(wc -c < "$staged_data"')
         idx_arm = put_code.find("put_data_rollback_armed=1")
@@ -979,7 +979,17 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "verify_tree_binaries() { return 0; }\n"
                     "init_paths() { return 0; }\n"
                     "lay_out() { return 0; }\n"
+                    "acquire_lifecycle_lock() { return 0; }\n"
+                    "release_lifecycle_lock() { return 0; }\n"
+                    "prepare_audit_log_source() { return 0; }\n"
+                    "validate_existing_audit_state_before_repair() { return 0; }\n"
+                    "detach_unsafe_installed_audit_log() { return 0; }\n"
+                    "place_audit_log() { return 0; }\n"
+                    "place_audit_shipper_state() { return 0; }\n"
+                    "place_tripwire_rules() { return 0; }\n"
                     f"place_policy() {{ {place_pol_body}; }}\n"
+                    f'audit_etc_dir="{prefix}/etc/tendcf-audit"\n'
+                    f'audit_spool_dir="{prefix}/var/audit-spool"\n'
                     f'prefix="{prefix}"\n'
                     f'cf_lib_path="{prefix}/lib"\n'
                     f'cf_agent="{prefix}/bin/cf-agent"\n'
@@ -1433,6 +1443,814 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             argv = args_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(argv, ["--no-augments", "-K", "-I", "-f", str(entry)])
+
+
+class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
+    """Issue #119 Slice 2: Linux audit shipper, tripwire rules, and uninstall contract."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = INSTALLER.read_text(encoding="utf-8")
+
+    def test_cmd_install_orders_audit_log_and_tripwire_securely(self) -> None:
+        cmd_fn = _extract_func(self.src, "cmd_install")
+        self.assertIn("--audit-log-src)", cmd_fn)
+        self.assertIn("--audit-log-sha256)", cmd_fn)
+        self.assertIn("--lock-auditd)", cmd_fn)
+        order = [
+            "acquire_lifecycle_lock",
+            "prepare_audit_log_source",
+            "validate_existing_audit_state_before_repair",
+            "detach_unsafe_installed_audit_log",
+            "check_tree",
+            "place_audit_log",
+            "place_audit_shipper_state",
+            "place_tripwire_rules",
+            "release_lifecycle_lock",
+        ]
+        idxs = [cmd_fn.find(name) for name in order]
+        for name, idx in zip(order, idxs):
+            self.assertNotEqual(idx, -1, f"missing {name} in cmd_install")
+        self.assertEqual(idxs, sorted(idxs))
+
+        # place_audit_log operates exclusively on $prepared_audit_log_file.
+        pa_fn = _extract_func(self.src, "place_audit_log")
+        pa_code = "\n".join(l for l in pa_fn.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("$audit_log_src", pa_code)
+        self.assertNotIn("prepare_audit_log_source", pa_code)
+        self.assertIn("$prepared_audit_log_file", pa_code)
+
+        # detach_unsafe_installed_audit_log checks full parent chain BEFORE unlink and never mutates dirs (H3).
+        da_fn = _extract_func(self.src, "detach_unsafe_installed_audit_log")
+        da_code = "\n".join(l for l in da_fn.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("chown", da_code)
+        self.assertNotIn("chmod", da_code)
+        self.assertLess(da_code.find('check_dir_root_unwritable "$d"'), da_code.find('rm -f "$installed_audit_log"'))
+
+        # enable_audit_shipper uses isolated python3 -I -S, mktemp (M1), --expected-spool-dir (N1), and systemd sandboxing.
+        es_fn = _extract_func(self.src, "enable_audit_shipper")
+        self.assertIn(
+            "ExecStart=$py -I -S $installed_audit_log ship --config $audit_shipper_cfg --expected-spool-dir $audit_spool_dir",
+            es_fn,
+        )
+        self.assertIn("mktemp /etc/systemd/system/.tendcf-audit-shipper.service.new.XXXXXX", es_fn)
+        self.assertIn("NoNewPrivileges=yes", es_fn)
+        self.assertIn("ProtectSystem=strict", es_fn)
+        self.assertIn("ReadWritePaths=$audit_spool_dir", es_fn)
+
+    def test_hermetic_shipper_tripwire_install_and_uninstall_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_linux_shims(shim_dir)
+            # Extend stat shim to support '%u %g %a %h' (nlink) and '%d' (st_dev).
+            stat_shim = shim_dir / "stat"
+            stat_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                "args = sys.argv[1:]\n"
+                "follow = False\n"
+                "if args and args[0] == '-L':\n"
+                "    follow = True\n"
+                "    args = args[1:]\n"
+                "fmt = args[1]\n"
+                "p = args[2]\n"
+                "st = os.stat(p) if follow else os.lstat(p)\n"
+                "mode = stat.S_IMODE(st.st_mode)\n"
+                "if fmt == '%U:%G %a': print(f'root:root {mode:o}')\n"
+                "elif fmt == '%u %g %a': print(f'0 0 {mode:o}')\n"
+                "elif fmt == '%u %g %a %h': print(f'0 0 {mode:o} {st.st_nlink}')\n"
+                "elif fmt == '%u:%g %a %h %d:%i': print(f'0:0 {mode:o} {st.st_nlink} {st.st_dev}:{st.st_ino}')\n"
+                "elif fmt == '%d:%i': print(f'{st.st_dev}:{st.st_ino}')\n"
+                "elif fmt == '%u %a': print(f'0 {mode:o}')\n"
+                "elif fmt == '%u': print('0')\n"
+                "elif fmt == '%d': print(f'{st.st_dev}')\n"
+                "else: raise SystemExit(f'unexpected stat fmt: {fmt}')\n",
+                encoding="utf-8",
+            )
+            stat_shim.chmod(0o755)
+            # M1: Isolate fixture from host systemd manager and host auditd loaders with a stateful systemctl shim.
+            fake_run_systemd = root / "run_systemd"
+            fake_run_systemd.mkdir()
+            sctl_log = root / "systemctl.log"
+            sctl_active_dir = root / "sctl_active"
+            sctl_active_dir.mkdir()
+            for u in ("tendcf-execd.service", "tendcf-audit-shipper.service", "tendcf-audit-shipper.timer"):
+                (sctl_active_dir / u).write_text("active\n", encoding="utf-8")
+            sctl_shim = shim_dir / "systemctl"
+            sctl_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                f"log = pathlib.Path({str(sctl_log)!r})\n"
+                f"st_dir = pathlib.Path({str(sctl_active_dir)!r})\n"
+                "args = sys.argv[1:]\n"
+                "with log.open('a', encoding='utf-8') as f: f.write(' '.join(args) + '\\n')\n"
+                "if not args: raise SystemExit(0)\n"
+                "cmd = args[0]\n"
+                "if cmd == 'daemon-reload': raise SystemExit(0)\n"
+                "if cmd == 'show':\n"
+                "    u = args[-1]\n"
+                "    if 'LoadState' in args:\n"
+                "        print('loaded' if (st_dir / u).exists() else 'not-found')\n"
+                "    elif 'ActiveState' in args:\n"
+                "        print((st_dir / u).read_text().strip() if (st_dir / u).exists() else 'inactive')\n"
+                "    raise SystemExit(0)\n"
+                "if cmd == 'is-active':\n"
+                "    u = args[-1]\n"
+                "    ok = (st_dir / u).exists() and (st_dir / u).read_text().strip() == 'active'\n"
+                "    raise SystemExit(0 if ok else 3)\n"
+                "if cmd == 'is-enabled':\n"
+                "    u = args[-1]\n"
+                "    ok = (st_dir / u).exists() and (st_dir / u).read_text().strip() == 'active'\n"
+                "    raise SystemExit(0 if ok else 1)\n"
+                "if cmd in ('disable', 'stop'):\n"
+                "    u = args[-1]\n"
+                "    if (st_dir / u).exists(): (st_dir / u).write_text('inactive\\n', encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "if cmd == 'enable':\n"
+                "    u = args[-1]\n"
+                "    (st_dir / u).write_text('active\\n', encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            sctl_shim.chmod(0o755)
+            prefix = root / "opt" / "tendcf"
+            workdir = prefix / "var" / "libntech"
+            etc_dir = root / "etc"
+            systemd_dir = etc_dir / "systemd" / "system"
+            (prefix / "share" / "tendcf" / "bin").mkdir(parents=True)
+            (workdir / "inputs").mkdir(parents=True)
+            (workdir / "data").mkdir(parents=True)
+            systemd_dir.mkdir(parents=True)
+
+            shutil.copy2(PROJECTOR, prefix / "share" / "tendcf" / "bin" / "projector.py")
+            shutil.copy2(REPO / "tools" / "audit_log.py", prefix / "share" / "tendcf" / "bin" / "audit_log.py")
+
+            fns = "\n".join(
+                _extract_func(self.src, name)
+                for name in (
+                    "check_dir_root_unwritable",
+                    "check_regular_file_root_unwritable",
+                    "check_dir_chain_strict_under_prefix",
+                    "check_private_dir_exact",
+                    "check_private_file_exact",
+                    "refuse_legacy_audit_shipper_config",
+                    "validate_existing_audit_state_before_repair",
+                    "verify_installed_projector",
+                    "verify_installed_audit_log",
+                    "place_audit_shipper_state",
+                    "render_linux_tripwire_auditd",
+                    "render_linux_tripwire_aide",
+                    "verify_auditd_expected_watches",
+                    "check_auditd_rules_dir_safe_to_load",
+                    "write_auditd_rule_files",
+                    "append_lock_to_frozen_auditd_rules",
+                    "reload_auditd_tripwire",
+                    "place_tripwire_rules",
+                    "enable_audit_shipper",
+                    "cmd_enable",
+                    "stop_and_disable_unit",
+                    "disable_units",
+                    "remove_managed_file_safe",
+                    "mountinfo_contains_target",
+                    "purge_audit_spool_safe",
+                    "cmd_uninstall",
+                )
+            )
+            fake_mountinfo = root / "mountinfo"
+            fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
+            fns_patched = (
+                fns.replace(" /etc/audit ", f" {etc_dir}/audit ")
+                .replace(" /etc/aide ", f" {etc_dir}/aide ")
+                .replace("/etc/systemd/system", str(systemd_dir))
+                .replace("check_dir_chain_ok /etc", "true")
+                .replace("/proc/self/mountinfo", str(fake_mountinfo))
+                .replace("/proc/self/fd/7", '"$fd7_probe"')
+                .replace("/run/systemd/system", str(fake_run_systemd))
+                .replace("/sbin/augenrules", str(root / "no-augenrules"))
+                .replace("/usr/sbin/augenrules", str(root / "no-augenrules"))
+                .replace("/sbin/auditctl", str(root / "no-auditctl"))
+                .replace("/usr/sbin/auditctl", str(root / "no-auditctl"))
+            )
+            audit_cfg = prefix / "etc" / "tendcf-audit" / "audit-shipper.json"
+            spool_dir = prefix / "var" / "audit-spool"
+            auditd_rules = etc_dir / "audit" / "rules.d" / "99-tendcf-tripwire.rules"
+            aide_rules = etc_dir / "aide" / "aide.conf.d" / "99-tendcf-tripwire"
+            svc_path = systemd_dir / "tendcf-audit-shipper.service"
+            tmr_path = systemd_dir / "tendcf-audit-shipper.timer"
+            execd_path = systemd_dir / "tendcf-execd.service"
+            execd_path.write_text("[Unit]\nDescription=test\n", encoding="utf-8")
+
+            env_setup = (
+                "set -euo pipefail\n"
+                f'export PATH="{shim_dir}:$PATH"\n'
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                'say() { echo "tendcf-install: $*"; }\n'
+                "check_ancestors_ok() { return 0; }\n"
+                "acquire_lifecycle_lock() { return 0; }\n"
+                "release_lifecycle_lock() { return 0; }\n"
+                "need_systemd() { return 0; }\n"
+                "init_paths() { return 0; }\n"
+                f'fd7_probe="{spool_dir}/.spool.lock"\n'
+                f'entry="{workdir}/inputs/promises.cf"\n'
+                f'cf_execd="{prefix}/bin/cf-execd"\n'
+                f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
+                f'prefix="{prefix}"\n'
+                f'workdir="{workdir}"\n'
+                f'unit="tendcf-execd.service"\n'
+                f'unit_path="{execd_path}"\n'
+                f'shipper_service="tendcf-audit-shipper.service"\n'
+                f'shipper_timer="tendcf-audit-shipper.timer"\n'
+                f'shipper_service_path="{svc_path}"\n'
+                f'shipper_timer_path="{tmr_path}"\n'
+                f'installed_projector="{prefix}/share/tendcf/bin/projector.py"\n'
+                f'installed_audit_log="{prefix}/share/tendcf/bin/audit_log.py"\n'
+                f'audit_etc_dir="{prefix}/etc/tendcf-audit"\n'
+                f'audit_shipper_cfg="{audit_cfg}"\n'
+                f'audit_spool_dir="{spool_dir}"\n'
+                f'tripwire_share_dir="{prefix}/share/tendcf/tripwire"\n'
+                f'auditd_rules_dir="{etc_dir}/audit/rules.d"\n'
+                f'auditd_rules_path="{auditd_rules}"\n'
+                f'aide_rules_dir="{etc_dir}/aide/aide.conf.d"\n'
+                f'aide_rules_path="{aide_rules}"\n'
+                "lock_auditd=0\n"
+                f"{fns_patched}\n"
+            )
+
+            # 1) Install shipper state, tripwire rules (without -e 2), and systemd shipper units.
+            r1 = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "place_audit_shipper_state\nplace_tripwire_rules\nenable_audit_shipper\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertTrue(audit_cfg.is_file())
+            self.assertEqual(stat.S_IMODE(audit_cfg.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(spool_dir.stat().st_mode), 0o700)
+            self.assertTrue(auditd_rules.is_file())
+            self.assertTrue(aide_rules.is_file())
+            self.assertTrue(svc_path.is_file())
+            self.assertTrue(tmr_path.is_file())
+            auditd_text = auditd_rules.read_text(encoding="utf-8")
+            self.assertIn("-k tendcf_tripwire", auditd_text)
+            self.assertIn(f"-w {workdir}/data -p wa", auditd_text)
+            self.assertIn("/etc/sudoers", auditd_text)
+            self.assertNotIn("\n-e 2\n", auditd_text)
+
+            # Default disabled config passes real python3 -I -S audit_log.py ship --config --expected-spool-dir.
+            p_ship = subprocess.run(
+                [
+                    sys.executable, "-I", "-S",
+                    str(prefix / "share" / "tendcf" / "bin" / "audit_log.py"),
+                    "ship", "--config", str(audit_cfg), "--expected-spool-dir", str(spool_dir),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p_ship.returncode, 0, p_ship.stderr)
+            self.assertIn('"skipped": true', p_ship.stdout)
+
+            # 2) M3: --lock-auditd fails closed when active auditd/augenrules is unavailable.
+            r_lock = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "lock_auditd=1\nplace_tripwire_rules\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_lock.returncode, 0)
+            self.assertIn("--lock-auditd requested", r_lock.stderr)
+
+            # 3) H1: Dirty pre-existing audit-shipper.json (0644) is rejected BEFORE repair.
+            os.chmod(audit_cfg, 0o644)
+            r_dirty_cfg = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_dirty_cfg.returncode, 0 if False else 1)
+            os.chmod(audit_cfg, 0o600)
+
+            # 3b) R8-M2: Empty spool (no .spool.lock yet) creates & acquires 0600 .spool.lock during validation.
+            self.assertFalse((spool_dir / ".spool.lock").exists())
+            r_empty_val = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_empty_val.returncode, 0, r_empty_val.stderr)
+            self.assertTrue((spool_dir / ".spool.lock").is_file(), "R8-M2: validation must create/hold .spool.lock on empty spool")
+            self.assertEqual(stat.S_IMODE((spool_dir / ".spool.lock").stat().st_mode), 0o600)
+            # R9-L1: Mandatory descriptor-to-path verification fails closed on mismatch or missing probe.
+            wrong_inode = root / "wrong-inode"
+            wrong_inode.write_text("x\n", encoding="utf-8")
+            os.chmod(wrong_inode, 0o600)
+            r_fd7_bad = subprocess.run(
+                ["/bin/bash", "-c", env_setup + f'fd7_probe="{wrong_inode}"\nvalidate_existing_audit_state_before_repair\n'],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_fd7_bad.returncode, 0, "R9-L1: mismatched FD 7 inode must fail closed")
+            self.assertIn("failed descriptor verification", r_fd7_bad.stderr)
+            r_fd7_miss = subprocess.run(
+                ["/bin/bash", "-c", env_setup + f'fd7_probe="{root}/missing-fd7"\nvalidate_existing_audit_state_before_repair\n'],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_fd7_miss.returncode, 0, "R9-L1: missing FD 7 probe must fail closed")
+
+            # 3c) R8-M4 & R9-M2: Legacy $prefix/etc/audit-shipper.json is refused before mutation
+            # (both-present & legacy-only, in install AND standalone cmd_enable), preserving originals & zero manager calls.
+            legacy_cfg = prefix / "etc" / "audit-shipper.json"
+            legacy_cfg.write_text('{"enabled":true,"legacy":1}\n', encoding="utf-8")
+            os.chmod(legacy_cfg, 0o600)
+            r_leg_both = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_both.returncode, 0, "R8-M4: legacy+new config must refuse with migration instructions")
+            self.assertIn("legacy audit shipper config", r_leg_both.stderr)
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            execd_before = execd_path.read_text(encoding="utf-8")
+            sctl_before_len = len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0
+            r_en_both = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_enable\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_en_both.returncode, 0, "R9-M2: standalone cmd_enable must refuse dual-location legacy config")
+            self.assertEqual(execd_path.read_text(encoding="utf-8"), execd_before, "R9-M2: cmd_enable must not touch execd unit")
+            self.assertEqual(len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0, sctl_before_len, "R9-M2: zero systemctl calls allowed")
+            audit_cfg_bak = audit_cfg.read_text(encoding="utf-8")
+            audit_cfg.unlink()
+            r_leg_only = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "place_audit_shipper_state\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_only.returncode, 0, "R8-M4: legacy-only config must refuse before writing default")
+            self.assertFalse(audit_cfg.exists())
+            r_en_only = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_enable\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_en_only.returncode, 0, "R9-M2: standalone cmd_enable must refuse legacy-only config")
+            self.assertEqual(execd_path.read_text(encoding="utf-8"), execd_before)
+            self.assertEqual(len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0, sctl_before_len)
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            legacy_cfg.unlink()
+            audit_cfg.write_text(audit_cfg_bak, encoding="utf-8")
+            os.chmod(audit_cfg, 0o600)
+
+            # 4) H5/M1: Populate spool with REAL AuditSpool (audit.jsonl, cursor.json, .spool.lock).
+            unrelated_trip = prefix / "share" / "tendcf" / "tripwire" / "operator-custom.conf"
+            unrelated_trip.write_text("keep me\n", encoding="utf-8")
+            p_emit = subprocess.run(
+                [
+                    sys.executable, "-I", "-S",
+                    str(prefix / "share" / "tendcf" / "bin" / "audit_log.py"),
+                    "emit", "--spool-dir", str(spool_dir),
+                    "--host", "test-host", "--src", "cf-agent", "--boot-id", "boot-1",
+                    "--type", "heartbeat",
+                    "--data-json",
+                    '{"running_release":"release-1.0.0","goal_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","projection_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","converged":true,"unshipped_count":0}',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p_emit.returncode, 0, p_emit.stderr)
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
+            self.assertTrue((spool_dir / "cursor.json").is_file())
+            self.assertTrue((spool_dir / ".spool.lock").is_file())
+            r_un = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_un.returncode, 0, r_un.stderr)
+            sctl_calls = sctl_log.read_text(encoding="utf-8")
+            self.assertIn("disable --now tendcf-audit-shipper.timer", sctl_calls, "M1: stateful stub must record timer stop")
+            self.assertIn("disable --now tendcf-execd.service", sctl_calls, "M1: stateful stub must record execd stop")
+            self.assertIn("daemon-reload", sctl_calls, "M1: stateful stub must record daemon-reload")
+            for gone in (execd_path, svc_path, tmr_path, auditd_rules, aide_rules, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
+                self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
+            self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
+            self.assertTrue((spool_dir / "audit.jsonl").is_file(), "default uninstall must preserve audit spool")
+
+            # M1: Empty, corrupt (no root '/'), unreadable, or bind-mounted-leaf mountinfo all fail closed BEFORE unlinking anything.
+            fake_mountinfo.write_text("", encoding="utf-8")
+            r_empty_mi = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_empty_mi.returncode, 0, "M1: empty mountinfo must fail closed")
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
+
+            fake_mountinfo.write_text("2 1 1:1 /a /var rw - ext4 /dev/sda1 rw\n", encoding="utf-8")
+            r_noroot_mi = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_noroot_mi.returncode, 0, "M1: mountinfo missing root '/' must fail closed")
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
+
+            real_cursor = os.path.realpath(spool_dir / "cursor.json")
+            fake_mountinfo.write_text(
+                f"1 0 1:1 / / rw - ext4 /dev/root rw\n2 1 1:1 /src {real_cursor} rw - ext4 /dev/root rw\n",
+                encoding="utf-8",
+            )
+            r_leaf_mi = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_leaf_mi.returncode, 0)
+            self.assertTrue((spool_dir / "audit.jsonl").is_file(), "M1: preflight must abort before deleting sibling audit.jsonl")
+            self.assertTrue((spool_dir / "cursor.json").is_file())
+            # Restore valid mountinfo for remaining checks.
+            fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
+
+            # Unexpected entry inside spool dir blocks --purge-spool (H5).
+            rogue_spool = spool_dir / "operator-notes.txt"
+            rogue_spool.write_text("do not delete\n", encoding="utf-8")
+            r_refuse_purge = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_refuse_purge.returncode, 0)
+            self.assertTrue(rogue_spool.is_file())
+            rogue_spool.unlink()
+
+            # 5) Clean --purge-spool removes real AuditSpool files (audit.jsonl, cursor.json, .spool.lock) & rmdir cleanly and is idempotent.
+            r_purge = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\ncmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_purge.returncode, 0, r_purge.stderr)
+            self.assertFalse(spool_dir.exists())
+
+            # 6) M1/M2: Empty spool also purges cleanly under set -u.
+            spool_dir.mkdir(mode=0o700)
+            os.chmod(spool_dir, 0o700)
+            r_empty = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_empty.returncode, 0, r_empty.stderr)
+            self.assertFalse(spool_dir.exists())
+
+    def test_m2_disable_stop_failure_propagates_and_preserves_files(self) -> None:
+        # M2: real systemctl stop failure must abort disable_units/cmd_uninstall BEFORE unlinking unit/config.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shim_dir = root / "shims"
+            shim_dir.mkdir()
+            _make_linux_shims(shim_dir)
+            fake_sys = shim_dir / "systemctl"
+            fake_sys.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  show) echo loaded; exit 0 ;;\n"
+                "  is-enabled|is-active) exit 0 ;;\n"
+                "  disable|stop) echo 'simulated stop failure' >&2; exit 1 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_sys.chmod(0o755)
+            fake_run_systemd = root / "run_systemd"
+            fake_run_systemd.mkdir()
+            svc = root / "tendcf-audit-shipper.service"
+            tmr = root / "tendcf-audit-shipper.timer"
+            unit = root / "tendcf-execd.service"
+            cfg = root / "audit-shipper.json"
+            for p in (svc, tmr, unit, cfg):
+                p.write_text("x\n", encoding="utf-8")
+
+            fns = "\n".join(
+                _extract_func(self.src, n)
+                for n in ("stop_and_disable_unit", "disable_units", "remove_managed_file_safe", "cmd_uninstall")
+            ).replace("/run/systemd/system", str(fake_run_systemd))
+            script = (
+                "set -euo pipefail\n"
+                f'export PATH="{shim_dir}:$PATH"\n'
+                'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                'say() { :; }\n'
+                "check_ancestors_ok() { return 0; }\n"
+                "acquire_lifecycle_lock() { return 0; }\n"
+                "release_lifecycle_lock() { return 0; }\n"
+                'unit="tendcf-execd.service"\n'
+                'shipper_service="tendcf-audit-shipper.service"\n'
+                'shipper_timer="tendcf-audit-shipper.timer"\n'
+                f'unit_path="{unit}"\n'
+                f'shipper_service_path="{svc}"\n'
+                f'shipper_timer_path="{tmr}"\n'
+                f'auditd_rules_path="{root}/none1"\n'
+                f'aide_rules_path="{root}/none2"\n'
+                f'installed_audit_log="{root}/none3"\n'
+                f'audit_shipper_cfg="{cfg}"\n'
+                f'tripwire_share_dir="{root}/none4"\n'
+                f'audit_spool_dir="{root}/none5"\n'
+                f"{fns}\n"
+                "cmd_uninstall\n"
+            )
+            r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(tmr.is_file(), "M2: timer file must not be unlinked when stop fails")
+            self.assertTrue(cfg.is_file(), "M2: config must not be removed when stop fails")
+
+            # N1: Manager query failure on ActiveState must propagate instead of treating unit as inactive.
+            fake_sys.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  show)\n"
+                "    case \"$*\" in\n"
+                "      *LoadState*) echo loaded; exit 0 ;;\n"
+                "      *ActiveState*) echo 'dbus failure' >&2; exit 1 ;;\n"
+                "    esac ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_sys.chmod(0o755)
+            r_mgr_err = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
+            self.assertNotEqual(r_mgr_err.returncode, 0)
+            self.assertTrue(tmr.is_file(), "N1: manager query failure must preserve unit files")
+
+    def test_r2_h1_m4_m5_linux_lock_fd8_close_and_auditd_coverage(self) -> None:
+        # H1: acquire_lifecycle_lock has no /var/tmp fallback and fails closed when lock parent is unavailable.
+        fn_lock = _extract_func(self.src, "acquire_lifecycle_lock")
+        self.assertNotIn("/var/tmp", fn_lock)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            r_nolock = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "check_dir_chain_ok() { return 1; }\n"
+                    f'lifecycle_lock_parent="{root}/missing-run"\n'
+                    f'lifecycle_lock_dir="{root}/missing-run/tendcf"\n'
+                    f'lifecycle_lock_file="{root}/missing-run/tendcf/install.lock"\n'
+                    "lifecycle_lock_held=0\n"
+                    f"{fn_lock}\n"
+                    "acquire_lifecycle_lock\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_nolock.returncode, 0)
+            self.assertIn("missing or untrusted", r_nolock.stderr)
+
+            # M4: Verify FD 8 is closed in cf-promises probe, cf-key, validate_cmdb_workdir, and projector.py.
+            for fn_name, needle in (
+                ("init_paths", "8>&- 9>&-"),
+                ("lay_out", "8>&- 9>&-"),
+                ("validate_cmdb_workdir", "8>&- 9>&-"),
+                ("put_data", "8>&- 9>&-"),
+            ):
+                self.assertIn(needle, _extract_func(self.src, fn_name), f"M4: {fn_name} must close FD 8 and FD 9")
+
+            # Runtime FD 8 leak check via validate_cmdb_workdir and lay_out with FD 8 open in parent.
+            shim_dir = root / "fd8_shims"
+            shim_dir.mkdir()
+            fd8_probe_bin = shim_dir / "fd8-probe"
+            fd8_probe_bin.write_text(
+                "#!/bin/sh\n"
+                "if (true >&8) 2>/dev/null; then echo 'FD8_LEAKED' >&2; exit 99; fi\n"
+                "printf 'tendcf_cmdb_evaluated source=promise\\n'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fd8_probe_bin.chmod(0o755)
+            fn_val = _extract_func(self.src, "validate_cmdb_workdir")
+            r_fd8 = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    f'exec 8>"{root}/parent.lock"\n'
+                    f'cf_lib_path="{root}"\n'
+                    f'cf_promises="{fd8_probe_bin}"\n'
+                    f"{fn_val}\n"
+                    f'validate_cmdb_workdir "{root}" "{root}/entry.cf" "{root}"\n'
+                    "exec 8>&-\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_fd8.returncode, 0, r_fd8.stderr)
+            self.assertNotIn("FD8_LEAKED", r_fd8.stderr)
+
+            # M5/H2: verify_auditd_expected_watches requires exact effective semantics
+            # (rejects narrower subject/syscall filters and dir-vs-file scope mismatch)
+            # and append_lock_to_frozen_auditd_rules preserves verified frozen bytes.
+            wdir_a = root / "wdir_a"
+            wdir_b = root / "wdir_b"
+            wfile_c = root / "wfile_c"
+            wdir_a.mkdir()
+            wdir_b.mkdir()
+            wfile_c.write_text("x\n", encoding="utf-8")
+            rules = root / "99-tendcf-tripwire.rules"
+            rules.write_text(
+                f"-w {wdir_a} -p wa -k tendcf_tripwire\n"
+                f"-w {wdir_b} -p wa -k tendcf_tripwire\n"
+                f"-w {wfile_c} -p wa -k tendcf_tripwire\n",
+                encoding="utf-8",
+            )
+            fn_ver = _extract_func(self.src, "verify_auditd_expected_watches")
+            # 1) Narrower rule with extra subject filter (-F uid=1000) MUST be rejected.
+            actl_narrow = root / "actl-narrow"
+            actl_narrow.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F dir={wdir_b} -F uid=1000 -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_narrow.chmod(0o755)
+            r_narrow = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_narrow}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_narrow.returncode, 0, "H2: narrower -F uid=1000 rule must be rejected")
+            self.assertIn(str(wdir_b), r_narrow.stdout)
+
+            # 2) File-scoped -F path= for a directory watch MUST be rejected.
+            actl_wrong_scope = root / "actl-scope"
+            actl_wrong_scope.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wdir_b} -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_wrong_scope.chmod(0o755)
+            r_scope = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_wrong_scope}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_scope.returncode, 0, "H2: -F path= must not satisfy directory watch")
+            self.assertIn(f"dir:{wdir_b}", r_scope.stdout)
+
+            # 3) Syscall-restricted rule (-S openat) MUST be rejected.
+            actl_sys = root / "actl-sys"
+            actl_sys.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S openat -F dir={wdir_b} -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_sys.chmod(0o755)
+            r_sys = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_sys}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_sys.returncode, 0, "H2: -S openat restricted rule must be rejected")
+
+            # 4) Exact equivalent unconditional rules (dir= for dirs, path= for files) PASS.
+            actl_full = root / "actl-full"
+            actl_full.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F dir={wdir_b}/ -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_full.chmod(0o755)
+            r_full = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_full}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_full.returncode, 0, r_full.stdout + r_full.stderr)
+
+            # 5) H1/H2: check_auditd_rules_dir_safe_to_load returns:
+            #    0 = positively safe, 1 = -e 2 found (incl. symlinked & >256KB early-match CRLF file with zero SIGPIPE),
+            #    2 = non-regular (FIFO/symlink-to-FIFO), unreadable, or broken symlink (fail closed).
+            fn_safe_load = _extract_func(self.src, "check_auditd_rules_dir_safe_to_load")
+            rules_d = root / "rules.d"
+            rules_d.mkdir()
+            managed_r = rules_d / "99-tendcf-tripwire.rules"
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n", encoding="utf-8")
+            # Clean unlocked rules dir -> returns 0 (positively safe).
+            r_clean = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_clean.returncode, 0, f"unlocked rules dir should return 0, got {r_clean.returncode}")
+            # (a) Large (>256 KB) symlinked drop-in with early -e 2\r\n on line 1 -> returns 1 (no SIGPIPE!).
+            pkg_target = root / "pkg-immutable-large.rules"
+            pkg_target.write_bytes(b"-e 2\r\n" + (b"# padding rule comment line for pipe buffer overflow test 0123456789\r\n" * 5000))
+            sym_rule = rules_d / "98-pkg-lock.rules"
+            os.symlink(pkg_target, sym_rule)
+            r_sym = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_sym.returncode, 1, "H1: large symlinked drop-in with early CRLF -e 2 must return 1 (no SIGPIPE fail-open)")
+            sym_rule.unlink()
+            # (b) FIFO (and symlink to FIFO) -> returns 2 immediately without blocking!
+            fifo_target = root / "trap.fifo"
+            os.mkfifo(fifo_target)
+            os.symlink(fifo_target, sym_rule)
+            r_fifo = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            self.assertEqual(r_fifo.returncode, 2, "H1: FIFO / symlink-to-FIFO drop-in must return 2 without blocking")
+            sym_rule.unlink()
+            # (c) Broken symlink / unreadable -> returns 2 (fail closed).
+            os.symlink(root / "does-not-exist.rules", sym_rule)
+            r_broken = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_broken.returncode, 2, "H1: broken symlink drop-in must return 2")
+            sym_rule.unlink()
+            # (d) Standalone cmd_enable with persisted -e 2 in managed 99-tendcf-tripwire.rules on mutable kernel -> blocks augenrules --load!
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n-e 2\n", encoding="utf-8")
+            augen_log = root / "augen.log"
+            fake_augen = root / "fake-augenrules"
+            fake_augen.write_text(f"#!/bin/sh\necho \"$*\" >> '{augen_log}'\nexit 0\n", encoding="utf-8")
+            fake_augen.chmod(0o755)
+            fake_actl = root / "fake-auditctl"
+            fake_actl.write_text("#!/bin/sh\nif [ \"$1\" = \"-s\" ]; then echo 'enabled 1'; exit 0; fi\nexit 0\n", encoding="utf-8")
+            fake_actl.chmod(0o755)
+            fake_sys_dir = root / "fake_run_systemd"
+            fake_sys_dir.mkdir()
+            fake_sctl = root / "fake_sctl_bin"
+            fake_sctl.mkdir()
+            (fake_sctl / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_sctl / "systemctl").chmod(0o755)
+            fn_reload = (
+                _extract_func(self.src, "reload_auditd_tripwire")
+                .replace("/sbin/augenrules", str(fake_augen))
+                .replace("/usr/sbin/augenrules", str(fake_augen))
+                .replace("/sbin/auditctl", str(fake_actl))
+                .replace("/usr/sbin/auditctl", str(fake_actl))
+                .replace("/run/systemd/system", str(fake_sys_dir))
+            )
+            r_persisted = subprocess.run(
+                [
+                    "/bin/bash", "-c",
+                    f"set -euo pipefail\nexport PATH='{fake_sctl}':\"$PATH\"\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    f"auditd_rules_dir='{rules_d}'\nauditd_rules_path='{managed_r}'\nlock_auditd=0\n"
+                    f"{fn_safe_load}\n{fn_reload}\nreload_auditd_tripwire\n",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_persisted.returncode, 0, r_persisted.stderr)
+            self.assertFalse(augen_log.exists(), "H1: standalone enable with persisted -e 2 on mutable kernel must NOT run augenrules --load")
+            self.assertIn("without running augenrules --load", r_persisted.stdout)
+            # (e) R6-H1: compact attached `-e2` spelling returns 1 and makes zero augenrules --load calls!
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n-e2\n", encoding="utf-8")
+            r_compact_chk = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_compact_chk.returncode, 1, "R6-H1: compact -e2 spelling must return 1")
+            r_compact_rel = subprocess.run(
+                [
+                    "/bin/bash", "-c",
+                    f"set -euo pipefail\nexport PATH='{fake_sctl}':\"$PATH\"\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    f"auditd_rules_dir='{rules_d}'\nauditd_rules_path='{managed_r}'\nlock_auditd=0\n"
+                    f"{fn_safe_load}\n{fn_reload}\nreload_auditd_tripwire\n",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_compact_rel.returncode, 0, r_compact_rel.stderr)
+            self.assertFalse(augen_log.exists(), "R6-H1: compact -e2 must prevent augenrules --load")
+            fn_purge = _extract_func(self.src, "purge_audit_spool_safe")
+            self.assertNotIn("mountinfo_path", fn_purge, "M1: production purge must not accept inherited mountinfo_path")
+            self.assertIn("mountinfo_contains_target /proc/self/mountinfo", fn_purge)
 
 
 if __name__ == "__main__":

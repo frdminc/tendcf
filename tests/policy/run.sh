@@ -557,11 +557,19 @@ check "reserved (malformed state): dedicated refusal reported" \
     grep -qF "tendcf: service 'org.tendcf.execd' refused: installer-owned unit (tendcf-install) cannot be managed by cfengine" "$out"
 check "reserved (malformed state): nothing rendered and no launchctl/systemctl" no_render_start "$out"
 
-# Bare `tendcf-execd` (present & absent) and companion `tendcf-execd.timer` (present) reserved checks (Opus H1 / Adv B1).
+# Bare `tendcf-execd` (present & absent), companion `tendcf-execd.timer`, and
+# #119 Slice 2 audit-shipper units (launchd folded + systemd exact/bare/timer).
 for spec in \
     "systemd-nosuffix-present:tendcf-execd:present:tendcf: service 'tendcf-execd' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
     "systemd-nosuffix-absent:tendcf-execd:absent:tendcf: service 'tendcf-execd' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
-    "systemd-timer-present:tendcf-execd.timer:present:tendcf: service 'tendcf-execd.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
+    "systemd-timer-present:tendcf-execd.timer:present:tendcf: service 'tendcf-execd.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "launchd-shipper-present:org.tendcf.audit-shipper:present:tendcf: service 'org.tendcf.audit-shipper' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "launchd-shipper-case-absent:ORG.TENDCF.AUDIT-SHIPPER:absent:tendcf: service 'ORG.TENDCF.AUDIT-SHIPPER' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
+    "systemd-shipper-present:tendcf-audit-shipper.service:present:tendcf: service 'tendcf-audit-shipper.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-shipper-nosuffix-absent:tendcf-audit-shipper:absent:tendcf: service 'tendcf-audit-shipper' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
+    "systemd-shipper-timer-present:tendcf-audit-shipper.timer:present:tendcf: service 'tendcf-audit-shipper.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-shipper-socket-present:tendcf-audit-shipper.socket:present:tendcf: service 'tendcf-audit-shipper.socket' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-shipper-path-present:tendcf-audit-shipper.path:present:tendcf: service 'tendcf-audit-shipper.path' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
     cname="${spec%%:*}"; rest="${spec#*:}"
     cid="${rest%%:*}"; rest="${rest#*:}"
     cstate="${rest%%:*}"; expected="${rest#*:}"

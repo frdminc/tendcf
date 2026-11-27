@@ -7741,6 +7741,7 @@ class CheckRenderer(Base):
             names = set(tf.getnames())
         self.assertIn("tendcf-install.sh", names)
         self.assertIn("bin/projector.py", names)
+        self.assertIn("bin/audit_log.py", names)
         self.assertIn(f"artifact/{self.tarball.name}", names)
         self.assertIn(f"artifact/{self.sha_file.name}", names)
         self.assertIn("policy/tendcf_services.cf", names)

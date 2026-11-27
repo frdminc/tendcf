@@ -225,6 +225,7 @@ jobs:
           mkdir -p /opt/tendcf/share/tendcf/bin
           cp -R policy deploy /opt/tendcf/share/tendcf/
           install -o root -g root -m 0644 tools/projector.py /opt/tendcf/share/tendcf/bin/projector.py
+          install -o root -g root -m 0644 tools/audit_log.py /opt/tendcf/share/tendcf/bin/audit_log.py
           chown -R root:root /opt/tendcf/share/tendcf
           echo "$GITHUB_SHA" > /opt/tendcf/share/tendcf/REVISION
           tar -C /opt -czf /tmp/cfengine-fork-debian13-$(uname -m).tar.gz tendcf

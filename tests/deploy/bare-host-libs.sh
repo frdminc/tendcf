@@ -66,12 +66,16 @@ echo "# the installer has to supply the path itself"
 check "bare host python3 -I -S has no third-party rfc8785 (stdlib JCS fallback active)" \
     python3 -I -S -c 'import importlib.util, sys; sys.exit(1 if importlib.util.find_spec("rfc8785") is not None else 0)'
 check "install succeeds with root-owned packaged projector and caller's LD_LIBRARY_PATH unset" \
-    env -u LD_LIBRARY_PATH "$installer" install --projector-src /opt/tendcf/share/tendcf/bin/projector.py --data "$canary/host_specific.json"
+    env -u LD_LIBRARY_PATH "$installer" install --projector-src /opt/tendcf/share/tendcf/bin/projector.py --audit-log-src /opt/tendcf/share/tendcf/bin/audit_log.py --data "$canary/host_specific.json"
 wd="$(env -u LD_LIBRARY_PATH "$installer" workdir)"
 check "projector.py installed root:root 0644 (non-symlink)" \
     bash -c "[ -f /opt/tendcf/share/tendcf/bin/projector.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/projector.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/projector.py)\" = 'root:root 644' ]"
+check "audit_log.py installed root:root 0644 (non-symlink)" \
+    bash -c "[ -f /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/audit_log.py)\" = 'root:root 644' ]"
 check "python3 -I -S verifies installed projector standalone" \
     python3 -I -S /opt/tendcf/share/tendcf/bin/projector.py --check "$wd/data/host_specific.json"
+check "python3 -I -S runs installed audit_log shipper with disabled default config" \
+    python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py ship --config /opt/tendcf/etc/tendcf-audit/audit-shipper.json
 check "data validated and placed" test -s "$wd/data/host_specific.json"
 check "packaged installer self-realpath install succeeds" \
     env -u LD_LIBRARY_PATH /opt/tendcf/share/tendcf/deploy/linux/tendcf-install.sh install --data /opt/tendcf/share/tendcf/deploy/linux/canary/host_specific.json
@@ -81,7 +85,7 @@ check "bare host rejects non-canonical projection via stdlib JCS fallback" \
     bash -c "! env -u LD_LIBRARY_PATH \"$installer\" data \"$bad_bare\" >/dev/null 2>&1 && cmp -s \"$canary/host_specific.json\" \"$wd/data/host_specific.json\""
 rm -f "$bad_bare"
 check "a hostile inherited LD_LIBRARY_PATH is replaced, not used" \
-    env LD_LIBRARY_PATH=/nonexistent "$installer" install --projector-src /opt/tendcf/share/tendcf/bin/projector.py --data "$canary/host_specific.json"
+    env LD_LIBRARY_PATH=/nonexistent "$installer" install --projector-src /opt/tendcf/share/tendcf/bin/projector.py --audit-log-src /opt/tendcf/share/tendcf/bin/audit_log.py --data "$canary/host_specific.json"
 check "no binary the root run loads is unresolved" \
     bash -c "! LD_LIBRARY_PATH=/opt/tendcf/lib ldd /opt/tendcf/bin/cf-agent /opt/tendcf/bin/cf-execd /opt/tendcf/bin/cf-promises /opt/tendcf/bin/cf-key | grep -q 'not found'"
 
