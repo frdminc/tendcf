@@ -1550,22 +1550,28 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "render_linux_tripwire_auditd",
                     "render_linux_tripwire_aide",
                     "verify_auditd_expected_watches",
+                    "other_auditd_dropin_requests_lock",
                     "write_auditd_rule_files",
+                    "append_lock_to_frozen_auditd_rules",
                     "reload_auditd_tripwire",
                     "place_tripwire_rules",
                     "enable_audit_shipper",
                     "stop_and_disable_unit",
                     "disable_units",
                     "remove_managed_file_safe",
+                    "mountinfo_contains_target",
                     "purge_audit_spool_safe",
                     "cmd_uninstall",
                 )
             )
+            fake_mountinfo = root / "mountinfo"
+            fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
             fns_patched = (
                 fns.replace("/etc/audit", f"{etc_dir}/audit")
                 .replace("/etc/aide", f"{etc_dir}/aide")
                 .replace("/etc/systemd/system", str(systemd_dir))
                 .replace("check_dir_chain_ok /etc", "true")
+                .replace("/proc/self/mountinfo", str(fake_mountinfo))
             )
             audit_cfg = prefix / "etc" / "audit-shipper.json"
             spool_dir = prefix / "var" / "audit-spool"
@@ -1576,9 +1582,6 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             execd_path = systemd_dir / "tendcf-execd.service"
             execd_path.write_text("[Unit]\nDescription=test\n", encoding="utf-8")
 
-            fake_mountinfo = root / "mountinfo"
-            fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
-
             env_setup = (
                 "set -euo pipefail\n"
                 f'export PATH="{shim_dir}:$PATH"\n'
@@ -1587,7 +1590,6 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 "check_ancestors_ok() { return 0; }\n"
                 "acquire_lifecycle_lock() { return 0; }\n"
                 "release_lifecycle_lock() { return 0; }\n"
-                f'mountinfo_path="{fake_mountinfo}"\n'
                 f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
                 f'prefix="{prefix}"\n'
                 f'workdir="{workdir}"\n'
@@ -1700,22 +1702,34 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
             self.assertTrue((spool_dir / "audit.jsonl").is_file(), "default uninstall must preserve audit spool")
 
-            # M1: Unreadable mountinfo fails closed without deleting spool files.
-            r_nomi = subprocess.run(
-                ["/bin/bash", "-c", env_setup + f'mountinfo_path="{root}/missing-mountinfo"\ncmd_uninstall --purge-spool\n'],
+            # M1: Empty, corrupt (no root '/'), unreadable, or bind-mounted-leaf mountinfo all fail closed BEFORE unlinking anything.
+            fake_mountinfo.write_text("", encoding="utf-8")
+            r_empty_mi = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertNotEqual(r_nomi.returncode, 0)
+            self.assertNotEqual(r_empty_mi.returncode, 0, "M1: empty mountinfo must fail closed")
             self.assertTrue((spool_dir / "audit.jsonl").is_file())
 
-            # M1: Bind-mounted leaf in mountinfo fails closed BEFORE deleting any sibling leaf.
+            fake_mountinfo.write_text("2 1 1:1 /a /var rw - ext4 /dev/sda1 rw\n", encoding="utf-8")
+            r_noroot_mi = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_noroot_mi.returncode, 0, "M1: mountinfo missing root '/' must fail closed")
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
+
             real_cursor = os.path.realpath(spool_dir / "cursor.json")
-            leaf_mi = root / "mountinfo-leaf"
-            leaf_mi.write_text(f"2 1 1:1 /src {real_cursor} rw - ext4 /dev/root rw\n", encoding="utf-8")
+            fake_mountinfo.write_text(
+                f"1 0 1:1 / / rw - ext4 /dev/root rw\n2 1 1:1 /src {real_cursor} rw - ext4 /dev/root rw\n",
+                encoding="utf-8",
+            )
             r_leaf_mi = subprocess.run(
-                ["/bin/bash", "-c", env_setup + f'mountinfo_path="{leaf_mi}"\ncmd_uninstall --purge-spool\n'],
+                ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\n"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1723,6 +1737,8 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertNotEqual(r_leaf_mi.returncode, 0)
             self.assertTrue((spool_dir / "audit.jsonl").is_file(), "M1: preflight must abort before deleting sibling audit.jsonl")
             self.assertTrue((spool_dir / "cursor.json").is_file())
+            # Restore valid mountinfo for remaining checks.
+            fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
 
             # Unexpected entry inside spool dir blocks --purge-spool (H5).
             rogue_spool = spool_dir / "operator-notes.txt"
@@ -1905,40 +1921,89 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r_fd8.returncode, 0, r_fd8.stderr)
             self.assertNotIn("FD8_LEAKED", r_fd8.stderr)
 
-            # M5: verify_auditd_expected_watches catches partial watch coverage and accepts full coverage.
+            # M5/H2: verify_auditd_expected_watches requires exact effective semantics
+            # (rejects narrower subject/syscall filters and dir-vs-file scope mismatch)
+            # and append_lock_to_frozen_auditd_rules preserves verified frozen bytes.
+            wdir_a = root / "wdir_a"
+            wdir_b = root / "wdir_b"
+            wfile_c = root / "wfile_c"
+            wdir_a.mkdir()
+            wdir_b.mkdir()
+            wfile_c.write_text("x\n", encoding="utf-8")
             rules = root / "99-tendcf-tripwire.rules"
             rules.write_text(
-                "-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n"
-                "-w /opt/tendcf/etc -p wa -k tendcf_tripwire\n"
-                "-w /root -p wa -k tendcf_tripwire\n",
+                f"-w {wdir_a} -p wa -k tendcf_tripwire\n"
+                f"-w {wdir_b} -p wa -k tendcf_tripwire\n"
+                f"-w {wfile_c} -p wa -k tendcf_tripwire\n",
                 encoding="utf-8",
             )
-            actl_partial = root / "actl-partial"
-            actl_partial.write_text(
-                "#!/bin/sh\n"
-                "echo '-w /opt/tendcf/bin -p wa -k tendcf_tripwire'\n",
-                encoding="utf-8",
-            )
-            actl_partial.chmod(0o755)
-            actl_full = root / "actl-full"
-            actl_full.write_text(
-                "#!/bin/sh\n"
-                "echo '-w /opt/tendcf/bin -p wa -k tendcf_tripwire'\n"
-                "echo '-a always,exit -S all -F dir=/opt/tendcf/etc -F perm=wa -F key=tendcf_tripwire'\n"
-                "echo '-a always,exit -S all -F path=/root/ -F perm=wa -F key=tendcf_tripwire'\n",
-                encoding="utf-8",
-            )
-            actl_full.chmod(0o755)
             fn_ver = _extract_func(self.src, "verify_auditd_expected_watches")
-            r_part = subprocess.run(
-                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_partial}'\n"],
+            # 1) Narrower rule with extra subject filter (-F uid=1000) MUST be rejected.
+            actl_narrow = root / "actl-narrow"
+            actl_narrow.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F dir={wdir_b} -F uid=1000 -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_narrow.chmod(0o755)
+            r_narrow = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_narrow}'\n"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertNotEqual(r_part.returncode, 0)
-            self.assertIn("/opt/tendcf/etc", r_part.stdout)
-            self.assertIn("/root", r_part.stdout)
+            self.assertNotEqual(r_narrow.returncode, 0, "H2: narrower -F uid=1000 rule must be rejected")
+            self.assertIn(str(wdir_b), r_narrow.stdout)
+
+            # 2) File-scoped -F path= for a directory watch MUST be rejected.
+            actl_wrong_scope = root / "actl-scope"
+            actl_wrong_scope.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wdir_b} -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_wrong_scope.chmod(0o755)
+            r_scope = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_wrong_scope}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_scope.returncode, 0, "H2: -F path= must not satisfy directory watch")
+            self.assertIn(f"dir:{wdir_b}", r_scope.stdout)
+
+            # 3) Syscall-restricted rule (-S openat) MUST be rejected.
+            actl_sys = root / "actl-sys"
+            actl_sys.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S openat -F dir={wdir_b} -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_sys.chmod(0o755)
+            r_sys = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_sys}'\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_sys.returncode, 0, "H2: -S openat restricted rule must be rejected")
+
+            # 4) Exact equivalent unconditional rules (dir= for dirs, path= for files) PASS.
+            actl_full = root / "actl-full"
+            actl_full.write_text(
+                "#!/bin/sh\n"
+                f"echo '-w {wdir_a} -p wa -k tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F dir={wdir_b}/ -F perm=wa -F key=tendcf_tripwire'\n"
+                f"echo '-a always,exit -S all -F path={wfile_c} -F perm=wa -F key=tendcf_tripwire'\n",
+                encoding="utf-8",
+            )
+            actl_full.chmod(0o755)
             r_full = subprocess.run(
                 ["/bin/bash", "-c", f"set -euo pipefail\n{fn_ver}\nverify_auditd_expected_watches '{rules}' '{actl_full}'\n"],
                 capture_output=True,
@@ -1946,6 +2011,28 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(r_full.returncode, 0, r_full.stdout + r_full.stderr)
+
+            # 5) H2: another drop-in with -e 2 is detected before pre-verification augenrules --load,
+            # and production purge_audit_spool_safe binds directly to /proc/self/mountinfo (no var override).
+            fn_other = _extract_func(self.src, "other_auditd_dropin_requests_lock")
+            rules_d = root / "rules.d"
+            rules_d.mkdir()
+            (rules_d / "99-tendcf-tripwire.rules").write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n", encoding="utf-8")
+            (rules_d / "98-existing-lock.rules").write_text("-e 2\n", encoding="utf-8")
+            r_other = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\nauditd_rules_path='{rules_d}/99-tendcf-tripwire.rules'\n{fn_other}\nother_auditd_dropin_requests_lock\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_other.returncode, 0, "H2: must detect pre-existing -e 2 in other drop-in")
+            fn_purge = _extract_func(self.src, "purge_audit_spool_safe")
+            self.assertNotIn("mountinfo_path", fn_purge, "M1: production purge must not accept inherited mountinfo_path")
+            self.assertIn("mountinfo_contains_target /proc/self/mountinfo", fn_purge)
 
 
 if __name__ == "__main__":

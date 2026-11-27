@@ -138,12 +138,14 @@ upgrade_needs_shipper_restart=0
 upgrade_rollback_armed=0
 upgrade_backup_prefix=""
 upgrade_staged_tree=""
+upgrade_had_var=0
+upgrade_had_etc=0
 upgrade_moved_var=0
 upgrade_moved_etc=0
 upgrade_was_loaded=0
 upgrade_had_plist=0
 upgrade_shipper_was_loaded=0
-upgrade_shipper_was_disabled=0
+upgrade_shipper_prior_disabled=""
 upgrade_had_shipper_plist=0
 upgrade_saved_shipper_plist=""
 upgrade_snapshot_taken=0
@@ -186,7 +188,7 @@ cleanup_stage() {
     fi
     local rollback_keep_stage=0
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
-        local restored_prefix=0 var_restored=1 etc_restored=1 shipper_plist_restored=1
+        local restored_prefix=0 var_restored=1 etc_restored=1 shipper_plist_restored=1 shipper_state_restored=1
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
             if execd_is_loaded; then
                 bootout_execd >/dev/null 2>&1 || true
@@ -201,10 +203,12 @@ cleanup_stage() {
             if [ -e "$prefix" ] || [ -L "$prefix" ]; then
                 /bin/mv "$prefix" "$failed_prefix" || true
             fi
-            # Reconcile actual var/ and etc/ presence regardless of signal timing
-            # relative to flag updates (H2); NEVER delete staging/failed_prefix if
-            # restoration cannot be confirmed.
-            if [ ! -e "$upgrade_backup_prefix/var" ]; then
+            # Reconcile var/ and etc/ ONLY when they belonged to the original prefix
+            # (or were already moved; H2/M2); NEVER copy staged_tree's new dirs into
+            # an old prefix that originally lacked them, and NEVER delete recovery
+            # dirs if restoration cannot be confirmed.
+            if { [ "${upgrade_had_var:-0}" -eq 1 ] || [ "$upgrade_moved_var" -eq 1 ]; } \
+                && [ ! -e "$upgrade_backup_prefix/var" ]; then
                 if [ -d "$failed_prefix/var" ]; then
                     if ! /bin/mv "$failed_prefix/var" "$upgrade_backup_prefix/var"; then
                         var_restored=0
@@ -217,13 +221,14 @@ cleanup_stage() {
                         rollback_keep_stage=1
                         echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/var to $upgrade_backup_prefix/var; preserving stage_dir $stage_dir" >&2
                     fi
-                elif [ "$upgrade_moved_var" -eq 1 ]; then
+                else
                     var_restored=0
                     rollback_keep_stage=1
                     echo "tendcf-install: ERROR: expected preserved var/ missing during rollback; preserving recovery dirs" >&2
                 fi
             fi
-            if [ ! -e "$upgrade_backup_prefix/etc" ]; then
+            if { [ "${upgrade_had_etc:-0}" -eq 1 ] || [ "${upgrade_moved_etc:-0}" -eq 1 ]; } \
+                && [ ! -e "$upgrade_backup_prefix/etc" ]; then
                 if [ -d "$failed_prefix/etc" ]; then
                     if ! /bin/mv "$failed_prefix/etc" "$upgrade_backup_prefix/etc"; then
                         etc_restored=0
@@ -236,7 +241,7 @@ cleanup_stage() {
                         rollback_keep_stage=1
                         echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/etc to $upgrade_backup_prefix/etc; preserving stage_dir $stage_dir" >&2
                     fi
-                elif [ "${upgrade_moved_etc:-0}" -eq 1 ]; then
+                else
                     etc_restored=0
                     rollback_keep_stage=1
                     echo "tendcf-install: ERROR: expected preserved etc/ missing during rollback; preserving recovery dirs" >&2
@@ -284,8 +289,8 @@ cleanup_stage() {
             fi
             /bin/rm -f "$plist_path" || true
         fi
-        # Restore prior shipper plist contents and disabled/loaded state before
-        # restarting (M3).
+        # Restore prior shipper plist contents (only from validated snapshot; H1)
+        # and restore prior disabled/loaded state independently of plist presence (M3).
         if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
             && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
             && [ -n "${shipper_plist_path:-}" ]; then
@@ -304,9 +309,6 @@ cleanup_stage() {
                 rollback_keep_stage=1
                 echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
             fi
-            if [ "${upgrade_shipper_was_disabled:-0}" -eq 1 ]; then
-                /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&- || true
-            fi
         elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
             && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
             if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
@@ -315,15 +317,47 @@ cleanup_stage() {
             fi
             /bin/rm -f "$shipper_plist_path" || true
         fi
+        # Restore disabled override state regardless of whether a plist existed (M3).
+        case "${upgrade_shipper_prior_disabled:-}" in
+            disabled)
+                if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                    bootout_shipper >/dev/null 2>&1 || true
+                    wait_shipper_unloaded || true
+                fi
+                if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
+                    shipper_state_restored=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to restore disabled override for system/$shipper_label; preserving recovery dirs" >&2
+                fi
+                ;;
+            unknown)
+                shipper_state_restored=0
+                rollback_keep_stage=1
+                echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
+                ;;
+        esac
         if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
-            bootstrap_execd_with_retry >/dev/null 2>&1 || true
+            if ! bootstrap_execd_with_retry >/dev/null 2>&1; then
+                rollback_keep_stage=1
+                echo "tendcf-install: ERROR: failed to re-bootstrap $label during rollback" >&2
+            fi
         fi
-        if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] && [ "$shipper_plist_restored" -eq 1 ] \
+        if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
+            && [ "${upgrade_shipper_prior_disabled:-enabled}" != "disabled" ] \
+            && [ "${upgrade_shipper_prior_disabled:-enabled}" != "unknown" ] \
+            && [ "$shipper_plist_restored" -eq 1 ] \
             && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] \
             && declare -F shipper_is_loaded >/dev/null 2>&1 && ! shipper_is_loaded; then
-            bootstrap_shipper_with_retry >/dev/null 2>&1 || true
+            if ! bootstrap_shipper_with_retry >/dev/null 2>&1; then
+                shipper_state_restored=0
+                rollback_keep_stage=1
+                echo "tendcf-install: ERROR: failed to re-bootstrap $shipper_label during rollback" >&2
+            fi
         fi
-        if [ "$restored_prefix" -eq 1 ]; then
+        if [ "$rollback_keep_stage" -eq 1 ] || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] \
+            || [ "$shipper_plist_restored" -eq 0 ] || [ "$shipper_state_restored" -eq 0 ]; then
+            echo "tendcf-install: ERROR: upgrade rollback was incomplete; inspect preserved recovery directories" >&2
+        elif [ "$restored_prefix" -eq 1 ]; then
             echo "tendcf-install: rolled back failed upgrade to previous $prefix" >&2
         elif [ "$upgrade_was_loaded" -eq 1 ]; then
             echo "tendcf-install: restarted $label after aborted upgrade" >&2
@@ -1190,26 +1224,36 @@ install_tarball() {
         if [ -L "$prefix/etc" ]; then
             die "existing $prefix/etc is a symlink; refusing upgrade"
         fi
-        if [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
+        # Validate any existing LaunchDaemon plist BEFORE snapshotting or mutating
+        # daemons so untrusted bytes can never be promoted to root LaunchDaemon (H1).
+        if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
+            validate_existing_launchd_plist_trusted "$plist_path"
             upgrade_had_plist=1
         else
             upgrade_had_plist=0
         fi
-        if [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
+        # Query pre-upgrade disabled override state unconditionally (even when
+        # no plist exists) and preserve unknown/error separately (M3).
+        local disabled_out=""
+        if disabled_out="$(/bin/launchctl print-disabled system 9>&- 2>/dev/null)"; then
+            if printf '%s\n' "$disabled_out" \
+                | /usr/bin/grep -Eq "\"$shipper_label\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
+                upgrade_shipper_prior_disabled="disabled"
+            else
+                upgrade_shipper_prior_disabled="enabled"
+            fi
+        else
+            upgrade_shipper_prior_disabled="unknown"
+        fi
+        if [ -n "${shipper_plist_path:-}" ] && { [ -e "$shipper_plist_path" ] || [ -L "$shipper_plist_path" ]; }; then
+            validate_existing_launchd_plist_trusted "$shipper_plist_path"
             upgrade_had_shipper_plist=1
             upgrade_saved_shipper_plist="$stage_dir/upgrade-shipper.plist.prev"
             /usr/bin/install -m 0644 -o root -g wheel "$shipper_plist_path" "$upgrade_saved_shipper_plist" \
                 || die "failed to snapshot previous $shipper_plist_path before upgrade"
-            if /bin/launchctl print-disabled system 9>&- 2>/dev/null \
-                | /usr/bin/grep -Eq "\"$shipper_label\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
-                upgrade_shipper_was_disabled=1
-            else
-                upgrade_shipper_was_disabled=0
-            fi
         else
             upgrade_had_shipper_plist=0
             upgrade_saved_shipper_plist=""
-            upgrade_shipper_was_disabled=0
         fi
         local was_loaded=0 shipper_loaded=0
         if execd_is_loaded; then
@@ -1228,10 +1272,17 @@ install_tarball() {
         fi
         local backup_prefix="$prefix.old.$$"
         /bin/rm -rf "$backup_prefix"
-        /bin/mv "$prefix" "$backup_prefix" || die "failed to move existing $prefix aside for upgrade"
+        # Record original var/etc presence, backup/staging paths, and arm rollback
+        # BEFORE the first prefix rename so a signal immediately after mv still
+        # restores the exact prior prefix layout (M2).
+        upgrade_had_var=0
+        upgrade_had_etc=0
+        [ -d "$prefix/var" ] && upgrade_had_var=1
+        [ -d "$prefix/etc" ] && upgrade_had_etc=1
         upgrade_backup_prefix="$backup_prefix"
         upgrade_staged_tree="$staged_tree"
         upgrade_rollback_armed=1
+        /bin/mv "$prefix" "$backup_prefix" || die "failed to move existing $prefix aside for upgrade"
         # Belt-and-suspenders check after move (concurrent symlink swap): EXIT trap
         # restores $upgrade_backup_prefix -> $prefix and restarts prior daemons.
         if [ -L "$backup_prefix/var" ]; then
@@ -2496,11 +2547,37 @@ bootstrap_shipper_with_retry() {
     /bin/launchctl bootstrap system "$shipper_plist_path" 9>&-
 }
 
+# Validate an existing LaunchDaemon plist before snapshotting or mutating any
+# daemon: parent directory verified, regular non-symlink inode, root:wheel,
+# single link (nlink=1), no SUID/SGID/go-w, no extended ACL, no quarantine (H1).
+validate_existing_launchd_plist_trusted() {  # validate_existing_launchd_plist_trusted PLIST_PATH
+    local p="$1" meta owner group mode nlink mode_oct
+    check_launchd_dir
+    [ ! -L "$p" ] && [ -f "$p" ] || die "existing $p is not a regular non-symlink file; refusing"
+    meta="$(/usr/bin/stat -f '%Su %Sg %Lp %l' "$p")" || die "cannot stat existing $p"
+    read -r owner group mode nlink <<< "$meta"
+    mode_oct=$((8#$mode))
+    if [ "$owner" != root ] || [ "$group" != wheel ] || [ "$nlink" != 1 ] \
+        || [ $((mode_oct & 8#6022)) -ne 0 ]; then
+        die "existing $p has untrusted metadata ($owner:$group $mode links=$nlink); refusing to snapshot or mutate"
+    fi
+    if has_acl_path "$p"; then
+        die "existing $p has an extended ACL; refusing to snapshot or mutate"
+    fi
+    if /usr/bin/xattr -p com.apple.quarantine "$p" >/dev/null 2>&1; then
+        die "existing $p has com.apple.quarantine; refusing to snapshot or mutate"
+    fi
+}
+
 enable_audit_shipper() {
     if [ ! -f "$installed_audit_log" ] || [ -L "$installed_audit_log" ]; then
         return 0
     fi
     check_launchd_dir
+    # Validate any pre-existing plist BEFORE snapshotting or touching launchd (H1).
+    if [ -e "$shipper_plist_path" ] || [ -L "$shipper_plist_path" ]; then
+        validate_existing_launchd_plist_trusted "$shipper_plist_path"
+    fi
     verify_installed_projector
     verify_installed_audit_log
     place_audit_shipper_state

@@ -1093,56 +1093,126 @@ EOF
 }
 
 # Compare the complete normalized expected watch set in RULES_FILE against
-# active kernel rules from `auditctl -l`. Prints missing watch paths (if any)
-# and exits non-zero if any expected watch is missing or RULES_FILE has none (M5).
+# active kernel rules from `auditctl -l`. Accepts ONLY the exact installed
+# watch syntax or the exact proven-equivalent unconditional kernel-normalized
+# syscall-watch form (rejecting extra subject/arch/syscall filters and
+# file-vs-dir scope mismatches; H2). Prints missing watch paths (if any) and
+# exits non-zero if any expected watch is missing or RULES_FILE has none.
 verify_auditd_expected_watches() {  # verify_auditd_expected_watches RULES_FILE ACTL_BIN
-    local rules_file="$1" actl="$2" active_rules
+    local rules_file="$1" actl="$2" active_rules exp_spec="" line wp kind
     active_rules="$("$actl" -l 8>&- 9>&- 2>/dev/null)" || return 1
-    awk -v rules_file="$rules_file" '
+    while IFS= read -r line; do
+        case "$line" in
+            "-w "*" -p wa -k tendcf_tripwire")
+                wp="${line#-w }"
+                wp="${wp% -p wa -k tendcf_tripwire}"
+                if [ -d "$wp" ] && [ ! -L "$wp" ]; then
+                    kind="dir"
+                else
+                    kind="file"
+                fi
+                exp_spec="${exp_spec}${kind}=${wp}|"
+                ;;
+        esac
+    done < "$rules_file"
+    awk -v exp_spec="$exp_spec" '
         function norm(p) {
             if (p != "/") sub(/\/+$/, "", p)
             return p
         }
         BEGIN {
             exp_n = 0
-            while ((getline line < rules_file) > 0) {
-                if (line ~ /^-w[[:space:]]+/ && line ~ /-p[[:space:]]+wa([[:space:]]|$)/ && line ~ /-k[[:space:]]+tendcf_tripwire([[:space:]]|$)/) {
-                    split(line, f, /[[:space:]]+/)
-                    if (f[2] != "") {
-                        p = norm(f[2])
-                        if (!(p in exp_seen)) {
-                            exp_seen[p] = 1
-                            exp_list[++exp_n] = p
-                        }
-                    }
+            n_lines = split(exp_spec, elines, "|")
+            for (i = 1; i <= n_lines; i++) {
+                if (elines[i] == "") continue
+                eq = index(elines[i], "=")
+                if (eq <= 1) continue
+                k = substr(elines[i], 1, eq - 1)
+                p = norm(substr(elines[i], eq + 1))
+                if (p != "" && !((k ":" p) in exp_seen)) {
+                    exp_seen[k ":" p] = 1
+                    exp_kind[++exp_n] = k
+                    exp_path[exp_n] = p
                 }
             }
-            close(rules_file)
         }
         {
-            has_key = ($0 ~ /(^|[[:space:]])-k[[:space:]]+tendcf_tripwire([[:space:]]|$)/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+key=tendcf_tripwire([[:space:]]|$)/)
-            has_perm = ($0 ~ /(^|[[:space:]])-p[[:space:]]+[^[:space:]]*w[^[:space:]]*a/ || $0 ~ /(^|[[:space:]])-p[[:space:]]+[^[:space:]]*a[^[:space:]]*w/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+perm=[^[:space:]]*w[^[:space:]]*a/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+perm=[^[:space:]]*a[^[:space:]]*w/)
-            if (!has_key || !has_perm) next
-            p = ""
-            for (i = 1; i <= NF; i++) {
-                if ($i == "-w" && i < NF) { p = $(i + 1); break }
-                if ($i == "-F" && i < NF && $(i + 1) ~ /^(path|dir)=/) {
-                    p = $(i + 1); sub(/^(path|dir)=/, "", p); break
+            # Shape 1: exact unconditional watch syntax: -w PATH -p (wa|aw) -k tendcf_tripwire
+            if (NF == 6 && $1 == "-w" && $3 == "-p" && ($4 == "wa" || $4 == "aw") && $5 == "-k" && $6 == "tendcf_tripwire") {
+                p = norm($2)
+                active_dir[p] = 1
+                active_file[p] = 1
+                next
+            }
+            # Shape 2: exact unconditional kernel-normalized watch syntax:
+            # -a always,exit [-S all] with ONLY -F (dir=P|path=P), -F perm=(wa|aw), -F key=tendcf_tripwire.
+            if (NF < 8 || $1 != "-a" || ($2 != "always,exit" && $2 != "exit,always")) next
+            idx = 3
+            if ($idx == "-S") {
+                if (idx + 1 > NF || $(idx + 1) != "all") next
+                idx += 2
+            }
+            bad = 0; seen_target = 0; target_kind = ""; target_path = ""
+            seen_perm = 0; seen_key = 0
+            while (idx <= NF) {
+                if ($idx != "-F" || idx + 1 > NF) { bad = 1; break }
+                pred = $(idx + 1)
+                idx += 2
+                if (pred ~ /^dir=/) {
+                    if (seen_target) { bad = 1; break }
+                    seen_target = 1; target_kind = "dir"
+                    target_path = norm(substr(pred, 5))
+                } else if (pred ~ /^path=/) {
+                    if (seen_target) { bad = 1; break }
+                    seen_target = 1; target_kind = "file"
+                    target_path = norm(substr(pred, 6))
+                } else if (pred == "perm=wa" || pred == "perm=aw") {
+                    if (seen_perm) { bad = 1; break }
+                    seen_perm = 1
+                } else if (pred == "key=tendcf_tripwire") {
+                    if (seen_key) { bad = 1; break }
+                    seen_key = 1
+                } else {
+                    # Any extra filter (uid=, auid=, arch=, success=, etc.) weakens/narrows semantics: reject!
+                    bad = 1; break
                 }
             }
-            if (p != "") active[norm(p)] = 1
+            if (!bad && seen_target && seen_perm && seen_key && target_path != "") {
+                if (target_kind == "dir") active_dir[target_path] = 1
+                else active_file[target_path] = 1
+            }
         }
         END {
             if (exp_n == 0) { print "no-expected-watches"; exit 1 }
             miss = ""
             for (i = 1; i <= exp_n; i++) {
-                p = exp_list[i]
-                if (!(p in active)) miss = (miss == "" ? p : miss "," p)
+                k = exp_kind[i]; p = exp_path[i]
+                ok = (k == "dir") ? (p in active_dir) : (p in active_file)
+                if (!ok) miss = (miss == "" ? k ":" p : miss "," k ":" p)
             }
             if (miss != "") { print miss; exit 1 }
             exit 0
         }
     ' <<< "$active_rules"
+}
+
+# Check whether any OTHER auditd drop-in under $auditd_rules_dir already
+# requests immutable mode (-e 2), which would prematurely lock the kernel
+# during our pre-verification augenrules --load (H2).
+other_auditd_dropin_requests_lock() {
+    local f had_ng=0
+    shopt -q nullglob && had_ng=1
+    shopt -s nullglob
+    for f in "$auditd_rules_dir"/*.rules; do
+        [ "$f" != "$auditd_rules_path" ] || continue
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        if grep -Eq '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)' "$f" 2>/dev/null; then
+            if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+            return 0
+        fi
+    done
+    if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+    return 1
 }
 
 write_auditd_rule_files() {  # write_auditd_rule_files INCLUDE_LOCK
@@ -1163,19 +1233,53 @@ write_auditd_rule_files() {  # write_auditd_rule_files INCLUDE_LOCK
     mv -f "$tmp_etc" "$auditd_rules_path"
 }
 
+# Append ONLY the immutable lock directive (-e 2) to the ALREADY-VERIFIED frozen
+# rule file bytes (never re-rendering optional paths between verification and
+# lock; H2).
+append_lock_to_frozen_auditd_rules() {
+    local old_umask tmp_share tmp_etc
+    old_umask="$(umask)"
+    umask 022
+    tmp_share="$(mktemp "$tripwire_share_dir/.auditd.lock.XXXXXX")"
+    umask "$old_umask"
+    grep -Ev '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)' "$auditd_rules_path" > "$tmp_share"
+    printf '# Immutable auditd lock requested via --lock-auditd (requires reboot to change)\n-e 2\n' >> "$tmp_share"
+    chown root:root "$tmp_share"
+    chmod 0640 "$tmp_share"
+    mv -f "$tmp_share" "$tripwire_share_dir/99-tendcf-tripwire.rules"
+
+    tmp_etc="$(mktemp "$auditd_rules_dir/.99-tendcf-tripwire.lock.XXXXXX")"
+    cp -p "$tripwire_share_dir/99-tendcf-tripwire.rules" "$tmp_etc"
+    chown root:root "$tmp_etc"
+    chmod 0640 "$tmp_etc"
+    mv -f "$tmp_etc" "$auditd_rules_path"
+}
+
 reload_auditd_tripwire() {
-    local augen="" actl="" missing=""
+    local augen="" actl="" missing="" already_locked=0
     if [ -x /sbin/augenrules ]; then augen=/sbin/augenrules; elif [ -x /usr/sbin/augenrules ]; then augen=/usr/sbin/augenrules; fi
     if [ -x /sbin/auditctl ]; then actl=/sbin/auditctl; elif [ -x /usr/sbin/auditctl ]; then actl=/usr/sbin/auditctl; fi
 
     if [ -n "$augen" ] && [ -d /run/systemd/system ] \
         && systemctl is-active --quiet auditd 8>&- 9>&- 2>/dev/null; then
-        if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then
+        if [ -n "$actl" ] && "$actl" -s 8>&- 9>&- 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
+            already_locked=1
+        fi
+        if [ "$already_locked" -eq 0 ] && other_auditd_dropin_requests_lock; then
             if [ "${lock_auditd:-0}" -eq 1 ]; then
-                die "--lock-auditd requested, but augenrules --load failed"
+                die "--lock-auditd requested, but another drop-in in $auditd_rules_dir already specifies -e 2; refusing premature lock before verifying tendcf_tripwire coverage"
             fi
-            say "tripwire: auditd rules staged at $auditd_rules_path (augenrules --load returned non-zero; rules may already be immutable)"
+            say "tripwire: warning: another drop-in in $auditd_rules_dir specifies -e 2; rules staged at $auditd_rules_path without running augenrules --load"
             return 0
+        fi
+        if [ "$already_locked" -eq 0 ]; then
+            if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then
+                if [ "${lock_auditd:-0}" -eq 1 ]; then
+                    die "--lock-auditd requested, but augenrules --load failed"
+                fi
+                say "tripwire: auditd rules staged at $auditd_rules_path (augenrules --load returned non-zero; rules may already be immutable)"
+                return 0
+            fi
         fi
         if [ -z "$actl" ]; then
             if [ "${lock_auditd:-0}" -eq 1 ]; then
@@ -1192,10 +1296,12 @@ reload_auditd_tripwire() {
             return 0
         fi
         if [ "${lock_auditd:-0}" -eq 1 ]; then
-            # Only append -e 2 and irreversibly lock AFTER 100% of expected watches are verified active (M5).
-            write_auditd_rule_files 1
-            if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then
-                die "--lock-auditd requested, but augenrules --load failed while applying -e 2"
+            # Freeze the verified rule bytes and append ONLY -e 2 (never re-render; H2).
+            append_lock_to_frozen_auditd_rules
+            if [ "$already_locked" -eq 0 ]; then
+                if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then
+                    die "--lock-auditd requested, but augenrules --load failed while applying -e 2"
+                fi
             fi
             if ! missing="$(verify_auditd_expected_watches "$auditd_rules_path" "$actl")"; then
                 die "--lock-auditd requested, but expected tripwire watches disappeared after lock (${missing:-query-failed})"
@@ -1735,23 +1841,51 @@ remove_managed_file_safe() {  # remove_managed_file_safe PATH
     rm -f "$target"
 }
 
+# Validate a single complete mountinfo snapshot and test whether TARGET_PATH
+# appears as a mount point. Exit codes:
+#   0 = confirmed mount match
+#   1 = valid non-empty mountinfo with root '/' confirmed, target NOT mounted
+#   2 = unreadable, empty, or malformed mountinfo (missing evidence; fail closed; M1)
+mountinfo_contains_target() {  # mountinfo_contains_target MOUNTINFO_FILE TARGET_PATH
+    local mi_file="$1" target="$2" snapshot=""
+    [ -r "$mi_file" ] || return 2
+    snapshot="$(cat "$mi_file" 2>/dev/null)" || return 2
+    [ -n "$snapshot" ] || return 2
+    awk -v target="$target" '
+        /^[[:space:]]*$/ { next }
+        {
+            if (NF < 7 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/) { bad=1; exit 2 }
+            rows++
+            if ($5 == "/") has_root = 1
+            if ($5 == target) found = 1
+        }
+        END {
+            if (bad || rows == 0 || !has_root) exit 2
+            exit (found ? 0 : 1)
+        }
+    ' <<< "$snapshot"
+}
+
 purge_audit_spool_safe() {
     if [ ! -e "$audit_spool_dir" ] && [ ! -L "$audit_spool_dir" ]; then
         return 0
     fi
     check_ancestors_ok "$audit_spool_dir" || die "unsafe ancestor for $audit_spool_dir; refusing purge"
     check_private_dir_exact "$audit_spool_dir"
-    local parent_dev spool_dev
-    local mi="${mountinfo_path:-/proc/self/mountinfo}"
+    local parent_dev spool_dev mi_rc=0
     parent_dev="$(stat -c '%d' "$(dirname "$audit_spool_dir")")" || die "cannot stat parent of $audit_spool_dir"
     spool_dev="$(stat -c '%d' "$audit_spool_dir")" || die "cannot stat $audit_spool_dir"
     [ "$spool_dev" = "$parent_dev" ] || die "$audit_spool_dir crosses a mount boundary; refusing purge"
-    # Fail closed if mountinfo cannot be read (M1).
-    [ -r "$mi" ] || die "cannot read $mi to verify mount boundaries; refusing purge"
+    # Bind production entry point directly to /proc/self/mountinfo (no env/var
+    # override) and fail closed on unreadable/empty/corrupt mountinfo (M1).
     local real_spool
     real_spool="$(readlink -f "$audit_spool_dir" 2>/dev/null)" || die "cannot resolve realpath of $audit_spool_dir; refusing purge"
-    if awk -v target="$real_spool" '$5 == target { found=1 } END { exit !found }' "$mi"; then
+    mi_rc=0
+    mountinfo_contains_target /proc/self/mountinfo "$real_spool" || mi_rc=$?
+    if [ "$mi_rc" -eq 0 ]; then
         die "$audit_spool_dir is a mount point (including bind mount); refusing purge"
+    elif [ "$mi_rc" -ne 1 ]; then
+        die "cannot verify /proc/self/mountinfo evidence for $audit_spool_dir; refusing purge"
     fi
     local had_nullglob=0 had_dotglob=0 ent base ent_dev real_ent
     local to_remove=()
@@ -1775,10 +1909,15 @@ purge_audit_spool_safe() {
         ent_dev="$(stat -c '%d' "$ent")" || die "cannot stat $ent"
         [ "$ent_dev" = "$spool_dev" ] || die "$ent crosses a mount boundary; refusing purge"
         real_ent="$(readlink -f "$ent" 2>/dev/null)" || die "cannot resolve realpath of $ent; refusing purge"
-        if awk -v target="$real_ent" '$5 == target { found=1 } END { exit !found }' "$mi"; then
+        mi_rc=0
+        mountinfo_contains_target /proc/self/mountinfo "$real_ent" || mi_rc=$?
+        if [ "$mi_rc" -ne 1 ]; then
             if [ "$had_nullglob" -eq 0 ]; then shopt -u nullglob; fi
             if [ "$had_dotglob" -eq 0 ]; then shopt -u dotglob; fi
-            die "$ent is a mount point (including bind mount); refusing purge"
+            if [ "$mi_rc" -eq 0 ]; then
+                die "$ent is a mount point (including bind mount); refusing purge"
+            fi
+            die "cannot verify /proc/self/mountinfo evidence for $ent; refusing purge"
         fi
         to_remove+=("$ent")
     done

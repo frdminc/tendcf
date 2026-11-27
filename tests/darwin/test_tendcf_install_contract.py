@@ -3183,19 +3183,21 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
 
             cs_fn = _extract_func(self.src, "cleanup_stage")
             # Simulate TERM arriving AFTER mv backup_prefix/{var,etc} -> staged_tree/{var,etc}
-            # even with upgrade_moved_var=0 and upgrade_moved_etc=0 (H2 worst-case boundary).
+            # with upgrade_had_var=1, upgrade_had_etc=1 and upgrade_moved_var/etc=0 (H2/M2).
             script = (
                 "set -euo pipefail\n"
                 f'prefix="{prefix}"\n'
                 f'upgrade_backup_prefix="{backup}"\n'
                 f'upgrade_staged_tree="{staged_tree}"\n'
                 'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=1\n'
+                'upgrade_had_etc=1\n'
                 'upgrade_moved_var=0\n'
                 'upgrade_moved_etc=0\n'
                 'upgrade_was_loaded=0\n'
                 'upgrade_had_plist=0\n'
                 'upgrade_shipper_was_loaded=1\n'
-                'upgrade_shipper_was_disabled=0\n'
+                'upgrade_shipper_prior_disabled="enabled"\n'
                 'upgrade_had_shipper_plist=1\n'
                 f'upgrade_saved_shipper_plist="{saved_plist}"\n'
                 'upgrade_snapshot_taken=0\n'
@@ -3237,12 +3239,14 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                     f'upgrade_backup_prefix="{backup2}"\n'
                     f'upgrade_staged_tree="{st2}"\n'
                     'upgrade_rollback_armed=1\n'
+                    'upgrade_had_var=1\n'
+                    'upgrade_had_etc=0\n'
                     'upgrade_moved_var=1\n'
                     'upgrade_moved_etc=0\n'
                     'upgrade_was_loaded=0\n'
                     'upgrade_had_plist=0\n'
                     'upgrade_shipper_was_loaded=0\n'
-                    'upgrade_shipper_was_disabled=0\n'
+                    'upgrade_shipper_prior_disabled="enabled"\n'
                     'upgrade_had_shipper_plist=0\n'
                     'upgrade_saved_shipper_plist=""\n'
                     'upgrade_snapshot_taken=0\n'
@@ -3268,6 +3272,155 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 for p_fix in (backup2, root / "opt" / "tendcf2"):
                     if p_fix.exists():
                         os.chmod(p_fix, 0o700)
+
+            # M2: Interruption immediately after first prefix rename with originally ABSENT etc/:
+            # must restore original prefix WITHOUT copying staged_tree/etc into it.
+            stage3 = root / "stage3"
+            st3 = stage3 / "extract" / "tendcf"
+            (st3 / "etc").mkdir(parents=True)
+            (st3 / "etc" / "from-new-tarball.json").write_text("new\n", encoding="utf-8")
+            backup3 = root / "opt" / "tendcf3.old"
+            (backup3 / "var").mkdir(parents=True)
+            (backup3 / "var" / "orig.txt").write_text("orig\n", encoding="utf-8")
+            prefix3 = root / "opt" / "tendcf3"
+            script3 = (
+                "set -euo pipefail\n"
+                f'prefix="{prefix3}"\n'
+                f'upgrade_backup_prefix="{backup3}"\n'
+                f'upgrade_staged_tree="{st3}"\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=1\n'
+                'upgrade_had_etc=0\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
+                'upgrade_was_loaded=0\n'
+                'upgrade_had_plist=0\n'
+                'upgrade_shipper_was_loaded=0\n'
+                'upgrade_shipper_prior_disabled="enabled"\n'
+                'upgrade_had_shipper_plist=0\n'
+                'upgrade_saved_shipper_plist=""\n'
+                'upgrade_snapshot_taken=0\n'
+                'upgrade_saved_workdir=""\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=0\n'
+                f'plist_path="{root}/execd3.plist"\n'
+                f'shipper_plist_path="{root}/shipper3.plist"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'stage_dir="{stage3}"\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 1; }\n'
+                'shipper_is_loaded() { return 1; }\n'
+                f"{cs_fn}\n"
+                "cleanup_stage\n"
+            )
+            r3 = subprocess.run(["/bin/bash", "-c", script3], capture_output=True, text=True, check=False)
+            self.assertEqual(r3.returncode, 0, r3.stderr)
+            self.assertEqual((prefix3 / "var" / "orig.txt").read_text(encoding="utf-8"), "orig\n")
+            self.assertFalse((prefix3 / "etc").exists(), "M2: staged_tree/etc must NOT be copied into prefix that originally lacked etc/")
+
+            # M3: Disabled override with ABSENT plist calls launchctl disable (and preserves stage_dir on failure).
+            lc_shim = root / "fake_launchctl"
+            lc_log = root / "lc_m3.log"
+            lc_shim.write_text(
+                f"#!/bin/sh\necho \"$*\" >> '{lc_log}'\nexit 0\n",
+                encoding="utf-8",
+            )
+            lc_shim.chmod(0o755)
+            cs_patched = cs_fn.replace("/bin/launchctl", str(lc_shim))
+            new_plist4 = root / "shipper4.plist"
+            new_plist4.write_text("<plist/>", encoding="utf-8")
+            stage4 = root / "stage4"
+            stage4.mkdir()
+            script4 = (
+                "set -euo pipefail\n"
+                f'prefix="{root}/opt/tendcf4"\n'
+                'upgrade_backup_prefix=""\n'
+                'upgrade_staged_tree=""\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=0\n'
+                'upgrade_had_etc=0\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
+                'upgrade_was_loaded=0\n'
+                'upgrade_had_plist=0\n'
+                'upgrade_shipper_was_loaded=0\n'
+                'upgrade_shipper_prior_disabled="disabled"\n'
+                'upgrade_had_shipper_plist=0\n'
+                'upgrade_saved_shipper_plist=""\n'
+                'upgrade_snapshot_taken=0\n'
+                'upgrade_saved_workdir=""\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=0\n'
+                f'plist_path="{root}/execd4.plist"\n'
+                f'shipper_plist_path="{new_plist4}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'stage_dir="{stage4}"\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 1; }\n'
+                'shipper_is_loaded() { return 1; }\n'
+                f"{cs_patched}\n"
+                "cleanup_stage\n"
+            )
+            r4 = subprocess.run(["/bin/bash", "-c", script4], capture_output=True, text=True, check=False)
+            self.assertEqual(r4.returncode, 0, r4.stderr)
+            self.assertFalse(new_plist4.exists())
+            self.assertIn("disable system/org.tendcf.audit-shipper", lc_log.read_text(encoding="utf-8"))
+
+            # Failed launchctl disable during rollback retains stage_dir and reports incomplete rollback.
+            lc_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            stage5 = root / "stage5"
+            stage5.mkdir()
+            r5 = subprocess.run(
+                ["/bin/bash", "-c", script4.replace(str(stage4), str(stage5))],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r5.returncode, 0, r5.stderr)
+            self.assertTrue(stage5.is_dir(), "M3: failed disabled-state restoration must preserve stage_dir")
+            self.assertIn("incomplete", r5.stderr)
+
+            # H1: Unsafe pre-existing shipper plist (world-writable 0666) is refused BEFORE any launchctl call.
+            unsafe_plist = root / "unsafe_shipper.plist"
+            unsafe_plist.write_text("<plist>UNTRUSTED</plist>\n", encoding="utf-8")
+            os.chmod(unsafe_plist, 0o666)
+            lc_h1_log = root / "lc_h1.log"
+            lc_h1 = root / "lc_h1"
+            lc_h1.write_text(f"#!/bin/sh\necho \"$*\" >> '{lc_h1_log}'\nexit 0\n", encoding="utf-8")
+            lc_h1.chmod(0o755)
+            fn_h1 = (
+                _extract_func(self.src, "has_acl_path")
+                + "\n"
+                + _extract_func(self.src, "validate_existing_launchd_plist_trusted")
+                + "\n"
+                + _extract_func(self.src, "enable_audit_shipper")
+            ).replace("/bin/launchctl", str(lc_h1)).replace('"$owner" != root', "false").replace('"$group" != wheel', "false")
+            inst_al = root / "audit_log.py"
+            inst_al.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            r_h1 = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    "check_launchd_dir() { return 0; }\n"
+                    f'installed_audit_log="{inst_al}"\n'
+                    f'shipper_plist_path="{unsafe_plist}"\n'
+                    'shipper_label="org.tendcf.audit-shipper"\n'
+                    f"{fn_h1}\n"
+                    "enable_audit_shipper\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(r_h1.returncode, 0, "H1: unsafe 0666 pre-existing plist must be refused")
+            self.assertIn("untrusted metadata", r_h1.stderr)
+            self.assertFalse(lc_h1_log.exists(), "H1: zero launchctl calls permitted on unsafe pre-existing plist")
 
 
 if __name__ == "__main__":

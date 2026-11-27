@@ -204,7 +204,10 @@ check "#119 tendcf-audit-shipper.service runs cleanly with disabled default conf
 # event, run tendcf-audit-shipper.service, verify sink witness & cursor ack.
 ship_tmp="$(mktemp -d /run/tendcf-ship-test.XXXXXX)"
 chmod 0700 "$ship_tmp"
-if [ -x /usr/sbin/sshd ] && command -v ssh-keygen >/dev/null 2>&1; then
+if [ ! -x /usr/sbin/sshd ] || ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "FAIL #119 required loopback sshd/ssh-keygen fixture unavailable"
+    fail=1
+else
     mkdir -p /run/sshd "$ship_tmp/sink" "$ship_tmp/run"
     chmod 0700 "$ship_tmp/sink" "$ship_tmp/run"
     ssh-keygen -q -t ed25519 -N '' -f "$ship_tmp/host_ed25519"
@@ -264,10 +267,27 @@ PYCFG
         systemctl start tendcf-audit-shipper.service
     check "#119 cursor.json advanced acked_seq to 1 after shipping" \
         python3 -c 'import json; c=json.load(open("/opt/tendcf/var/audit-spool/cursor.json")); assert c["acked_seq"]==1 and c["local_seq"]==1, c'
-    check "#119 audit_log.py verify confirms local spool matches sink witness line-for-line" \
-        python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py verify \
-            --local /opt/tendcf/var/audit-spool/audit.jsonl \
-            --sink-dir "$ship_tmp/sink" --host canary-host --src cf-agent
+    check "#119 audit_log.py verify confirms local spool matches sink witness (local=1, sink=1, quarantine=0)" \
+        python3 - "$ship_tmp/sink/canary-host/cf-agent" <<'PYVER'
+import json, subprocess, sys
+p = subprocess.run(
+    [
+        "python3", "-I", "-S", "/opt/tendcf/share/tendcf/bin/audit_log.py",
+        "verify",
+        "--local", "/opt/tendcf/var/audit-spool/audit.jsonl",
+        "--sink-dir", sys.argv[1],
+        "--host", "canary-host",
+        "--src", "cf-agent",
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+rep = json.loads(p.stdout)
+assert rep["ok"] is True, rep
+assert rep["local_count"] == 1 and rep["sink_count"] == 1 and rep["quarantine_count"] == 0, rep
+PYVER
 fi
 cleanup_ship_fixture
 
