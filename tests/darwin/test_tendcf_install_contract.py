@@ -2930,6 +2930,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                     "check_dir_root_unwritable",
                     "check_private_dir_exact",
                     "check_private_file_exact",
+                    "refuse_legacy_audit_shipper_config",
                     "validate_existing_audit_state_before_repair",
                     "place_audit_shipper_state",
                     "render_darwin_tripwire_osquery",
@@ -3070,41 +3071,55 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue(osq_conf_d.is_file(), "osquery.conf.d drop-in must register tripwire pack when osquery.conf.d exists")
             self.assertIn("tendcf_tripwire", osq_conf_d.read_text(encoding="utf-8"))
             self.assertIn("unverified until observed", r.stdout)
-            # R8-M5: Verify osquery FIM pack watches parent dirs (not rename-replaced leaf files)
-            # and SQL query filters shared dirs so unrelated files are excluded while atomic renames match.
+            # R8-M5 & R9-M1: Verify osquery FIM pack watches canonical parent dirs (incl. /private/var/root/.ssh/%%)
+            # and SQL query matches canonical + logical authorized_keys, exact host_specific.json & audit-shipper.json
+            # across atomic replace + second write, while excluding unrelated SSH/data/audit/system files.
             import sqlite3
             osq_pack_obj = _json.loads((trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
+            self.assertIn("/private/var/root/.ssh/%%", osq_pack_obj["file_paths"]["tendcf_launchd_and_trust"])
             for cat, patterns in osq_pack_obj["file_paths"].items():
                 for pat in patterns:
                     self.assertTrue(pat.endswith("/%") or pat.endswith("/%%"), f"R8-M5: {cat} watch {pat} must watch parent dir, not leaf file")
             conn = sqlite3.connect(":memory:")
-            conn.execute("CREATE TABLE file_events (target_path TEXT, action TEXT, uid INT, gid INT, mode TEXT, sha256 TEXT, time INT)")
+            conn.execute("CREATE TABLE file_events (target_path TEXT, action TEXT, uid INT, gid INT, mode TEXT, sha256 TEXT, time INT, category TEXT)")
             conn.executemany(
-                "INSERT INTO file_events VALUES (?, ?, 0, 0, '0600', 'abc', 1)",
+                "INSERT INTO file_events VALUES (?, ?, 0, 0, '0600', 'abc', ?, ?)",
                 [
-                    (f"{workdir}/data/host_specific.json", "UPDATED"),
-                    (f"{audit_cfg}", "UPDATED"),
-                    (str(shipper_plist), "UPDATED"),
-                    ("/Library/LaunchDaemons/com.apple.unrelated.plist", "UPDATED"),
-                    ("/private/etc/hosts", "UPDATED"),
-                    ("/private/etc/sudoers", "UPDATED"),
-                    ("/private/etc/sudoers.d/local", "CREATED"),
-                    ("/var/root/.ssh/authorized_keys", "UPDATED"),
+                    (f"{workdir}/inputs/promises.cf", "UPDATED", 1, "tendcf_policy_and_data"),
+                    (f"{workdir}/data/host_specific.json", "CREATED", 2, "tendcf_policy_and_data"),
+                    (f"{workdir}/data/host_specific.json", "UPDATED", 3, "tendcf_policy_and_data"),
+                    (f"{workdir}/data/.publish.lock", "UPDATED", 4, "tendcf_policy_and_data"),
+                    (f"{audit_cfg}", "CREATED", 5, "tendcf_policy_and_data"),
+                    (f"{audit_cfg}", "UPDATED", 6, "tendcf_policy_and_data"),
+                    (f"{prefix}/etc/tendcf-audit/unrelated.tmp", "UPDATED", 7, "tendcf_policy_and_data"),
+                    (str(shipper_plist), "UPDATED", 8, "tendcf_launchd_and_trust"),
+                    ("/Library/LaunchDaemons/com.apple.unrelated.plist", "UPDATED", 9, "tendcf_launchd_and_trust"),
+                    ("/private/etc/hosts", "UPDATED", 10, "tendcf_launchd_and_trust"),
+                    ("/private/etc/sudoers", "UPDATED", 11, "tendcf_launchd_and_trust"),
+                    ("/private/etc/sudoers.d/local", "CREATED", 12, "tendcf_launchd_and_trust"),
+                    ("/var/root/.ssh/authorized_keys", "UPDATED", 13, "tendcf_launchd_and_trust"),
+                    ("/private/var/root/.ssh/authorized_keys", "UPDATED", 14, "tendcf_launchd_and_trust"),
+                    ("/var/root/.ssh/config", "UPDATED", 15, "tendcf_launchd_and_trust"),
+                    ("/private/var/root/.ssh/config", "UPDATED", 16, "tendcf_launchd_and_trust"),
                 ],
             )
-            # Map each event row with its category column to test the exact rendered SQL query.
-            conn.execute("ALTER TABLE file_events ADD COLUMN category TEXT")
-            conn.execute("UPDATE file_events SET category='tendcf_policy_and_data' WHERE target_path LIKE ?", (f"{prefix}/%",))
-            conn.execute("UPDATE file_events SET category='tendcf_launchd_and_trust' WHERE category IS NULL")
             sql_q = osq_pack_obj["queries"]["tendcf_file_events"]["query"]
-            matched = {row[0] for row in conn.execute(sql_q).fetchall()}
+            rows = conn.execute(sql_q).fetchall()
             conn.close()
+            matched = {row[0] for row in rows}
+            cfg_actions = [row[1] for row in rows if row[0] == str(audit_cfg)]
+            self.assertEqual(cfg_actions, ["CREATED", "UPDATED"], "R9-M1: replacement + second update must both be observed")
+            self.assertIn(f"{workdir}/inputs/promises.cf", matched)
             self.assertIn(f"{workdir}/data/host_specific.json", matched)
-            self.assertIn(str(audit_cfg), matched)
             self.assertIn(str(shipper_plist), matched)
             self.assertIn("/private/etc/sudoers", matched)
             self.assertIn("/private/etc/sudoers.d/local", matched)
             self.assertIn("/var/root/.ssh/authorized_keys", matched)
+            self.assertIn("/private/var/root/.ssh/authorized_keys", matched, "R9-M1: canonical /private/var/root/.ssh/authorized_keys must match")
+            self.assertNotIn("/var/root/.ssh/config", matched, "R9-M1: unrelated SSH config must be excluded")
+            self.assertNotIn("/private/var/root/.ssh/config", matched)
+            self.assertNotIn(f"{workdir}/data/.publish.lock", matched, "R9-M1: unrelated data dir file must be excluded")
+            self.assertNotIn(f"{prefix}/etc/tendcf-audit/unrelated.tmp", matched, "R9-M1: unrelated audit dir file must be excluded")
             self.assertNotIn("/Library/LaunchDaemons/com.apple.unrelated.plist", matched)
             self.assertNotIn("/private/etc/hosts", matched)
 
@@ -3535,6 +3550,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             fn_h2 = "\n".join(
                 _extract_func(self.src, n)
                 for n in (
+                    "refuse_legacy_audit_shipper_config",
                     "validate_existing_launchd_plist_trusted",
                     "preflight_existing_launchd_plists",
                     "cmd_enable",
@@ -3558,6 +3574,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                         "init_paths() { return 0; }\n"
                         "check_launchd_dir() { return 0; }\n"
                         "has_acl_path() { return 1; }\n"
+                        f'prefix="{root}/clean_en_prefix"\n'
+                        f'audit_etc_dir="{root}/clean_en_prefix/etc/tendcf-audit"\n'
                         f'enable_execd() {{ echo "execd" >> "{mut_log}"; }}\n'
                         f'enable_audit_shipper() {{ echo "shipper" >> "{mut_log}"; }}\n'
                         f'plist_path="{ep}"\n'
@@ -3571,6 +3589,45 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 )
                 self.assertNotEqual(r_h2.returncode, 0, f"H2: cmd_enable must refuse {case_name}")
                 self.assertFalse(mut_log.exists(), f"H2: zero daemon mutations allowed for {case_name}")
+
+            # R9-M2: Standalone Darwin cmd_enable refuses legacy-only AND dual-location legacy config
+            # BEFORE touching execd or shipper daemons!
+            leg_prefix = root / "leg_en_prefix"
+            (leg_prefix / "etc" / "tendcf-audit").mkdir(parents=True)
+            (leg_prefix / "etc" / "audit-shipper.json").write_text('{"enabled":true}\n', encoding="utf-8")
+            (leg_prefix / "etc" / "tendcf-audit" / "audit-shipper.json").write_text('{"enabled":false}\n', encoding="utf-8")
+            for mode_name, remove_new in (("dual-location", False), ("legacy-only", True)):
+                if remove_new:
+                    (leg_prefix / "etc" / "tendcf-audit" / "audit-shipper.json").unlink()
+                if mut_log.exists():
+                    mut_log.unlink()
+                r_leg_en = subprocess.run(
+                    [
+                        "/bin/bash", "-c",
+                        "set -euo pipefail\n"
+                        'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                        'say() { :; }\n'
+                        "acquire_publish_lock() { return 0; }\n"
+                        "release_publish_lock() { return 0; }\n"
+                        "init_paths() { return 0; }\n"
+                        "check_launchd_dir() { return 0; }\n"
+                        "has_acl_path() { return 1; }\n"
+                        f'prefix="{leg_prefix}"\n'
+                        f'audit_etc_dir="{leg_prefix}/etc/tendcf-audit"\n'
+                        f'enable_execd() {{ echo "execd" >> "{mut_log}"; }}\n'
+                        f'enable_audit_shipper() {{ echo "shipper" >> "{mut_log}"; }}\n'
+                        f'plist_path="{good_execd}"\n'
+                        f'shipper_plist_path="{good_ship}"\n'
+                        'label="org.tendcf.execd"\n'
+                        'changed=0\n'
+                        f"{fn_h2}\n"
+                        "cmd_enable\n",
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(r_leg_en.returncode, 0, f"R9-M2: Darwin cmd_enable must refuse {mode_name}")
+                self.assertIn("legacy audit shipper config", r_leg_en.stderr)
+                self.assertFalse(mut_log.exists(), f"R9-M2: zero daemon mutations allowed for {mode_name}")
 
             # M1 (1): literal label matching in launchd_print_disabled_matches_label rejects unescaped dot spoof.
             fn_lbl = _extract_func(self.src, "launchd_print_disabled_matches_label")

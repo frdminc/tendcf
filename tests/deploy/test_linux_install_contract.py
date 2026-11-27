@@ -1596,6 +1596,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "check_dir_chain_strict_under_prefix",
                     "check_private_dir_exact",
                     "check_private_file_exact",
+                    "refuse_legacy_audit_shipper_config",
                     "validate_existing_audit_state_before_repair",
                     "verify_installed_projector",
                     "verify_installed_audit_log",
@@ -1609,6 +1610,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "reload_auditd_tripwire",
                     "place_tripwire_rules",
                     "enable_audit_shipper",
+                    "cmd_enable",
                     "stop_and_disable_unit",
                     "disable_units",
                     "remove_managed_file_safe",
@@ -1625,6 +1627,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 .replace("/etc/systemd/system", str(systemd_dir))
                 .replace("check_dir_chain_ok /etc", "true")
                 .replace("/proc/self/mountinfo", str(fake_mountinfo))
+                .replace("/proc/self/fd/7", '"$fd7_probe"')
                 .replace("/run/systemd/system", str(fake_run_systemd))
                 .replace("/sbin/augenrules", str(root / "no-augenrules"))
                 .replace("/usr/sbin/augenrules", str(root / "no-augenrules"))
@@ -1648,6 +1651,11 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 "check_ancestors_ok() { return 0; }\n"
                 "acquire_lifecycle_lock() { return 0; }\n"
                 "release_lifecycle_lock() { return 0; }\n"
+                "need_systemd() { return 0; }\n"
+                "init_paths() { return 0; }\n"
+                f'fd7_probe="{spool_dir}/.spool.lock"\n'
+                f'entry="{workdir}/inputs/promises.cf"\n'
+                f'cf_execd="{prefix}/bin/cf-execd"\n'
                 f'find_trusted_python() {{ echo "{sys.executable}"; }}\n'
                 f'prefix="{prefix}"\n'
                 f'workdir="{workdir}"\n'
@@ -1736,8 +1744,24 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r_empty_val.returncode, 0, r_empty_val.stderr)
             self.assertTrue((spool_dir / ".spool.lock").is_file(), "R8-M2: validation must create/hold .spool.lock on empty spool")
             self.assertEqual(stat.S_IMODE((spool_dir / ".spool.lock").stat().st_mode), 0o600)
+            # R9-L1: Mandatory descriptor-to-path verification fails closed on mismatch or missing probe.
+            wrong_inode = root / "wrong-inode"
+            wrong_inode.write_text("x\n", encoding="utf-8")
+            os.chmod(wrong_inode, 0o600)
+            r_fd7_bad = subprocess.run(
+                ["/bin/bash", "-c", env_setup + f'fd7_probe="{wrong_inode}"\nvalidate_existing_audit_state_before_repair\n'],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_fd7_bad.returncode, 0, "R9-L1: mismatched FD 7 inode must fail closed")
+            self.assertIn("failed descriptor verification", r_fd7_bad.stderr)
+            r_fd7_miss = subprocess.run(
+                ["/bin/bash", "-c", env_setup + f'fd7_probe="{root}/missing-fd7"\nvalidate_existing_audit_state_before_repair\n'],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_fd7_miss.returncode, 0, "R9-L1: missing FD 7 probe must fail closed")
 
-            # 3c) R8-M4: Legacy $prefix/etc/audit-shipper.json is refused before mutation (both-present & legacy-only), preserving originals.
+            # 3c) R8-M4 & R9-M2: Legacy $prefix/etc/audit-shipper.json is refused before mutation
+            # (both-present & legacy-only, in install AND standalone cmd_enable), preserving originals & zero manager calls.
             legacy_cfg = prefix / "etc" / "audit-shipper.json"
             legacy_cfg.write_text('{"enabled":true,"legacy":1}\n', encoding="utf-8")
             os.chmod(legacy_cfg, 0o600)
@@ -1748,6 +1772,15 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertNotEqual(r_leg_both.returncode, 0, "R8-M4: legacy+new config must refuse with migration instructions")
             self.assertIn("legacy audit shipper config", r_leg_both.stderr)
             self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            execd_before = execd_path.read_text(encoding="utf-8")
+            sctl_before_len = len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0
+            r_en_both = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_enable\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_en_both.returncode, 0, "R9-M2: standalone cmd_enable must refuse dual-location legacy config")
+            self.assertEqual(execd_path.read_text(encoding="utf-8"), execd_before, "R9-M2: cmd_enable must not touch execd unit")
+            self.assertEqual(len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0, sctl_before_len, "R9-M2: zero systemctl calls allowed")
             audit_cfg_bak = audit_cfg.read_text(encoding="utf-8")
             audit_cfg.unlink()
             r_leg_only = subprocess.run(
@@ -1756,6 +1789,13 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             )
             self.assertNotEqual(r_leg_only.returncode, 0, "R8-M4: legacy-only config must refuse before writing default")
             self.assertFalse(audit_cfg.exists())
+            r_en_only = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "cmd_enable\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_en_only.returncode, 0, "R9-M2: standalone cmd_enable must refuse legacy-only config")
+            self.assertEqual(execd_path.read_text(encoding="utf-8"), execd_before)
+            self.assertEqual(len(sctl_log.read_text(encoding="utf-8")) if sctl_log.exists() else 0, sctl_before_len)
             self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
             legacy_cfg.unlink()
             audit_cfg.write_text(audit_cfg_bak, encoding="utf-8")

@@ -1308,9 +1308,7 @@ install_tarball() {
             die "existing $prefix/etc/tendcf-audit is a symlink; refusing upgrade"
         fi
         # Refuse before any mutation if a legacy $prefix/etc/audit-shipper.json exists (M4).
-        if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
-            die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
-        fi
+        refuse_legacy_audit_shipper_config
         # Validate any existing LaunchDaemon plist BEFORE snapshotting or mutating
         # daemons so untrusted bytes can never be promoted to root LaunchDaemon (H1).
         if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
@@ -2085,6 +2083,12 @@ check_private_file_exact() {  # check_private_file_exact FILE
     fi
 }
 
+refuse_legacy_audit_shipper_config() {
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install or enable"
+    fi
+}
+
 validate_existing_audit_state_before_repair() {
     check_ancestors "$prefix"
     if [ -e "$prefix" ] || [ -L "$prefix" ]; then
@@ -2093,9 +2097,7 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$prefix/share/tendcf/bin/__pycache__" ] || [ -L "$prefix/share/tendcf/bin/__pycache__" ]; then
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
-    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
-        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
-    fi
+    refuse_legacy_audit_shipper_config
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
@@ -2223,9 +2225,7 @@ place_audit_log() {
 }
 
 place_audit_shipper_state() {
-    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
-        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
-    fi
+    refuse_legacy_audit_shipper_config
     ensure_dir 755 "$prefix/etc"
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
@@ -2285,14 +2285,14 @@ render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
       "$launchd_dir/%%",
       "/private/etc/%",
       "/private/etc/sudoers.d/%%",
-      "/var/root/.ssh/%%"
+      "/private/var/root/.ssh/%%"
     ]
   },
   "queries": {
     "tendcf_file_events": {
-      "query": "SELECT target_path, action, uid, gid, mode, sha256, time FROM file_events WHERE category IN ('tendcf_binaries','tendcf_policy_and_data') OR (category = 'tendcf_launchd_and_trust' AND (target_path IN ('$plist_path','$shipper_plist_path','/etc/sudoers','/private/etc/sudoers','/var/root/.ssh/authorized_keys') OR target_path LIKE '/etc/sudoers.d/%' OR target_path LIKE '/private/etc/sudoers.d/%' OR target_path LIKE '/var/root/.ssh/%'));",
+      "query": "SELECT target_path, action, uid, gid, mode, sha256, time FROM file_events WHERE category = 'tendcf_binaries' OR (category = 'tendcf_policy_and_data' AND (target_path LIKE '$workdir/inputs/%' OR target_path IN ('$workdir/data/host_specific.json','$audit_shipper_cfg'))) OR (category = 'tendcf_launchd_and_trust' AND (target_path IN ('$plist_path','$shipper_plist_path','/etc/sudoers','/private/etc/sudoers','/var/root/.ssh/authorized_keys','/private/var/root/.ssh/authorized_keys') OR target_path LIKE '/etc/sudoers.d/%' OR target_path LIKE '/private/etc/sudoers.d/%'));",
       "interval": 60,
-      "description": "Monitor tendcf binaries, policy, CMDB data dir, audit config dir, launchd plists, sudoers, and root authorized_keys across atomic renames (issue #119)"
+      "description": "Monitor tendcf binaries, policy, CMDB host data, audit shipper config, launchd plists, sudoers, and root authorized_keys across atomic renames (issue #119)"
     }
   }
 }
@@ -3095,6 +3095,7 @@ cmd_run_once() {
 
 cmd_enable() {
     acquire_publish_lock
+    refuse_legacy_audit_shipper_config
     init_paths
     preflight_existing_launchd_plists
     enable_execd

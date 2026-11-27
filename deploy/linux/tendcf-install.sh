@@ -883,6 +883,12 @@ check_private_file_exact() {  # check_private_file_exact FILE
         || die "$f has untrusted ownership/mode/links ($uid:$gid $mode links=$nlink), expected 0:0 600 links=1"
 }
 
+refuse_legacy_audit_shipper_config() {
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install or enable"
+    fi
+}
+
 validate_existing_audit_state_before_repair() {
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     if [ -e "$prefix" ] || [ -L "$prefix" ]; then
@@ -891,9 +897,7 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$prefix/share/tendcf/bin/__pycache__" ] || [ -L "$prefix/share/tendcf/bin/__pycache__" ]; then
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
-    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
-        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
-    fi
+    refuse_legacy_audit_shipper_config
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
@@ -928,14 +932,13 @@ validate_existing_audit_state_before_repair() {
             die "$spool_lock is not a regular non-symlink file; refusing"
         fi
         check_private_file_exact "$spool_lock"
-        if [ -e /proc/self/fd/7 ]; then
-            fd_meta="$(stat -L -c '%u:%g %a %h %d:%i' /proc/self/fd/7 2>/dev/null || true)"
-            path_id="$(stat -c '%d:%i' "$spool_lock" 2>/dev/null || true)"
-            if [ -z "$path_id" ] || [ "$fd_meta" != "0:0 600 1 $path_id" ]; then
-                exec 7>&-
-                spool_scan_lock_held=0
-                die "$spool_lock failed descriptor verification (got '${fd_meta:-none}')"
-            fi
+        # Mandatory descriptor-to-path identity check (identical to FD 8; L1).
+        fd_meta="$(stat -L -c '%u:%g %a %h %d:%i' /proc/self/fd/7 2>/dev/null || true)"
+        path_id="$(stat -c '%d:%i' "$spool_lock" 2>/dev/null || true)"
+        if [ -z "$path_id" ] || [ "$fd_meta" != "0:0 600 1 $path_id" ]; then
+            exec 7>&-
+            spool_scan_lock_held=0
+            die "$spool_lock failed descriptor verification (got '${fd_meta:-none}')"
         fi
         local had_nullglob=0 had_dotglob=0 ent
         shopt -q nullglob && had_nullglob=1
@@ -1024,9 +1027,7 @@ place_audit_log() {
 place_audit_shipper_state() {
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     check_dir_root_unwritable "$prefix"
-    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
-        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
-    fi
+    refuse_legacy_audit_shipper_config
     local d
     for d in "$prefix/etc" "$audit_etc_dir" "$prefix/var" "$audit_spool_dir"; do
         [ ! -L "$d" ] || die "$d is a symlink; refusing"
@@ -1817,6 +1818,7 @@ EOF
 cmd_enable() {
     need_systemd
     acquire_lifecycle_lock
+    refuse_legacy_audit_shipper_config
     init_paths
     [ -f "$entry" ] || die "not installed: run install first"
     check_dir_root_unwritable /etc/systemd/system
