@@ -1829,6 +1829,30 @@ class AuditSpool:
 # Hardened SSH append-only transport and offline-resilient shipper
 # ---------------------------------------------------------------------------
 
+_DARWIN_ACL_LINE_RE = re.compile(r"^ \d+: ")
+
+
+def _check_darwin_no_extended_acl(path: Path) -> None:
+    """On macOS, fail closed if `path` carries any extended ACL or cannot be inspected (H3)."""
+    if sys.platform != "darwin":
+        return
+    try:
+        proc = subprocess.run(
+            ["/bin/ls", "-lde", "--", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AuditFileSecurityError(f"cannot inspect macOS ACL on {path}") from exc
+    if proc.returncode != 0:
+        raise AuditFileSecurityError(f"cannot inspect macOS ACL on {path}")
+    for line in proc.stdout.splitlines()[1:]:
+        if _DARWIN_ACL_LINE_RE.match(line):
+            raise AuditFileSecurityError(f"{path} has a macOS extended ACL; refusing")
+
+
 def _check_ancestors_trusted_unwritable(path: Path, *, allowed_uids: set[int]) -> None:
     """Verify every ancestor directory from `/` down to `path.parent` is real, trusted-owned, and go-w."""
     parts = path.parts
@@ -1847,6 +1871,7 @@ def _check_ancestors_trusted_unwritable(path: Path, *, allowed_uids: set[int]) -
             raise AuditFileSecurityError(
                 f"ancestor {cur} is group- or world-writable (mode {oct(stat.S_IMODE(st.st_mode))})"
             )
+        _check_darwin_no_extended_acl(cur)
 
 
 def _validate_ssh_safe_file_path(
@@ -1878,6 +1903,7 @@ def _validate_ssh_safe_file_path(
             raise AuditFileSecurityError(f"{label} owned by untrusted uid {st.st_uid}")
         if (mode & 0o6022) != 0:
             raise AuditFileSecurityError(f"{label} has writable or SUID/SGID mode {oct(mode)}")
+        _check_darwin_no_extended_acl(p)
     if require_private_mode and (mode & 0o6077) != 0:
         raise AuditFileSecurityError(
             f"{label} must be private without group/other or SUID/SGID bits (mode {oct(mode)})"
@@ -3157,6 +3183,8 @@ def load_shipper_config(
     _check_ancestors_no_symlinks(abs_cfg)
     if os.geteuid() == 0:
         _check_ancestors_trusted_unwritable(abs_cfg, allowed_uids={0})
+    _check_darwin_no_extended_acl(abs_cfg.parent)
+    _check_darwin_no_extended_acl(abs_cfg)
     with _open_dir_fd(abs_cfg.parent, require_private=True) as dfd:
         fd, _ = _open_regular_in_dir(dfd, abs_cfg.name, os.O_RDONLY)
         try:

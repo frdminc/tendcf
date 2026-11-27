@@ -195,38 +195,47 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Serialize all mutating lifecycle operations (install, data, enable, disable,
-# uninstall) on a stable lock file outside $prefix (FD 8; distinct from put_data's
-# FD 9 data-publish lock so nested install --data never self-deadlocks; M1).
+# uninstall) on one fixed root-controlled lock outside $prefix (FD 8; distinct
+# from put_data's FD 9 data-publish lock so nested install --data never
+# self-deadlocks; H1/M1). Never falls back to a shared writable directory.
+lifecycle_lock_parent=/run
+lifecycle_lock_dir="$lifecycle_lock_parent/tendcf"
+lifecycle_lock_file="$lifecycle_lock_dir/install.lock"
+
 acquire_lifecycle_lock() {
     if [ "${lifecycle_lock_held:-0}" -eq 1 ]; then
         return 0
     fi
-    local lock_dir lock_file old_umask
-    if [ -d /run/lock ] && [ ! -L /run/lock ] && check_dir_chain_ok /run/lock; then
-        lock_dir=/run/lock
-    elif [ -d /run ] && [ ! -L /run ] && check_dir_chain_ok /run; then
-        lock_dir=/run
+    if [ ! -d "$lifecycle_lock_parent" ] || [ -L "$lifecycle_lock_parent" ] \
+        || ! check_dir_chain_ok "$lifecycle_lock_parent"; then
+        die "lifecycle lock parent $lifecycle_lock_parent is missing or untrusted; refusing"
+    fi
+    if [ -e "$lifecycle_lock_dir" ] || [ -L "$lifecycle_lock_dir" ]; then
+        check_private_dir_exact "$lifecycle_lock_dir"
     else
-        lock_dir=/var/tmp
+        install -d -m 0700 -o root -g root "$lifecycle_lock_dir"
+        check_private_dir_exact "$lifecycle_lock_dir"
     fi
-    lock_file="$lock_dir/tendcf-install.lock"
-    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
-        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || die "$lock_file is not a regular file; refusing"
+    if [ -e "$lifecycle_lock_file" ] || [ -L "$lifecycle_lock_file" ]; then
+        check_private_file_exact "$lifecycle_lock_file"
     fi
+    local old_umask fd_meta path_id
     old_umask="$(umask)"
     umask 077
-    exec 8>>"$lock_file"
+    exec 8>>"$lifecycle_lock_file"
     umask "$old_umask"
     if ! flock -x 8; then
         exec 8>&-
-        die "failed to acquire lifecycle lock $lock_file"
+        die "failed to acquire lifecycle lock $lifecycle_lock_file"
     fi
-    if [ -L "$lock_file" ] || [ ! -f "$lock_file" ]; then
+    # Descriptor-bound verification: never chown/chmod by pathname after open.
+    fd_meta="$(stat -L -c '%u:%g %a %h %d:%i' /proc/self/fd/8 2>/dev/null || true)"
+    path_id="$(stat -c '%d:%i' "$lifecycle_lock_file" 2>/dev/null || true)"
+    if [ -L "$lifecycle_lock_file" ] || [ ! -f "$lifecycle_lock_file" ] \
+        || [ -z "$path_id" ] || [ "$fd_meta" != "0:0 600 1 $path_id" ]; then
         exec 8>&-
-        die "$lock_file is not a regular file; refusing"
+        die "lifecycle lock $lifecycle_lock_file failed descriptor verification (got '${fd_meta:-none}')"
     fi
-    chown root:root "$lock_file"
-    chmod 0600 "$lock_file"
     lifecycle_lock_held=1
 }
 
@@ -503,7 +512,7 @@ init_paths() {
     umask "$old_umask"
     probe_tmp="$probe"
     printf 'bundle agent main {}\n' > "$probe"
-    out="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --show-vars -f "$probe" 2>/dev/null 9>&- | awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
+    out="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --show-vars -f "$probe" 2>/dev/null 8>&- 9>&- | awk '$1 == "default:sys.workdir" { print $2; exit }')" || true
     rm -f "$probe"
     probe_tmp=""
     case "$out" in
@@ -558,7 +567,7 @@ lay_out() {
     if [ ! -f "$workdir/ppkeys/localhost.priv" ] || [ ! -f "$workdir/ppkeys/localhost.pub" ]; then
         # A half pair (a build step can leave one file) is not a key: start over.
         rm -f "$workdir/ppkeys/localhost.priv" "$workdir/ppkeys/localhost.pub"
-        if ! keyout="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_key" 2>&1 9>&-)"; then
+        if ! keyout="$(LD_LIBRARY_PATH="$cf_lib_path" "$cf_key" 2>&1 8>&- 9>&-)"; then
             die "cf-key failed: $keyout"
         fi
     fi
@@ -1014,30 +1023,49 @@ place_audit_shipper_state() {
     fi
 }
 
-render_linux_tripwire_auditd() {  # render_linux_tripwire_auditd DEST
-    local dest="$1"
-    # Watch existing trusted directories (so auditctl/augenrules never fail on
-    # targets not yet created at install time) plus existing target files (M3).
+render_linux_tripwire_auditd() {  # render_linux_tripwire_auditd DEST [INCLUDE_LOCK]
+    local dest="$1" include_lock="${2:-0}"
+    local unit_dir seen="|" p
+    unit_dir="$(dirname "$unit_path")"
+    emit_watch() {
+        local wp="$1"
+        case "$seen" in
+            *"|$wp|"*) return 0 ;;
+        esac
+        seen="${seen}${wp}|"
+        printf -- '-w %s -p wa -k tendcf_tripwire\n' "$wp" >> "$dest"
+    }
+    # Watch validated existing directories/files (falling back to an existing
+    # trusted parent whenever an optional sensitive leaf is absent; M3/M5).
     cat > "$dest" <<EOF
 # Managed by deploy/linux/tendcf-install.sh (issue #119 Slice 2).
 # Watches tendcf binaries, policy, CMDB data dir, shipper config dir, systemd unit dir,
 # sudoers, and root authorized_keys for writes or attribute changes.
--w $prefix/bin -p wa -k tendcf_tripwire
--w $prefix/lib -p wa -k tendcf_tripwire
--w $prefix/share/tendcf -p wa -k tendcf_tripwire
--w $workdir/inputs -p wa -k tendcf_tripwire
--w $workdir/data -p wa -k tendcf_tripwire
--w $audit_etc_dir -p wa -k tendcf_tripwire
--w /etc/systemd/system -p wa -k tendcf_tripwire
--w /etc/sudoers -p wa -k tendcf_tripwire
--w /etc/sudoers.d -p wa -k tendcf_tripwire
 EOF
-    if [ -e /root/.ssh/authorized_keys ] && [ ! -L /root/.ssh/authorized_keys ]; then
-        printf -- '-w /root/.ssh/authorized_keys -p wa -k tendcf_tripwire\n' >> "$dest"
-    elif [ -d /root/.ssh ] && [ ! -L /root/.ssh ]; then
-        printf -- '-w /root/.ssh -p wa -k tendcf_tripwire\n' >> "$dest"
+    for p in "$prefix/bin" "$prefix/lib" "$prefix/share/tendcf" \
+        "$workdir/inputs" "$workdir/data" "$audit_etc_dir" "$unit_dir"; do
+        if [ -d "$p" ] && [ ! -L "$p" ]; then
+            emit_watch "$p"
+        fi
+    done
+    if [ -e /etc/sudoers ] && [ ! -L /etc/sudoers ]; then
+        emit_watch /etc/sudoers
+    elif [ -d /etc ] && [ ! -L /etc ]; then
+        emit_watch /etc
     fi
-    if [ "${lock_auditd:-0}" -eq 1 ]; then
+    if [ -d /etc/sudoers.d ] && [ ! -L /etc/sudoers.d ]; then
+        emit_watch /etc/sudoers.d
+    elif [ -d /etc ] && [ ! -L /etc ]; then
+        emit_watch /etc
+    fi
+    if [ -e /root/.ssh/authorized_keys ] && [ ! -L /root/.ssh/authorized_keys ]; then
+        emit_watch /root/.ssh/authorized_keys
+    elif [ -d /root/.ssh ] && [ ! -L /root/.ssh ]; then
+        emit_watch /root/.ssh
+    elif [ -d /root ] && [ ! -L /root ]; then
+        emit_watch /root
+    fi
+    if [ "$include_lock" -eq 1 ]; then
         printf '# Immutable auditd lock requested via --lock-auditd (requires reboot to change)\n-e 2\n' >> "$dest"
     else
         printf '# To lock kernel audit rules until reboot, re-run install with --lock-auditd (adds -e 2)\n' >> "$dest"
@@ -1064,8 +1092,79 @@ $shipper_timer_path p+i+n+u+g+s+m+c+sha256
 EOF
 }
 
+# Compare the complete normalized expected watch set in RULES_FILE against
+# active kernel rules from `auditctl -l`. Prints missing watch paths (if any)
+# and exits non-zero if any expected watch is missing or RULES_FILE has none (M5).
+verify_auditd_expected_watches() {  # verify_auditd_expected_watches RULES_FILE ACTL_BIN
+    local rules_file="$1" actl="$2" active_rules
+    active_rules="$("$actl" -l 8>&- 9>&- 2>/dev/null)" || return 1
+    awk -v rules_file="$rules_file" '
+        function norm(p) {
+            if (p != "/") sub(/\/+$/, "", p)
+            return p
+        }
+        BEGIN {
+            exp_n = 0
+            while ((getline line < rules_file) > 0) {
+                if (line ~ /^-w[[:space:]]+/ && line ~ /-p[[:space:]]+wa([[:space:]]|$)/ && line ~ /-k[[:space:]]+tendcf_tripwire([[:space:]]|$)/) {
+                    split(line, f, /[[:space:]]+/)
+                    if (f[2] != "") {
+                        p = norm(f[2])
+                        if (!(p in exp_seen)) {
+                            exp_seen[p] = 1
+                            exp_list[++exp_n] = p
+                        }
+                    }
+                }
+            }
+            close(rules_file)
+        }
+        {
+            has_key = ($0 ~ /(^|[[:space:]])-k[[:space:]]+tendcf_tripwire([[:space:]]|$)/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+key=tendcf_tripwire([[:space:]]|$)/)
+            has_perm = ($0 ~ /(^|[[:space:]])-p[[:space:]]+[^[:space:]]*w[^[:space:]]*a/ || $0 ~ /(^|[[:space:]])-p[[:space:]]+[^[:space:]]*a[^[:space:]]*w/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+perm=[^[:space:]]*w[^[:space:]]*a/ || $0 ~ /(^|[[:space:]])-F[[:space:]]+perm=[^[:space:]]*a[^[:space:]]*w/)
+            if (!has_key || !has_perm) next
+            p = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-w" && i < NF) { p = $(i + 1); break }
+                if ($i == "-F" && i < NF && $(i + 1) ~ /^(path|dir)=/) {
+                    p = $(i + 1); sub(/^(path|dir)=/, "", p); break
+                }
+            }
+            if (p != "") active[norm(p)] = 1
+        }
+        END {
+            if (exp_n == 0) { print "no-expected-watches"; exit 1 }
+            miss = ""
+            for (i = 1; i <= exp_n; i++) {
+                p = exp_list[i]
+                if (!(p in active)) miss = (miss == "" ? p : miss "," p)
+            }
+            if (miss != "") { print miss; exit 1 }
+            exit 0
+        }
+    ' <<< "$active_rules"
+}
+
+write_auditd_rule_files() {  # write_auditd_rule_files INCLUDE_LOCK
+    local include_lock="${1:-0}" old_umask tmp_share tmp_etc
+    old_umask="$(umask)"
+    umask 022
+    tmp_share="$(mktemp "$tripwire_share_dir/.auditd.new.XXXXXX")"
+    umask "$old_umask"
+    render_linux_tripwire_auditd "$tmp_share" "$include_lock"
+    chown root:root "$tmp_share"
+    chmod 0640 "$tmp_share"
+    mv -f "$tmp_share" "$tripwire_share_dir/99-tendcf-tripwire.rules"
+
+    tmp_etc="$(mktemp "$auditd_rules_dir/.99-tendcf-tripwire.rules.new.XXXXXX")"
+    cp -p "$tripwire_share_dir/99-tendcf-tripwire.rules" "$tmp_etc"
+    chown root:root "$tmp_etc"
+    chmod 0640 "$tmp_etc"
+    mv -f "$tmp_etc" "$auditd_rules_path"
+}
+
 reload_auditd_tripwire() {
-    local augen="" actl=""
+    local augen="" actl="" missing=""
     if [ -x /sbin/augenrules ]; then augen=/sbin/augenrules; elif [ -x /usr/sbin/augenrules ]; then augen=/usr/sbin/augenrules; fi
     if [ -x /sbin/auditctl ]; then actl=/sbin/auditctl; elif [ -x /usr/sbin/auditctl ]; then actl=/usr/sbin/auditctl; fi
 
@@ -1078,20 +1177,35 @@ reload_auditd_tripwire() {
             say "tripwire: auditd rules staged at $auditd_rules_path (augenrules --load returned non-zero; rules may already be immutable)"
             return 0
         fi
-        if [ -n "$actl" ] && ! "$actl" -l 8>&- 9>&- 2>/dev/null | grep -q 'tendcf_tripwire'; then
+        if [ -z "$actl" ]; then
             if [ "${lock_auditd:-0}" -eq 1 ]; then
-                die "--lock-auditd requested, but tendcf_tripwire watches are not active in auditctl -l"
+                die "--lock-auditd requested, but auditctl is unavailable to verify complete watch coverage"
             fi
-            say "tripwire: warning: auditd rules staged at $auditd_rules_path, but tendcf_tripwire not observed in auditctl -l"
+            say "tripwire: incomplete auditd verification at $auditd_rules_path (auditctl not found)"
+            return 0
+        fi
+        if ! missing="$(verify_auditd_expected_watches "$auditd_rules_path" "$actl")"; then
+            if [ "${lock_auditd:-0}" -eq 1 ]; then
+                die "--lock-auditd requested, but expected tripwire watches are missing from auditctl -l (${missing:-query-failed}); refusing to lock"
+            fi
+            say "tripwire: incomplete auditd coverage at $auditd_rules_path (missing active watches: ${missing:-query-failed})"
             return 0
         fi
         if [ "${lock_auditd:-0}" -eq 1 ]; then
-            if [ -z "$actl" ] || ! "$actl" -s 8>&- 9>&- 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
+            # Only append -e 2 and irreversibly lock AFTER 100% of expected watches are verified active (M5).
+            write_auditd_rule_files 1
+            if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then
+                die "--lock-auditd requested, but augenrules --load failed while applying -e 2"
+            fi
+            if ! missing="$(verify_auditd_expected_watches "$auditd_rules_path" "$actl")"; then
+                die "--lock-auditd requested, but expected tripwire watches disappeared after lock (${missing:-query-failed})"
+            fi
+            if ! "$actl" -s 8>&- 9>&- 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
                 die "--lock-auditd requested, but auditctl -s did not confirm immutable mode (enabled 2)"
             fi
-            say "tripwire: auditd rules loaded and locked immutable (-e 2)"
+            say "tripwire: all expected auditd watches verified active and locked immutable (-e 2)"
         else
-            say "tripwire: auditd rules loaded ($auditd_rules_path)"
+            say "tripwire: all expected auditd watches verified active ($auditd_rules_path)"
         fi
     else
         if [ "${lock_auditd:-0}" -eq 1 ]; then
@@ -1111,16 +1225,11 @@ place_tripwire_rules() {
     install -d -m 0755 -o root -g root "$tripwire_share_dir"
     check_dir_root_unwritable "$tripwire_share_dir"
 
-    local old_umask tmp_audit tmp_aide
+    local old_umask tmp_aide
     old_umask="$(umask)"
     umask 022
-    tmp_audit="$(mktemp "$tripwire_share_dir/.auditd.new.XXXXXX")"
     tmp_aide="$(mktemp "$tripwire_share_dir/.aide.new.XXXXXX")"
     umask "$old_umask"
-    render_linux_tripwire_auditd "$tmp_audit"
-    chown root:root "$tmp_audit"
-    chmod 0640 "$tmp_audit"
-    mv -f "$tmp_audit" "$tripwire_share_dir/99-tendcf-tripwire.rules"
 
     render_linux_tripwire_aide "$tmp_aide"
     chown root:root "$tmp_aide"
@@ -1143,11 +1252,9 @@ place_tripwire_rules() {
     done
     [ ! -L "$auditd_rules_path" ] && [ ! -d "$auditd_rules_path" ] \
         || die "$auditd_rules_path is not a regular file; refusing"
-    tmp_audit="$(mktemp "$auditd_rules_dir/.99-tendcf-tripwire.rules.new.XXXXXX")"
-    cp -p "$tripwire_share_dir/99-tendcf-tripwire.rules" "$tmp_audit"
-    chown root:root "$tmp_audit"
-    chmod 0640 "$tmp_audit"
-    mv -f "$tmp_audit" "$auditd_rules_path"
+    # Always stage watch rules without -e 2 first; reload_auditd_tripwire only
+    # writes -e 2 after confirming complete expected watch coverage (M5).
+    write_auditd_rule_files 0
 
     for d in /etc/aide "$aide_rules_dir"; do
         [ ! -L "$d" ] || die "$d is a symlink; refusing"
@@ -1186,7 +1293,7 @@ validate_cmdb_workdir() {  # validate_cmdb_workdir WD ENTRY_FILE TMP_DIR
     umask "$old_umask"
     chmod 0600 "$classes_file" "$err_file"
 
-    if ! LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --workdir "$wd" -f "$entry_file" --show-classes >"$classes_file" 2>"$err_file" 9>&-; then
+    if ! LD_LIBRARY_PATH="$cf_lib_path" "$cf_promises" --workdir "$wd" -f "$entry_file" --show-classes >"$classes_file" 2>"$err_file" 8>&- 9>&-; then
         if [ -s "$err_file" ]; then
             cat "$err_file" >&2
         fi
@@ -1311,7 +1418,7 @@ put_data() {  # put_data FILE
 
     # Gate 1 (#53): projector contract check (stdlib-only isolated python3 -I -S,
     # FD 9 closed in child, no LD_LIBRARY_PATH, site-packages disabled).
-    if ! "$py" -I -S "$installed_projector" --check "$staged_data" 9>&-; then
+    if ! "$py" -I -S "$installed_projector" --check "$staged_data" 8>&- 9>&-; then
         die "projector rejected $src; live $data untouched"
     fi
 
@@ -1571,8 +1678,9 @@ EOF
 }
 
 stop_and_disable_unit() {  # stop_and_disable_unit UNIT UNIT_PATH
-    local u="$1" upath="$2" load_state=""
-    load_state="$(systemctl show -p LoadState --value "$u" 8>&- 9>&- 2>/dev/null || true)"
+    local u="$1" upath="$2" load_state="" active_state=""
+    load_state="$(systemctl show -p LoadState --value "$u" 8>&- 9>&- 2>/dev/null)" \
+        || die "systemctl show LoadState failed for $u; refusing to remove unit or state"
     if [ "$load_state" = "not-found" ] && [ ! -e "$upath" ] && [ ! -L "$upath" ]; then
         return 0
     fi
@@ -1582,9 +1690,12 @@ stop_and_disable_unit() {  # stop_and_disable_unit UNIT UNIT_PATH
         systemctl disable "$u" 8>&- 9>&- >/dev/null 2>&1 || true
         systemctl stop "$u" 8>&- 9>&- || die "failed to stop $u"
     fi
-    if systemctl is-active --quiet "$u" 8>&- 9>&- 2>/dev/null; then
-        die "$u is still active after stop; refusing to remove unit or state"
-    fi
+    active_state="$(systemctl show -p ActiveState --value "$u" 8>&- 9>&- 2>/dev/null)" \
+        || die "systemctl show ActiveState failed for $u; refusing to remove unit or state"
+    case "$active_state" in
+        inactive|failed) ;;
+        *) die "$u ActiveState is '${active_state:-unknown}' after stop; refusing to remove unit or state" ;;
+    esac
 }
 
 disable_units() {
@@ -1631,26 +1742,29 @@ purge_audit_spool_safe() {
     check_ancestors_ok "$audit_spool_dir" || die "unsafe ancestor for $audit_spool_dir; refusing purge"
     check_private_dir_exact "$audit_spool_dir"
     local parent_dev spool_dev
+    local mi="${mountinfo_path:-/proc/self/mountinfo}"
     parent_dev="$(stat -c '%d' "$(dirname "$audit_spool_dir")")" || die "cannot stat parent of $audit_spool_dir"
     spool_dev="$(stat -c '%d' "$audit_spool_dir")" || die "cannot stat $audit_spool_dir"
     [ "$spool_dev" = "$parent_dev" ] || die "$audit_spool_dir crosses a mount boundary; refusing purge"
-    if [ -r /proc/self/mountinfo ]; then
-        local real_spool
-        real_spool="$(readlink -f "$audit_spool_dir" 2>/dev/null || echo "$audit_spool_dir")"
-        if awk -v target="$real_spool" '$5 == target { found=1 } END { exit !found }' /proc/self/mountinfo; then
-            die "$audit_spool_dir is a mount point (including bind mount); refusing purge"
-        fi
+    # Fail closed if mountinfo cannot be read (M1).
+    [ -r "$mi" ] || die "cannot read $mi to verify mount boundaries; refusing purge"
+    local real_spool
+    real_spool="$(readlink -f "$audit_spool_dir" 2>/dev/null)" || die "cannot resolve realpath of $audit_spool_dir; refusing purge"
+    if awk -v target="$real_spool" '$5 == target { found=1 } END { exit !found }' "$mi"; then
+        die "$audit_spool_dir is a mount point (including bind mount); refusing purge"
     fi
-    local had_nullglob=0 had_dotglob=0 ent base ent_dev
+    local had_nullglob=0 had_dotglob=0 ent base ent_dev real_ent
     local to_remove=()
     shopt -q nullglob && had_nullglob=1
     shopt -q dotglob && had_dotglob=1
     shopt -s nullglob dotglob
+    # Preflight EVERY managed leaf (allowlist matching tools/audit_log.py AuditSpool:
+    # audit.jsonl, cursor.json, .spool.lock) and its mount status BEFORE deleting anything (M1).
     for ent in "$audit_spool_dir"/*; do
         base="${ent##*/}"
         [ "$base" != "." ] && [ "$base" != ".." ] || continue
         case "$base" in
-            audit.jsonl|.audit.cursor|.audit.lock) ;;
+            audit.jsonl|cursor.json|.spool.lock) ;;
             *)
                 if [ "$had_nullglob" -eq 0 ]; then shopt -u nullglob; fi
                 if [ "$had_dotglob" -eq 0 ]; then shopt -u dotglob; fi
@@ -1660,13 +1774,21 @@ purge_audit_spool_safe() {
         check_private_file_exact "$ent"
         ent_dev="$(stat -c '%d' "$ent")" || die "cannot stat $ent"
         [ "$ent_dev" = "$spool_dev" ] || die "$ent crosses a mount boundary; refusing purge"
+        real_ent="$(readlink -f "$ent" 2>/dev/null)" || die "cannot resolve realpath of $ent; refusing purge"
+        if awk -v target="$real_ent" '$5 == target { found=1 } END { exit !found }' "$mi"; then
+            if [ "$had_nullglob" -eq 0 ]; then shopt -u nullglob; fi
+            if [ "$had_dotglob" -eq 0 ]; then shopt -u dotglob; fi
+            die "$ent is a mount point (including bind mount); refusing purge"
+        fi
         to_remove+=("$ent")
     done
     if [ "$had_nullglob" -eq 0 ]; then shopt -u nullglob; fi
     if [ "$had_dotglob" -eq 0 ]; then shopt -u dotglob; fi
-    for ent in "${to_remove[@]}"; do
-        rm -f "$ent"
-    done
+    if [ "${#to_remove[@]}" -gt 0 ]; then
+        for ent in "${to_remove[@]}"; do
+            rm -f "$ent"
+        done
+    fi
     rmdir "$audit_spool_dir" || die "could not remove $audit_spool_dir (not empty or busy)"
 }
 

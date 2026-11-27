@@ -567,7 +567,9 @@ for spec in \
     "launchd-shipper-case-absent:ORG.TENDCF.AUDIT-SHIPPER:absent:tendcf: service 'ORG.TENDCF.AUDIT-SHIPPER' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
     "systemd-shipper-present:tendcf-audit-shipper.service:present:tendcf: service 'tendcf-audit-shipper.service' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
     "systemd-shipper-nosuffix-absent:tendcf-audit-shipper:absent:tendcf: service 'tendcf-audit-shipper' tombstone refused: installer-owned unit (tendcf-install) cannot be removed by cfengine" \
-    "systemd-shipper-timer-present:tendcf-audit-shipper.timer:present:tendcf: service 'tendcf-audit-shipper.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
+    "systemd-shipper-timer-present:tendcf-audit-shipper.timer:present:tendcf: service 'tendcf-audit-shipper.timer' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-shipper-socket-present:tendcf-audit-shipper.socket:present:tendcf: service 'tendcf-audit-shipper.socket' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine" \
+    "systemd-shipper-path-present:tendcf-audit-shipper.path:present:tendcf: service 'tendcf-audit-shipper.path' refused: installer-owned unit (tendcf-install) cannot be actuated by cfengine"; do
     cname="${spec%%:*}"; rest="${spec#*:}"
     cid="${rest%%:*}"; rest="${rest#*:}"
     cstate="${rest%%:*}"; expected="${rest#*:}"

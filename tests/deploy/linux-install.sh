@@ -30,7 +30,23 @@ canary="$repo/deploy/linux/canary"
 unit=tendcf.canary.service
 fail=0
 
+ship_tmp=""
+ship_sshd_pid=""
+cleanup_ship_fixture() {
+    if [ -n "${ship_sshd_pid:-}" ]; then
+        kill "$ship_sshd_pid" >/dev/null 2>&1 || true
+        wait "$ship_sshd_pid" >/dev/null 2>&1 || true
+        ship_sshd_pid=""
+    fi
+    if [ -n "${ship_tmp:-}" ]; then
+        rm -rf "$ship_tmp" 2>/dev/null || true
+        ship_tmp=""
+    fi
+    rm -f /opt/tendcf/etc/shipper_test_id_ed25519 /opt/tendcf/etc/shipper_test_id_ed25519.pub /opt/tendcf/etc/shipper_test_known_hosts 2>/dev/null || true
+}
+
 cleanup() {
+    cleanup_ship_fixture
     "$installer" uninstall --purge-spool >/dev/null 2>&1 || true
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$unit"
@@ -183,6 +199,78 @@ check "#119 tendcf-audit-shipper.timer enabled and active" \
     bash -c "systemctl is-enabled --quiet tendcf-audit-shipper.timer && systemctl is-active --quiet tendcf-audit-shipper.timer"
 check "#119 tendcf-audit-shipper.service runs cleanly with disabled default config" \
     systemctl start tendcf-audit-shipper.service
+
+# L1: disposable enabled-service fixture over loopback sshd: emit one real
+# event, run tendcf-audit-shipper.service, verify sink witness & cursor ack.
+ship_tmp="$(mktemp -d /run/tendcf-ship-test.XXXXXX)"
+chmod 0700 "$ship_tmp"
+if [ -x /usr/sbin/sshd ] && command -v ssh-keygen >/dev/null 2>&1; then
+    mkdir -p /run/sshd "$ship_tmp/sink" "$ship_tmp/run"
+    chmod 0700 "$ship_tmp/sink" "$ship_tmp/run"
+    ssh-keygen -q -t ed25519 -N '' -f "$ship_tmp/host_ed25519"
+    ssh-keygen -q -t ed25519 -N '' -f /opt/tendcf/etc/shipper_test_id_ed25519
+    chmod 0600 /opt/tendcf/etc/shipper_test_id_ed25519
+    ship_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+    printf '[127.0.0.1]:%s %s\n' "$ship_port" "$(cat "$ship_tmp/host_ed25519.pub")" > /opt/tendcf/etc/shipper_test_known_hosts
+    chmod 0600 /opt/tendcf/etc/shipper_test_known_hosts
+    printf 'command="/usr/bin/python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py sink-append --sink-root %s --host canary-host --src cf-agent",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,restrict %s\n' \
+        "$ship_tmp/sink" "$(cat /opt/tendcf/etc/shipper_test_id_ed25519.pub)" > "$ship_tmp/authorized_keys"
+    chmod 0600 "$ship_tmp/authorized_keys"
+    cat > "$ship_tmp/sshd_config" <<SSHD_EOF
+ListenAddress 127.0.0.1
+Port $ship_port
+HostKey $ship_tmp/host_ed25519
+PidFile $ship_tmp/sshd.pid
+AuthorizedKeysFile $ship_tmp/authorized_keys
+PermitRootLogin forced-commands-only
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+Subsystem sftp /bin/false
+SSHD_EOF
+    /usr/sbin/sshd -D -f "$ship_tmp/sshd_config" -E "$ship_tmp/sshd.log" &
+    ship_sshd_pid="$!"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if python3 -c "import socket,sys; s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),0.2); s.close()" "$ship_port" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py emit \
+        --spool-dir /opt/tendcf/var/audit-spool \
+        --host canary-host --src cf-agent --boot-id boot-ci-1 \
+        --type heartbeat \
+        --data-json '{"running_release":"release-1.0.0","goal_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","projection_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","converged":true,"unshipped_count":0}' >/dev/null
+    python3 - "$ship_port" <<'PYCFG'
+import json, os, pathlib, sys
+cfg = {
+    "enabled": True,
+    "spool_dir": "/opt/tendcf/var/audit-spool",
+    "host": "canary-host",
+    "src": "cf-agent",
+    "target": "root@127.0.0.1",
+    "port": int(sys.argv[1]),
+    "identity": "/opt/tendcf/etc/shipper_test_id_ed25519",
+    "known_hosts": "/opt/tendcf/etc/shipper_test_known_hosts",
+    "ssh_bin": "/usr/bin/ssh",
+    "batch_size": 50,
+}
+p = pathlib.Path("/opt/tendcf/etc/audit-shipper.json")
+p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+os.chmod(p, 0o600)
+PYCFG
+    check "#119 enabled tendcf-audit-shipper.service ships real event over forced-command SSH" \
+        systemctl start tendcf-audit-shipper.service
+    check "#119 cursor.json advanced acked_seq to 1 after shipping" \
+        python3 -c 'import json; c=json.load(open("/opt/tendcf/var/audit-spool/cursor.json")); assert c["acked_seq"]==1 and c["local_seq"]==1, c'
+    check "#119 audit_log.py verify confirms local spool matches sink witness line-for-line" \
+        python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py verify \
+            --local /opt/tendcf/var/audit-spool/audit.jsonl \
+            --sink-dir "$ship_tmp/sink" --host canary-host --src cf-agent
+fi
+cleanup_ship_fixture
+
 "$installer" uninstall --purge-spool
 check "#119 uninstall removes tendcf-execd.service and shipper units" \
     bash -c "[ ! -e /etc/systemd/system/tendcf-execd.service ] && [ ! -e /etc/systemd/system/tendcf-audit-shipper.service ] && [ ! -e /etc/systemd/system/tendcf-audit-shipper.timer ]"

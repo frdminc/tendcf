@@ -1762,6 +1762,60 @@ class TestR1AdversaryRegressions(unittest.TestCase):
             audit.RECOVERED_PARTIAL_TMP_RE.match(".2026-11-26.jsonl.1.json.tmp.123.0123456789abcdef\n")
         )
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS extended ACL fixture")
+    def test_h3_darwin_extended_acl_on_known_hosts_ancestor_and_config_refused(self) -> None:
+        # H3: On macOS, a file or ancestor carrying a writable extended ACL that passes
+        # UID and POSIX 0600/0700 mode checks must still be refused by runtime trust checks.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            cred_dir = root / "cred"
+            cred_dir.mkdir(mode=0o700)
+            os.chmod(cred_dir, 0o700)
+            id_file = cred_dir / "id_ed25519"
+            kh_file = cred_dir / "known_hosts"
+            id_file.write_text("dummy-key\n", encoding="utf-8")
+            kh_file.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA\n", encoding="utf-8")
+            os.chmod(id_file, 0o600)
+            os.chmod(kh_file, 0o600)
+
+            # Baseline passes before ACL is added.
+            audit._validate_ssh_safe_file_path(
+                kh_file, label="known_hosts", enforce_owner_and_ancestors=True
+            )
+
+            # 1) Add writable extended ACL to known_hosts while keeping POSIX mode 0600 & owner UID intact.
+            r_acl = subprocess.run(
+                ["/bin/chmod", "+a", "everyone allow write", str(kh_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_acl.returncode, 0, r_acl.stderr)
+            self.assertEqual(stat.S_IMODE(kh_file.stat().st_mode), 0o600)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit._validate_ssh_safe_file_path(
+                    kh_file, label="known_hosts", enforce_owner_and_ancestors=True
+                )
+            subprocess.run(["/bin/chmod", "-N", str(kh_file)], check=True)
+
+            # 2) Add writable extended ACL to parent directory while keeping POSIX mode 0700.
+            subprocess.run(["/bin/chmod", "+a", "everyone allow add_file", str(cred_dir)], check=True)
+            self.assertEqual(stat.S_IMODE(cred_dir.stat().st_mode), 0o700)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit._validate_ssh_safe_file_path(
+                    kh_file, label="known_hosts", enforce_owner_and_ancestors=True
+                )
+            subprocess.run(["/bin/chmod", "-N", str(cred_dir)], check=True)
+
+            # 3) Add extended ACL to shipper config file while keeping POSIX mode 0600.
+            cfg = cred_dir / "audit-shipper.json"
+            cfg.write_text(json.dumps({"enabled": False}) + "\n", encoding="utf-8")
+            os.chmod(cfg, 0o600)
+            subprocess.run(["/bin/chmod", "+a", "everyone allow write", str(cfg)], check=True)
+            with self.assertRaises(audit.AuditFileSecurityError):
+                audit.load_shipper_config(cfg)
+            subprocess.run(["/bin/chmod", "-N", str(cfg)], check=True)
+
 
 def _parse_yaml_scalar(val: str):
     if val.startswith('"') and val.endswith('"'):

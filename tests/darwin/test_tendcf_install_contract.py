@@ -3086,12 +3086,39 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertNotEqual(r_dirty.returncode, 0)
             os.chmod(audit_cfg, 0o600)
 
-            # H5: Unrelated file under tripwire_share_dir survives uninstall; unexpected file in spool blocks purge.
+            # H5/M1/M2: First verify empty spool purges cleanly under macOS /bin/bash 3.2 (set -u).
+            r_empty = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "purge_audit_spool_safe\n"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(r_empty.returncode, 0, r_empty.stderr)
+            self.assertFalse(spool_dir.exists())
+            spool_dir.mkdir(mode=0o700)
+            os.chmod(spool_dir, 0o700)
+
+            # Populate spool with REAL AuditSpool (audit.jsonl, cursor.json, .spool.lock).
             unrelated_trip = trip_dir / "operator-custom.conf"
             unrelated_trip.write_text("keep me\n", encoding="utf-8")
-            spool_marker = spool_dir / "audit.jsonl"
-            spool_marker.write_text("witness\n", encoding="utf-8")
-            os.chmod(spool_marker, 0o600)
+            p_emit = subprocess.run(
+                [
+                    sys.executable, "-I", "-S",
+                    str(prefix / "share" / "tendcf" / "bin" / "audit_log.py"),
+                    "emit", "--spool-dir", str(spool_dir),
+                    "--host", "macbook", "--src", "cf-agent", "--boot-id", "boot-1",
+                    "--type", "heartbeat",
+                    "--data-json",
+                    '{"running_release":"release-1.0.0","goal_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","projection_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","converged":true,"unshipped_count":0}',
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(p_emit.returncode, 0, p_emit.stderr)
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
+            self.assertTrue((spool_dir / "cursor.json").is_file())
+            self.assertTrue((spool_dir / ".spool.lock").is_file())
             r_un = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall\n"],
                 capture_output=True,
@@ -3102,7 +3129,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             for gone in (execd_plist, shipper_plist, osq_pack, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
                 self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
             self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
-            self.assertTrue(spool_marker.is_file())
+            self.assertTrue((spool_dir / "audit.jsonl").is_file())
 
             rogue_spool = spool_dir / "operator-notes.txt"
             rogue_spool.write_text("do not delete\n", encoding="utf-8")
@@ -3116,7 +3143,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue(rogue_spool.is_file())
             rogue_spool.unlink()
 
-            # Uninstall with --purge-spool removes known spool files & rmdir cleanly and re-run reports no change.
+            # Uninstall with --purge-spool removes real AuditSpool files & rmdir cleanly and re-run reports no change.
             r_purge = subprocess.run(
                 ["/bin/bash", "-c", env_setup + "cmd_uninstall --purge-spool\nchanged=0\ncmd_uninstall --purge-spool\n"],
                 capture_output=True,
@@ -3128,34 +3155,49 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertIn("no change (already uninstalled)", r_purge.stdout)
 
     def test_h4_cleanup_stage_restores_moved_etc_and_shipper_on_failed_upgrade(self) -> None:
-        # H4: interrupted upgrade after moving etc/ and var/ restores enabled config and re-bootstraps shipper.
+        # H2/H4/M3: interrupted upgrade restores moved var/ & etc/ (even if interrupted before flag set),
+        # restores ORIGINAL overwritten shipper plist bytes before re-bootstrapping, and retains stage_dir
+        # if restoration fails.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             prefix = root / "opt" / "tendcf"
             backup = root / "opt" / "tendcf.old.999"
-            (prefix / "etc").mkdir(parents=True)
-            (prefix / "var" / "audit-spool").mkdir(parents=True)
+            stage = root / "stage"
+            staged_tree = stage / "extract" / "tendcf"
+            (staged_tree / "etc").mkdir(parents=True)
+            (staged_tree / "var" / "audit-spool").mkdir(parents=True)
             backup.mkdir(parents=True)
             enrolled = '{"enabled":true,"host":"macbook","spool_dir":"/opt/tendcf/var/audit-spool","src":"tendcf"}\n'
-            (prefix / "etc" / "audit-shipper.json").write_text(enrolled, encoding="utf-8")
-            (prefix / "var" / "audit-spool" / "audit.jsonl").write_text("rec1\n", encoding="utf-8")
+            (staged_tree / "etc" / "audit-shipper.json").write_text(enrolled, encoding="utf-8")
+            (staged_tree / "var" / "audit-spool" / "audit.jsonl").write_text("rec1\n", encoding="utf-8")
+            (staged_tree / "var" / "audit-spool" / "cursor.json").write_text('{"acked_seq":0}\n', encoding="utf-8")
+
+            # M3: Save ORIGINAL shipper plist in stage_dir, then overwrite live shipper_plist with NEW content!
+            old_plist = "<plist><string>OLD_V1_SHIPPER</string></plist>\n"
+            new_plist = "<plist><string>NEW_V2_BROKEN_SHIPPER</string></plist>\n"
+            saved_plist = stage / "upgrade-shipper.plist.prev"
+            saved_plist.write_text(old_plist, encoding="utf-8")
             shipper_plist = root / "org.tendcf.audit-shipper.plist"
-            shipper_plist.write_text("<plist/>", encoding="utf-8")
+            shipper_plist.write_text(new_plist, encoding="utf-8")
             log_file = root / "actions.log"
 
             cs_fn = _extract_func(self.src, "cleanup_stage")
+            # Simulate TERM arriving AFTER mv backup_prefix/{var,etc} -> staged_tree/{var,etc}
+            # even with upgrade_moved_var=0 and upgrade_moved_etc=0 (H2 worst-case boundary).
             script = (
                 "set -euo pipefail\n"
                 f'prefix="{prefix}"\n'
                 f'upgrade_backup_prefix="{backup}"\n'
-                'upgrade_staged_tree=""\n'
+                f'upgrade_staged_tree="{staged_tree}"\n'
                 'upgrade_rollback_armed=1\n'
-                'upgrade_moved_var=1\n'
-                'upgrade_moved_etc=1\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
                 'upgrade_was_loaded=0\n'
                 'upgrade_had_plist=0\n'
                 'upgrade_shipper_was_loaded=1\n'
+                'upgrade_shipper_was_disabled=0\n'
                 'upgrade_had_shipper_plist=1\n'
+                f'upgrade_saved_shipper_plist="{saved_plist}"\n'
                 'upgrade_snapshot_taken=0\n'
                 'upgrade_saved_workdir=""\n'
                 'upgrade_saved_inputs=0\n'
@@ -3164,12 +3206,12 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 f'shipper_plist_path="{shipper_plist}"\n'
                 'label="org.tendcf.execd"\n'
                 'shipper_label="org.tendcf.audit-shipper"\n'
-                'stage_dir=""\n'
+                f'stage_dir="{stage}"\n'
                 'publish_lock_held=0\n'
                 'put_data_rollback_armed=0\n'
                 'execd_is_loaded() { return 1; }\n'
                 'shipper_is_loaded() { return 1; }\n'
-                f'bootstrap_shipper_with_retry() {{ echo "bootstrapped_shipper" >> "{log_file}"; return 0; }}\n'
+                f'bootstrap_shipper_with_retry() {{ cat "{shipper_plist}" >> "{log_file}"; return 0; }}\n'
                 f"{cs_fn}\n"
                 "cleanup_stage\n"
             )
@@ -3177,7 +3219,55 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual((prefix / "etc" / "audit-shipper.json").read_text(encoding="utf-8"), enrolled)
             self.assertEqual((prefix / "var" / "audit-spool" / "audit.jsonl").read_text(encoding="utf-8"), "rec1\n")
-            self.assertIn("bootstrapped_shipper", log_file.read_text(encoding="utf-8"))
+            self.assertEqual(shipper_plist.read_text(encoding="utf-8"), old_plist, "M3: original shipper plist contents must be restored")
+            self.assertIn("OLD_V1_SHIPPER", log_file.read_text(encoding="utf-8"), "M3: bootstrap must run AFTER old plist is restored")
+
+            # H2: Verify stage_dir is RETAINED when moving var/ back from staging fails.
+            stage2 = root / "stage2"
+            st2 = stage2 / "extract" / "tendcf"
+            (st2 / "var").mkdir(parents=True)
+            (st2 / "var" / "keep.txt").write_text("precious\n", encoding="utf-8")
+            backup2 = root / "opt" / "tendcf2.old"
+            backup2.mkdir(parents=True)
+            os.chmod(backup2, 0o500)  # make backup2 unwritable so mv back fails!
+            try:
+                script2 = (
+                    "set -euo pipefail\n"
+                    f'prefix="{root}/opt/tendcf2"\n'
+                    f'upgrade_backup_prefix="{backup2}"\n'
+                    f'upgrade_staged_tree="{st2}"\n'
+                    'upgrade_rollback_armed=1\n'
+                    'upgrade_moved_var=1\n'
+                    'upgrade_moved_etc=0\n'
+                    'upgrade_was_loaded=0\n'
+                    'upgrade_had_plist=0\n'
+                    'upgrade_shipper_was_loaded=0\n'
+                    'upgrade_shipper_was_disabled=0\n'
+                    'upgrade_had_shipper_plist=0\n'
+                    'upgrade_saved_shipper_plist=""\n'
+                    'upgrade_snapshot_taken=0\n'
+                    'upgrade_saved_workdir=""\n'
+                    'upgrade_saved_inputs=0\n'
+                    'upgrade_saved_data=0\n'
+                    f'plist_path="{root}/execd2.plist"\n'
+                    f'shipper_plist_path="{root}/shipper2.plist"\n'
+                    'label="org.tendcf.execd"\n'
+                    'shipper_label="org.tendcf.audit-shipper"\n'
+                    f'stage_dir="{stage2}"\n'
+                    'publish_lock_held=0\n'
+                    'put_data_rollback_armed=0\n'
+                    'execd_is_loaded() { return 1; }\n'
+                    'shipper_is_loaded() { return 1; }\n'
+                    f"{cs_fn}\n"
+                    "cleanup_stage\n"
+                )
+                r2 = subprocess.run(["/bin/bash", "-c", script2], capture_output=True, text=True, check=False)
+                self.assertEqual(r2.returncode, 0, r2.stderr)
+                self.assertTrue((st2 / "var" / "keep.txt").is_file(), "H2: stage_dir must be retained when var/ restoration fails!")
+            finally:
+                for p_fix in (backup2, root / "opt" / "tendcf2"):
+                    if p_fix.exists():
+                        os.chmod(p_fix, 0o700)
 
 
 if __name__ == "__main__":
