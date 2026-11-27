@@ -188,7 +188,7 @@ cleanup_stage() {
     fi
     local rollback_keep_stage=0
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
-        local restored_prefix=0 var_restored=1 etc_restored=1 shipper_plist_restored=1 shipper_state_restored=1
+        local restored_prefix=0 var_restored=1 etc_restored=1 snapshot_restored=1 shipper_plist_restored=1 shipper_state_restored=1
         local execd_quiesced=1 shipper_quiesced=1 prefix_suitable=1
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
             if execd_is_loaded; then
@@ -272,30 +272,49 @@ cleanup_stage() {
                         fi
                     fi
                 fi
-                if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ]; then
-                    if [ "$upgrade_saved_inputs" -eq 1 ] && [ -d "$stage_dir/upgrade-var-backup/inputs" ]; then
-                        /bin/rm -rf "$upgrade_saved_workdir/inputs" || true
-                        /bin/mv "$stage_dir/upgrade-var-backup/inputs" "$upgrade_saved_workdir/inputs" || true
+                if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ] \
+                    && [ "$restored_prefix" -eq 1 ] && [ "$var_restored" -eq 1 ] && [ "$etc_restored" -eq 1 ]; then
+                    if [ "$upgrade_saved_inputs" -eq 1 ]; then
+                        if [ ! -d "$stage_dir/upgrade-var-backup/inputs" ] \
+                            || ! /bin/rm -rf "$upgrade_saved_workdir/inputs" \
+                            || ! /bin/mv "$stage_dir/upgrade-var-backup/inputs" "$upgrade_saved_workdir/inputs"; then
+                            snapshot_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore saved inputs snapshot to $upgrade_saved_workdir/inputs; preserving stage_dir" >&2
+                        fi
                     fi
-                    if [ "$upgrade_saved_data" -eq 1 ] && [ -f "$stage_dir/upgrade-var-backup/host_specific.json" ]; then
-                        /bin/mkdir -p "$upgrade_saved_workdir/data" || true
-                        if /bin/cp -p "$stage_dir/upgrade-var-backup/host_specific.json" \
-                            "$upgrade_saved_workdir/data/host_specific.json.rollback.$$"; then
-                            /bin/mv -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
-                                "$upgrade_saved_workdir/data/host_specific.json" || true
-                            /bin/chmod 0600 "$upgrade_saved_workdir/data/host_specific.json" || true
+                    if [ "$upgrade_saved_data" -eq 1 ]; then
+                        if [ ! -f "$stage_dir/upgrade-var-backup/host_specific.json" ] \
+                            || ! /bin/mkdir -p "$upgrade_saved_workdir/data" \
+                            || ! /bin/cp -p "$stage_dir/upgrade-var-backup/host_specific.json" \
+                                "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
+                            || ! /bin/mv -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
+                                "$upgrade_saved_workdir/data/host_specific.json" \
+                            || ! /bin/chmod 0600 "$upgrade_saved_workdir/data/host_specific.json"; then
+                            /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" 2>/dev/null || true
+                            snapshot_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore saved host_specific.json snapshot to $upgrade_saved_workdir/data; preserving stage_dir" >&2
+                        else
                             /usr/sbin/chown root:wheel "$upgrade_saved_workdir/data/host_specific.json" 2>/dev/null || true
                         fi
                     elif [ "$upgrade_saved_data" -eq 0 ] && [ -e "$upgrade_saved_workdir/data/host_specific.json" ]; then
-                        /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" || true
+                        if ! /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" \
+                            || [ -e "$upgrade_saved_workdir/data/host_specific.json" ]; then
+                            snapshot_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to remove newly created host_specific.json during rollback; preserving stage_dir" >&2
+                        fi
                     fi
                 fi
             fi
             # Because the original prefix had moved to $upgrade_backup_prefix,
             # the live $prefix is only suitable for plist publication and daemon
-            # restarts if quiescence + prefix + var/etc restoration all succeeded (M1).
+            # restarts if quiescence + prefix + var/etc + workdir snapshot
+            # restoration all succeeded (M1).
             if [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
-                || [ "$restored_prefix" -eq 0 ] || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ]; then
+                || [ "$restored_prefix" -eq 0 ] || [ "$var_restored" -eq 0 ] \
+                || [ "$etc_restored" -eq 0 ] || [ "$snapshot_restored" -eq 0 ]; then
                 prefix_suitable=0
                 rollback_keep_stage=1
             fi
@@ -405,7 +424,7 @@ cleanup_stage() {
         fi
         if [ "$rollback_keep_stage" -eq 1 ] || [ "$prefix_suitable" -eq 0 ] \
             || [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
-            || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] \
+            || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] || [ "$snapshot_restored" -eq 0 ] \
             || [ "$shipper_plist_restored" -eq 0 ] || [ "$shipper_state_restored" -eq 0 ]; then
             echo "tendcf-install: ERROR: upgrade rollback was incomplete; inspect preserved recovery directories" >&2
         elif [ "$restored_prefix" -eq 1 ]; then

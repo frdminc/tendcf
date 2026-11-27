@@ -3553,6 +3553,65 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual((prefix6 / "marker").read_text(encoding="utf-8"), "new-tree\n", "M1: must not swap prefix under running unquiesced job")
             self.assertEqual((backup6 / "marker").read_text(encoding="utf-8"), "old-tree\n", "M1: backup prefix must remain intact for recovery")
 
+            # R6-M1: Successful prefix rename, but workdir host_specific.json snapshot restore fails:
+            # saved snapshot bytes MUST remain intact, ZERO bootstraps may run, and incomplete rollback reported.
+            stage7 = root / "stage7"
+            snap_dir7 = stage7 / "upgrade-var-backup"
+            snap_dir7.mkdir(parents=True)
+            saved_data7 = snap_dir7 / "host_specific.json"
+            saved_data7.write_text('{"saved":"precious"}\n', encoding="utf-8")
+            backup7 = root / "opt" / "tendcf7.old"
+            wd7_data = backup7 / "var" / "libntech" / "data"
+            wd7_data.mkdir(parents=True)
+            prefix7 = root / "opt" / "tendcf7"
+            bs_log7 = root / "bs7.log"
+            os.chmod(wd7_data, 0o500)  # make workdir/data unwritable so cp into restored prefix fails!
+            try:
+                script7 = (
+                    "set -euo pipefail\n"
+                    f'prefix="{prefix7}"\n'
+                    f'upgrade_backup_prefix="{backup7}"\n'
+                    'upgrade_staged_tree=""\n'
+                    'upgrade_rollback_armed=1\n'
+                    'upgrade_had_var=1\n'
+                    'upgrade_had_etc=0\n'
+                    'upgrade_moved_var=0\n'
+                    'upgrade_moved_etc=0\n'
+                    'upgrade_was_loaded=1\n'
+                    'upgrade_had_plist=1\n'
+                    'upgrade_shipper_was_loaded=1\n'
+                    'upgrade_shipper_prior_disabled="enabled"\n'
+                    'upgrade_had_shipper_plist=1\n'
+                    'upgrade_saved_shipper_plist=""\n'
+                    'upgrade_snapshot_taken=1\n'
+                    f'upgrade_saved_workdir="{prefix7}/var/libntech"\n'
+                    'upgrade_saved_inputs=0\n'
+                    'upgrade_saved_data=1\n'
+                    f'plist_path="{execd_plist6}"\n'
+                    f'shipper_plist_path="{live_plist6}"\n'
+                    'label="org.tendcf.execd"\n'
+                    'shipper_label="org.tendcf.audit-shipper"\n'
+                    f'stage_dir="{stage7}"\n'
+                    'publish_lock_held=0\n'
+                    'put_data_rollback_armed=0\n'
+                    'execd_is_loaded() { return 1; }\n'
+                    'shipper_is_loaded() { return 1; }\n'
+                    f'bootstrap_execd_with_retry() {{ echo "execd" >> "{bs_log7}"; return 0; }}\n'
+                    f'bootstrap_shipper_with_retry() {{ echo "shipper" >> "{bs_log7}"; return 0; }}\n'
+                    f"{cs_fn}\n"
+                    "cleanup_stage\n"
+                )
+                r7 = subprocess.run(["/bin/bash", "-c", script7], capture_output=True, text=True, check=False)
+                self.assertEqual(r7.returncode, 0, r7.stderr)
+                self.assertTrue(saved_data7.is_file(), "R6-M1: saved snapshot bytes must remain intact when workdir restore fails")
+                self.assertEqual(saved_data7.read_text(encoding="utf-8"), '{"saved":"precious"}\n')
+                self.assertFalse(bs_log7.exists(), "R6-M1: ZERO bootstraps allowed when workdir snapshot restore fails")
+                self.assertIn("incomplete", r7.stderr)
+            finally:
+                for p_fix in (wd7_data, prefix7 / "var" / "libntech" / "data"):
+                    if p_fix.exists():
+                        os.chmod(p_fix, 0o700)
+
 
 if __name__ == "__main__":
     unittest.main()

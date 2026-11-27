@@ -2092,6 +2092,26 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r_persisted.returncode, 0, r_persisted.stderr)
             self.assertFalse(augen_log.exists(), "H1: standalone enable with persisted -e 2 on mutable kernel must NOT run augenrules --load")
             self.assertIn("without running augenrules --load", r_persisted.stdout)
+            # (e) R6-H1: compact attached `-e2` spelling returns 1 and makes zero augenrules --load calls!
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n-e2\n", encoding="utf-8")
+            r_compact_chk = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_compact_chk.returncode, 1, "R6-H1: compact -e2 spelling must return 1")
+            r_compact_rel = subprocess.run(
+                [
+                    "/bin/bash", "-c",
+                    f"set -euo pipefail\nexport PATH='{fake_sctl}':\"$PATH\"\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    f"auditd_rules_dir='{rules_d}'\nauditd_rules_path='{managed_r}'\nlock_auditd=0\n"
+                    f"{fn_safe_load}\n{fn_reload}\nreload_auditd_tripwire\n",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_compact_rel.returncode, 0, r_compact_rel.stderr)
+            self.assertFalse(augen_log.exists(), "R6-H1: compact -e2 must prevent augenrules --load")
             fn_purge = _extract_func(self.src, "purge_audit_spool_safe")
             self.assertNotIn("mountinfo_path", fn_purge, "M1: production purge must not accept inherited mountinfo_path")
             self.assertIn("mountinfo_contains_target /proc/self/mountinfo", fn_purge)

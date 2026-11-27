@@ -1218,7 +1218,7 @@ check_auditd_rules_dir_safe_to_load() {
         awk '
             {
                 gsub(/\r/, "")
-                if ($0 ~ /^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)/) found = 1
+                if ($0 ~ /^[[:space:]]*-e[[:space:]]*2([[:space:]#]|$)/) found = 1
             }
             END { exit (found ? 10 : 0) }
         ' "$f" 2>/dev/null || awk_rc=$?
@@ -1261,7 +1261,7 @@ append_lock_to_frozen_auditd_rules() {
     umask 022
     tmp_share="$(mktemp "$tripwire_share_dir/.auditd.lock.XXXXXX")"
     umask "$old_umask"
-    grep -Ev '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)' "$auditd_rules_path" > "$tmp_share"
+    grep -Ev '^[[:space:]]*-e[[:space:]]*2([[:space:]#]|$)' "$auditd_rules_path" > "$tmp_share"
     printf '# Immutable auditd lock requested via --lock-auditd (requires reboot to change)\n-e 2\n' >> "$tmp_share"
     chown root:root "$tmp_share"
     chmod 0640 "$tmp_share"
