@@ -189,7 +189,7 @@ cleanup_stage() {
     local rollback_keep_stage=0
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
         local restored_prefix=0 var_restored=1 etc_restored=1 shipper_plist_restored=1 shipper_state_restored=1
-        local execd_quiesced=1 shipper_quiesced=1
+        local execd_quiesced=1 shipper_quiesced=1 prefix_suitable=1
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
             if execd_is_loaded; then
                 if ! bootout_execd >/dev/null 2>&1 || ! wait_execd_unloaded || execd_is_loaded; then
@@ -291,101 +291,120 @@ cleanup_stage() {
                     fi
                 fi
             fi
-        fi
-        if [ "${upgrade_had_plist:-0}" -eq 0 ] && [ "$upgrade_was_loaded" -eq 0 ] \
-            && [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
-            if execd_is_loaded; then
-                if ! bootout_execd >/dev/null 2>&1 || ! wait_execd_unloaded || execd_is_loaded; then
-                    execd_quiesced=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: failed to unload newly created $label during rollback" >&2
-                fi
-            fi
-            if [ "$execd_quiesced" -eq 1 ]; then
-                /bin/rm -f "$plist_path" || true
-            fi
-        fi
-        # Restore prior shipper plist contents (only from validated snapshot; H1)
-        # and restore prior disabled/loaded state independently of plist presence (M1/M3).
-        if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
-            && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
-            && [ -n "${shipper_plist_path:-}" ]; then
-            if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
-                    shipper_quiesced=0
-                    shipper_state_restored=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
-                fi
-            fi
-            local sp_rb="$shipper_plist_path.rollback.$$"
-            if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
-                && /bin/chmod 0644 "$sp_rb" \
-                && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
-                /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
-            else
-                /bin/rm -f "$sp_rb" || true
-                shipper_plist_restored=0
+            # Because the original prefix had moved to $upgrade_backup_prefix,
+            # the live $prefix is only suitable for plist publication and daemon
+            # restarts if quiescence + prefix + var/etc restoration all succeeded (M1).
+            if [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
+                || [ "$restored_prefix" -eq 0 ] || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ]; then
+                prefix_suitable=0
                 rollback_keep_stage=1
-                echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
-            fi
-        elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
-            && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
-            if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
-                    shipper_quiesced=0
-                    shipper_state_restored=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: failed to unload newly created $shipper_label during rollback" >&2
-                fi
-            fi
-            if [ "$shipper_quiesced" -eq 1 ]; then
-                /bin/rm -f "$shipper_plist_path" || true
             fi
         fi
-        # Restore disabled override state regardless of whether a plist existed (M1/M3).
-        case "${upgrade_shipper_prior_disabled:-}" in
-            disabled)
+        # Once a required prefix rollback cannot proceed, skip dependent plist
+        # publication/removal and daemon bootstraps to avoid mutating plists or
+        # restarting daemons against the replacement tree (M1).
+        if [ "$prefix_suitable" -eq 1 ]; then
+            if [ "${upgrade_had_plist:-0}" -eq 0 ] && [ "$upgrade_was_loaded" -eq 0 ] \
+                && [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
+                if execd_is_loaded; then
+                    if ! bootout_execd >/dev/null 2>&1 || ! wait_execd_unloaded || execd_is_loaded; then
+                        execd_quiesced=0
+                        rollback_keep_stage=1
+                        echo "tendcf-install: ERROR: failed to unload newly created $label during rollback" >&2
+                    fi
+                fi
+                if [ "$execd_quiesced" -eq 1 ]; then
+                    /bin/rm -f "$plist_path" || true
+                fi
+            fi
+            # Restore prior shipper plist contents (only from validated snapshot and
+            # only when replacement job is confirmed quiesced; H1/M1).
+            if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
+                && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
+                && [ -n "${shipper_plist_path:-}" ]; then
                 if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
                     if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
                         shipper_quiesced=0
                         shipper_state_restored=0
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to stop $shipper_label while restoring disabled state" >&2
+                        echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
                     fi
                 fi
-                if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
+                if [ "$shipper_quiesced" -eq 1 ]; then
+                    local sp_rb="$shipper_plist_path.rollback.$$"
+                    if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
+                        && /bin/chmod 0644 "$sp_rb" \
+                        && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
+                        /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
+                    else
+                        /bin/rm -f "$sp_rb" || true
+                        shipper_plist_restored=0
+                        rollback_keep_stage=1
+                        echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
+                    fi
+                fi
+            elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
+                && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
+                if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                    if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                        shipper_quiesced=0
+                        shipper_state_restored=0
+                        rollback_keep_stage=1
+                        echo "tendcf-install: ERROR: failed to unload newly created $shipper_label during rollback" >&2
+                    fi
+                fi
+                if [ "$shipper_quiesced" -eq 1 ]; then
+                    /bin/rm -f "$shipper_plist_path" || true
+                fi
+            fi
+            # Restore disabled override state regardless of whether a plist existed (M1/M3).
+            case "${upgrade_shipper_prior_disabled:-}" in
+                disabled)
+                    if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                        if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                            shipper_quiesced=0
+                            shipper_state_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to stop $shipper_label while restoring disabled state" >&2
+                        fi
+                    fi
+                    if [ "$shipper_quiesced" -eq 1 ]; then
+                        if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
+                            shipper_state_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore disabled override for system/$shipper_label; preserving recovery dirs" >&2
+                        fi
+                    fi
+                    ;;
+                unknown)
                     shipper_state_restored=0
                     rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: failed to restore disabled override for system/$shipper_label; preserving recovery dirs" >&2
+                    echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
+                    ;;
+            esac
+            if [ "$upgrade_was_loaded" -eq 1 ] && [ "$execd_quiesced" -eq 1 ] && [ "$shipper_quiesced" -eq 1 ] \
+                && [ -f "$plist_path" ] && ! execd_is_loaded; then
+                if ! bootstrap_execd_with_retry >/dev/null 2>&1; then
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to re-bootstrap $label during rollback" >&2
                 fi
-                ;;
-            unknown)
-                shipper_state_restored=0
-                rollback_keep_stage=1
-                echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
-                ;;
-        esac
-        if [ "$upgrade_was_loaded" -eq 1 ] && [ "$execd_quiesced" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
-            if ! bootstrap_execd_with_retry >/dev/null 2>&1; then
-                rollback_keep_stage=1
-                echo "tendcf-install: ERROR: failed to re-bootstrap $label during rollback" >&2
+            fi
+            if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
+                && [ "$execd_quiesced" -eq 1 ] && [ "$shipper_quiesced" -eq 1 ] \
+                && [ "${upgrade_shipper_prior_disabled:-enabled}" != "disabled" ] \
+                && [ "${upgrade_shipper_prior_disabled:-enabled}" != "unknown" ] \
+                && [ "$shipper_plist_restored" -eq 1 ] \
+                && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] \
+                && declare -F shipper_is_loaded >/dev/null 2>&1 && ! shipper_is_loaded; then
+                if ! bootstrap_shipper_with_retry >/dev/null 2>&1; then
+                    shipper_state_restored=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to re-bootstrap $shipper_label during rollback" >&2
+                fi
             fi
         fi
-        if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
-            && [ "$shipper_quiesced" -eq 1 ] \
-            && [ "${upgrade_shipper_prior_disabled:-enabled}" != "disabled" ] \
-            && [ "${upgrade_shipper_prior_disabled:-enabled}" != "unknown" ] \
-            && [ "$shipper_plist_restored" -eq 1 ] \
-            && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] \
-            && declare -F shipper_is_loaded >/dev/null 2>&1 && ! shipper_is_loaded; then
-            if ! bootstrap_shipper_with_retry >/dev/null 2>&1; then
-                shipper_state_restored=0
-                rollback_keep_stage=1
-                echo "tendcf-install: ERROR: failed to re-bootstrap $shipper_label during rollback" >&2
-            fi
-        fi
-        if [ "$rollback_keep_stage" -eq 1 ] || [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
+        if [ "$rollback_keep_stage" -eq 1 ] || [ "$prefix_suitable" -eq 0 ] \
+            || [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
             || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] \
             || [ "$shipper_plist_restored" -eq 0 ] || [ "$shipper_state_restored" -eq 0 ]; then
             echo "tendcf-install: ERROR: upgrade rollback was incomplete; inspect preserved recovery directories" >&2

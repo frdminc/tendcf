@@ -1196,30 +1196,42 @@ verify_auditd_expected_watches() {  # verify_auditd_expected_watches RULES_FILE 
     ' <<< "$active_rules"
 }
 
-# Inspect EVERY *.rules entry in $auditd_rules_dir (including $auditd_rules_path
-# itself and symlinked package drop-ins, matching upstream augenrules enumeration
-# and CR stripping; H1). Returns 0 ("would lock / cannot safely inspect") if ANY
-# entry is unreadable, cannot be read with cat, or contains an uncommented `-e 2`
-# directive; returns 1 ONLY when every entry was safely read and none requests `-e 2`.
-auditd_rules_dir_would_lock() {
-    local f content had_ng=0
-    [ -d "$auditd_rules_dir" ] || return 0
+# Check that EVERY *.rules entry in $auditd_rules_dir resolves to a readable
+# regular file (supporting symlinks to regular files, rejecting FIFOs/broken
+# links before open) and contains NO uncommented `-e 2` directive using a
+# single pipe-free awk pass (zero SIGPIPE under pipefail; H1).
+# Exit codes:
+#   0 = positively safe (every entry inspected cleanly, none requests -e 2)
+#   1 = confirmed -e 2 lock directive found
+#   2 = error / non-regular / unreadable / parser failure (fail closed)
+check_auditd_rules_dir_safe_to_load() {
+    local f awk_rc=0 had_ng=0
+    [ -d "$auditd_rules_dir" ] || return 2
     shopt -q nullglob && had_ng=1
     shopt -s nullglob
     for f in "$auditd_rules_dir"/*.rules; do
-        # Upstream augenrules reads any existing *.rules path (including symlinks)
-        # via cat and strips CR; fail closed on broken symlinks or read errors.
-        if [ ! -r "$f" ] || ! content="$(cat "$f" 2>/dev/null)"; then
+        if [ ! -f "$f" ] || [ ! -r "$f" ]; then
             if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
-            return 0
+            return 2
         fi
-        if printf '%s\n' "$content" | tr -d '\r' | grep -Eq '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)'; then
+        awk_rc=0
+        awk '
+            {
+                gsub(/\r/, "")
+                if ($0 ~ /^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)/) found = 1
+            }
+            END { exit (found ? 10 : 0) }
+        ' "$f" 2>/dev/null || awk_rc=$?
+        if [ "$awk_rc" -eq 10 ]; then
             if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
-            return 0
+            return 1
+        elif [ "$awk_rc" -ne 0 ]; then
+            if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+            return 2
         fi
     done
     if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
-    return 1
+    return 0
 }
 
 write_auditd_rule_files() {  # write_auditd_rule_files INCLUDE_LOCK
@@ -1272,12 +1284,16 @@ reload_auditd_tripwire() {
         if [ -n "$actl" ] && "$actl" -s 8>&- 9>&- 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
             already_locked=1
         fi
-        if [ "$already_locked" -eq 0 ] && auditd_rules_dir_would_lock; then
-            if [ "${lock_auditd:-0}" -eq 1 ]; then
-                die "--lock-auditd requested, but an auditd drop-in in $auditd_rules_dir (including symlinked or persisted rules) requests -e 2 or cannot be inspected; refusing premature lock before verifying tendcf_tripwire coverage"
+        if [ "$already_locked" -eq 0 ]; then
+            local safe_rc=0
+            check_auditd_rules_dir_safe_to_load || safe_rc=$?
+            if [ "$safe_rc" -ne 0 ]; then
+                if [ "${lock_auditd:-0}" -eq 1 ]; then
+                    die "--lock-auditd requested, but auditd rules preflight failed (rc=$safe_rc: drop-in requests -e 2 or is non-regular/unreadable); refusing premature lock before verifying tendcf_tripwire coverage"
+                fi
+                say "tripwire: warning: auditd rules preflight failed (rc=$safe_rc: drop-in requests -e 2 or is non-regular/unreadable); rules staged at $auditd_rules_path without running augenrules --load"
+                return 0
             fi
-            say "tripwire: warning: an auditd drop-in in $auditd_rules_dir requests -e 2 or cannot be inspected; rules staged at $auditd_rules_path without running augenrules --load"
-            return 0
         fi
         if [ "$already_locked" -eq 0 ]; then
             if ! "$augen" --load 8>&- 9>&- >/dev/null 2>&1; then

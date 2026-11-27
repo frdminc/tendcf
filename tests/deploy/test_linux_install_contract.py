@@ -1550,7 +1550,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "render_linux_tripwire_auditd",
                     "render_linux_tripwire_aide",
                     "verify_auditd_expected_watches",
-                    "auditd_rules_dir_would_lock",
+                    "check_auditd_rules_dir_safe_to_load",
                     "write_auditd_rule_files",
                     "append_lock_to_frozen_auditd_rules",
                     "reload_auditd_tripwire",
@@ -2012,42 +2012,50 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             )
             self.assertEqual(r_full.returncode, 0, r_full.stdout + r_full.stderr)
 
-            # 5) H1/H2: auditd_rules_dir_would_lock catches:
-            #    (a) symlinked package drop-in with CRLF -e 2\r\n,
-            #    (b) persisted -e 2 in managed 99-tendcf-tripwire.rules (standalone cmd_enable on mutable kernel),
-            #    (c) unreadable/broken-symlink .rules drop-in (fail closed),
-            #    and refuses pre-verification augenrules --load in reload_auditd_tripwire.
-            fn_would_lock = _extract_func(self.src, "auditd_rules_dir_would_lock")
+            # 5) H1/H2: check_auditd_rules_dir_safe_to_load returns:
+            #    0 = positively safe, 1 = -e 2 found (incl. symlinked & >256KB early-match CRLF file with zero SIGPIPE),
+            #    2 = non-regular (FIFO/symlink-to-FIFO), unreadable, or broken symlink (fail closed).
+            fn_safe_load = _extract_func(self.src, "check_auditd_rules_dir_safe_to_load")
             rules_d = root / "rules.d"
             rules_d.mkdir()
             managed_r = rules_d / "99-tendcf-tripwire.rules"
             managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n", encoding="utf-8")
-            # Clean unlocked rules dir -> returns 1 (safe to load).
+            # Clean unlocked rules dir -> returns 0 (positively safe).
             r_clean = subprocess.run(
-                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
                 capture_output=True, text=True, check=False,
             )
-            self.assertEqual(r_clean.returncode, 1, "unlocked rules dir should be allowed")
-            # (a) Symlinked package drop-in with CRLF -e 2\r\n -> returns 0 (would lock).
-            pkg_target = root / "pkg-immutable.rules"
-            pkg_target.write_bytes(b"# package lock\r\n-e 2\r\n")
+            self.assertEqual(r_clean.returncode, 0, f"unlocked rules dir should return 0, got {r_clean.returncode}")
+            # (a) Large (>256 KB) symlinked drop-in with early -e 2\r\n on line 1 -> returns 1 (no SIGPIPE!).
+            pkg_target = root / "pkg-immutable-large.rules"
+            pkg_target.write_bytes(b"-e 2\r\n" + (b"# padding rule comment line for pipe buffer overflow test 0123456789\r\n" * 5000))
             sym_rule = rules_d / "98-pkg-lock.rules"
             os.symlink(pkg_target, sym_rule)
             r_sym = subprocess.run(
-                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
                 capture_output=True, text=True, check=False,
             )
-            self.assertEqual(r_sym.returncode, 0, "H1: symlinked drop-in with CRLF -e 2 must block pre-verification load")
+            self.assertEqual(r_sym.returncode, 1, "H1: large symlinked drop-in with early CRLF -e 2 must return 1 (no SIGPIPE fail-open)")
             sym_rule.unlink()
-            # (b) Broken symlink (unreadable) -> returns 0 (fail closed).
+            # (b) FIFO (and symlink to FIFO) -> returns 2 immediately without blocking!
+            fifo_target = root / "trap.fifo"
+            os.mkfifo(fifo_target)
+            os.symlink(fifo_target, sym_rule)
+            r_fifo = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            self.assertEqual(r_fifo.returncode, 2, "H1: FIFO / symlink-to-FIFO drop-in must return 2 without blocking")
+            sym_rule.unlink()
+            # (c) Broken symlink / unreadable -> returns 2 (fail closed).
             os.symlink(root / "does-not-exist.rules", sym_rule)
             r_broken = subprocess.run(
-                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_safe_load}\ncheck_auditd_rules_dir_safe_to_load\n"],
                 capture_output=True, text=True, check=False,
             )
-            self.assertEqual(r_broken.returncode, 0, "H1: unreadable/broken symlink drop-in must fail closed")
+            self.assertEqual(r_broken.returncode, 2, "H1: broken symlink drop-in must return 2")
             sym_rule.unlink()
-            # (c) Standalone cmd_enable with persisted -e 2 in managed 99-tendcf-tripwire.rules on mutable kernel -> blocks augenrules --load!
+            # (d) Standalone cmd_enable with persisted -e 2 in managed 99-tendcf-tripwire.rules on mutable kernel -> blocks augenrules --load!
             managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n-e 2\n", encoding="utf-8")
             augen_log = root / "augen.log"
             fake_augen = root / "fake-augenrules"
@@ -2077,7 +2085,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
                     'say() { echo "tendcf-install: $*"; }\n'
                     f"auditd_rules_dir='{rules_d}'\nauditd_rules_path='{managed_r}'\nlock_auditd=0\n"
-                    f"{fn_would_lock}\n{fn_reload}\nreload_auditd_tripwire\n",
+                    f"{fn_safe_load}\n{fn_reload}\nreload_auditd_tripwire\n",
                 ],
                 capture_output=True, text=True, check=False,
             )

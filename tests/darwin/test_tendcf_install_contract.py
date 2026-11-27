@@ -3487,14 +3487,18 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             )
             self.assertEqual(r_real.returncode, 0, "M1: exact literal label must match")
 
-            # M1 (2): Failed bootout where replacement shipper remains loaded while prior plist differs:
-            # prefix must NOT be swapped, stage_dir MUST be preserved, and incomplete rollback reported.
+            # M1 (2): Both execd and shipper previously loaded; execd stops cleanly but shipper fails bootout:
+            # prefix must NOT be swapped, live shipper plist bytes must remain UNCHANGED, ZERO bootstraps
+            # (including execd!) may run against the replacement tree, stage_dir preserved, incomplete reported.
             stage6 = root / "stage6"
             stage6.mkdir()
             saved6 = stage6 / "upgrade-shipper.plist.prev"
             saved6.write_text("<plist>OLD_V1</plist>\n", encoding="utf-8")
             live_plist6 = root / "shipper6.plist"
             live_plist6.write_text("<plist>NEW_V2_RUNNING</plist>\n", encoding="utf-8")
+            execd_plist6 = root / "execd6.plist"
+            execd_plist6.write_text("<plist>EXECD</plist>\n", encoding="utf-8")
+            bs_log6 = root / "bs6.log"
             prefix6 = root / "opt" / "tendcf6"
             prefix6.mkdir(parents=True)
             (prefix6 / "marker").write_text("new-tree\n", encoding="utf-8")
@@ -3511,8 +3515,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_had_etc=0\n'
                 'upgrade_moved_var=0\n'
                 'upgrade_moved_etc=0\n'
-                'upgrade_was_loaded=0\n'
-                'upgrade_had_plist=0\n'
+                'upgrade_was_loaded=1\n'
+                'upgrade_had_plist=1\n'
                 'upgrade_shipper_was_loaded=1\n'
                 'upgrade_shipper_prior_disabled="enabled"\n'
                 'upgrade_had_shipper_plist=1\n'
@@ -3521,17 +3525,22 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_saved_workdir=""\n'
                 'upgrade_saved_inputs=0\n'
                 'upgrade_saved_data=0\n'
-                f'plist_path="{root}/execd6.plist"\n'
+                f'plist_path="{execd_plist6}"\n'
                 f'shipper_plist_path="{live_plist6}"\n'
                 'label="org.tendcf.execd"\n'
                 'shipper_label="org.tendcf.audit-shipper"\n'
                 f'stage_dir="{stage6}"\n'
                 'publish_lock_held=0\n'
                 'put_data_rollback_armed=0\n'
-                'execd_is_loaded() { return 1; }\n'
+                'execd_loaded=1\n'
+                'execd_is_loaded() { [ "$execd_loaded" -eq 1 ]; }\n'
+                'bootout_execd() { execd_loaded=0; return 0; }\n'
+                'wait_execd_unloaded() { return 0; }\n'
                 'shipper_is_loaded() { return 0; }\n'
                 'bootout_shipper() { return 1; }\n'
                 'wait_shipper_unloaded() { return 1; }\n'
+                f'bootstrap_execd_with_retry() {{ echo "execd" >> "{bs_log6}"; return 0; }}\n'
+                f'bootstrap_shipper_with_retry() {{ echo "shipper" >> "{bs_log6}"; return 0; }}\n'
                 f"{cs_fn}\n"
                 "cleanup_stage\n"
             )
@@ -3539,6 +3548,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r6.returncode, 0, r6.stderr)
             self.assertTrue(stage6.is_dir(), "M1: failed bootout must preserve stage_dir")
             self.assertIn("incomplete", r6.stderr)
+            self.assertFalse(bs_log6.exists(), "M1: ZERO bootstraps allowed when prefix rollback could not proceed")
+            self.assertEqual(live_plist6.read_text(encoding="utf-8"), "<plist>NEW_V2_RUNNING</plist>\n", "M1: live plist must remain unchanged when rollback cannot proceed")
             self.assertEqual((prefix6 / "marker").read_text(encoding="utf-8"), "new-tree\n", "M1: must not swap prefix under running unquiesced job")
             self.assertEqual((backup6 / "marker").read_text(encoding="utf-8"), "old-tree\n", "M1: backup prefix must remain intact for recovery")
 
