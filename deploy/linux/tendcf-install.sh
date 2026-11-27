@@ -1196,17 +1196,24 @@ verify_auditd_expected_watches() {  # verify_auditd_expected_watches RULES_FILE 
     ' <<< "$active_rules"
 }
 
-# Check whether any OTHER auditd drop-in under $auditd_rules_dir already
-# requests immutable mode (-e 2), which would prematurely lock the kernel
-# during our pre-verification augenrules --load (H2).
-other_auditd_dropin_requests_lock() {
-    local f had_ng=0
+# Inspect EVERY *.rules entry in $auditd_rules_dir (including $auditd_rules_path
+# itself and symlinked package drop-ins, matching upstream augenrules enumeration
+# and CR stripping; H1). Returns 0 ("would lock / cannot safely inspect") if ANY
+# entry is unreadable, cannot be read with cat, or contains an uncommented `-e 2`
+# directive; returns 1 ONLY when every entry was safely read and none requests `-e 2`.
+auditd_rules_dir_would_lock() {
+    local f content had_ng=0
+    [ -d "$auditd_rules_dir" ] || return 0
     shopt -q nullglob && had_ng=1
     shopt -s nullglob
     for f in "$auditd_rules_dir"/*.rules; do
-        [ "$f" != "$auditd_rules_path" ] || continue
-        [ -f "$f" ] && [ ! -L "$f" ] || continue
-        if grep -Eq '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)' "$f" 2>/dev/null; then
+        # Upstream augenrules reads any existing *.rules path (including symlinks)
+        # via cat and strips CR; fail closed on broken symlinks or read errors.
+        if [ ! -r "$f" ] || ! content="$(cat "$f" 2>/dev/null)"; then
+            if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
+            return 0
+        fi
+        if printf '%s\n' "$content" | tr -d '\r' | grep -Eq '^[[:space:]]*-e[[:space:]]+2([[:space:]#]|$)'; then
             if [ "$had_ng" -eq 0 ]; then shopt -u nullglob; fi
             return 0
         fi
@@ -1265,11 +1272,11 @@ reload_auditd_tripwire() {
         if [ -n "$actl" ] && "$actl" -s 8>&- 9>&- 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
             already_locked=1
         fi
-        if [ "$already_locked" -eq 0 ] && other_auditd_dropin_requests_lock; then
+        if [ "$already_locked" -eq 0 ] && auditd_rules_dir_would_lock; then
             if [ "${lock_auditd:-0}" -eq 1 ]; then
-                die "--lock-auditd requested, but another drop-in in $auditd_rules_dir already specifies -e 2; refusing premature lock before verifying tendcf_tripwire coverage"
+                die "--lock-auditd requested, but an auditd drop-in in $auditd_rules_dir (including symlinked or persisted rules) requests -e 2 or cannot be inspected; refusing premature lock before verifying tendcf_tripwire coverage"
             fi
-            say "tripwire: warning: another drop-in in $auditd_rules_dir specifies -e 2; rules staged at $auditd_rules_path without running augenrules --load"
+            say "tripwire: warning: an auditd drop-in in $auditd_rules_dir requests -e 2 or cannot be inspected; rules staged at $auditd_rules_path without running augenrules --load"
             return 0
         fi
         if [ "$already_locked" -eq 0 ]; then

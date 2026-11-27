@@ -189,114 +189,134 @@ cleanup_stage() {
     local rollback_keep_stage=0
     if [ "$upgrade_rollback_armed" -eq 1 ]; then
         local restored_prefix=0 var_restored=1 etc_restored=1 shipper_plist_restored=1 shipper_state_restored=1
+        local execd_quiesced=1 shipper_quiesced=1
         if [ -n "$upgrade_backup_prefix" ] && [ -d "$upgrade_backup_prefix" ]; then
             if execd_is_loaded; then
-                bootout_execd >/dev/null 2>&1 || true
-                wait_execd_unloaded || true
+                if ! bootout_execd >/dev/null 2>&1 || ! wait_execd_unloaded || execd_is_loaded; then
+                    execd_quiesced=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to quiesce $label before prefix rollback; preserving recovery dirs" >&2
+                fi
             fi
             if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                bootout_shipper >/dev/null 2>&1 || true
-                wait_shipper_unloaded || true
+                if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                    shipper_quiesced=0
+                    shipper_state_restored=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to quiesce $shipper_label before prefix rollback; preserving recovery dirs" >&2
+                fi
             fi
-            local failed_prefix="$prefix.failed.$$"
-            /bin/rm -rf "$failed_prefix" || true
-            if [ -e "$prefix" ] || [ -L "$prefix" ]; then
-                /bin/mv "$prefix" "$failed_prefix" || true
-            fi
-            # Reconcile var/ and etc/ ONLY when they belonged to the original prefix
-            # (or were already moved; H2/M2); NEVER copy staged_tree's new dirs into
-            # an old prefix that originally lacked them, and NEVER delete recovery
-            # dirs if restoration cannot be confirmed.
-            if { [ "${upgrade_had_var:-0}" -eq 1 ] || [ "$upgrade_moved_var" -eq 1 ]; } \
-                && [ ! -e "$upgrade_backup_prefix/var" ]; then
-                if [ -d "$failed_prefix/var" ]; then
-                    if ! /bin/mv "$failed_prefix/var" "$upgrade_backup_prefix/var"; then
+            # Only swap the live prefix back after confirming running jobs quiesced (M1).
+            if [ "$execd_quiesced" -eq 1 ] && [ "$shipper_quiesced" -eq 1 ]; then
+                local failed_prefix="$prefix.failed.$$"
+                /bin/rm -rf "$failed_prefix" || true
+                if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+                    /bin/mv "$prefix" "$failed_prefix" || true
+                fi
+                # Reconcile var/ and etc/ ONLY when they belonged to the original prefix
+                # (or were already moved; H2/M2); NEVER copy staged_tree's new dirs into
+                # an old prefix that originally lacked them, and NEVER delete recovery
+                # dirs if restoration cannot be confirmed.
+                if { [ "${upgrade_had_var:-0}" -eq 1 ] || [ "$upgrade_moved_var" -eq 1 ]; } \
+                    && [ ! -e "$upgrade_backup_prefix/var" ]; then
+                    if [ -d "$failed_prefix/var" ]; then
+                        if ! /bin/mv "$failed_prefix/var" "$upgrade_backup_prefix/var"; then
+                            var_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore $failed_prefix/var to $upgrade_backup_prefix/var; preserving recovery dirs" >&2
+                        fi
+                    elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/var" ]; then
+                        if ! /bin/mv "$upgrade_staged_tree/var" "$upgrade_backup_prefix/var"; then
+                            var_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/var to $upgrade_backup_prefix/var; preserving stage_dir $stage_dir" >&2
+                        fi
+                    else
                         var_restored=0
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to restore $failed_prefix/var to $upgrade_backup_prefix/var; preserving recovery dirs" >&2
+                        echo "tendcf-install: ERROR: expected preserved var/ missing during rollback; preserving recovery dirs" >&2
                     fi
-                elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/var" ]; then
-                    if ! /bin/mv "$upgrade_staged_tree/var" "$upgrade_backup_prefix/var"; then
-                        var_restored=0
-                        rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/var to $upgrade_backup_prefix/var; preserving stage_dir $stage_dir" >&2
-                    fi
-                else
-                    var_restored=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: expected preserved var/ missing during rollback; preserving recovery dirs" >&2
                 fi
-            fi
-            if { [ "${upgrade_had_etc:-0}" -eq 1 ] || [ "${upgrade_moved_etc:-0}" -eq 1 ]; } \
-                && [ ! -e "$upgrade_backup_prefix/etc" ]; then
-                if [ -d "$failed_prefix/etc" ]; then
-                    if ! /bin/mv "$failed_prefix/etc" "$upgrade_backup_prefix/etc"; then
+                if { [ "${upgrade_had_etc:-0}" -eq 1 ] || [ "${upgrade_moved_etc:-0}" -eq 1 ]; } \
+                    && [ ! -e "$upgrade_backup_prefix/etc" ]; then
+                    if [ -d "$failed_prefix/etc" ]; then
+                        if ! /bin/mv "$failed_prefix/etc" "$upgrade_backup_prefix/etc"; then
+                            etc_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore $failed_prefix/etc to $upgrade_backup_prefix/etc; preserving recovery dirs" >&2
+                        fi
+                    elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/etc" ]; then
+                        if ! /bin/mv "$upgrade_staged_tree/etc" "$upgrade_backup_prefix/etc"; then
+                            etc_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/etc to $upgrade_backup_prefix/etc; preserving stage_dir $stage_dir" >&2
+                        fi
+                    else
                         etc_restored=0
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to restore $failed_prefix/etc to $upgrade_backup_prefix/etc; preserving recovery dirs" >&2
+                        echo "tendcf-install: ERROR: expected preserved etc/ missing during rollback; preserving recovery dirs" >&2
                     fi
-                elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/etc" ]; then
-                    if ! /bin/mv "$upgrade_staged_tree/etc" "$upgrade_backup_prefix/etc"; then
-                        etc_restored=0
+                fi
+                if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
+                    if /bin/mv "$upgrade_backup_prefix" "$prefix"; then
+                        restored_prefix=1
+                    else
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/etc to $upgrade_backup_prefix/etc; preserving stage_dir $stage_dir" >&2
-                    fi
-                else
-                    etc_restored=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: expected preserved etc/ missing during rollback; preserving recovery dirs" >&2
-                fi
-            fi
-            if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
-                if /bin/mv "$upgrade_backup_prefix" "$prefix"; then
-                    restored_prefix=1
-                else
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: failed to restore $upgrade_backup_prefix to $prefix; preserving recovery dirs" >&2
-                fi
-            fi
-            if [ "$upgrade_moved_var" -eq 0 ] || [ ! -e "$failed_prefix/var" ]; then
-                if [ "${upgrade_moved_etc:-0}" -eq 0 ] || [ ! -e "$failed_prefix/etc" ]; then
-                    if [ "$var_restored" -eq 1 ] && [ "$etc_restored" -eq 1 ] && [ "$restored_prefix" -eq 1 ]; then
-                        /bin/rm -rf "$failed_prefix" || true
+                        echo "tendcf-install: ERROR: failed to restore $upgrade_backup_prefix to $prefix; preserving recovery dirs" >&2
                     fi
                 fi
-            fi
-            if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ]; then
-                if [ "$upgrade_saved_inputs" -eq 1 ] && [ -d "$stage_dir/upgrade-var-backup/inputs" ]; then
-                    /bin/rm -rf "$upgrade_saved_workdir/inputs" || true
-                    /bin/mv "$stage_dir/upgrade-var-backup/inputs" "$upgrade_saved_workdir/inputs" || true
-                fi
-                if [ "$upgrade_saved_data" -eq 1 ] && [ -f "$stage_dir/upgrade-var-backup/host_specific.json" ]; then
-                    /bin/mkdir -p "$upgrade_saved_workdir/data" || true
-                    if /bin/cp -p "$stage_dir/upgrade-var-backup/host_specific.json" \
-                        "$upgrade_saved_workdir/data/host_specific.json.rollback.$$"; then
-                        /bin/mv -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
-                            "$upgrade_saved_workdir/data/host_specific.json" || true
-                        /bin/chmod 0600 "$upgrade_saved_workdir/data/host_specific.json" || true
-                        /usr/sbin/chown root:wheel "$upgrade_saved_workdir/data/host_specific.json" 2>/dev/null || true
+                if [ "$upgrade_moved_var" -eq 0 ] || [ ! -e "$failed_prefix/var" ]; then
+                    if [ "${upgrade_moved_etc:-0}" -eq 0 ] || [ ! -e "$failed_prefix/etc" ]; then
+                        if [ "$var_restored" -eq 1 ] && [ "$etc_restored" -eq 1 ] && [ "$restored_prefix" -eq 1 ]; then
+                            /bin/rm -rf "$failed_prefix" || true
+                        fi
                     fi
-                elif [ "$upgrade_saved_data" -eq 0 ] && [ -e "$upgrade_saved_workdir/data/host_specific.json" ]; then
-                    /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" || true
+                fi
+                if [ "$upgrade_snapshot_taken" -eq 1 ] && [ -n "$upgrade_saved_workdir" ]; then
+                    if [ "$upgrade_saved_inputs" -eq 1 ] && [ -d "$stage_dir/upgrade-var-backup/inputs" ]; then
+                        /bin/rm -rf "$upgrade_saved_workdir/inputs" || true
+                        /bin/mv "$stage_dir/upgrade-var-backup/inputs" "$upgrade_saved_workdir/inputs" || true
+                    fi
+                    if [ "$upgrade_saved_data" -eq 1 ] && [ -f "$stage_dir/upgrade-var-backup/host_specific.json" ]; then
+                        /bin/mkdir -p "$upgrade_saved_workdir/data" || true
+                        if /bin/cp -p "$stage_dir/upgrade-var-backup/host_specific.json" \
+                            "$upgrade_saved_workdir/data/host_specific.json.rollback.$$"; then
+                            /bin/mv -f "$upgrade_saved_workdir/data/host_specific.json.rollback.$$" \
+                                "$upgrade_saved_workdir/data/host_specific.json" || true
+                            /bin/chmod 0600 "$upgrade_saved_workdir/data/host_specific.json" || true
+                            /usr/sbin/chown root:wheel "$upgrade_saved_workdir/data/host_specific.json" 2>/dev/null || true
+                        fi
+                    elif [ "$upgrade_saved_data" -eq 0 ] && [ -e "$upgrade_saved_workdir/data/host_specific.json" ]; then
+                        /bin/rm -f "$upgrade_saved_workdir/data/host_specific.json" || true
+                    fi
                 fi
             fi
         fi
         if [ "${upgrade_had_plist:-0}" -eq 0 ] && [ "$upgrade_was_loaded" -eq 0 ] \
             && [ -f "$plist_path" ] && [ ! -L "$plist_path" ]; then
             if execd_is_loaded; then
-                bootout_execd >/dev/null 2>&1 || true
-                wait_execd_unloaded || true
+                if ! bootout_execd >/dev/null 2>&1 || ! wait_execd_unloaded || execd_is_loaded; then
+                    execd_quiesced=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to unload newly created $label during rollback" >&2
+                fi
             fi
-            /bin/rm -f "$plist_path" || true
+            if [ "$execd_quiesced" -eq 1 ]; then
+                /bin/rm -f "$plist_path" || true
+            fi
         fi
         # Restore prior shipper plist contents (only from validated snapshot; H1)
-        # and restore prior disabled/loaded state independently of plist presence (M3).
+        # and restore prior disabled/loaded state independently of plist presence (M1/M3).
         if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
             && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
             && [ -n "${shipper_plist_path:-}" ]; then
             if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                bootout_shipper >/dev/null 2>&1 || true
-                wait_shipper_unloaded || true
+                if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                    shipper_quiesced=0
+                    shipper_state_restored=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
+                fi
             fi
             local sp_rb="$shipper_plist_path.rollback.$$"
             if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
@@ -312,17 +332,27 @@ cleanup_stage() {
         elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
             && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
             if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                bootout_shipper >/dev/null 2>&1 || true
-                wait_shipper_unloaded || true
+                if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                    shipper_quiesced=0
+                    shipper_state_restored=0
+                    rollback_keep_stage=1
+                    echo "tendcf-install: ERROR: failed to unload newly created $shipper_label during rollback" >&2
+                fi
             fi
-            /bin/rm -f "$shipper_plist_path" || true
+            if [ "$shipper_quiesced" -eq 1 ]; then
+                /bin/rm -f "$shipper_plist_path" || true
+            fi
         fi
-        # Restore disabled override state regardless of whether a plist existed (M3).
+        # Restore disabled override state regardless of whether a plist existed (M1/M3).
         case "${upgrade_shipper_prior_disabled:-}" in
             disabled)
                 if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                    bootout_shipper >/dev/null 2>&1 || true
-                    wait_shipper_unloaded || true
+                    if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                        shipper_quiesced=0
+                        shipper_state_restored=0
+                        rollback_keep_stage=1
+                        echo "tendcf-install: ERROR: failed to stop $shipper_label while restoring disabled state" >&2
+                    fi
                 fi
                 if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
                     shipper_state_restored=0
@@ -336,13 +366,14 @@ cleanup_stage() {
                 echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
                 ;;
         esac
-        if [ "$upgrade_was_loaded" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
+        if [ "$upgrade_was_loaded" -eq 1 ] && [ "$execd_quiesced" -eq 1 ] && [ -f "$plist_path" ] && ! execd_is_loaded; then
             if ! bootstrap_execd_with_retry >/dev/null 2>&1; then
                 rollback_keep_stage=1
                 echo "tendcf-install: ERROR: failed to re-bootstrap $label during rollback" >&2
             fi
         fi
         if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
+            && [ "$shipper_quiesced" -eq 1 ] \
             && [ "${upgrade_shipper_prior_disabled:-enabled}" != "disabled" ] \
             && [ "${upgrade_shipper_prior_disabled:-enabled}" != "unknown" ] \
             && [ "$shipper_plist_restored" -eq 1 ] \
@@ -354,7 +385,8 @@ cleanup_stage() {
                 echo "tendcf-install: ERROR: failed to re-bootstrap $shipper_label during rollback" >&2
             fi
         fi
-        if [ "$rollback_keep_stage" -eq 1 ] || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] \
+        if [ "$rollback_keep_stage" -eq 1 ] || [ "$execd_quiesced" -eq 0 ] || [ "$shipper_quiesced" -eq 0 ] \
+            || [ "$var_restored" -eq 0 ] || [ "$etc_restored" -eq 0 ] \
             || [ "$shipper_plist_restored" -eq 0 ] || [ "$shipper_state_restored" -eq 0 ]; then
             echo "tendcf-install: ERROR: upgrade rollback was incomplete; inspect preserved recovery directories" >&2
         elif [ "$restored_prefix" -eq 1 ]; then
@@ -1233,11 +1265,11 @@ install_tarball() {
             upgrade_had_plist=0
         fi
         # Query pre-upgrade disabled override state unconditionally (even when
-        # no plist exists) and preserve unknown/error separately (M3).
+        # no plist exists) using literal label comparison (no unescaped regex
+        # dots) and preserve unknown/error separately (M1/M3).
         local disabled_out=""
         if disabled_out="$(/bin/launchctl print-disabled system 9>&- 2>/dev/null)"; then
-            if printf '%s\n' "$disabled_out" \
-                | /usr/bin/grep -Eq "\"$shipper_label\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
+            if printf '%s\n' "$disabled_out" | launchd_print_disabled_matches_label "$shipper_label"; then
                 upgrade_shipper_prior_disabled="disabled"
             else
                 upgrade_shipper_prior_disabled="enabled"
@@ -2547,6 +2579,26 @@ bootstrap_shipper_with_retry() {
     /bin/launchctl bootstrap system "$shipper_plist_path" 9>&-
 }
 
+# Match an exact literal launchd label in `launchctl print-disabled system`
+# output (no regex metacharacters from `.` in reverse-DNS labels; M1).
+launchd_print_disabled_matches_label() {  # launchd_print_disabled_matches_label LABEL < stdin
+    /usr/bin/awk -v lbl="$1" '
+        {
+            needle = "\"" lbl "\""
+            pos = index($0, needle)
+            if (pos == 0) next
+            before = substr($0, 1, pos - 1)
+            if (before !~ /^[[:space:]]*$/) next
+            after = substr($0, pos + length(needle))
+            if (after ~ /^[[:space:]]*=>[[:space:]]*(disabled|true)[[:space:]]*;?[[:space:]]*$/) {
+                found = 1
+                exit 0
+            }
+        }
+        END { exit (found ? 0 : 1) }
+    '
+}
+
 # Validate an existing LaunchDaemon plist before snapshotting or mutating any
 # daemon: parent directory verified, regular non-symlink inode, root:wheel,
 # single link (nlink=1), no SUID/SGID/go-w, no extended ACL, no quarantine (H1).
@@ -2566,6 +2618,18 @@ validate_existing_launchd_plist_trusted() {  # validate_existing_launchd_plist_t
     fi
     if /usr/bin/xattr -p com.apple.quarantine "$p" >/dev/null 2>&1; then
         die "existing $p has com.apple.quarantine; refusing to snapshot or mutate"
+    fi
+}
+
+# Preflight BOTH managed LaunchDaemon plists before the first daemon mutation
+# at public enable / install-enable entry points (H2).
+preflight_existing_launchd_plists() {
+    check_launchd_dir
+    if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
+        validate_existing_launchd_plist_trusted "$plist_path"
+    fi
+    if [ -n "${shipper_plist_path:-}" ] && { [ -e "$shipper_plist_path" ] || [ -L "$shipper_plist_path" ]; }; then
+        validate_existing_launchd_plist_trusted "$shipper_plist_path"
     fi
 }
 
@@ -2711,6 +2775,10 @@ bootstrap_execd_with_retry() {
 
 enable_execd() {
     check_launchd_dir
+    # Validate any pre-existing execd plist BEFORE snapshotting or touching launchd (H2).
+    if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
+        validate_existing_launchd_plist_trusted "$plist_path"
+    fi
     [ -f "$entry" ] || die "not installed: run install first"
 
     make_stage
@@ -2882,6 +2950,9 @@ cmd_install() {
     if [ -n "$datafile" ]; then
         put_data "$datafile"
     fi
+    if [ "$do_enable" -eq 1 ] || [ "$upgrade_needs_execd_restart" -eq 1 ] || [ "${upgrade_needs_shipper_restart:-0}" -eq 1 ]; then
+        preflight_existing_launchd_plists
+    fi
     if [ "$do_enable" -eq 1 ] || [ "$upgrade_needs_execd_restart" -eq 1 ]; then
         enable_execd
         if [ "$upgrade_needs_execd_restart" -eq 1 ]; then
@@ -2932,6 +3003,7 @@ cmd_run_once() {
 cmd_enable() {
     acquire_publish_lock
     init_paths
+    preflight_existing_launchd_plists
     enable_execd
     enable_audit_shipper
     release_publish_lock

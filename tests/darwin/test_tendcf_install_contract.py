@@ -3422,6 +3422,126 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertIn("untrusted metadata", r_h1.stderr)
             self.assertFalse(lc_h1_log.exists(), "H1: zero launchctl calls permitted on unsafe pre-existing plist")
 
+            # H2: cmd_enable preflights BOTH existing plists before mutating EITHER execd or shipper.
+            good_execd = root / "good_execd.plist"
+            good_execd.write_text("<plist>GOOD</plist>\n", encoding="utf-8")
+            os.chmod(good_execd, 0o644)
+            bad_execd = root / "bad_execd.plist"
+            bad_execd.write_text("<plist>BAD</plist>\n", encoding="utf-8")
+            os.chmod(bad_execd, 0o666)
+            good_ship = root / "good_ship.plist"
+            good_ship.write_text("<plist>GOOD</plist>\n", encoding="utf-8")
+            os.chmod(good_ship, 0o644)
+            fn_h2 = "\n".join(
+                _extract_func(self.src, n)
+                for n in (
+                    "has_acl_path",
+                    "validate_existing_launchd_plist_trusted",
+                    "preflight_existing_launchd_plists",
+                    "cmd_enable",
+                )
+            ).replace('"$owner" != root', "false").replace('"$group" != wheel', "false")
+            mut_log = root / "h2_mut.log"
+            for case_name, ep, sp in (
+                ("unsafe-execd", bad_execd, good_ship),
+                ("unsafe-shipper", good_execd, unsafe_plist),
+            ):
+                if mut_log.exists():
+                    mut_log.unlink()
+                r_h2 = subprocess.run(
+                    [
+                        "/bin/bash", "-c",
+                        "set -euo pipefail\n"
+                        'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                        'say() { :; }\n'
+                        "acquire_publish_lock() { return 0; }\n"
+                        "release_publish_lock() { return 0; }\n"
+                        "init_paths() { return 0; }\n"
+                        "check_launchd_dir() { return 0; }\n"
+                        f'enable_execd() {{ echo "execd" >> "{mut_log}"; }}\n'
+                        f'enable_audit_shipper() {{ echo "shipper" >> "{mut_log}"; }}\n'
+                        f'plist_path="{ep}"\n'
+                        f'shipper_plist_path="{sp}"\n'
+                        'label="org.tendcf.execd"\n'
+                        'changed=0\n'
+                        f"{fn_h2}\n"
+                        "cmd_enable\n",
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(r_h2.returncode, 0, f"H2: cmd_enable must refuse {case_name}")
+                self.assertFalse(mut_log.exists(), f"H2: zero daemon mutations allowed for {case_name}")
+
+            # M1 (1): literal label matching in launchd_print_disabled_matches_label rejects unescaped dot spoof.
+            fn_lbl = _extract_func(self.src, "launchd_print_disabled_matches_label")
+            spoof_out = '\t"orgXtendcfXaudit-shipper" => disabled\n'
+            real_out = '\t"org.tendcf.audit-shipper" => disabled\n'
+            r_spoof = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_lbl}\nlaunchd_print_disabled_matches_label 'org.tendcf.audit-shipper'\n"],
+                input=spoof_out, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_spoof.returncode, 0, "M1: unescaped dot spoof label must NOT match")
+            r_real = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\n{fn_lbl}\nlaunchd_print_disabled_matches_label 'org.tendcf.audit-shipper'\n"],
+                input=real_out, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_real.returncode, 0, "M1: exact literal label must match")
+
+            # M1 (2): Failed bootout where replacement shipper remains loaded while prior plist differs:
+            # prefix must NOT be swapped, stage_dir MUST be preserved, and incomplete rollback reported.
+            stage6 = root / "stage6"
+            stage6.mkdir()
+            saved6 = stage6 / "upgrade-shipper.plist.prev"
+            saved6.write_text("<plist>OLD_V1</plist>\n", encoding="utf-8")
+            live_plist6 = root / "shipper6.plist"
+            live_plist6.write_text("<plist>NEW_V2_RUNNING</plist>\n", encoding="utf-8")
+            prefix6 = root / "opt" / "tendcf6"
+            prefix6.mkdir(parents=True)
+            (prefix6 / "marker").write_text("new-tree\n", encoding="utf-8")
+            backup6 = root / "opt" / "tendcf6.old"
+            backup6.mkdir(parents=True)
+            (backup6 / "marker").write_text("old-tree\n", encoding="utf-8")
+            script6 = (
+                "set -euo pipefail\n"
+                f'prefix="{prefix6}"\n'
+                f'upgrade_backup_prefix="{backup6}"\n'
+                'upgrade_staged_tree=""\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=0\n'
+                'upgrade_had_etc=0\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
+                'upgrade_was_loaded=0\n'
+                'upgrade_had_plist=0\n'
+                'upgrade_shipper_was_loaded=1\n'
+                'upgrade_shipper_prior_disabled="enabled"\n'
+                'upgrade_had_shipper_plist=1\n'
+                f'upgrade_saved_shipper_plist="{saved6}"\n'
+                'upgrade_snapshot_taken=0\n'
+                'upgrade_saved_workdir=""\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=0\n'
+                f'plist_path="{root}/execd6.plist"\n'
+                f'shipper_plist_path="{live_plist6}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'stage_dir="{stage6}"\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 1; }\n'
+                'shipper_is_loaded() { return 0; }\n'
+                'bootout_shipper() { return 1; }\n'
+                'wait_shipper_unloaded() { return 1; }\n'
+                f"{cs_fn}\n"
+                "cleanup_stage\n"
+            )
+            r6 = subprocess.run(["/bin/bash", "-c", script6], capture_output=True, text=True, check=False)
+            self.assertEqual(r6.returncode, 0, r6.stderr)
+            self.assertTrue(stage6.is_dir(), "M1: failed bootout must preserve stage_dir")
+            self.assertIn("incomplete", r6.stderr)
+            self.assertEqual((prefix6 / "marker").read_text(encoding="utf-8"), "new-tree\n", "M1: must not swap prefix under running unquiesced job")
+            self.assertEqual((backup6 / "marker").read_text(encoding="utf-8"), "old-tree\n", "M1: backup prefix must remain intact for recovery")
+
 
 if __name__ == "__main__":
     unittest.main()

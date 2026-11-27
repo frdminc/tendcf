@@ -1550,7 +1550,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                     "render_linux_tripwire_auditd",
                     "render_linux_tripwire_aide",
                     "verify_auditd_expected_watches",
-                    "other_auditd_dropin_requests_lock",
+                    "auditd_rules_dir_would_lock",
                     "write_auditd_rule_files",
                     "append_lock_to_frozen_auditd_rules",
                     "reload_auditd_tripwire",
@@ -2012,24 +2012,78 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             )
             self.assertEqual(r_full.returncode, 0, r_full.stdout + r_full.stderr)
 
-            # 5) H2: another drop-in with -e 2 is detected before pre-verification augenrules --load,
-            # and production purge_audit_spool_safe binds directly to /proc/self/mountinfo (no var override).
-            fn_other = _extract_func(self.src, "other_auditd_dropin_requests_lock")
+            # 5) H1/H2: auditd_rules_dir_would_lock catches:
+            #    (a) symlinked package drop-in with CRLF -e 2\r\n,
+            #    (b) persisted -e 2 in managed 99-tendcf-tripwire.rules (standalone cmd_enable on mutable kernel),
+            #    (c) unreadable/broken-symlink .rules drop-in (fail closed),
+            #    and refuses pre-verification augenrules --load in reload_auditd_tripwire.
+            fn_would_lock = _extract_func(self.src, "auditd_rules_dir_would_lock")
             rules_d = root / "rules.d"
             rules_d.mkdir()
-            (rules_d / "99-tendcf-tripwire.rules").write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n", encoding="utf-8")
-            (rules_d / "98-existing-lock.rules").write_text("-e 2\n", encoding="utf-8")
-            r_other = subprocess.run(
-                [
-                    "/bin/bash",
-                    "-c",
-                    f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\nauditd_rules_path='{rules_d}/99-tendcf-tripwire.rules'\n{fn_other}\nother_auditd_dropin_requests_lock\n",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            managed_r = rules_d / "99-tendcf-tripwire.rules"
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n", encoding="utf-8")
+            # Clean unlocked rules dir -> returns 1 (safe to load).
+            r_clean = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                capture_output=True, text=True, check=False,
             )
-            self.assertEqual(r_other.returncode, 0, "H2: must detect pre-existing -e 2 in other drop-in")
+            self.assertEqual(r_clean.returncode, 1, "unlocked rules dir should be allowed")
+            # (a) Symlinked package drop-in with CRLF -e 2\r\n -> returns 0 (would lock).
+            pkg_target = root / "pkg-immutable.rules"
+            pkg_target.write_bytes(b"# package lock\r\n-e 2\r\n")
+            sym_rule = rules_d / "98-pkg-lock.rules"
+            os.symlink(pkg_target, sym_rule)
+            r_sym = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_sym.returncode, 0, "H1: symlinked drop-in with CRLF -e 2 must block pre-verification load")
+            sym_rule.unlink()
+            # (b) Broken symlink (unreadable) -> returns 0 (fail closed).
+            os.symlink(root / "does-not-exist.rules", sym_rule)
+            r_broken = subprocess.run(
+                ["/bin/bash", "-c", f"set -euo pipefail\nauditd_rules_dir='{rules_d}'\n{fn_would_lock}\nauditd_rules_dir_would_lock\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_broken.returncode, 0, "H1: unreadable/broken symlink drop-in must fail closed")
+            sym_rule.unlink()
+            # (c) Standalone cmd_enable with persisted -e 2 in managed 99-tendcf-tripwire.rules on mutable kernel -> blocks augenrules --load!
+            managed_r.write_text("-w /opt/tendcf/bin -p wa -k tendcf_tripwire\n-e 2\n", encoding="utf-8")
+            augen_log = root / "augen.log"
+            fake_augen = root / "fake-augenrules"
+            fake_augen.write_text(f"#!/bin/sh\necho \"$*\" >> '{augen_log}'\nexit 0\n", encoding="utf-8")
+            fake_augen.chmod(0o755)
+            fake_actl = root / "fake-auditctl"
+            fake_actl.write_text("#!/bin/sh\nif [ \"$1\" = \"-s\" ]; then echo 'enabled 1'; exit 0; fi\nexit 0\n", encoding="utf-8")
+            fake_actl.chmod(0o755)
+            fake_sys_dir = root / "fake_run_systemd"
+            fake_sys_dir.mkdir()
+            fake_sctl = root / "fake_sctl_bin"
+            fake_sctl.mkdir()
+            (fake_sctl / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_sctl / "systemctl").chmod(0o755)
+            fn_reload = (
+                _extract_func(self.src, "reload_auditd_tripwire")
+                .replace("/sbin/augenrules", str(fake_augen))
+                .replace("/usr/sbin/augenrules", str(fake_augen))
+                .replace("/sbin/auditctl", str(fake_actl))
+                .replace("/usr/sbin/auditctl", str(fake_actl))
+                .replace("/run/systemd/system", str(fake_sys_dir))
+            )
+            r_persisted = subprocess.run(
+                [
+                    "/bin/bash", "-c",
+                    f"set -euo pipefail\nexport PATH='{fake_sctl}':\"$PATH\"\n"
+                    'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
+                    'say() { echo "tendcf-install: $*"; }\n'
+                    f"auditd_rules_dir='{rules_d}'\nauditd_rules_path='{managed_r}'\nlock_auditd=0\n"
+                    f"{fn_would_lock}\n{fn_reload}\nreload_auditd_tripwire\n",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_persisted.returncode, 0, r_persisted.stderr)
+            self.assertFalse(augen_log.exists(), "H1: standalone enable with persisted -e 2 on mutable kernel must NOT run augenrules --load")
+            self.assertIn("without running augenrules --load", r_persisted.stdout)
             fn_purge = _extract_func(self.src, "purge_audit_spool_safe")
             self.assertNotIn("mountinfo_path", fn_purge, "M1: production purge must not accept inherited mountinfo_path")
             self.assertIn("mountinfo_contains_target /proc/self/mountinfo", fn_purge)
