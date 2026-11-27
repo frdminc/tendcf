@@ -3069,7 +3069,68 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertTrue((prefix / "etc" / "ssl" / "openssl.cnf").is_file(), "packaged etc/ssl must remain intact")
             self.assertTrue(osq_conf_d.is_file(), "osquery.conf.d drop-in must register tripwire pack when osquery.conf.d exists")
             self.assertIn("tendcf_tripwire", osq_conf_d.read_text(encoding="utf-8"))
-            self.assertIn("registered via", r.stdout)
+            self.assertIn("unverified until observed", r.stdout)
+            # R8-M5: Verify osquery FIM pack watches parent dirs (not rename-replaced leaf files)
+            # and SQL query filters shared dirs so unrelated files are excluded while atomic renames match.
+            import sqlite3
+            osq_pack_obj = _json.loads((trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
+            for cat, patterns in osq_pack_obj["file_paths"].items():
+                for pat in patterns:
+                    self.assertTrue(pat.endswith("/%") or pat.endswith("/%%"), f"R8-M5: {cat} watch {pat} must watch parent dir, not leaf file")
+            conn = sqlite3.connect(":memory:")
+            conn.execute("CREATE TABLE file_events (target_path TEXT, action TEXT, uid INT, gid INT, mode TEXT, sha256 TEXT, time INT)")
+            conn.executemany(
+                "INSERT INTO file_events VALUES (?, ?, 0, 0, '0600', 'abc', 1)",
+                [
+                    (f"{workdir}/data/host_specific.json", "UPDATED"),
+                    (f"{audit_cfg}", "UPDATED"),
+                    (str(shipper_plist), "UPDATED"),
+                    ("/Library/LaunchDaemons/com.apple.unrelated.plist", "UPDATED"),
+                    ("/private/etc/hosts", "UPDATED"),
+                    ("/private/etc/sudoers", "UPDATED"),
+                    ("/private/etc/sudoers.d/local", "CREATED"),
+                    ("/var/root/.ssh/authorized_keys", "UPDATED"),
+                ],
+            )
+            # Map each event row with its category column to test the exact rendered SQL query.
+            conn.execute("ALTER TABLE file_events ADD COLUMN category TEXT")
+            conn.execute("UPDATE file_events SET category='tendcf_policy_and_data' WHERE target_path LIKE ?", (f"{prefix}/%",))
+            conn.execute("UPDATE file_events SET category='tendcf_launchd_and_trust' WHERE category IS NULL")
+            sql_q = osq_pack_obj["queries"]["tendcf_file_events"]["query"]
+            matched = {row[0] for row in conn.execute(sql_q).fetchall()}
+            conn.close()
+            self.assertIn(f"{workdir}/data/host_specific.json", matched)
+            self.assertIn(str(audit_cfg), matched)
+            self.assertIn(str(shipper_plist), matched)
+            self.assertIn("/private/etc/sudoers", matched)
+            self.assertIn("/private/etc/sudoers.d/local", matched)
+            self.assertIn("/var/root/.ssh/authorized_keys", matched)
+            self.assertNotIn("/Library/LaunchDaemons/com.apple.unrelated.plist", matched)
+            self.assertNotIn("/private/etc/hosts", matched)
+
+            # R8-M4: Legacy $prefix/etc/audit-shipper.json refused before mutation (both-present & legacy-only), preserving originals.
+            legacy_cfg = prefix / "etc" / "audit-shipper.json"
+            legacy_cfg.write_text('{"enabled":true,"legacy":1}\n', encoding="utf-8")
+            os.chmod(legacy_cfg, 0o600)
+            r_leg_both = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_both.returncode, 0, "R8-M4: legacy+new config must refuse")
+            self.assertIn("legacy audit shipper config", r_leg_both.stderr)
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            audit_cfg_bak = audit_cfg.read_text(encoding="utf-8")
+            audit_cfg.unlink()
+            r_leg_only = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "place_audit_shipper_state\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_only.returncode, 0, "R8-M4: legacy-only config must refuse before writing default")
+            self.assertFalse(audit_cfg.exists())
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            legacy_cfg.unlink()
+            audit_cfg.write_text(audit_cfg_bak, encoding="utf-8")
+            os.chmod(audit_cfg, 0o600)
             # When osquery.conf.d is absent, explicitly report staged-only status.
             r_staged = subprocess.run(
                 ["/bin/bash", "-c", env_setup + f'osquery_conf_d_dir="{root}/no-conf-d"\nplace_tripwire_rules\n'],
@@ -3222,6 +3283,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_was_loaded=0\n'
                 'upgrade_had_plist=0\n'
                 'upgrade_shipper_was_loaded=1\n'
+                'upgrade_touched_shipper=1\n'
                 'upgrade_shipper_prior_disabled="enabled"\n'
                 'upgrade_had_shipper_plist=1\n'
                 f'upgrade_saved_shipper_plist="{saved_plist}"\n'
@@ -3371,6 +3433,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_was_loaded=0\n'
                 'upgrade_had_plist=0\n'
                 'upgrade_shipper_was_loaded=0\n'
+                'upgrade_touched_shipper=1\n'
                 'upgrade_shipper_prior_disabled="disabled"\n'
                 'upgrade_had_shipper_plist=0\n'
                 'upgrade_saved_shipper_plist=""\n'
@@ -3555,6 +3618,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_was_loaded=1\n'
                 'upgrade_had_plist=1\n'
                 'upgrade_shipper_was_loaded=1\n'
+                'upgrade_touched_shipper=1\n'
                 'upgrade_shipper_prior_disabled="enabled"\n'
                 'upgrade_had_shipper_plist=1\n'
                 f'upgrade_saved_shipper_plist="{saved6}"\n'
@@ -3620,6 +3684,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_was_loaded=1\n'
                 'upgrade_had_plist=1\n'
                 'upgrade_shipper_was_loaded=1\n'
+                'upgrade_touched_shipper=1\n'
                 'upgrade_shipper_prior_disabled="enabled"\n'
                 'upgrade_had_shipper_plist=1\n'
                 'upgrade_saved_shipper_plist=""\n'
@@ -3648,7 +3713,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertFalse(bs_log7.exists(), "R6-M1: ZERO bootstraps allowed when workdir snapshot restore fails")
             self.assertIn("incomplete", r7.stderr)
 
-            # Macroscope #4714558789: Early execd bootout failure before shipper plist changed must NOT boot out running shipper!
+            # Macroscope #4714558789 & R8-M3: Early execd bootout failure before upgrade touched shipper
+            # (even when shipper is loaded + disabled override + byte-identical plist!) must cause ZERO shipper mutations!
             stage8 = root / "stage8"
             stage8.mkdir()
             unchanged_plist = root / "shipper8.plist"
@@ -3656,6 +3722,11 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             saved8 = stage8 / "upgrade-shipper.plist.prev"
             saved8.write_text("<plist>SAME</plist>\n", encoding="utf-8")
             bootout8_log = root / "bootout8.log"
+            lc8_log = root / "lc8.log"
+            lc8_shim = root / "lc8"
+            lc8_shim.write_text(f"#!/bin/sh\necho \"$*\" >> '{lc8_log}'\nexit 0\n", encoding="utf-8")
+            lc8_shim.chmod(0o755)
+            cs_lc8 = cs_fn.replace("/bin/launchctl", str(lc8_shim))
             script8 = (
                 "set -euo pipefail\n"
                 f'prefix="{root}/opt/tendcf8"\n'
@@ -3669,7 +3740,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'upgrade_was_loaded=1\n'
                 'upgrade_had_plist=1\n'
                 'upgrade_shipper_was_loaded=1\n'
-                'upgrade_shipper_prior_disabled="enabled"\n'
+                'upgrade_touched_shipper=0\n'
+                'upgrade_shipper_prior_disabled="disabled"\n'
                 'upgrade_had_shipper_plist=1\n'
                 f'upgrade_saved_shipper_plist="{saved8}"\n'
                 'upgrade_snapshot_taken=0\n'
@@ -3687,12 +3759,14 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 'shipper_is_loaded() { return 0; }\n'
                 f'bootout_shipper() {{ echo "booted_out" >> "{bootout8_log}"; return 0; }}\n'
                 'wait_shipper_unloaded() { return 0; }\n'
-                f"{cs_fn}\n"
+                f'bootstrap_shipper_with_retry() {{ echo "bootstrapped" >> "{bootout8_log}"; return 0; }}\n'
+                f"{cs_lc8}\n"
                 "cleanup_stage\n"
             )
             r8 = subprocess.run(["/bin/bash", "-c", script8], capture_output=True, text=True, check=False)
             self.assertEqual(r8.returncode, 0, r8.stderr)
-            self.assertFalse(bootout8_log.exists(), "untouched running shipper must NOT be booted out when saved plist matches live plist")
+            self.assertFalse(bootout8_log.exists(), "R8-M3: untouched loaded+disabled shipper must NOT be booted out or re-bootstrapped")
+            self.assertFalse(lc8_log.exists(), "R8-M3: untouched loaded+disabled shipper must cause ZERO launchctl calls")
 
 
 if __name__ == "__main__":

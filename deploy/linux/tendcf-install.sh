@@ -891,6 +891,9 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$prefix/share/tendcf/bin/__pycache__" ] || [ -L "$prefix/share/tendcf/bin/__pycache__" ]; then
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
+    fi
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
@@ -901,17 +904,37 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; then
         check_dir_root_unwritable "$prefix/var"
         check_private_dir_exact "$audit_spool_dir"
-        # Serialize spool inspection with any running shipper/emitter holding
-        # .spool.lock so atomic .cursor.json.tmp.* renames never race the scan.
-        local spool_lock="$audit_spool_dir/.spool.lock"
+        # Always open-or-create .spool.lock inside the validated 0700 spool
+        # directory (mode 0600, no truncation, no symlink follow, descriptor
+        # verified) and hold flock -x across enumeration so even a first
+        # concurrent AuditSpool writer cannot race the scan (M2).
+        local spool_lock="$audit_spool_dir/.spool.lock" old_umask fd_meta path_id
         if [ -e "$spool_lock" ] || [ -L "$spool_lock" ]; then
             check_private_file_exact "$spool_lock"
-            exec 7<"$spool_lock"
-            spool_scan_lock_held=1
-            if ! flock -x 7; then
+        fi
+        old_umask="$(umask)"
+        umask 077
+        exec 7>>"$spool_lock"
+        umask "$old_umask"
+        spool_scan_lock_held=1
+        if ! flock -x 7; then
+            exec 7>&-
+            spool_scan_lock_held=0
+            die "failed to acquire $spool_lock before spool validation"
+        fi
+        if [ -L "$spool_lock" ] || [ ! -f "$spool_lock" ]; then
+            exec 7>&-
+            spool_scan_lock_held=0
+            die "$spool_lock is not a regular non-symlink file; refusing"
+        fi
+        check_private_file_exact "$spool_lock"
+        if [ -e /proc/self/fd/7 ]; then
+            fd_meta="$(stat -L -c '%u:%g %a %h %d:%i' /proc/self/fd/7 2>/dev/null || true)"
+            path_id="$(stat -c '%d:%i' "$spool_lock" 2>/dev/null || true)"
+            if [ -z "$path_id" ] || [ "$fd_meta" != "0:0 600 1 $path_id" ]; then
                 exec 7>&-
                 spool_scan_lock_held=0
-                die "failed to acquire $spool_lock before spool validation"
+                die "$spool_lock failed descriptor verification (got '${fd_meta:-none}')"
             fi
         fi
         local had_nullglob=0 had_dotglob=0 ent
@@ -1001,6 +1024,9 @@ place_audit_log() {
 place_audit_shipper_state() {
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     check_dir_root_unwritable "$prefix"
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
+    fi
     local d
     for d in "$prefix/etc" "$audit_etc_dir" "$prefix/var" "$audit_spool_dir"; do
         [ ! -L "$d" ] || die "$d is a symlink; refusing"

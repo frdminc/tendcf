@@ -147,6 +147,7 @@ upgrade_moved_etc=0
 upgrade_was_loaded=0
 upgrade_had_plist=0
 upgrade_shipper_was_loaded=0
+upgrade_touched_shipper=0
 upgrade_shipper_prior_disabled=""
 upgrade_had_shipper_plist=0
 upgrade_saved_shipper_plist=""
@@ -339,74 +340,77 @@ cleanup_stage() {
                     /bin/rm -f "$plist_path" || true
                 fi
             fi
-            # Restore prior shipper plist contents ONLY when the live plist actually
-            # differs from the validated snapshot (avoids booting out an untouched
-            # shipper on early execd failure) and only when quiesced (H1/M1).
-            if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
-                && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
-                && [ -n "${shipper_plist_path:-}" ]; then
-                if [ ! -f "$shipper_plist_path" ] || ! /usr/bin/cmp -s "$upgrade_saved_shipper_plist" "$shipper_plist_path"; then
+            # Skip ALL shipper rollback actions when the upgrade never touched
+            # shipper state (e.g., early execd bootout failure; M3).
+            if [ "${upgrade_touched_shipper:-0}" -eq 1 ]; then
+                # Restore prior shipper plist contents ONLY when the live plist actually
+                # differs from the validated snapshot and only when quiesced (H1/M1).
+                if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
+                    && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
+                    && [ -n "${shipper_plist_path:-}" ]; then
+                    if [ ! -f "$shipper_plist_path" ] || ! /usr/bin/cmp -s "$upgrade_saved_shipper_plist" "$shipper_plist_path"; then
+                        if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                            if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                                shipper_quiesced=0
+                                shipper_state_restored=0
+                                rollback_keep_stage=1
+                                echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
+                            fi
+                        fi
+                        if [ "$shipper_quiesced" -eq 1 ]; then
+                            local sp_rb="$shipper_plist_path.rollback.$$"
+                            if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
+                                && /bin/chmod 0644 "$sp_rb" \
+                                && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
+                                /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
+                            else
+                                /bin/rm -f "$sp_rb" || true
+                                shipper_plist_restored=0
+                                rollback_keep_stage=1
+                                echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
+                            fi
+                        fi
+                    fi
+                elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
+                    && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
                     if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
                         if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
                             shipper_quiesced=0
                             shipper_state_restored=0
                             rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
+                            echo "tendcf-install: ERROR: failed to unload newly created $shipper_label during rollback" >&2
                         fi
                     fi
                     if [ "$shipper_quiesced" -eq 1 ]; then
-                        local sp_rb="$shipper_plist_path.rollback.$$"
-                        if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
-                            && /bin/chmod 0644 "$sp_rb" \
-                            && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
-                            /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
-                        else
-                            /bin/rm -f "$sp_rb" || true
-                            shipper_plist_restored=0
-                            rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
-                        fi
+                        /bin/rm -f "$shipper_plist_path" || true
                     fi
                 fi
-            elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
-                && [ -n "${shipper_plist_path:-}" ] && [ -f "$shipper_plist_path" ] && [ ! -L "$shipper_plist_path" ]; then
-                if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                    if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
-                        shipper_quiesced=0
+                # Restore disabled override state regardless of whether a plist existed (M1/M3).
+                case "${upgrade_shipper_prior_disabled:-}" in
+                    disabled)
+                        if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                            if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                                shipper_quiesced=0
+                                shipper_state_restored=0
+                                rollback_keep_stage=1
+                                echo "tendcf-install: ERROR: failed to stop $shipper_label while restoring disabled state" >&2
+                            fi
+                        fi
+                        if [ "$shipper_quiesced" -eq 1 ]; then
+                            if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
+                                shipper_state_restored=0
+                                rollback_keep_stage=1
+                                echo "tendcf-install: ERROR: failed to restore disabled override for system/$shipper_label; preserving recovery dirs" >&2
+                            fi
+                        fi
+                        ;;
+                    unknown)
                         shipper_state_restored=0
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to unload newly created $shipper_label during rollback" >&2
-                    fi
-                fi
-                if [ "$shipper_quiesced" -eq 1 ]; then
-                    /bin/rm -f "$shipper_plist_path" || true
-                fi
+                        echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
+                        ;;
+                esac
             fi
-            # Restore disabled override state regardless of whether a plist existed (M1/M3).
-            case "${upgrade_shipper_prior_disabled:-}" in
-                disabled)
-                    if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                        if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
-                            shipper_quiesced=0
-                            shipper_state_restored=0
-                            rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to stop $shipper_label while restoring disabled state" >&2
-                        fi
-                    fi
-                    if [ "$shipper_quiesced" -eq 1 ]; then
-                        if ! /bin/launchctl disable "system/$shipper_label" >/dev/null 2>&1 9>&-; then
-                            shipper_state_restored=0
-                            rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to restore disabled override for system/$shipper_label; preserving recovery dirs" >&2
-                        fi
-                    fi
-                    ;;
-                unknown)
-                    shipper_state_restored=0
-                    rollback_keep_stage=1
-                    echo "tendcf-install: ERROR: pre-upgrade disabled state for system/$shipper_label was unknown; refusing to claim complete rollback" >&2
-                    ;;
-            esac
             if [ "$upgrade_was_loaded" -eq 1 ] && [ "$execd_quiesced" -eq 1 ] && [ "$shipper_quiesced" -eq 1 ] \
                 && [ -f "$plist_path" ] && ! execd_is_loaded; then
                 if ! bootstrap_execd_with_retry >/dev/null 2>&1; then
@@ -414,7 +418,7 @@ cleanup_stage() {
                     echo "tendcf-install: ERROR: failed to re-bootstrap $label during rollback" >&2
                 fi
             fi
-            if [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
+            if [ "${upgrade_touched_shipper:-0}" -eq 1 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 1 ] \
                 && [ "$execd_quiesced" -eq 1 ] && [ "$shipper_quiesced" -eq 1 ] \
                 && [ "${upgrade_shipper_prior_disabled:-enabled}" != "disabled" ] \
                 && [ "${upgrade_shipper_prior_disabled:-enabled}" != "unknown" ] \
@@ -1303,6 +1307,10 @@ install_tarball() {
         if [ -L "$prefix/etc/tendcf-audit" ]; then
             die "existing $prefix/etc/tendcf-audit is a symlink; refusing upgrade"
         fi
+        # Refuse before any mutation if a legacy $prefix/etc/audit-shipper.json exists (M4).
+        if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+            die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
+        fi
         # Validate any existing LaunchDaemon plist BEFORE snapshotting or mutating
         # daemons so untrusted bytes can never be promoted to root LaunchDaemon (H1).
         if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
@@ -1335,8 +1343,10 @@ install_tarball() {
             upgrade_saved_shipper_plist=""
         fi
         # Record BOTH prior loaded states BEFORE booting out either daemon so an
-        # early execd bootout failure never forgets a running shipper.
+        # early execd bootout failure never forgets a running shipper; only mark
+        # upgrade_touched_shipper=1 once shipper mutation actually begins (M3).
         local was_loaded=0 shipper_loaded=0
+        upgrade_touched_shipper=0
         if execd_is_loaded; then
             was_loaded=1
             upgrade_was_loaded=1
@@ -1351,6 +1361,7 @@ install_tarball() {
             wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
         fi
         if [ "$shipper_loaded" -eq 1 ]; then
+            upgrade_touched_shipper=1
             upgrade_rollback_armed=1
             /bin/launchctl bootout "system/$shipper_label" 9>&- || die "launchctl bootout system/$shipper_label failed before upgrade"
             wait_shipper_unloaded || die "$shipper_label remained loaded after bootout before upgrade"
@@ -2082,6 +2093,9 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$prefix/share/tendcf/bin/__pycache__" ] || [ -L "$prefix/share/tendcf/bin/__pycache__" ]; then
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
+    fi
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
@@ -2209,6 +2223,9 @@ place_audit_log() {
 }
 
 place_audit_shipper_state() {
+    if [ -e "$prefix/etc/audit-shipper.json" ] || [ -L "$prefix/etc/audit-shipper.json" ]; then
+        die "legacy audit shipper config found at $prefix/etc/audit-shipper.json; migrate it (and any colocated SSH keys/known_hosts) into root-only 0700 $audit_etc_dir/ and remove the legacy file before re-running install"
+    fi
     ensure_dir 755 "$prefix/etc"
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
         check_dir_root_unwritable "$prefix/etc"
@@ -2248,6 +2265,9 @@ place_audit_shipper_state() {
 
 render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
     local dest="$1"
+    # Watch stable parent directories (not individual files replaced by atomic
+    # rename, which lose osquery FIM coverage until daemon restart; M5) and
+    # filter shared system directories to the exact managed/security paths.
     /bin/cat > "$dest" <<OSQUERY_EOF
 {
   "file_paths": {
@@ -2258,22 +2278,21 @@ render_darwin_tripwire_osquery() {  # render_darwin_tripwire_osquery DEST
     ],
     "tendcf_policy_and_data": [
       "$workdir/inputs/%%",
-      "$workdir/data/host_specific.json",
-      "$audit_shipper_cfg"
+      "$workdir/data/%%",
+      "$audit_etc_dir/%%"
     ],
     "tendcf_launchd_and_trust": [
-      "$plist_path",
-      "$shipper_plist_path",
-      "/etc/sudoers",
-      "/etc/sudoers.d/%%",
-      "/var/root/.ssh/authorized_keys"
+      "$launchd_dir/%%",
+      "/private/etc/%",
+      "/private/etc/sudoers.d/%%",
+      "/var/root/.ssh/%%"
     ]
   },
   "queries": {
     "tendcf_file_events": {
-      "query": "SELECT target_path, action, uid, gid, mode, sha256, time FROM file_events WHERE category IN ('tendcf_binaries','tendcf_policy_and_data','tendcf_launchd_and_trust');",
+      "query": "SELECT target_path, action, uid, gid, mode, sha256, time FROM file_events WHERE category IN ('tendcf_binaries','tendcf_policy_and_data') OR (category = 'tendcf_launchd_and_trust' AND (target_path IN ('$plist_path','$shipper_plist_path','/etc/sudoers','/private/etc/sudoers','/var/root/.ssh/authorized_keys') OR target_path LIKE '/etc/sudoers.d/%' OR target_path LIKE '/private/etc/sudoers.d/%' OR target_path LIKE '/var/root/.ssh/%'));",
       "interval": 60,
-      "description": "Monitor tendcf binaries, policy, CMDB data, launchd plists, sudoers, and root authorized_keys (issue #119)"
+      "description": "Monitor tendcf binaries, policy, CMDB data dir, audit config dir, launchd plists, sudoers, and root authorized_keys across atomic renames (issue #119)"
     }
   }
 }
@@ -2361,7 +2380,7 @@ place_tripwire_rules() {
             local staged_conf_d="$stage_dir/99-tendcf-tripwire.conf"
             printf '{\n  "packs": {\n    "tendcf_tripwire": "%s"\n  }\n}\n' "$osquery_pack_path" > "$staged_conf_d"
             install_managed_file_idempotent "$staged_conf_d" "$osquery_conf_d_path" 644
-            say "tripwire: osquery pack registered via $osquery_conf_d_path"
+            say "tripwire: osquery pack and conf.d drop-in staged on disk at $osquery_conf_d_path (runtime FIM activation requires a main osquery.conf and event collection enabled; unverified until observed)"
         else
             say "tripwire: osquery pack staged only at $osquery_pack_path (inactive until referenced under packs in /private/var/osquery/osquery.conf or osquery.conf.d)"
         fi
@@ -2735,6 +2754,7 @@ enable_audit_shipper() {
     fi
 
     if [ "$plist_changed" -eq 1 ]; then
+        upgrade_touched_shipper=1
         if [ -f "$shipper_plist_path" ]; then
             /usr/bin/install -m 0644 -o root -g wheel "$shipper_plist_path" "$prev_plist"
             had_prev=1
@@ -2748,6 +2768,7 @@ enable_audit_shipper() {
         changed=1
     fi
 
+    upgrade_touched_shipper=1
     if ! /bin/launchctl enable "system/$shipper_label" 9>&-; then
         if [ "$plist_changed" -eq 1 ]; then
             if [ "$had_prev" -eq 1 ]; then
@@ -3049,6 +3070,7 @@ cmd_install() {
     upgrade_was_loaded=0
     upgrade_had_plist=0
     upgrade_shipper_was_loaded=0
+    upgrade_touched_shipper=0
     upgrade_had_shipper_plist=0
     upgrade_needs_execd_restart=0
     upgrade_needs_shipper_restart=0

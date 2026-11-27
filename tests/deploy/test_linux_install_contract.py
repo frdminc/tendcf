@@ -1509,13 +1509,20 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             stat_shim.write_text(
                 f"#!{sys.executable}\n"
                 "import os, stat, sys\n"
-                "fmt = sys.argv[2]\n"
-                "p = sys.argv[3]\n"
-                "st = os.lstat(p)\n"
+                "args = sys.argv[1:]\n"
+                "follow = False\n"
+                "if args and args[0] == '-L':\n"
+                "    follow = True\n"
+                "    args = args[1:]\n"
+                "fmt = args[1]\n"
+                "p = args[2]\n"
+                "st = os.stat(p) if follow else os.lstat(p)\n"
                 "mode = stat.S_IMODE(st.st_mode)\n"
                 "if fmt == '%U:%G %a': print(f'root:root {mode:o}')\n"
                 "elif fmt == '%u %g %a': print(f'0 0 {mode:o}')\n"
                 "elif fmt == '%u %g %a %h': print(f'0 0 {mode:o} {st.st_nlink}')\n"
+                "elif fmt == '%u:%g %a %h %d:%i': print(f'0:0 {mode:o} {st.st_nlink} {st.st_dev}:{st.st_ino}')\n"
+                "elif fmt == '%d:%i': print(f'{st.st_dev}:{st.st_ino}')\n"
                 "elif fmt == '%u %a': print(f'0 {mode:o}')\n"
                 "elif fmt == '%u': print('0')\n"
                 "elif fmt == '%d': print(f'{st.st_dev}')\n"
@@ -1523,6 +1530,52 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 encoding="utf-8",
             )
             stat_shim.chmod(0o755)
+            # M1: Isolate fixture from host systemd manager and host auditd loaders with a stateful systemctl shim.
+            fake_run_systemd = root / "run_systemd"
+            fake_run_systemd.mkdir()
+            sctl_log = root / "systemctl.log"
+            sctl_active_dir = root / "sctl_active"
+            sctl_active_dir.mkdir()
+            for u in ("tendcf-execd.service", "tendcf-audit-shipper.service", "tendcf-audit-shipper.timer"):
+                (sctl_active_dir / u).write_text("active\n", encoding="utf-8")
+            sctl_shim = shim_dir / "systemctl"
+            sctl_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                f"log = pathlib.Path({str(sctl_log)!r})\n"
+                f"st_dir = pathlib.Path({str(sctl_active_dir)!r})\n"
+                "args = sys.argv[1:]\n"
+                "with log.open('a', encoding='utf-8') as f: f.write(' '.join(args) + '\\n')\n"
+                "if not args: raise SystemExit(0)\n"
+                "cmd = args[0]\n"
+                "if cmd == 'daemon-reload': raise SystemExit(0)\n"
+                "if cmd == 'show':\n"
+                "    u = args[-1]\n"
+                "    if 'LoadState' in args:\n"
+                "        print('loaded' if (st_dir / u).exists() else 'not-found')\n"
+                "    elif 'ActiveState' in args:\n"
+                "        print((st_dir / u).read_text().strip() if (st_dir / u).exists() else 'inactive')\n"
+                "    raise SystemExit(0)\n"
+                "if cmd == 'is-active':\n"
+                "    u = args[-1]\n"
+                "    ok = (st_dir / u).exists() and (st_dir / u).read_text().strip() == 'active'\n"
+                "    raise SystemExit(0 if ok else 3)\n"
+                "if cmd == 'is-enabled':\n"
+                "    u = args[-1]\n"
+                "    ok = (st_dir / u).exists() and (st_dir / u).read_text().strip() == 'active'\n"
+                "    raise SystemExit(0 if ok else 1)\n"
+                "if cmd in ('disable', 'stop'):\n"
+                "    u = args[-1]\n"
+                "    if (st_dir / u).exists(): (st_dir / u).write_text('inactive\\n', encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "if cmd == 'enable':\n"
+                "    u = args[-1]\n"
+                "    (st_dir / u).write_text('active\\n', encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            sctl_shim.chmod(0o755)
             prefix = root / "opt" / "tendcf"
             workdir = prefix / "var" / "libntech"
             etc_dir = root / "etc"
@@ -1567,11 +1620,16 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
             fake_mountinfo = root / "mountinfo"
             fake_mountinfo.write_text("1 0 1:1 / / rw - ext4 /dev/root rw\n", encoding="utf-8")
             fns_patched = (
-                fns.replace("/etc/audit", f"{etc_dir}/audit")
-                .replace("/etc/aide", f"{etc_dir}/aide")
+                fns.replace(" /etc/audit ", f" {etc_dir}/audit ")
+                .replace(" /etc/aide ", f" {etc_dir}/aide ")
                 .replace("/etc/systemd/system", str(systemd_dir))
                 .replace("check_dir_chain_ok /etc", "true")
                 .replace("/proc/self/mountinfo", str(fake_mountinfo))
+                .replace("/run/systemd/system", str(fake_run_systemd))
+                .replace("/sbin/augenrules", str(root / "no-augenrules"))
+                .replace("/usr/sbin/augenrules", str(root / "no-augenrules"))
+                .replace("/sbin/auditctl", str(root / "no-auditctl"))
+                .replace("/usr/sbin/auditctl", str(root / "no-auditctl"))
             )
             audit_cfg = prefix / "etc" / "tendcf-audit" / "audit-shipper.json"
             spool_dir = prefix / "var" / "audit-spool"
@@ -1666,7 +1724,41 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 text=True,
                 check=False,
             )
-            self.assertNotEqual(r_dirty_cfg.returncode, 0)
+            self.assertEqual(r_dirty_cfg.returncode, 0 if False else 1)
+            os.chmod(audit_cfg, 0o600)
+
+            # 3b) R8-M2: Empty spool (no .spool.lock yet) creates & acquires 0600 .spool.lock during validation.
+            self.assertFalse((spool_dir / ".spool.lock").exists())
+            r_empty_val = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_empty_val.returncode, 0, r_empty_val.stderr)
+            self.assertTrue((spool_dir / ".spool.lock").is_file(), "R8-M2: validation must create/hold .spool.lock on empty spool")
+            self.assertEqual(stat.S_IMODE((spool_dir / ".spool.lock").stat().st_mode), 0o600)
+
+            # 3c) R8-M4: Legacy $prefix/etc/audit-shipper.json is refused before mutation (both-present & legacy-only), preserving originals.
+            legacy_cfg = prefix / "etc" / "audit-shipper.json"
+            legacy_cfg.write_text('{"enabled":true,"legacy":1}\n', encoding="utf-8")
+            os.chmod(legacy_cfg, 0o600)
+            r_leg_both = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "validate_existing_audit_state_before_repair\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_both.returncode, 0, "R8-M4: legacy+new config must refuse with migration instructions")
+            self.assertIn("legacy audit shipper config", r_leg_both.stderr)
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            audit_cfg_bak = audit_cfg.read_text(encoding="utf-8")
+            audit_cfg.unlink()
+            r_leg_only = subprocess.run(
+                ["/bin/bash", "-c", env_setup + "place_audit_shipper_state\n"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(r_leg_only.returncode, 0, "R8-M4: legacy-only config must refuse before writing default")
+            self.assertFalse(audit_cfg.exists())
+            self.assertEqual(legacy_cfg.read_text(encoding="utf-8"), '{"enabled":true,"legacy":1}\n')
+            legacy_cfg.unlink()
+            audit_cfg.write_text(audit_cfg_bak, encoding="utf-8")
             os.chmod(audit_cfg, 0o600)
 
             # 4) H5/M1: Populate spool with REAL AuditSpool (audit.jsonl, cursor.json, .spool.lock).
@@ -1697,6 +1789,10 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(r_un.returncode, 0, r_un.stderr)
+            sctl_calls = sctl_log.read_text(encoding="utf-8")
+            self.assertIn("disable --now tendcf-audit-shipper.timer", sctl_calls, "M1: stateful stub must record timer stop")
+            self.assertIn("disable --now tendcf-execd.service", sctl_calls, "M1: stateful stub must record execd stop")
+            self.assertIn("daemon-reload", sctl_calls, "M1: stateful stub must record daemon-reload")
             for gone in (execd_path, svc_path, tmr_path, auditd_rules, aide_rules, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
                 self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
             self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
