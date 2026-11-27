@@ -102,12 +102,14 @@ audit_log_src=""
 audit_log_sha256=""
 audit_log_explicit=0
 installed_audit_log="$prefix/share/tendcf/bin/audit_log.py"
-audit_etc_dir="$prefix/etc"
+audit_etc_dir="$prefix/etc/tendcf-audit"
 audit_shipper_cfg="$audit_etc_dir/audit-shipper.json"
 audit_spool_dir="$prefix/var/audit-spool"
 tripwire_share_dir="$prefix/share/tendcf/tripwire"
 osquery_packs_dir=/private/var/osquery/packs
 osquery_pack_path="$osquery_packs_dir/tendcf-tripwire.conf"
+osquery_conf_d_dir=/private/var/osquery/osquery.conf.d
+osquery_conf_d_path="$osquery_conf_d_dir/99-tendcf-tripwire.conf"
 
 cf_agent="$prefix/bin/cf-agent"
 cf_promises="$prefix/bin/cf-promises"
@@ -238,23 +240,24 @@ cleanup_stage() {
                     fi
                 fi
                 if { [ "${upgrade_had_etc:-0}" -eq 1 ] || [ "${upgrade_moved_etc:-0}" -eq 1 ]; } \
-                    && [ ! -e "$upgrade_backup_prefix/etc" ]; then
-                    if [ -d "$failed_prefix/etc" ]; then
-                        if ! /bin/mv "$failed_prefix/etc" "$upgrade_backup_prefix/etc"; then
+                    && [ ! -e "$upgrade_backup_prefix/etc/tendcf-audit" ]; then
+                    /bin/mkdir -p "$upgrade_backup_prefix/etc" 2>/dev/null || true
+                    if [ -d "$failed_prefix/etc/tendcf-audit" ]; then
+                        if ! /bin/mv "$failed_prefix/etc/tendcf-audit" "$upgrade_backup_prefix/etc/tendcf-audit"; then
                             etc_restored=0
                             rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to restore $failed_prefix/etc to $upgrade_backup_prefix/etc; preserving recovery dirs" >&2
+                            echo "tendcf-install: ERROR: failed to restore $failed_prefix/etc/tendcf-audit to $upgrade_backup_prefix/etc/tendcf-audit; preserving recovery dirs" >&2
                         fi
-                    elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/etc" ]; then
-                        if ! /bin/mv "$upgrade_staged_tree/etc" "$upgrade_backup_prefix/etc"; then
+                    elif [ -n "$upgrade_staged_tree" ] && [ -d "$upgrade_staged_tree/etc/tendcf-audit" ]; then
+                        if ! /bin/mv "$upgrade_staged_tree/etc/tendcf-audit" "$upgrade_backup_prefix/etc/tendcf-audit"; then
                             etc_restored=0
                             rollback_keep_stage=1
-                            echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/etc to $upgrade_backup_prefix/etc; preserving stage_dir $stage_dir" >&2
+                            echo "tendcf-install: ERROR: failed to restore $upgrade_staged_tree/etc/tendcf-audit to $upgrade_backup_prefix/etc/tendcf-audit; preserving stage_dir $stage_dir" >&2
                         fi
                     else
                         etc_restored=0
                         rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: expected preserved etc/ missing during rollback; preserving recovery dirs" >&2
+                        echo "tendcf-install: ERROR: expected preserved etc/tendcf-audit missing during rollback; preserving recovery dirs" >&2
                     fi
                 fi
                 if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
@@ -266,7 +269,7 @@ cleanup_stage() {
                     fi
                 fi
                 if [ "$upgrade_moved_var" -eq 0 ] || [ ! -e "$failed_prefix/var" ]; then
-                    if [ "${upgrade_moved_etc:-0}" -eq 0 ] || [ ! -e "$failed_prefix/etc" ]; then
+                    if [ "${upgrade_moved_etc:-0}" -eq 0 ] || [ ! -e "$failed_prefix/etc/tendcf-audit" ]; then
                         if [ "$var_restored" -eq 1 ] && [ "$etc_restored" -eq 1 ] && [ "$restored_prefix" -eq 1 ]; then
                             /bin/rm -rf "$failed_prefix" || true
                         fi
@@ -336,30 +339,33 @@ cleanup_stage() {
                     /bin/rm -f "$plist_path" || true
                 fi
             fi
-            # Restore prior shipper plist contents (only from validated snapshot and
-            # only when replacement job is confirmed quiesced; H1/M1).
+            # Restore prior shipper plist contents ONLY when the live plist actually
+            # differs from the validated snapshot (avoids booting out an untouched
+            # shipper on early execd failure) and only when quiesced (H1/M1).
             if [ "${upgrade_had_shipper_plist:-0}" -eq 1 ] \
                 && [ -n "${upgrade_saved_shipper_plist:-}" ] && [ -f "$upgrade_saved_shipper_plist" ] \
                 && [ -n "${shipper_plist_path:-}" ]; then
-                if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
-                    if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
-                        shipper_quiesced=0
-                        shipper_state_restored=0
-                        rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
+                if [ ! -f "$shipper_plist_path" ] || ! /usr/bin/cmp -s "$upgrade_saved_shipper_plist" "$shipper_plist_path"; then
+                    if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
+                        if ! bootout_shipper >/dev/null 2>&1 || ! wait_shipper_unloaded || shipper_is_loaded; then
+                            shipper_quiesced=0
+                            shipper_state_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to unload replacement $shipper_label before restoring prior plist" >&2
+                        fi
                     fi
-                fi
-                if [ "$shipper_quiesced" -eq 1 ]; then
-                    local sp_rb="$shipper_plist_path.rollback.$$"
-                    if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
-                        && /bin/chmod 0644 "$sp_rb" \
-                        && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
-                        /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
-                    else
-                        /bin/rm -f "$sp_rb" || true
-                        shipper_plist_restored=0
-                        rollback_keep_stage=1
-                        echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
+                    if [ "$shipper_quiesced" -eq 1 ]; then
+                        local sp_rb="$shipper_plist_path.rollback.$$"
+                        if /bin/cp -p "$upgrade_saved_shipper_plist" "$sp_rb" \
+                            && /bin/chmod 0644 "$sp_rb" \
+                            && /bin/mv -f "$sp_rb" "$shipper_plist_path"; then
+                            /usr/sbin/chown root:wheel "$shipper_plist_path" 2>/dev/null || true
+                        else
+                            /bin/rm -f "$sp_rb" || true
+                            shipper_plist_restored=0
+                            rollback_keep_stage=1
+                            echo "tendcf-install: ERROR: failed to restore previous $shipper_plist_path from $upgrade_saved_shipper_plist; preserving stage_dir" >&2
+                        fi
                     fi
                 fi
             elif [ "${upgrade_had_shipper_plist:-0}" -eq 0 ] && [ "${upgrade_shipper_was_loaded:-0}" -eq 0 ] \
@@ -1294,6 +1300,9 @@ install_tarball() {
         if [ -L "$prefix/etc" ]; then
             die "existing $prefix/etc is a symlink; refusing upgrade"
         fi
+        if [ -L "$prefix/etc/tendcf-audit" ]; then
+            die "existing $prefix/etc/tendcf-audit is a symlink; refusing upgrade"
+        fi
         # Validate any existing LaunchDaemon plist BEFORE snapshotting or mutating
         # daemons so untrusted bytes can never be promoted to root LaunchDaemon (H1).
         if [ -e "$plist_path" ] || [ -L "$plist_path" ]; then
@@ -1325,30 +1334,36 @@ install_tarball() {
             upgrade_had_shipper_plist=0
             upgrade_saved_shipper_plist=""
         fi
+        # Record BOTH prior loaded states BEFORE booting out either daemon so an
+        # early execd bootout failure never forgets a running shipper.
         local was_loaded=0 shipper_loaded=0
         if execd_is_loaded; then
             was_loaded=1
             upgrade_was_loaded=1
-            upgrade_rollback_armed=1
-            /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed before upgrade"
-            wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
         fi
         if declare -F shipper_is_loaded >/dev/null 2>&1 && shipper_is_loaded; then
             shipper_loaded=1
             upgrade_shipper_was_loaded=1
+        fi
+        if [ "$was_loaded" -eq 1 ]; then
+            upgrade_rollback_armed=1
+            /bin/launchctl bootout "system/$label" 9>&- || die "launchctl bootout system/$label failed before upgrade"
+            wait_execd_unloaded || die "org.tendcf.execd remained loaded after bootout before upgrade"
+        fi
+        if [ "$shipper_loaded" -eq 1 ]; then
             upgrade_rollback_armed=1
             /bin/launchctl bootout "system/$shipper_label" 9>&- || die "launchctl bootout system/$shipper_label failed before upgrade"
             wait_shipper_unloaded || die "$shipper_label remained loaded after bootout before upgrade"
         fi
         local backup_prefix="$prefix.old.$$"
         /bin/rm -rf "$backup_prefix"
-        # Record original var/etc presence, backup/staging paths, and arm rollback
-        # BEFORE the first prefix rename so a signal immediately after mv still
-        # restores the exact prior prefix layout (M2).
+        # Record original var & etc/tendcf-audit presence, backup/staging paths,
+        # and arm rollback BEFORE the first prefix rename so a signal immediately
+        # after mv still restores the exact prior prefix layout (M2).
         upgrade_had_var=0
         upgrade_had_etc=0
         [ -d "$prefix/var" ] && upgrade_had_var=1
-        [ -d "$prefix/etc" ] && upgrade_had_etc=1
+        [ -d "$prefix/etc/tendcf-audit" ] && upgrade_had_etc=1
         upgrade_backup_prefix="$backup_prefix"
         upgrade_staged_tree="$staged_tree"
         upgrade_rollback_armed=1
@@ -1358,8 +1373,8 @@ install_tarball() {
         if [ -L "$backup_prefix/var" ]; then
             die "existing $prefix/var is a symlink; refusing upgrade"
         fi
-        if [ -L "$backup_prefix/etc" ]; then
-            die "existing $prefix/etc is a symlink; refusing upgrade"
+        if [ -L "$backup_prefix/etc" ] || [ -L "$backup_prefix/etc/tendcf-audit" ]; then
+            die "existing $prefix/etc/tendcf-audit is a symlink; refusing upgrade"
         fi
         if [ -d "$backup_prefix/var" ]; then
             /bin/rm -rf "${staged_tree:?}/var"
@@ -1368,11 +1383,13 @@ install_tarball() {
             /bin/mv "$backup_prefix/var" "$staged_tree/var" \
                 || die "failed to preserve $prefix/var during upgrade"
         fi
-        if [ -d "$backup_prefix/etc" ]; then
-            /bin/rm -rf "${staged_tree:?}/etc"
+        if [ -d "$backup_prefix/etc/tendcf-audit" ]; then
+            # Preserve ONLY private etc/tendcf-audit (leaving packaged etc/ssl untouched).
+            /usr/bin/install -d -m 0755 -o root -g wheel "$staged_tree/etc"
+            /bin/rm -rf "${staged_tree:?}/etc/tendcf-audit"
             upgrade_moved_etc=1
-            /bin/mv "$backup_prefix/etc" "$staged_tree/etc" \
-                || die "failed to preserve $prefix/etc during upgrade"
+            /bin/mv "$backup_prefix/etc/tendcf-audit" "$staged_tree/etc/tendcf-audit" \
+                || die "failed to preserve $prefix/etc/tendcf-audit during upgrade"
         fi
         /bin/mv "$staged_tree" "$prefix" \
             || die "failed to install new tree at $prefix"
@@ -2066,6 +2083,7 @@ validate_existing_audit_state_before_repair() {
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
+        check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
         if [ -e "$audit_shipper_cfg" ] || [ -L "$audit_shipper_cfg" ]; then
             check_private_file_exact "$audit_shipper_cfg"
@@ -2191,7 +2209,9 @@ place_audit_log() {
 }
 
 place_audit_shipper_state() {
+    ensure_dir 755 "$prefix/etc"
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
+        check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
     else
         ensure_dir 700 "$audit_etc_dir"
@@ -2330,10 +2350,23 @@ place_tripwire_rules() {
     install_managed_file_idempotent "$staged_es" "$tripwire_share_dir/eslogger-events.json" 644
 
     # If osquery packs directory exists and is a trusted root-owned directory,
-    # also drop the FIM pack into /var/osquery/packs/tendcf-tripwire.conf.
+    # stage the FIM pack into /private/var/osquery/packs/tendcf-tripwire.conf.
+    # Register it via /private/var/osquery/osquery.conf.d/99-tendcf-tripwire.conf
+    # when osquery.conf.d exists; otherwise explicitly report staged-only status.
     if [ -d "$osquery_packs_dir" ] && [ ! -L "$osquery_packs_dir" ] \
         && check_ancestors_ok "$osquery_packs_dir" && check_ancestor_dir_ok "$osquery_packs_dir"; then
         install_managed_file_idempotent "$staged_osq" "$osquery_pack_path" 644
+        if [ -d "$osquery_conf_d_dir" ] && [ ! -L "$osquery_conf_d_dir" ] \
+            && check_ancestors_ok "$osquery_conf_d_dir" && check_ancestor_dir_ok "$osquery_conf_d_dir"; then
+            local staged_conf_d="$stage_dir/99-tendcf-tripwire.conf"
+            printf '{\n  "packs": {\n    "tendcf_tripwire": "%s"\n  }\n}\n' "$osquery_pack_path" > "$staged_conf_d"
+            install_managed_file_idempotent "$staged_conf_d" "$osquery_conf_d_path" 644
+            say "tripwire: osquery pack registered via $osquery_conf_d_path"
+        else
+            say "tripwire: osquery pack staged only at $osquery_pack_path (inactive until referenced under packs in /private/var/osquery/osquery.conf or osquery.conf.d)"
+        fi
+    else
+        say "tripwire: Darwin tripwire templates staged only under $tripwire_share_dir (osquery not installed)"
     fi
 }
 
@@ -3149,6 +3182,7 @@ cmd_uninstall() {
         /bin/rm -f "$plist_path"
         changed=1
     fi
+    remove_managed_file_safe "$osquery_conf_d_path"
     remove_managed_file_safe "$osquery_pack_path"
     remove_managed_file_safe "$installed_audit_log"
     remove_managed_file_safe "$audit_shipper_cfg"

@@ -42,7 +42,7 @@ cleanup_ship_fixture() {
         rm -rf "$ship_tmp" 2>/dev/null || true
         ship_tmp=""
     fi
-    rm -f /opt/tendcf/etc/shipper_test_id_ed25519 /opt/tendcf/etc/shipper_test_id_ed25519.pub /opt/tendcf/etc/shipper_test_known_hosts 2>/dev/null || true
+    rm -f /opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519 /opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519.pub /opt/tendcf/etc/tendcf-audit/shipper_test_known_hosts 2>/dev/null || true
 }
 
 cleanup() {
@@ -79,7 +79,7 @@ check "projector.py is installed root:root 0644 (non-symlink)" \
 check "audit_log.py is installed root:root 0644 (non-symlink)" \
     bash -c "[ -f /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -L /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/share/tendcf/bin/audit_log.py)\" = 'root:root 644' ]"
 check "audit-shipper.json is installed root:root 0600" \
-    bash -c "[ -f /opt/tendcf/etc/audit-shipper.json ] && [ ! -L /opt/tendcf/etc/audit-shipper.json ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/etc/audit-shipper.json)\" = 'root:root 600' ]"
+    bash -c "[ -f /opt/tendcf/etc/tendcf-audit/audit-shipper.json ] && [ ! -L /opt/tendcf/etc/tendcf-audit/audit-shipper.json ] && [ \"\$(stat -c '%U:%G %a' /opt/tendcf/etc/tendcf-audit/audit-shipper.json)\" = 'root:root 600' ]"
 check "auditd tripwire rules installed root:root 0640" \
     bash -c "[ -f /etc/audit/rules.d/99-tendcf-tripwire.rules ] && [ \"\$(stat -c '%U:%G %a' /etc/audit/rules.d/99-tendcf-tripwire.rules)\" = 'root:root 640' ]"
 check "AIDE tripwire rules installed root:root 0644" \
@@ -211,13 +211,13 @@ else
     mkdir -p /run/sshd "$ship_tmp/sink" "$ship_tmp/run"
     chmod 0700 "$ship_tmp/sink" "$ship_tmp/run"
     ssh-keygen -q -t ed25519 -N '' -f "$ship_tmp/host_ed25519"
-    ssh-keygen -q -t ed25519 -N '' -f /opt/tendcf/etc/shipper_test_id_ed25519
-    chmod 0600 /opt/tendcf/etc/shipper_test_id_ed25519
+    ssh-keygen -q -t ed25519 -N '' -f /opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519
+    chmod 0600 /opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519
     ship_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-    printf '[127.0.0.1]:%s %s\n' "$ship_port" "$(cat "$ship_tmp/host_ed25519.pub")" > /opt/tendcf/etc/shipper_test_known_hosts
-    chmod 0600 /opt/tendcf/etc/shipper_test_known_hosts
+    printf '[127.0.0.1]:%s %s\n' "$ship_port" "$(cat "$ship_tmp/host_ed25519.pub")" > /opt/tendcf/etc/tendcf-audit/shipper_test_known_hosts
+    chmod 0600 /opt/tendcf/etc/tendcf-audit/shipper_test_known_hosts
     printf 'command="/usr/bin/python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py sink-append --sink-root %s --host canary-host --src cf-agent",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,restrict %s\n' \
-        "$ship_tmp/sink" "$(cat /opt/tendcf/etc/shipper_test_id_ed25519.pub)" > "$ship_tmp/authorized_keys"
+        "$ship_tmp/sink" "$(cat /opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519.pub)" > "$ship_tmp/authorized_keys"
     chmod 0600 "$ship_tmp/authorized_keys"
     cat > "$ship_tmp/sshd_config" <<SSHD_EOF
 ListenAddress 127.0.0.1
@@ -254,12 +254,12 @@ cfg = {
     "src": "cf-agent",
     "target": "root@127.0.0.1",
     "port": int(sys.argv[1]),
-    "identity": "/opt/tendcf/etc/shipper_test_id_ed25519",
-    "known_hosts": "/opt/tendcf/etc/shipper_test_known_hosts",
+    "identity": "/opt/tendcf/etc/tendcf-audit/shipper_test_id_ed25519",
+    "known_hosts": "/opt/tendcf/etc/tendcf-audit/shipper_test_known_hosts",
     "ssh_bin": "/usr/bin/ssh",
     "batch_size": 50,
 }
-p = pathlib.Path("/opt/tendcf/etc/audit-shipper.json")
+p = pathlib.Path("/opt/tendcf/etc/tendcf-audit/audit-shipper.json")
 p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 os.chmod(p, 0o600)
 PYCFG
@@ -297,7 +297,7 @@ check "#119 uninstall removes tendcf-execd.service and shipper units" \
 check "#119 uninstall removes auditd and AIDE tripwire rules" \
     bash -c "[ ! -e /etc/audit/rules.d/99-tendcf-tripwire.rules ] && [ ! -e /etc/aide/aide.conf.d/99-tendcf-tripwire ]"
 check "#119 uninstall removes audit_log.py, shipper config, tripwire templates, and purged spool" \
-    bash -c "[ ! -e /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -e /opt/tendcf/etc/audit-shipper.json ] && [ ! -e /opt/tendcf/share/tendcf/tripwire ] && [ ! -e /opt/tendcf/var/audit-spool ]"
+    bash -c "[ ! -e /opt/tendcf/share/tendcf/bin/audit_log.py ] && [ ! -e /opt/tendcf/etc/tendcf-audit/audit-shipper.json ] && [ ! -e /opt/tendcf/share/tendcf/tripwire ] && [ ! -e /opt/tendcf/var/audit-spool ]"
 
 if [ "$fail" != 0 ]; then exit 1; fi
 echo; echo "all install tests passed"

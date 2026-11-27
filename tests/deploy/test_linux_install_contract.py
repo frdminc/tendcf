@@ -988,7 +988,7 @@ class LinuxInstallerHardeningContract(unittest.TestCase):
                     "place_audit_shipper_state() { return 0; }\n"
                     "place_tripwire_rules() { return 0; }\n"
                     f"place_policy() {{ {place_pol_body}; }}\n"
-                    f'audit_etc_dir="{prefix}/etc"\n'
+                    f'audit_etc_dir="{prefix}/etc/tendcf-audit"\n'
                     f'audit_spool_dir="{prefix}/var/audit-spool"\n'
                     f'prefix="{prefix}"\n'
                     f'cf_lib_path="{prefix}/lib"\n'
@@ -1573,7 +1573,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 .replace("check_dir_chain_ok /etc", "true")
                 .replace("/proc/self/mountinfo", str(fake_mountinfo))
             )
-            audit_cfg = prefix / "etc" / "audit-shipper.json"
+            audit_cfg = prefix / "etc" / "tendcf-audit" / "audit-shipper.json"
             spool_dir = prefix / "var" / "audit-spool"
             auditd_rules = etc_dir / "audit" / "rules.d" / "99-tendcf-tripwire.rules"
             aide_rules = etc_dir / "aide" / "aide.conf.d" / "99-tendcf-tripwire"
@@ -1601,7 +1601,7 @@ class LinuxAuditShipperAndTripwireContract(unittest.TestCase):
                 f'shipper_timer_path="{tmr_path}"\n'
                 f'installed_projector="{prefix}/share/tendcf/bin/projector.py"\n'
                 f'installed_audit_log="{prefix}/share/tendcf/bin/audit_log.py"\n'
-                f'audit_etc_dir="{prefix}/etc"\n'
+                f'audit_etc_dir="{prefix}/etc/tendcf-audit"\n'
                 f'audit_shipper_cfg="{audit_cfg}"\n'
                 f'audit_spool_dir="{spool_dir}"\n'
                 f'tripwire_share_dir="{prefix}/share/tendcf/tripwire"\n'

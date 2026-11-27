@@ -75,7 +75,7 @@ check "audit_log.py installed root:root 0644 (non-symlink)" \
 check "python3 -I -S verifies installed projector standalone" \
     python3 -I -S /opt/tendcf/share/tendcf/bin/projector.py --check "$wd/data/host_specific.json"
 check "python3 -I -S runs installed audit_log shipper with disabled default config" \
-    python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py ship --config /opt/tendcf/etc/audit-shipper.json
+    python3 -I -S /opt/tendcf/share/tendcf/bin/audit_log.py ship --config /opt/tendcf/etc/tendcf-audit/audit-shipper.json
 check "data validated and placed" test -s "$wd/data/host_specific.json"
 check "packaged installer self-realpath install succeeds" \
     env -u LD_LIBRARY_PATH /opt/tendcf/share/tendcf/deploy/linux/tendcf-install.sh install --data /opt/tendcf/share/tendcf/deploy/linux/canary/host_specific.json

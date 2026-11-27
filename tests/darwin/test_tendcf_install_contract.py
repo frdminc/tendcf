@@ -2991,13 +2991,22 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 .replace("/bin/chmod -N", f"{noop_shim}")
                 .replace("/bin/launchctl", str(noop_shim))
             )
-            audit_cfg = prefix / "etc" / "audit-shipper.json"
+            audit_cfg = prefix / "etc" / "tendcf-audit" / "audit-shipper.json"
             spool_dir = prefix / "var" / "audit-spool"
             trip_dir = prefix / "share" / "tendcf" / "tripwire"
             osq_pack = osq_dir / "tendcf-tripwire.conf"
+            osq_conf_d_dir = root / "osquery_conf_d"
+            osq_conf_d_dir.mkdir()
+            osq_conf_d = osq_conf_d_dir / "99-tendcf-tripwire.conf"
             execd_plist = launchd_dir / "org.tendcf.execd.plist"
             shipper_plist = launchd_dir / "org.tendcf.audit-shipper.plist"
             execd_plist.write_text("<plist/>", encoding="utf-8")
+            # Simulate packaged OpenSSL etc/ssl (mode 0755) from macos-fork-build.yml:
+            # must coexist cleanly with private etc/tendcf-audit (0700).
+            (prefix / "etc" / "ssl").mkdir(parents=True, mode=0o755)
+            os.chmod(prefix / "etc", 0o755)
+            os.chmod(prefix / "etc" / "ssl", 0o755)
+            (prefix / "etc" / "ssl" / "openssl.cnf").write_text("# openssl\n", encoding="utf-8")
 
             env_setup = (
                 "set -euo pipefail\n"
@@ -3027,12 +3036,14 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 f'plist_path="{execd_plist}"\n'
                 f'shipper_plist_path="{shipper_plist}"\n'
                 f'installed_audit_log="{prefix}/share/tendcf/bin/audit_log.py"\n'
-                f'audit_etc_dir="{prefix}/etc"\n'
+                f'audit_etc_dir="{prefix}/etc/tendcf-audit"\n'
                 f'audit_shipper_cfg="{audit_cfg}"\n'
                 f'audit_spool_dir="{spool_dir}"\n'
                 f'tripwire_share_dir="{trip_dir}"\n'
                 f'osquery_packs_dir="{osq_dir}"\n'
                 f'osquery_pack_path="{osq_pack}"\n'
+                f'osquery_conf_d_dir="{osq_conf_d_dir}"\n'
+                f'osquery_conf_d_path="{osq_conf_d}"\n'
                 f"{fns_patched}\n"
             )
 
@@ -3041,7 +3052,9 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                     "/bin/bash",
                     "-c",
                     env_setup
+                    + "validate_existing_audit_state_before_repair\n"
                     + "place_audit_shipper_state\n"
+                    + "validate_existing_audit_state_before_repair\n"
                     + "place_tripwire_rules\n"
                     + f'render_shipper_plist "{shipper_plist}" "{sys.executable}"\n',
                 ],
@@ -3052,6 +3065,18 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(audit_cfg.is_file())
             self.assertEqual(stat.S_IMODE(audit_cfg.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((prefix / "etc").stat().st_mode), 0o755, "packaged etc/ must stay 0755")
+            self.assertTrue((prefix / "etc" / "ssl" / "openssl.cnf").is_file(), "packaged etc/ssl must remain intact")
+            self.assertTrue(osq_conf_d.is_file(), "osquery.conf.d drop-in must register tripwire pack when osquery.conf.d exists")
+            self.assertIn("tendcf_tripwire", osq_conf_d.read_text(encoding="utf-8"))
+            self.assertIn("registered via", r.stdout)
+            # When osquery.conf.d is absent, explicitly report staged-only status.
+            r_staged = subprocess.run(
+                ["/bin/bash", "-c", env_setup + f'osquery_conf_d_dir="{root}/no-conf-d"\nplace_tripwire_rules\n'],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r_staged.returncode, 0, r_staged.stderr)
+            self.assertIn("staged only", r_staged.stdout)
             self.assertTrue(shipper_plist.is_file())
             self.assertIn("--expected-spool-dir", shipper_plist.read_text(encoding="utf-8"))
             osq_obj = _json.loads((trip_dir / "osquery-fim.conf").read_text(encoding="utf-8"))
@@ -3126,7 +3151,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(r_un.returncode, 0, r_un.stderr)
-            for gone in (execd_plist, shipper_plist, osq_pack, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
+            for gone in (execd_plist, shipper_plist, osq_pack, osq_conf_d, audit_cfg, prefix / "share" / "tendcf" / "bin" / "audit_log.py"):
                 self.assertFalse(gone.exists(), f"uninstall left {gone} behind")
             self.assertTrue(unrelated_trip.is_file(), "H5: unrelated file under tripwire/ must survive uninstall")
             self.assertTrue((spool_dir / "audit.jsonl").is_file())
@@ -3164,11 +3189,11 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             backup = root / "opt" / "tendcf.old.999"
             stage = root / "stage"
             staged_tree = stage / "extract" / "tendcf"
-            (staged_tree / "etc").mkdir(parents=True)
+            (staged_tree / "etc" / "tendcf-audit").mkdir(parents=True)
             (staged_tree / "var" / "audit-spool").mkdir(parents=True)
             backup.mkdir(parents=True)
             enrolled = '{"enabled":true,"host":"macbook","spool_dir":"/opt/tendcf/var/audit-spool","src":"tendcf"}\n'
-            (staged_tree / "etc" / "audit-shipper.json").write_text(enrolled, encoding="utf-8")
+            (staged_tree / "etc" / "tendcf-audit" / "audit-shipper.json").write_text(enrolled, encoding="utf-8")
             (staged_tree / "var" / "audit-spool" / "audit.jsonl").write_text("rec1\n", encoding="utf-8")
             (staged_tree / "var" / "audit-spool" / "cursor.json").write_text('{"acked_seq":0}\n', encoding="utf-8")
 
@@ -3219,7 +3244,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             )
             r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, check=False)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual((prefix / "etc" / "audit-shipper.json").read_text(encoding="utf-8"), enrolled)
+            self.assertEqual((prefix / "etc" / "tendcf-audit" / "audit-shipper.json").read_text(encoding="utf-8"), enrolled)
             self.assertEqual((prefix / "var" / "audit-spool" / "audit.jsonl").read_text(encoding="utf-8"), "rec1\n")
             self.assertEqual(shipper_plist.read_text(encoding="utf-8"), old_plist, "M3: original shipper plist contents must be restored")
             self.assertIn("OLD_V1_SHIPPER", log_file.read_text(encoding="utf-8"), "M3: bootstrap must run AFTER old plist is restored")
@@ -3385,6 +3410,19 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertIn("incomplete", r5.stderr)
 
             # H1: Unsafe pre-existing shipper plist (world-writable 0666) is refused BEFORE any launchctl call.
+            # Use a portable BSD-stat shim so this test passes identically on Linux CI and macOS.
+            bsd_stat_shim = root / "bsd_stat_shim"
+            bsd_stat_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import os, stat, sys\n"
+                "st = os.lstat(sys.argv[-1])\n"
+                "print(f'root wheel {stat.S_IMODE(st.st_mode):o} {st.st_nlink}')\n",
+                encoding="utf-8",
+            )
+            bsd_stat_shim.chmod(0o755)
+            no_xattr = root / "no_xattr"
+            no_xattr.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            no_xattr.chmod(0o755)
             unsafe_plist = root / "unsafe_shipper.plist"
             unsafe_plist.write_text("<plist>UNTRUSTED</plist>\n", encoding="utf-8")
             os.chmod(unsafe_plist, 0o666)
@@ -3393,12 +3431,10 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             lc_h1.write_text(f"#!/bin/sh\necho \"$*\" >> '{lc_h1_log}'\nexit 0\n", encoding="utf-8")
             lc_h1.chmod(0o755)
             fn_h1 = (
-                _extract_func(self.src, "has_acl_path")
-                + "\n"
-                + _extract_func(self.src, "validate_existing_launchd_plist_trusted")
+                _extract_func(self.src, "validate_existing_launchd_plist_trusted")
                 + "\n"
                 + _extract_func(self.src, "enable_audit_shipper")
-            ).replace("/bin/launchctl", str(lc_h1)).replace('"$owner" != root', "false").replace('"$group" != wheel', "false")
+            ).replace("/bin/launchctl", str(lc_h1)).replace("/usr/bin/stat", str(bsd_stat_shim)).replace("/usr/bin/xattr", str(no_xattr))
             inst_al = root / "audit_log.py"
             inst_al.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             r_h1 = subprocess.run(
@@ -3408,6 +3444,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                     "set -euo pipefail\n"
                     'die() { echo "tendcf-install: $*" >&2; exit 1; }\n'
                     "check_launchd_dir() { return 0; }\n"
+                    "has_acl_path() { return 1; }\n"
                     f'installed_audit_log="{inst_al}"\n'
                     f'shipper_plist_path="{unsafe_plist}"\n'
                     'shipper_label="org.tendcf.audit-shipper"\n'
@@ -3435,12 +3472,11 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             fn_h2 = "\n".join(
                 _extract_func(self.src, n)
                 for n in (
-                    "has_acl_path",
                     "validate_existing_launchd_plist_trusted",
                     "preflight_existing_launchd_plists",
                     "cmd_enable",
                 )
-            ).replace('"$owner" != root', "false").replace('"$group" != wheel', "false")
+            ).replace("/usr/bin/stat", str(bsd_stat_shim)).replace("/usr/bin/xattr", str(no_xattr))
             mut_log = root / "h2_mut.log"
             for case_name, ep, sp in (
                 ("unsafe-execd", bad_execd, good_ship),
@@ -3458,6 +3494,7 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
                         "release_publish_lock() { return 0; }\n"
                         "init_paths() { return 0; }\n"
                         "check_launchd_dir() { return 0; }\n"
+                        "has_acl_path() { return 1; }\n"
                         f'enable_execd() {{ echo "execd" >> "{mut_log}"; }}\n'
                         f'enable_audit_shipper() {{ echo "shipper" >> "{mut_log}"; }}\n'
                         f'plist_path="{ep}"\n'
@@ -3553,7 +3590,8 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             self.assertEqual((prefix6 / "marker").read_text(encoding="utf-8"), "new-tree\n", "M1: must not swap prefix under running unquiesced job")
             self.assertEqual((backup6 / "marker").read_text(encoding="utf-8"), "old-tree\n", "M1: backup prefix must remain intact for recovery")
 
-            # R6-M1: Successful prefix rename, but workdir host_specific.json snapshot restore fails:
+            # R6-M1 & R7-N1: Successful prefix rename, but workdir host_specific.json snapshot restore fails
+            # (forced via a failing /bin/cp stub so test is UID-independent even under root):
             # saved snapshot bytes MUST remain intact, ZERO bootstraps may run, and incomplete rollback reported.
             stage7 = root / "stage7"
             snap_dir7 = stage7 / "upgrade-var-backup"
@@ -3565,52 +3603,96 @@ class DarwinAuditShipperAndTripwireContract(unittest.TestCase):
             wd7_data.mkdir(parents=True)
             prefix7 = root / "opt" / "tendcf7"
             bs_log7 = root / "bs7.log"
-            os.chmod(wd7_data, 0o500)  # make workdir/data unwritable so cp into restored prefix fails!
-            try:
-                script7 = (
-                    "set -euo pipefail\n"
-                    f'prefix="{prefix7}"\n'
-                    f'upgrade_backup_prefix="{backup7}"\n'
-                    'upgrade_staged_tree=""\n'
-                    'upgrade_rollback_armed=1\n'
-                    'upgrade_had_var=1\n'
-                    'upgrade_had_etc=0\n'
-                    'upgrade_moved_var=0\n'
-                    'upgrade_moved_etc=0\n'
-                    'upgrade_was_loaded=1\n'
-                    'upgrade_had_plist=1\n'
-                    'upgrade_shipper_was_loaded=1\n'
-                    'upgrade_shipper_prior_disabled="enabled"\n'
-                    'upgrade_had_shipper_plist=1\n'
-                    'upgrade_saved_shipper_plist=""\n'
-                    'upgrade_snapshot_taken=1\n'
-                    f'upgrade_saved_workdir="{prefix7}/var/libntech"\n'
-                    'upgrade_saved_inputs=0\n'
-                    'upgrade_saved_data=1\n'
-                    f'plist_path="{execd_plist6}"\n'
-                    f'shipper_plist_path="{live_plist6}"\n'
-                    'label="org.tendcf.execd"\n'
-                    'shipper_label="org.tendcf.audit-shipper"\n'
-                    f'stage_dir="{stage7}"\n'
-                    'publish_lock_held=0\n'
-                    'put_data_rollback_armed=0\n'
-                    'execd_is_loaded() { return 1; }\n'
-                    'shipper_is_loaded() { return 1; }\n'
-                    f'bootstrap_execd_with_retry() {{ echo "execd" >> "{bs_log7}"; return 0; }}\n'
-                    f'bootstrap_shipper_with_retry() {{ echo "shipper" >> "{bs_log7}"; return 0; }}\n'
-                    f"{cs_fn}\n"
-                    "cleanup_stage\n"
-                )
-                r7 = subprocess.run(["/bin/bash", "-c", script7], capture_output=True, text=True, check=False)
-                self.assertEqual(r7.returncode, 0, r7.stderr)
-                self.assertTrue(saved_data7.is_file(), "R6-M1: saved snapshot bytes must remain intact when workdir restore fails")
-                self.assertEqual(saved_data7.read_text(encoding="utf-8"), '{"saved":"precious"}\n')
-                self.assertFalse(bs_log7.exists(), "R6-M1: ZERO bootstraps allowed when workdir snapshot restore fails")
-                self.assertIn("incomplete", r7.stderr)
-            finally:
-                for p_fix in (wd7_data, prefix7 / "var" / "libntech" / "data"):
-                    if p_fix.exists():
-                        os.chmod(p_fix, 0o700)
+            fail_cp = root / "fail_cp"
+            fail_cp.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fail_cp.chmod(0o755)
+            cs_fail_cp = cs_fn.replace("/bin/cp", str(fail_cp))
+            script7 = (
+                "set -euo pipefail\n"
+                f'prefix="{prefix7}"\n'
+                f'upgrade_backup_prefix="{backup7}"\n'
+                'upgrade_staged_tree=""\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=1\n'
+                'upgrade_had_etc=0\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
+                'upgrade_was_loaded=1\n'
+                'upgrade_had_plist=1\n'
+                'upgrade_shipper_was_loaded=1\n'
+                'upgrade_shipper_prior_disabled="enabled"\n'
+                'upgrade_had_shipper_plist=1\n'
+                'upgrade_saved_shipper_plist=""\n'
+                'upgrade_snapshot_taken=1\n'
+                f'upgrade_saved_workdir="{prefix7}/var/libntech"\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=1\n'
+                f'plist_path="{execd_plist6}"\n'
+                f'shipper_plist_path="{live_plist6}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'stage_dir="{stage7}"\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 1; }\n'
+                'shipper_is_loaded() { return 1; }\n'
+                f'bootstrap_execd_with_retry() {{ echo "execd" >> "{bs_log7}"; return 0; }}\n'
+                f'bootstrap_shipper_with_retry() {{ echo "shipper" >> "{bs_log7}"; return 0; }}\n'
+                f"{cs_fail_cp}\n"
+                "cleanup_stage\n"
+            )
+            r7 = subprocess.run(["/bin/bash", "-c", script7], capture_output=True, text=True, check=False)
+            self.assertEqual(r7.returncode, 0, r7.stderr)
+            self.assertTrue(saved_data7.is_file(), "R6-M1: saved snapshot bytes must remain intact when workdir restore fails")
+            self.assertEqual(saved_data7.read_text(encoding="utf-8"), '{"saved":"precious"}\n')
+            self.assertFalse(bs_log7.exists(), "R6-M1: ZERO bootstraps allowed when workdir snapshot restore fails")
+            self.assertIn("incomplete", r7.stderr)
+
+            # Macroscope #4714558789: Early execd bootout failure before shipper plist changed must NOT boot out running shipper!
+            stage8 = root / "stage8"
+            stage8.mkdir()
+            unchanged_plist = root / "shipper8.plist"
+            unchanged_plist.write_text("<plist>SAME</plist>\n", encoding="utf-8")
+            saved8 = stage8 / "upgrade-shipper.plist.prev"
+            saved8.write_text("<plist>SAME</plist>\n", encoding="utf-8")
+            bootout8_log = root / "bootout8.log"
+            script8 = (
+                "set -euo pipefail\n"
+                f'prefix="{root}/opt/tendcf8"\n'
+                'upgrade_backup_prefix=""\n'
+                'upgrade_staged_tree=""\n'
+                'upgrade_rollback_armed=1\n'
+                'upgrade_had_var=0\n'
+                'upgrade_had_etc=0\n'
+                'upgrade_moved_var=0\n'
+                'upgrade_moved_etc=0\n'
+                'upgrade_was_loaded=1\n'
+                'upgrade_had_plist=1\n'
+                'upgrade_shipper_was_loaded=1\n'
+                'upgrade_shipper_prior_disabled="enabled"\n'
+                'upgrade_had_shipper_plist=1\n'
+                f'upgrade_saved_shipper_plist="{saved8}"\n'
+                'upgrade_snapshot_taken=0\n'
+                'upgrade_saved_workdir=""\n'
+                'upgrade_saved_inputs=0\n'
+                'upgrade_saved_data=0\n'
+                f'plist_path="{execd_plist6}"\n'
+                f'shipper_plist_path="{unchanged_plist}"\n'
+                'label="org.tendcf.execd"\n'
+                'shipper_label="org.tendcf.audit-shipper"\n'
+                f'stage_dir="{stage8}"\n'
+                'publish_lock_held=0\n'
+                'put_data_rollback_armed=0\n'
+                'execd_is_loaded() { return 0; }\n'
+                'shipper_is_loaded() { return 0; }\n'
+                f'bootout_shipper() {{ echo "booted_out" >> "{bootout8_log}"; return 0; }}\n'
+                'wait_shipper_unloaded() { return 0; }\n'
+                f"{cs_fn}\n"
+                "cleanup_stage\n"
+            )
+            r8 = subprocess.run(["/bin/bash", "-c", script8], capture_output=True, text=True, check=False)
+            self.assertEqual(r8.returncode, 0, r8.stderr)
+            self.assertFalse(bootout8_log.exists(), "untouched running shipper must NOT be booted out when saved plist matches live plist")
 
 
 if __name__ == "__main__":

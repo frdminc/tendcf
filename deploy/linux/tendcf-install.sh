@@ -89,7 +89,7 @@ audit_log_src=""
 audit_log_sha256=""
 audit_log_explicit=0
 installed_audit_log="$prefix/share/tendcf/bin/audit_log.py"
-audit_etc_dir="$prefix/etc"
+audit_etc_dir="$prefix/etc/tendcf-audit"
 audit_shipper_cfg="$audit_etc_dir/audit-shipper.json"
 audit_spool_dir="$prefix/var/audit-spool"
 tripwire_share_dir="$prefix/share/tendcf/tripwire"
@@ -112,6 +112,7 @@ prepared_audit_log_file=""
 audit_log_prepared=0
 installed_audit_log_originally_clean=0
 lifecycle_lock_held=0
+spool_scan_lock_held=0
 put_data_stage_wd=""
 put_data_tmp=""
 put_data_backup=""
@@ -184,6 +185,10 @@ cleanup_temp() {
     if [ -n "${probe_tmp:-}" ]; then
         rm -f "$probe_tmp" || true
         probe_tmp=""
+    fi
+    if [ "${spool_scan_lock_held:-0}" -eq 1 ]; then
+        exec 7>&-
+        spool_scan_lock_held=0
     fi
     if [ "${lifecycle_lock_held:-0}" -eq 1 ]; then
         exec 8>&-
@@ -887,6 +892,7 @@ validate_existing_audit_state_before_repair() {
         die "unexpected bytecode cache at $prefix/share/tendcf/bin/__pycache__; refusing"
     fi
     if [ -e "$audit_etc_dir" ] || [ -L "$audit_etc_dir" ]; then
+        check_dir_root_unwritable "$prefix/etc"
         check_private_dir_exact "$audit_etc_dir"
         if [ -e "$audit_shipper_cfg" ] || [ -L "$audit_shipper_cfg" ]; then
             check_private_file_exact "$audit_shipper_cfg"
@@ -895,6 +901,19 @@ validate_existing_audit_state_before_repair() {
     if [ -e "$audit_spool_dir" ] || [ -L "$audit_spool_dir" ]; then
         check_dir_root_unwritable "$prefix/var"
         check_private_dir_exact "$audit_spool_dir"
+        # Serialize spool inspection with any running shipper/emitter holding
+        # .spool.lock so atomic .cursor.json.tmp.* renames never race the scan.
+        local spool_lock="$audit_spool_dir/.spool.lock"
+        if [ -e "$spool_lock" ] || [ -L "$spool_lock" ]; then
+            check_private_file_exact "$spool_lock"
+            exec 7<"$spool_lock"
+            spool_scan_lock_held=1
+            if ! flock -x 7; then
+                exec 7>&-
+                spool_scan_lock_held=0
+                die "failed to acquire $spool_lock before spool validation"
+            fi
+        fi
         local had_nullglob=0 had_dotglob=0 ent
         shopt -q nullglob && had_nullglob=1
         shopt -q dotglob && had_dotglob=1
@@ -906,6 +925,10 @@ validate_existing_audit_state_before_repair() {
         done
         if [ "$had_nullglob" -eq 0 ]; then shopt -u nullglob; fi
         if [ "$had_dotglob" -eq 0 ]; then shopt -u dotglob; fi
+        if [ "${spool_scan_lock_held:-0}" -eq 1 ]; then
+            exec 7>&-
+            spool_scan_lock_held=0
+        fi
     fi
 }
 
@@ -979,12 +1002,18 @@ place_audit_shipper_state() {
     check_ancestors_ok "$prefix" || die "unsafe ancestor above $prefix"
     check_dir_root_unwritable "$prefix"
     local d
-    for d in "$audit_etc_dir" "$prefix/var" "$audit_spool_dir"; do
+    for d in "$prefix/etc" "$audit_etc_dir" "$prefix/var" "$audit_spool_dir"; do
         [ ! -L "$d" ] || die "$d is a symlink; refusing"
         if [ -e "$d" ] && [ ! -d "$d" ]; then
             die "$d is not a directory; refusing"
         fi
     done
+    if [ -d "$prefix/etc" ]; then
+        check_dir_root_unwritable "$prefix/etc"
+    else
+        install -d -m 0755 -o root -g root "$prefix/etc"
+        check_dir_root_unwritable "$prefix/etc"
+    fi
     if [ -d "$audit_etc_dir" ]; then
         check_private_dir_exact "$audit_etc_dir"
     else
