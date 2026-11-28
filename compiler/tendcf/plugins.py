@@ -12,12 +12,15 @@ Implements `docs/architecture/plugin-layout.md` §3–§4 (decision D-a + 2026-1
    bytes directly from the fd (bypassing `__pycache__/*.pyc` and leaf symlink TOCTOU).
 3. Out-of-tree plugins (`tendcf.frontends` and `tendcf.importers`, unlocked by #47) load ONLY
    when explicitly pinned in site-private `plugins.toml` (`source = "out-of-tree"`), unexpired,
-   not revoked under the site's revocation policy, and verified inside an isolated plugin
-   environment via our non-deduplicating `*.dist-info` scanner (`plugin_env.py`).
+   not revoked (primary OR signing subkey) and still reachable from current trust anchors (M3),
+   anchored byte-for-byte against SHA-256-verified pinned wheels with zero `__pycache__`/`.pyc`
+   (H1), and imported with `dont_write_bytecode=True` + private `pycache_prefix` + full
+   post-import verification of newly loaded modules (H1.3, L6).
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import importlib
@@ -25,16 +28,13 @@ import importlib.machinery
 import os
 import stat
 import sys
-from collections.abc import Mapping
+import tempfile
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Any
-
-# Note: plugin_manifest / plugin_env / plugin_wot are imported lazily inside out-of-tree
-# loader functions to avoid circular imports (plugin_manifest imports RESERVED_PLUGIN_NAMES
-# and STATIC_PLUGIN_TABLE from this module).
 
 
 class PluginError(Exception):
@@ -300,12 +300,7 @@ def resolve_contrib_plugin_path(
 
 
 def exec_verified_source_module(module_name: str, resolved_file: Path) -> ModuleType:
-    """Open `resolved_file` with `O_NOFOLLOW`, verify `S_ISREG`, and exec source directly.
-
-    Bypasses `__pycache__/*.pyc` completely and eliminates leaf symlink TOCTOU.
-    Registers `sys.modules[module_name]` before execution (Python 3.14+ dataclasses
-    requirement) and cleans up on failure while preserving `KeyboardInterrupt`/`SystemExit`.
-    """
+    """Open `resolved_file` with `O_NOFOLLOW`, verify `S_ISREG`, and exec source directly."""
     flags = os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
     try:
         fd = os.open(resolved_file, flags)
@@ -424,6 +419,40 @@ def load_contrib_plugin(
     return module
 
 
+@contextlib.contextmanager
+def plugin_env_import_context(resolved_env: Path) -> Iterator[None]:
+    """Scope `sys.path`, `sys.dont_write_bytecode`, and private `sys.pycache_prefix` for out-of-tree plugin execution (H1.3, L6)."""
+    saved_path = list(sys.path)
+    saved_dont_write = sys.dont_write_bytecode
+    saved_pycache_prefix = sys.pycache_prefix
+    with tempfile.TemporaryDirectory(prefix="tendcf-pycache.") as pycache_td:
+        os.chmod(pycache_td, 0o700)
+        sys.dont_write_bytecode = True
+        sys.pycache_prefix = pycache_td
+        sys.path.insert(0, str(resolved_env))
+        importlib.invalidate_caches()
+        try:
+            yield
+        finally:
+            sys.path[:] = saved_path
+            sys.dont_write_bytecode = saved_dont_write
+            sys.pycache_prefix = saved_pycache_prefix
+            importlib.invalidate_caches()
+
+
+def _is_allowed_system_module_file(mod_file: Path, tendcf_root: Path | None) -> bool:
+    """True for Python stdlib, base compiler package (`tendcf`), or locked base compiler deps."""
+    stdlib_dir = Path(os.__file__).resolve().parent
+    if mod_file.is_relative_to(stdlib_dir):
+        return True
+    if tendcf_root is not None and mod_file.is_relative_to((tendcf_root / "compiler").resolve()):
+        return True
+    # Base compiler deps (pyyaml, jsonschema, rfc8785) may already live in active interpreter prefix.
+    prefix_dir = Path(sys.prefix).resolve()
+    base_prefix_dir = Path(sys.base_prefix).resolve()
+    return mod_file.is_relative_to(prefix_dir) or mod_file.is_relative_to(base_prefix_dir)
+
+
 def load_out_of_tree_plugin(
     kind: str,
     name: str,
@@ -437,22 +466,25 @@ def load_out_of_tree_plugin(
 ) -> Any:
     """Load an explicitly pinned out-of-tree `frontend` or `importer` plugin from an isolated env.
 
-    Enforces:
-    - Supervisor renderers are never loadable out-of-tree.
-    - Built-in names are reserved and unconditionally refused.
-    - Exact pin must exist in `plugins.toml` (`source = "out-of-tree"`).
-    - Signer key must not be revoked (hard or soft) and manifest must not be expired (`expires_at > now`).
-    - Isolated `plugin_env` passes full symlink/startup-hook/receipt/RECORD/non-dedup dist-info checks.
-    - Loaded module resolves strictly inside `plugin_env` (never ambient `site-packages` or `tendcf`).
+    Enforces (H1, M3, L3, L6):
+    - Supervisor renderers are never loadable out-of-tree; built-in names are reserved.
+    - Exact pin must exist in `plugins.toml` (`source = "out-of-tree"`), unexpired (`expires_at > now`).
+    - Primary AND signing subkey fingerprints must not be revoked; when `site_root` is provided and
+      trust anchors exist, verifies signer is STILL reachable in the current Web of Trust (M3).
+    - Isolated `plugin_env` passes full byte-for-byte pinned-wheel anchoring, zero `__pycache__`/`.pyc`,
+      receipt digest, RECORD, and non-deduplicating `*.dist-info` checks (H1).
+    - Imports with `dont_write_bytecode=True` and fresh private `sys.pycache_prefix`; verifies the
+      target module resolves strictly inside `plugin_env` and checks every newly loaded module (H1.3, L6).
     """
     from .plugin_env import PluginEnvError, discover_env_entry_points
     from .plugin_manifest import (
         ALLOWED_ENTRY_POINT_GROUPS,
+        PluginManifestError,
         normalize_dist_name,
         parse_rfc3339_utc,
         utc_now,
     )
-    from .plugin_wot import PluginTrustError, evaluate_revocation_policy
+    from .plugin_wot import PluginTrustError, evaluate_revocation_policy, verify_signer_reachable_in_wot
 
     if kind not in ("frontend", "importer"):
         raise PluginError(
@@ -470,7 +502,10 @@ def load_out_of_tree_plugin(
         )
 
     current_time = now if now is not None else utc_now()
-    expires_dt = parse_rfc3339_utc(pin.expires_at, label="pin.expires_at")
+    try:
+        expires_dt = parse_rfc3339_utc(pin.expires_at, label="pin.expires_at")
+    except PluginManifestError as exc:
+        raise PluginError(str(exc)) from exc
     if current_time >= expires_dt:
         raise PluginError(
             f"out-of-tree {kind} plugin {name!r} pin expired at {pin.expires_at} "
@@ -478,12 +513,23 @@ def load_out_of_tree_plugin(
         )
 
     try:
-        evaluate_revocation_policy(
-            pin.signer_fingerprint,
-            config.trust,
-            historical=False,
-            as_of=current_time,
-        )
+        # Check BOTH primary and signing subkey fingerprints against revocations (M3.2).
+        for fpr in sorted({pin.signer_fingerprint, pin.signing_subkey_fingerprint or pin.signer_fingerprint}):
+            evaluate_revocation_policy(
+                fpr,
+                config.trust,
+                historical=False,
+                as_of=current_time,
+            )
+        # Re-check live WoT reachability when site_root is present (M3.1 & M3.3: catches removed anchor / revoked introducer!).
+        if site_root is not None:
+            verify_signer_reachable_in_wot(
+                pin.signer_fingerprint,
+                signing_subkey_fingerprint=pin.signing_subkey_fingerprint,
+                site_root=site_root,
+                policy=config.trust,
+                historical=False,
+            )
     except PluginTrustError as exc:
         raise PluginError(str(exc)) from exc
 
@@ -495,7 +541,7 @@ def load_out_of_tree_plugin(
             site_root=site_root,
             check_releasable=check_releasable,
         )
-    except PluginEnvError as exc:
+    except (PluginEnvError, PluginManifestError, OSError) as exc:
         raise PluginError(str(exc)) from exc
 
     group = ALLOWED_ENTRY_POINT_GROUPS[kind]
@@ -518,16 +564,12 @@ def load_out_of_tree_plugin(
 
     mod_name, _, attr_path = ep.value.partition(":")
     resolved_env = plugin_env.resolve(strict=True)
-    env_str = str(resolved_env)
 
-    # Import strictly with `resolved_env` at front of sys.path, refusing any module whose
-    # resolved __file__ does not live strictly inside `resolved_env`.
     top_pkg = mod_name.split(".", 1)[0]
     if top_pkg in ("tendcf", "nix2cf"):
         raise PluginError(f"out-of-tree plugin entry point {ep.value!r} attempts to shadow {top_pkg!r}")
 
-    saved_path = list(sys.path)
-    # Remove any prior cached copy of this plugin module loaded from a different directory.
+    # Evict any prior cached copy of this plugin package loaded from a different directory.
     prior_mod = sys.modules.get(mod_name)
     if prior_mod is not None:
         prior_file = getattr(prior_mod, "__file__", None)
@@ -535,24 +577,45 @@ def load_out_of_tree_plugin(
             for k in [m for m in list(sys.modules) if m == top_pkg or m.startswith(top_pkg + ".")]:
                 sys.modules.pop(k, None)
 
-    sys.path.insert(0, env_str)
-    importlib.invalidate_caches()
-    try:
-        mod = importlib.import_module(mod_name)
-    except Exception as exc:
-        raise PluginError(f"failed to import out-of-tree plugin module {mod_name!r}: {exc}") from exc
-    finally:
-        sys.path[:] = saved_path
+    before_modules = set(sys.modules)
+    with plugin_env_import_context(resolved_env):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:
+            raise PluginError(f"failed to import out-of-tree plugin module {mod_name!r}: {exc}") from exc
 
     mod_file = getattr(mod, "__file__", None)
     if not isinstance(mod_file, str):
         raise PluginError(f"out-of-tree plugin module {mod_name!r} has no __file__ (refused)")
     resolved_mod_file = Path(mod_file).resolve(strict=True)
+    if resolved_mod_file.suffix.lower() in (".pyc", ".pyo") or "__pycache__" in resolved_mod_file.parts:
+        raise PluginError(
+            f"out-of-tree plugin module {mod_name!r} resolved to bytecode {resolved_mod_file} (refused)"
+        )
     if not resolved_mod_file.is_relative_to(resolved_env):
         raise PluginError(
             f"out-of-tree plugin module {mod_name!r} loaded from {resolved_mod_file}, "
             f"outside isolated plugin env {resolved_env} (ambient shadowing refused)"
         )
+
+    # L6: Verify every newly imported module came from resolved_env or allowed stdlib/base-compiler paths,
+    # never from stray bytecode or an unrelated directory on sys.path.
+    for new_name in sorted(set(sys.modules) - before_modules):
+        new_mod = sys.modules.get(new_name)
+        new_file = getattr(new_mod, "__file__", None)
+        if not isinstance(new_file, str):
+            continue
+        p = Path(new_file).resolve(strict=False)
+        if p.is_relative_to(resolved_env):
+            if p.suffix.lower() in (".pyc", ".pyo") or "__pycache__" in p.parts:
+                raise PluginError(
+                    f"out-of-tree plugin import loaded unexpected bytecode inside plugin env: {p}"
+                )
+        elif not _is_allowed_system_module_file(p, tendcf_root):
+            raise PluginError(
+                f"out-of-tree plugin {name!r} imported unexpected external module {new_name!r} from {p} "
+                f"(outside isolated plugin env {resolved_env})"
+            )
 
     obj: Any = mod
     for part in attr_path.split("."):
@@ -575,12 +638,7 @@ def load_configured_plugin(
     check_releasable: bool = False,
     now: datetime | None = None,
 ) -> Any:
-    """Resolve and load a `frontend` or `importer` plugin respecting `plugins.toml` activation rules.
-
-    - If `config` is `None`: loads built-in in-tree plugins from `STATIC_PLUGIN_TABLE` only.
-    - If `config` is provided: enforces Activation step 3 ("only named plugins are loaded"):
-      the plugin must be named in `plugins.toml` as `in-tree`, `contrib`, or `out-of-tree`.
-    """
+    """Resolve and load a `frontend` or `importer` plugin respecting `plugins.toml` activation rules."""
     if kind == "supervisor":
         return load_plugin("supervisor", name, tendcf_root=tendcf_root)
 

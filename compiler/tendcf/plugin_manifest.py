@@ -2,20 +2,20 @@
 
 Implements issue #47 (operator rulings 2026-11-28) and `docs/architecture/plugin-layout.md` §4:
 - Offline deterministic trust store inside `site-private` (`plugins.toml` + `plugins/keyring/`).
-- Bounded Web of Trust configuration (`max_depth` in 0..2, default 1; full & marginal thresholds).
+- Bounded Web of Trust configuration (`max_depth` in 0..2, default 1; full & marginal thresholds;
+  `max_validity_days` anti-freeze ceiling).
 - Soft vs hard key revocations (`soft`: blocks add/update & future releases, permits pre-revocation
   historical rebuilds; `hard`: blocks all verification including historical rebuilds).
-- Explicit plugin pins:
-  - `in-tree` (built-in `plugins/`) and `contrib` (`contrib/`) named explicitly, inheriting the
-    verified tendcf git pin.
-  - `out-of-tree` (frontends & importers ONLY; supervisors unconditionally refused) pinned by
-    distribution, version, entry point, wheel SHA-256, full transitive wheel-only dependency
-    closure, OpenPGP signer fingerprint, monotonic `release_seq` (anti-rollback), `issued_at`,
-    `expires_at` (anti-freeze), `manifest_sha256`, and `verified_at`.
+- Explicit plugin pins (`in-tree`, `contrib`, `out-of-tree` frontends/importers only; supervisors
+  unconditionally refused), recording both `signer_fingerprint` (primary) and
+  `signing_subkey_fingerprint` (signing key/subkey) for full revocation & rotation enforcement.
+- Anti-rollback tombstones (`[[plugin_floors]]`) preserved on `remove` so `remove` + `add`
+  cannot downgrade `release_seq` or swap signers silently.
 - Dependency-confusion protection: `tendcf` and `nix2cf` are unconditionally forbidden as
   pinned external plugin or transitive dependency distributions.
-- Deterministic RFC 8785 `plugin_set_digest()` so Gate 5 detects any privileged change to
-  trust anchors, revocations, plugin pins, or `external_import.without_ai`.
+- Deterministic RFC 8785 `plugin_set_digest(site_root=...)` covering `[external_import]`,
+  `[trust]` (including SHA-256 of every imported keyring file when `site_root` is provided),
+  `[[plugins]]`, and `[[plugin_floors]]` so Gate 5 detects every privileged trust or plugin change.
 """
 
 from __future__ import annotations
@@ -43,6 +43,10 @@ RELEASE_MANIFEST_SCHEMA_VERSION = 1
 
 MAX_TOML_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_KEY_DIGEST_FILE_BYTES = 1024 * 1024
+
+DEFAULT_MAX_VALIDITY_DAYS = 365
+MAX_ALLOWED_VALIDITY_DAYS = 3650
 
 ALLOWED_WITHOUT_AI = frozenset({"require-human-ack", "warn", "refuse"})
 ALLOWED_BACKENDS = frozenset({"auto", "sequoia", "gpg"})
@@ -55,6 +59,7 @@ ALLOWED_ENTRY_POINT_GROUPS = {
     "importer": "tendcf.importers",
 }
 FORBIDDEN_EXTERNAL_DISTRIBUTIONS = frozenset({"tendcf", "nix2cf"})
+KEYRING_FILE_EXTS = frozenset({".asc", ".gpg", ".pgp", ".pub", ".rev"})
 
 # Strict RFC 3339 UTC timestamp: YYYY-MM-DDTHH:MM:SSZ (no fractional seconds/offsets/newlines).
 RFC3339_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
@@ -72,7 +77,7 @@ ENTRY_POINT_RE = re.compile(
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}\Z")
 # PEP 427 wheel filename grammar.
 WHEEL_FILENAME_RE = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?-[A-Za-z0-9._+!]+(?:-[0-9][A-Za-z0-9._]*)?-[A-Za-z0-9._]+-[A-Za-z0-9._]+-[A-Za-z0-9._]+\.whl\Z"
+    r"^(?P<dist>[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?)-(?P<ver>[A-Za-z0-9._+!]+)(?:-[0-9][A-Za-z0-9._]*)?-[A-Za-z0-9._]+-[A-Za-z0-9._]+-[A-Za-z0-9._]+\.whl\Z"
 )
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -160,6 +165,14 @@ def validate_wheel_filename(value: Any, *, label: str = "wheel filename") -> str
             f"invalid {label} {value!r}: wheels only (PEP 427 *.whl filename required; sdists refused)"
         )
     return value
+
+
+def parse_wheel_filename_parts(filename: str) -> tuple[str, str]:
+    """Return `(normalized_dist, version)` from a validated PEP 427 wheel filename."""
+    m = WHEEL_FILENAME_RE.match(filename)
+    if not m:
+        raise PluginManifestError(f"invalid PEP 427 wheel filename: {filename!r}")
+    return normalize_dist_name(m.group("dist")), m.group("ver")
 
 
 def validate_external_distribution(value: Any, *, label: str = "distribution") -> str:
@@ -257,6 +270,53 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return dict(pairs)
 
 
+def compute_keyring_file_digests(site_root: Path, keyring_rel: str) -> list[dict[str, str]]:
+    """Return sorted `[{"filename": name, "sha256": hex}, ...]` for all imported keyring files.
+
+    Returns `[]` if the keyring directory does not exist yet; fails closed on symlinks or escapes.
+    """
+    try:
+        st_site = os.lstat(site_root)
+    except OSError as exc:
+        raise PluginManifestError(f"cannot inspect site directory {site_root}: {exc}") from exc
+    if stat.S_ISLNK(st_site.st_mode) or not stat.S_ISDIR(st_site.st_mode):
+        raise PluginManifestError(f"site directory must be a real non-symlink directory: {site_root}")
+    resolved_site = site_root.resolve(strict=True)
+
+    cur = resolved_site
+    for part in keyring_rel.split("/"):
+        if part in ("", ".", ".."):
+            raise PluginManifestError(f"unsafe keyring_dir component in {keyring_rel!r}")
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise PluginManifestError(f"cannot inspect keyring directory {cur}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise PluginManifestError(f"keyring directory component must be a real non-symlink directory: {cur}")
+    resolved_kr = cur.resolve(strict=True)
+    if not resolved_kr.is_relative_to(resolved_site):
+        raise PluginManifestError(f"keyring directory {resolved_kr} escapes site directory {resolved_site}")
+
+    digests: list[dict[str, str]] = []
+    for entry in sorted(os.scandir(resolved_kr), key=lambda e: e.name):
+        if entry.name.startswith("."):
+            continue
+        p = Path(entry.path)
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            raise PluginManifestError(f"symlink forbidden inside site-private keyring: {p}")
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if p.suffix.lower() not in KEYRING_FILE_EXTS:
+            continue
+        raw = read_regular_file_bytes(p, max_bytes=MAX_KEY_DIGEST_FILE_BYTES, label=f"keyring file {entry.name}")
+        digests.append({"filename": entry.name, "sha256": hashlib.sha256(raw).hexdigest()})
+    return digests
+
+
 @dataclass(frozen=True)
 class TrustAnchor:
     fingerprint: str
@@ -303,20 +363,25 @@ class TrustPolicy:
     max_depth: int = 1
     marginal_threshold: int = 2
     full_threshold: int = 1
+    max_validity_days: int = DEFAULT_MAX_VALIDITY_DAYS
     backend: str = "auto"
     anchors: tuple[TrustAnchor, ...] = ()
     revocations: tuple[KeyRevocation, ...] = ()
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, keyring_files: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "keyring_dir": self.keyring_dir,
             "max_depth": self.max_depth,
             "marginal_threshold": self.marginal_threshold,
             "full_threshold": self.full_threshold,
+            "max_validity_days": self.max_validity_days,
             "backend": self.backend,
-            "anchors": [a.to_dict() for a in self.anchors],
-            "revocations": [r.to_dict() for r in self.revocations],
+            "anchors": [a.to_dict() for a in sorted(self.anchors, key=lambda x: x.fingerprint)],
+            "revocations": [r.to_dict() for r in sorted(self.revocations, key=lambda x: x.fingerprint)],
         }
+        if keyring_files is not None:
+            out["keyring_files"] = keyring_files
+        return out
 
 
 @dataclass(frozen=True)
@@ -332,6 +397,26 @@ class WheelDependencyPin:
             "version": self.version,
             "filename": self.filename,
             "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class PluginFloor:
+    """Anti-rollback tombstone preserved across `remove` -> `add` (M5)."""
+
+    name: str
+    kind: str  # "frontend" | "importer"
+    distribution: str
+    min_release_seq: int
+    signer_fingerprint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "distribution": self.distribution,
+            "min_release_seq": self.min_release_seq,
+            "signer_fingerprint": self.signer_fingerprint,
         }
 
 
@@ -353,6 +438,7 @@ class PluginPin:
     expires_at: str | None = None
     manifest_sha256: str | None = None
     signer_fingerprint: str | None = None
+    signing_subkey_fingerprint: str | None = None
     verified_at: str | None = None
     dependencies: tuple[WheelDependencyPin, ...] = ()
 
@@ -381,8 +467,12 @@ class PluginPin:
                     "expires_at": self.expires_at,
                     "manifest_sha256": self.manifest_sha256,
                     "signer_fingerprint": self.signer_fingerprint,
+                    "signing_subkey_fingerprint": self.signing_subkey_fingerprint or self.signer_fingerprint,
                     "verified_at": self.verified_at,
-                    "dependencies": [d.to_dict() for d in self.dependencies],
+                    "dependencies": [
+                        d.to_dict()
+                        for d in sorted(self.dependencies, key=lambda x: normalize_dist_name(x.distribution))
+                    ],
                 }
             )
         return out
@@ -394,24 +484,39 @@ class SitePluginsConfig:
     without_ai: str = "require-human-ack"
     trust: TrustPolicy = TrustPolicy()
     plugins: tuple[PluginPin, ...] = ()
+    plugin_floors: tuple[PluginFloor, ...] = ()
 
-    def to_canonical_dict(self) -> dict[str, Any]:
+    def to_canonical_dict(self, *, site_root: Path | None = None) -> dict[str, Any]:
+        keyring_files = (
+            compute_keyring_file_digests(site_root, self.trust.keyring_dir)
+            if site_root is not None
+            else None
+        )
         return {
             "schema_version": self.schema_version,
             "external_import": {"without_ai": self.without_ai},
-            "trust": self.trust.to_dict(),
+            "trust": self.trust.to_dict(keyring_files=keyring_files),
             "plugins": [p.to_dict() for p in sorted(self.plugins, key=lambda x: (x.kind, x.name))],
+            "plugin_floors": [
+                f.to_dict() for f in sorted(self.plugin_floors, key=lambda x: (x.kind, x.name))
+            ],
         }
 
-    def plugin_set_digest(self) -> str:
-        """Deterministic SHA-256 over RFC 8785 canonical JSON of all trust & plugin settings."""
-        canonical = rfc8785.dumps(self.to_canonical_dict())
+    def plugin_set_digest(self, *, site_root: Path | None = None) -> str:
+        """Deterministic SHA-256 over RFC 8785 canonical JSON of all trust, keyring, floor & plugin settings."""
+        canonical = rfc8785.dumps(self.to_canonical_dict(site_root=site_root))
         return hashlib.sha256(canonical).hexdigest()
 
     def get_plugin(self, kind: str, name: str) -> PluginPin | None:
         for p in self.plugins:
             if p.kind == kind and p.name == name:
                 return p
+        return None
+
+    def get_floor(self, kind: str, name: str) -> PluginFloor | None:
+        for f in self.plugin_floors:
+            if f.kind == kind and f.name == name:
+                return f
         return None
 
 
@@ -472,6 +577,11 @@ def _parse_dependency(raw: Any, *, context: str) -> WheelDependencyPin:
     if not isinstance(ver, str) or not VERSION_RE.match(ver):
         raise PluginManifestError(f"{context}: invalid dependency version {ver!r}")
     fn = validate_wheel_filename(raw.get("filename"), label=f"{context}.filename")
+    fn_dist, fn_ver = parse_wheel_filename_parts(fn)
+    if fn_dist != normalize_dist_name(dist) or fn_ver != ver:
+        raise PluginManifestError(
+            f"{context}: wheel filename {fn!r} does not match distribution={dist!r} version={ver!r}"
+        )
     sha = validate_sha256(raw.get("sha256"), label=f"{context}.sha256")
     return WheelDependencyPin(distribution=dist, version=ver, filename=fn, sha256=sha)
 
@@ -541,6 +651,11 @@ def parse_release_manifest_bytes(raw_bytes: bytes, *, source_label: str = "plugi
         raise PluginManifestError(f"{source_label}.wheel must be an object")
     _reject_extra_keys(wheel_obj, frozenset({"filename", "sha256"}), context=f"{source_label}.wheel")
     wheel_fn = validate_wheel_filename(wheel_obj.get("filename"), label=f"{source_label}.wheel.filename")
+    fn_dist, fn_ver = parse_wheel_filename_parts(wheel_fn)
+    if fn_dist != normalize_dist_name(dist) or fn_ver != version:
+        raise PluginManifestError(
+            f"{source_label}: wheel filename {wheel_fn!r} does not match distribution={dist!r} version={version!r}"
+        )
     wheel_sha = validate_sha256(wheel_obj.get("sha256"), label=f"{source_label}.wheel.sha256")
 
     raw_deps = data.get("dependencies", [])
@@ -602,7 +717,7 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
 
     _reject_extra_keys(
         data,
-        frozenset({"schema_version", "external_import", "trust", "plugins"}),
+        frozenset({"schema_version", "external_import", "trust", "plugins", "plugin_floors"}),
         context=source_label,
     )
     sv = _require_int(data.get("schema_version", 1), label=f"{source_label}.schema_version", minimum=1, maximum=1)
@@ -622,7 +737,18 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
         raise PluginManifestError(f"{source_label}.trust must be a table")
     _reject_extra_keys(
         trust_raw,
-        frozenset({"keyring_dir", "max_depth", "marginal_threshold", "full_threshold", "backend", "anchors", "revocations"}),
+        frozenset(
+            {
+                "keyring_dir",
+                "max_depth",
+                "marginal_threshold",
+                "full_threshold",
+                "max_validity_days",
+                "backend",
+                "anchors",
+                "revocations",
+            }
+        ),
         context=f"{source_label}.trust",
     )
     keyring_dir = validate_relative_dir(
@@ -646,6 +772,12 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
         label=f"{source_label}.trust.full_threshold",
         minimum=1,
         maximum=10,
+    )
+    max_validity_days = _require_int(
+        trust_raw.get("max_validity_days", DEFAULT_MAX_VALIDITY_DAYS),
+        label=f"{source_label}.trust.max_validity_days",
+        minimum=1,
+        maximum=MAX_ALLOWED_VALIDITY_DAYS,
     )
     backend = trust_raw.get("backend", "auto")
     if backend not in ALLOWED_BACKENDS:
@@ -715,6 +847,7 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
         max_depth=max_depth,
         marginal_threshold=marginal_threshold,
         full_threshold=full_threshold,
+        max_validity_days=max_validity_days,
         backend=backend,
         anchors=tuple(anchors),
         revocations=tuple(revocations),
@@ -769,6 +902,7 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
                         "expires_at",
                         "manifest_sha256",
                         "signer_fingerprint",
+                        "signing_subkey_fingerprint",
                         "verified_at",
                         "dependencies",
                     }
@@ -783,6 +917,11 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
             if not isinstance(ep, str) or not ENTRY_POINT_RE.match(ep):
                 raise PluginManifestError(f"{ctx}.entry_point invalid: {ep!r}")
             wfn = validate_wheel_filename(item.get("wheel_filename"), label=f"{ctx}.wheel_filename")
+            fn_dist, fn_ver = parse_wheel_filename_parts(wfn)
+            if fn_dist != normalize_dist_name(dist) or fn_ver != ver:
+                raise PluginManifestError(
+                    f"{ctx}: wheel_filename {wfn!r} does not match distribution={dist!r} version={ver!r}"
+                )
             wsha = validate_sha256(item.get("wheel_sha256"), label=f"{ctx}.wheel_sha256")
             rseq = _require_int(item.get("release_seq"), label=f"{ctx}.release_seq", minimum=1)
             issued_dt = parse_rfc3339_utc(item.get("issued_at"), label=f"{ctx}.issued_at")
@@ -791,6 +930,12 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
                 raise PluginManifestError(f"{ctx}: expires_at must be strictly after issued_at")
             msha = validate_sha256(item.get("manifest_sha256"), label=f"{ctx}.manifest_sha256")
             sfpr = validate_fingerprint(item.get("signer_fingerprint"), label=f"{ctx}.signer_fingerprint")
+            sub_raw = item.get("signing_subkey_fingerprint")
+            sub_fpr = (
+                validate_fingerprint(sub_raw, label=f"{ctx}.signing_subkey_fingerprint")
+                if sub_raw is not None
+                else sfpr
+            )
             ver_dt = parse_rfc3339_utc(item.get("verified_at"), label=f"{ctx}.verified_at")
 
             raw_deps = item.get("dependencies", [])
@@ -825,16 +970,52 @@ def parse_site_plugins_toml(raw_bytes: bytes, *, source_label: str = "plugins.to
                     expires_at=format_rfc3339_utc(expires_dt),
                     manifest_sha256=msha,
                     signer_fingerprint=sfpr,
+                    signing_subkey_fingerprint=sub_fpr,
                     verified_at=format_rfc3339_utc(ver_dt),
                     dependencies=tuple(deps),
                 )
             )
+
+    raw_floors = data.get("plugin_floors", [])
+    if not isinstance(raw_floors, list):
+        raise PluginManifestError(f"{source_label}.plugin_floors must be an array of tables")
+    floors: list[PluginFloor] = []
+    seen_floors: set[tuple[str, str]] = set()
+    for idx, item in enumerate(raw_floors):
+        ctx = f"{source_label}.plugin_floors[{idx}]"
+        if not isinstance(item, dict):
+            raise PluginManifestError(f"{ctx} must be a table")
+        _reject_extra_keys(
+            item,
+            frozenset({"name", "kind", "distribution", "min_release_seq", "signer_fingerprint"}),
+            context=ctx,
+        )
+        kind = item.get("kind")
+        if kind not in ALLOWED_SITE_PLUGIN_KINDS:
+            raise PluginManifestError(f"{ctx}.kind {kind!r} is forbidden")
+        name = validate_plugin_name(item.get("name"), kind=kind, source="out-of-tree")
+        if (kind, name) in seen_floors:
+            raise PluginManifestError(f"{ctx}: duplicate plugin_floor ({kind!r}, {name!r})")
+        seen_floors.add((kind, name))
+        dist = validate_external_distribution(item.get("distribution"), label=f"{ctx}.distribution")
+        min_seq = _require_int(item.get("min_release_seq"), label=f"{ctx}.min_release_seq", minimum=1)
+        sfpr = validate_fingerprint(item.get("signer_fingerprint"), label=f"{ctx}.signer_fingerprint")
+        floors.append(
+            PluginFloor(
+                name=name,
+                kind=kind,
+                distribution=dist,
+                min_release_seq=min_seq,
+                signer_fingerprint=sfpr,
+            )
+        )
 
     return SitePluginsConfig(
         schema_version=sv,
         without_ai=without_ai,
         trust=trust,
         plugins=tuple(plugins),
+        plugin_floors=tuple(floors),
     )
 
 
@@ -866,6 +1047,7 @@ def render_site_plugins_toml(config: SitePluginsConfig) -> str:
         f"max_depth = {config.trust.max_depth}",
         f"marginal_threshold = {config.trust.marginal_threshold}",
         f"full_threshold = {config.trust.full_threshold}",
+        f"max_validity_days = {config.trust.max_validity_days}",
         f"backend = {_toml_str(config.trust.backend)}",
     ]
 
@@ -932,6 +1114,7 @@ def render_site_plugins_toml(config: SitePluginsConfig) -> str:
                     f"expires_at = {_toml_str(pin.expires_at)}",
                     f"manifest_sha256 = {_toml_str(pin.manifest_sha256)}",
                     f"signer_fingerprint = {_toml_str(pin.signer_fingerprint)}",
+                    f"signing_subkey_fingerprint = {_toml_str(pin.signing_subkey_fingerprint or pin.signer_fingerprint)}",
                     f"verified_at = {_toml_str(pin.verified_at)}",
                 ]
             )
@@ -950,8 +1133,20 @@ def render_site_plugins_toml(config: SitePluginsConfig) -> str:
             else:
                 lines.append("dependencies = []")
 
+    for floor in sorted(config.plugin_floors, key=lambda f: (f.kind, f.name)):
+        lines.extend(
+            [
+                "",
+                "[[plugin_floors]]",
+                f"name = {_toml_str(floor.name)}",
+                f"kind = {_toml_str(floor.kind)}",
+                f"distribution = {_toml_str(floor.distribution)}",
+                f"min_release_seq = {floor.min_release_seq}",
+                f"signer_fingerprint = {_toml_str(floor.signer_fingerprint)}",
+            ]
+        )
+
     rendered = "\n".join(lines) + "\n"
-    # Self-verify round-trip before returning.
     parse_site_plugins_toml(rendered.encode("utf-8"), source_label="<rendered plugins.toml>")
     return rendered
 

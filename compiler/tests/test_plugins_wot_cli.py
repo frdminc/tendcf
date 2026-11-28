@@ -512,74 +512,67 @@ def test_soft_vs_hard_revocation_and_historical_rebuild(tmp_path: Path, gpg_tmp:
 
 
 # ---------------------------------------------------------------------------
-# 2. Sequoia sq / sq-wot backend adapter (offline flags, auto preference)
+# 2. Backend selection honesty (M7: auto -> gpg, sequoia fails closed) & SHA-1 refusal (L1)
 # ---------------------------------------------------------------------------
 
 
-def test_sequoia_backend_adapter_and_auto_selection(tmp_path: Path) -> None:
-    root_fpr = "A" * 40
-    auth_fpr = "B" * 40
+def test_backend_selection_auto_is_gpg_and_sequoia_fails_closed() -> None:
+    backend, bins = select_wot_backend("auto", gpg_bin="/usr/bin/gpg")
+    assert backend == "gpg" and bins["gpg"] == "/usr/bin/gpg"
+    with pytest.raises(PluginTrustError, match="not yet enabled"):
+        select_wot_backend("sequoia", gpg_bin="/usr/bin/gpg")
+
+
+@pytest.mark.skipif(shutil.which("gpg") is None, reason="gpg not installed")
+def test_sha1_weak_signature_refused_and_revoked_introducer_blocked(tmp_path: Path, gpg_tmp: Path) -> None:
+    keys_dir = gpg_tmp / "k"
+    keys_dir.mkdir()
+    root_h, root_fpr, root_pub = _make_gpg_identity(keys_dir, "root")
+    intro_h, intro_fpr, intro_pub = _make_gpg_identity(keys_dir, "intro")
+    auth_h, auth_fpr, auth_pub = _make_gpg_identity(keys_dir, "auth")
+    intro_cert = _gpg_tsign(root_h, intro_pub, intro_fpr, trust_level=2, depth=1)
+    auth_cert = _gpg_certify(intro_h, auth_pub, auth_fpr)
+
     site_root = tmp_path / "site-private"
     kr = site_root / "plugins" / "keyring"
     kr.mkdir(parents=True)
-    (kr / "root.asc").write_text("-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake\n-----END PGP PUBLIC KEY BLOCK-----\n", encoding="utf-8")
+    (kr / "root.asc").write_text(root_pub, encoding="utf-8")
+    (kr / "chain.asc").write_text(intro_cert + "\n" + auth_cert, encoding="utf-8")
 
-    manifest = tmp_path / "plugin-release.json"
+    manifest = tmp_path / "m.json"
     manifest.write_text('{"schema_version": 1}\n', encoding="utf-8")
-    sig = tmp_path / "plugin-release.json.asc"
-    sig.write_text("-----BEGIN PGP SIGNATURE-----\nfake\n-----END PGP SIGNATURE-----\n", encoding="utf-8")
-
-    now_iso = format_rfc3339_utc(utc_now() - timedelta(minutes=1))
-    fake_sq = tmp_path / "sq"
-    fake_sq.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
-        "assert '--network-policy' in sys.argv and 'offline' in sys.argv, sys.argv\n"
-        f"print(json.dumps({{'signatures': [{{'status': 'good', 'primary_fingerprint': {auth_fpr!r}, 'signing_fingerprint': {auth_fpr!r}, 'created_at': {now_iso!r}}}]}}))\n",
-        encoding="utf-8",
-    )
-    fake_sq.chmod(0o755)
-
-    fake_wot = tmp_path / "sq-wot"
-    fake_wot.write_text(
-        f"#!{sys.executable}\n"
-        "import json, sys\n"
-        "assert '--trust-root' in sys.argv and '--depth' in sys.argv, sys.argv\n"
-        "print(json.dumps({'trust_amount': 120, 'depth': 1}))\n",
-        encoding="utf-8",
-    )
-    fake_wot.chmod(0o755)
-
-    backend, bins = select_wot_backend("auto", sq_bin=str(fake_sq), sq_wot_bin=str(fake_wot), gpg_bin="/usr/bin/gpg")
-    assert backend == "sequoia" and bins["sq"] == str(fake_sq)
+    # L1: Force SHA1 signature -> refused by --weak-digest SHA1 / ALLOWED_HASH_ALGOS!
+    sha1_sig = tmp_path / "m-sha1.asc"
+    r_sig = _gpg_run(auth_h, "--digest-algo", "SHA1", "--armor", "--detach-sign", "-o", str(sha1_sig), str(manifest))
+    assert r_sig.returncode == 0, r_sig.stderr
 
     policy = TrustPolicy(
         keyring_dir="plugins/keyring",
         max_depth=1,
-        backend="auto",
+        backend="gpg",
         anchors=(TrustAnchor(fingerprint=root_fpr, label="root", role="root", key_file="root.asc"),),
     )
-    res = verify_detached_manifest_signature(
-        manifest,
-        sig,
-        site_root=site_root,
-        policy=policy,
-        sq_bin=str(fake_sq),
-        sq_wot_bin=str(fake_wot),
-    )
-    assert res.backend == "sequoia" and res.primary_fingerprint == auth_fpr and res.trust_level == "full"
+    with pytest.raises(PluginTrustError):
+        verify_detached_manifest_signature(manifest, sha1_sig, site_root=site_root, policy=policy)
 
-    # Insufficient trust_amount (< 120) or excessive depth -> refused!
-    fake_wot_low = tmp_path / "sq-wot-low"
-    fake_wot_low.write_text(
-        f"#!{sys.executable}\nimport json\nprint(json.dumps({{'trust_amount': 60, 'depth': 1}}))\n",
-        encoding="utf-8",
+    # M3: Valid SHA-256 signature succeeds when introducer is active, but FAILS once introducer is revoked!
+    good_sig = _gpg_detach_sign(auth_h, manifest, tmp_path / "m-good.asc")
+    res_ok = verify_detached_manifest_signature(manifest, good_sig, site_root=site_root, policy=policy)
+    assert res_ok.primary_fingerprint == auth_fpr
+
+    rev_intro_policy = replace(
+        policy,
+        revocations=(
+            KeyRevocation(
+                fingerprint=intro_fpr,
+                mode="hard",
+                revoked_at=format_rfc3339_utc(utc_now()),
+                reason="introducer compromised",
+            ),
+        ),
     )
-    fake_wot_low.chmod(0o755)
-    with pytest.raises(PluginTrustError, match="trust amount insufficient"):
-        verify_detached_manifest_signature(
-            manifest, sig, site_root=site_root, policy=policy, sq_bin=str(fake_sq), sq_wot_bin=str(fake_wot_low)
-        )
+    with pytest.raises(PluginTrustError, match="Web-of-Trust check failed"):
+        verify_detached_manifest_signature(manifest, good_sig, site_root=site_root, policy=rev_intro_policy)
 
 
 # ---------------------------------------------------------------------------
@@ -895,8 +888,40 @@ def test_end_to_end_cli_add_compile_import_update_rollback_and_tamper_detection(
     assert json.loads(r_ver.stdout)["ok"] is True
 
     # 3. `tendcf compile --frontend acme` loads the verified out-of-tree frontend from isolated env and renders a valid goal file!
+    # Copy Site Model files into site_root so `--site site_root --check-releasable` keeps plugins.toml inside site-private (L9).
+    for fn in ("services.yml", "roles.yml", "launchd-writers.yml", "device-trust.json"):
+        shutil.copyfile(SITE_EXAMPLE / fn, site_root / fn)
+
     clean_env = {k: v for k, v in os.environ.items() if k != "TENDCF_DIR"}
     r_comp = _run_cli(
+        [
+            "compile",
+            "--host",
+            "mac",
+            "--platform",
+            "macos",
+            "--supervisor",
+            "launchd",
+            "--host-key",
+            HOST_KEY,
+            "--device-trust",
+            str(site_root / "device-trust.json"),
+            "--site",
+            str(site_root),
+            "--frontend",
+            "acme",
+            "--plugin-env",
+            str(plugin_env),
+            "--check-releasable",
+        ],
+        env=clean_env,
+    )
+    assert r_comp.returncode == 0, r_comp.stderr
+    goal = json.loads(r_comp.stdout)
+    assert goal["schema_version"] == 9 and goal["host"] == HOST_KEY
+
+    # L9: Under --check-releasable, passing --plugins-config outside the resolved site dir is REFUSED!
+    r_ext_cfg = _run_cli(
         [
             "compile",
             "--host",
@@ -921,9 +946,7 @@ def test_end_to_end_cli_add_compile_import_update_rollback_and_tamper_detection(
         ],
         env=clean_env,
     )
-    assert r_comp.returncode == 0, r_comp.stderr
-    goal = json.loads(r_comp.stdout)
-    assert goal["schema_version"] == 9 and goal["host"] == HOST_KEY
+    assert r_ext_cfg.returncode == 1 and "outside the resolved site-private" in r_ext_cfg.stderr
 
     # Activation rule check: since plugins.toml only names `acme` (not `yaml`), compiling with `--frontend yaml` is REFUSED!
     r_unnamed = _run_cli(
@@ -1186,7 +1209,7 @@ def test_end_to_end_cli_add_compile_import_update_rollback_and_tamper_detection(
     assert r_tamp.returncode == 1
     assert any("tampered file detected" in f for f in json.loads(r_tamp.stdout)["findings"])
 
-    # 7. Remove plugin -> updates plugins.toml & re-stages env cleanly without acme!
+    # 7. Remove plugin -> updates plugins.toml, writes anti-rollback floor tombstone (M5), & re-stages env cleanly!
     r_rm = _run_cli(
         [
             "plugin",
@@ -1200,8 +1223,36 @@ def test_end_to_end_cli_add_compile_import_update_rollback_and_tamper_detection(
         ]
     )
     assert r_rm.returncode == 0, r_rm.stderr
+    rm_data = json.loads(r_rm.stdout)
+    assert rm_data["recorded_floor"]["min_release_seq"] == 2
     assert not (plugin_env / "acme_frontend").exists()
     assert (plugin_env / "acme_importer").exists()
+
+    # M5: Re-adding v1 (seq 1 <= floor 2) after remove is REFUSED by the tombstone floor!
+    r_readd_old = _run_cli(
+        [
+            "plugin",
+            "add",
+            "--site-dir",
+            str(site_root),
+            "--manifest",
+            str(man_v1),
+            "--sig",
+            str(sig_v1),
+            "--wheel-dir",
+            str(wdir_v1),
+            "--plugin-env",
+            str(plugin_env),
+        ]
+    )
+    assert r_readd_old.returncode == 1 and "floor tombstone" in r_readd_old.stderr
+
+    # M5: Clearing the floor explicitly is a privileged action that succeeds.
+    r_cf = _run_cli(
+        ["plugin", "clear-floor", "acme", "--kind", "frontend", "--site-dir", str(site_root), "--json"]
+    )
+    assert r_cf.returncode == 0, r_cf.stderr
+    assert json.loads(r_cf.stdout)["privileged_change"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1218,7 +1269,7 @@ def test_non_dedup_dist_info_detects_duplicate_distributions_and_reserved_impers
     env_dir = tmp_path / "env"
     env_dir.mkdir()
     (env_dir / ".tendcf-plugin-env.json").write_text(
-        json.dumps({"schema_version": 1, "plugin_set_digest": cfg.plugin_set_digest(), "wheels": []}),
+        json.dumps({"schema_version": 1, "plugin_set_digest": cfg.plugin_set_digest(site_root=site_root), "wheels": []}),
         encoding="utf-8",
     )
 
@@ -1322,3 +1373,372 @@ def test_manifest_validation_rejects_supervisor_reserved_and_bad_depth() -> None
                 }
             ).encode("utf-8")
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Fable R1 regression tests: PoCs A/B/C/D, H2, M4, M6, M8, M9, L2, L4, L5, L6
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("gpg") is None, reason="gpg not installed")
+def test_fable_r1_pocs_a_b_c_d_h2_m4_m6_m8_m9_l2_l4_l5_l6(tmp_path: Path, gpg_tmp: Path) -> None:
+    keys_dir = gpg_tmp / "k"
+    keys_dir.mkdir()
+    root_h, root_fpr, root_pub = _make_gpg_identity(keys_dir, "root")
+    auth_a_h, auth_a_fpr, auth_a_pub = _make_gpg_identity(keys_dir, "autha")
+    auth_b_h, auth_b_fpr, auth_b_pub = _make_gpg_identity(keys_dir, "authb")
+    auth_a_cert = _gpg_certify(root_h, auth_a_pub, auth_a_fpr)
+    auth_b_cert = _gpg_certify(root_h, auth_b_pub, auth_b_fpr)
+
+    site_root = tmp_path / "site-private"
+    kr = site_root / "plugins" / "keyring"
+    kr.mkdir(parents=True)
+    root_src = tmp_path / "root.asc"
+    root_src.write_text(root_pub, encoding="utf-8")
+
+    # Note 4: add-anchor --fingerprint mismatch refuses!
+    r_bad_fpr = _run_cli(
+        [
+            "plugin", "trust", "add-anchor",
+            "--site-dir", str(site_root),
+            "--key", str(root_src),
+            "--label", "root",
+            "--fingerprint", "0" * 40,
+        ]
+    )
+    assert r_bad_fpr.returncode == 1 and "does not match expected --fingerprint" in r_bad_fpr.stderr
+
+    r_ok_fpr = _run_cli(
+        [
+            "plugin", "trust", "add-anchor",
+            "--site-dir", str(site_root),
+            "--key", str(root_src),
+            "--label", "root",
+            "--fingerprint", root_fpr,
+            "--json",
+        ]
+    )
+    assert r_ok_fpr.returncode == 0, r_ok_fpr.stderr
+
+    # M4: Dropping a new key file into plugins/keyring/ MUST change plugin_set_digest(site_root=...)!
+    cfg_before = load_site_plugins_config(site_root / "plugins.toml")
+    d_before = cfg_before.plugin_set_digest(site_root=site_root)
+    (kr / "authors.asc").write_text(auth_a_cert + "\n" + auth_b_cert, encoding="utf-8")
+    d_after = cfg_before.plugin_set_digest(site_root=site_root)
+    assert d_after != d_before
+
+    # Build clean plugin wheel A and second plugin wheel B
+    wdir_a = tmp_path / "wa"
+    wdir_a.mkdir()
+    whl_a, sha_a = _build_wheel(
+        wdir_a,
+        dist="demo-a",
+        version="1.0.0",
+        files={"demo_a/__init__.py": b"VALUE = 'clean'\n"},
+        entry_points_txt="[tendcf.frontends]\ndemoa = demo_a:VALUE\n",
+    )
+    man_a = _write_manifest(
+        tmp_path / "ma.json",
+        name="demoa",
+        kind="frontend",
+        dist="demo-a",
+        version="1.0.0",
+        entry_point="demo_a:VALUE",
+        wheel_filename=whl_a.name,
+        wheel_sha256=sha_a,
+        release_seq=1,
+    )
+    sig_a = _gpg_detach_sign(auth_a_h, man_a, tmp_path / "ma.json.asc")
+
+    # PoC D (M2): Passing a non-empty non-plugin-env dir with thesis.txt MUST refuse and preserve thesis.txt!
+    unrelated = tmp_path / "unrelated-dir"
+    unrelated.mkdir()
+    (unrelated / "thesis.txt").write_text("do not delete me", encoding="utf-8")
+    r_poc_d = _run_cli(
+        [
+            "plugin", "add",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_a),
+            "--sig", str(sig_a),
+            "--wheel-dir", str(wdir_a),
+            "--plugin-env", str(unrelated),
+        ]
+    )
+    assert r_poc_d.returncode == 1 and "not a tendcf plugin environment" in r_poc_d.stderr
+    assert (unrelated / "thesis.txt").read_text(encoding="utf-8") == "do not delete me"
+
+    # M6: Add TWO out-of-tree plugins with NO --plugin-env (using isolated XDG_STATE_HOME)!
+    xdg_state = tmp_path / "xdg-state"
+    env_xdg = dict(os.environ, XDG_STATE_HOME=str(xdg_state))
+    r_add_a = _run_cli(
+        [
+            "plugin", "add",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_a),
+            "--sig", str(sig_a),
+            "--wheel-dir", str(wdir_a),
+            "--json",
+        ],
+        env=env_xdg,
+    )
+    assert r_add_a.returncode == 0, r_add_a.stderr
+
+    wdir_b = tmp_path / "wb"
+    wdir_b.mkdir()
+    whl_b, sha_b = _build_wheel(
+        wdir_b,
+        dist="demo-b",
+        version="1.0.0",
+        files={"demo_b/__init__.py": b"VALUE = 'clean-b'\n"},
+        entry_points_txt="[tendcf.frontends]\ndemob = demo_b:VALUE\n",
+    )
+    man_b = _write_manifest(
+        tmp_path / "mb.json",
+        name="demob",
+        kind="frontend",
+        dist="demo-b",
+        version="1.0.0",
+        entry_point="demo_b:VALUE",
+        wheel_filename=whl_b.name,
+        wheel_sha256=sha_b,
+        release_seq=1,
+    )
+    sig_b = _gpg_detach_sign(auth_b_h, man_b, tmp_path / "mb.json.asc")
+    r_add_b = _run_cli(
+        [
+            "plugin", "add",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_b),
+            "--sig", str(sig_b),
+            "--wheel-dir", str(wdir_b),
+            "--json",
+        ],
+        env=env_xdg,
+    )
+    assert r_add_b.returncode == 0, r_add_b.stderr
+    env_b_path = Path(json.loads(r_add_b.stdout)["staged_plugin_env"])
+    assert (env_b_path / "demo_a" / "__init__.py").is_file()
+    assert (env_b_path / "demo_b" / "__init__.py").is_file()
+
+    # M6: After another digest change (add --in-tree yaml), `tendcf plugin restage` rebuilds the new digest env!
+    assert _run_cli(["plugin", "add", "--in-tree", "yaml", "--kind", "frontend", "--site-dir", str(site_root)], env=env_xdg).returncode == 0
+    r_restage = _run_cli(["plugin", "restage", "--site-dir", str(site_root), "--json"], env=env_xdg)
+    assert r_restage.returncode == 0, r_restage.stderr
+    restaged_env = Path(json.loads(r_restage.stdout)["staged_plugin_env"])
+    cfg_now = load_site_plugins_config(site_root / "plugins.toml")
+    assert load_out_of_tree_plugin("frontend", "demoa", config=cfg_now, plugin_env=restaged_env, site_root=site_root) == "clean"
+
+    # PoC A (H1): Rewrite BOTH demo_a/__init__.py AND its RECORD row -> MUST STILL BE REFUSED (pinned wheel anchor)!
+    poc_a_env = tmp_path / "poc-a-env"
+    shutil.copytree(restaged_env, poc_a_env)
+    evil_py = b"VALUE = 'PWNED-RECORD'\n"
+    (poc_a_env / "demo_a" / "__init__.py").write_bytes(evil_py)
+    rec_path = poc_a_env / "demo_a-1.0.0.dist-info" / "RECORD"
+    evil_b64 = base64.urlsafe_b64encode(hashlib.sha256(evil_py).digest()).rstrip(b"=").decode("ascii")
+    new_rows = []
+    for line in rec_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("demo_a/__init__.py,"):
+            new_rows.append(f"demo_a/__init__.py,sha256={evil_b64},{len(evil_py)}")
+        else:
+            new_rows.append(line)
+    rec_path.write_text("\n".join(new_rows) + "\n", encoding="utf-8")
+    with pytest.raises(PluginError, match="differs from SHA-256-verified pinned wheel bytes"):
+        load_out_of_tree_plugin("frontend", "demoa", config=cfg_now, plugin_env=poc_a_env, site_root=site_root)
+
+    # PoC B (H1): Leave source & RECORD untouched, plant forged __pycache__/*.pyc -> MUST BE REFUSED!
+    poc_b_env = tmp_path / "poc-b-env"
+    shutil.copytree(restaged_env, poc_b_env)
+    pycache = poc_b_env / "demo_a" / "__pycache__"
+    pycache.mkdir()
+    (pycache / f"__init__.{sys.implementation.cache_tag}.pyc").write_bytes(b"FORGED_PYC")
+    with pytest.raises(PluginError, match="__pycache__"):
+        load_out_of_tree_plugin("frontend", "demoa", config=cfg_now, plugin_env=poc_b_env, site_root=site_root)
+
+    # PoC C (M1): Swap wheel on disk AFTER verify_wheel_artifact BEFORE stage_plugin_env -> stages ORIGINAL verified bytes!
+    wdir_c = tmp_path / "wc"
+    wdir_c.mkdir()
+    orig_whl, orig_sha = _build_wheel(
+        wdir_c,
+        dist="demo-a",
+        version="1.0.0",
+        files={"demo_a/__init__.py": b"VALUE = 'clean'\n"},
+        entry_points_txt="[tendcf.frontends]\ndemoa = demo_a:VALUE\n",
+    )
+    verified_c = verify_wheel_artifact(
+        orig_whl,
+        expected_filename=orig_whl.name,
+        expected_sha256=orig_sha,
+        expected_distribution="demo-a",
+        expected_version="1.0.0",
+        is_plugin_wheel=True,
+        expected_entry_point_group="tendcf.frontends",
+        expected_plugin_name="demoa",
+        expected_entry_point="demo_a:VALUE",
+    )
+    # Attacker swaps wheel file on disk right before staging!
+    _build_wheel(
+        wdir_c,
+        dist="demo-a",
+        version="1.0.0",
+        files={"demo_a/__init__.py": b"VALUE = 'PWNED-TOCTOU'\n"},
+        entry_points_txt="[tendcf.frontends]\ndemoa = demo_a:VALUE\n",
+    )
+    poc_c_env = tmp_path / "poc-c-env"
+    stage_plugin_env(
+        poc_c_env,
+        config=cfg_now,
+        verified_wheels=[verified_c],
+        site_root=site_root,
+        wheel_cache_dir=xdg_state / "tendcf" / "wheel-cache",
+    )
+    assert (poc_c_env / "demo_a" / "__init__.py").read_bytes() == b"VALUE = 'clean'\n"
+
+    # H2: Author B (also trusted by root!) tries to update Author A's plugin `demoa` -> REFUSED without --allow-signer-change!
+    wdir_a2 = tmp_path / "wa2"
+    wdir_a2.mkdir()
+    whl_a2, sha_a2 = _build_wheel(
+        wdir_a2,
+        dist="demo-a",
+        version="1.1.0",
+        files={"demo_a/__init__.py": b"VALUE = 'v1.1'\n"},
+        entry_points_txt="[tendcf.frontends]\ndemoa = demo_a:VALUE\n",
+    )
+    man_a2 = _write_manifest(
+        tmp_path / "ma2.json",
+        name="demoa",
+        kind="frontend",
+        dist="demo-a",
+        version="1.1.0",
+        entry_point="demo_a:VALUE",
+        wheel_filename=whl_a2.name,
+        wheel_sha256=sha_a2,
+        release_seq=2,
+    )
+    sig_a2_by_b = _gpg_detach_sign(auth_b_h, man_a2, tmp_path / "ma2-b.json.asc")
+    r_hijack = _run_cli(
+        [
+            "plugin", "update", "demoa",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_a2),
+            "--sig", str(sig_a2_by_b),
+            "--wheel-dir", str(wdir_a2),
+        ],
+        env=env_xdg,
+    )
+    assert r_hijack.returncode == 1 and "signer pin mismatch" in r_hijack.stderr
+
+    # Explicit --allow-signer-change OLD:NEW authorizes rotation and records signer_changed=true!
+    r_rotate = _run_cli(
+        [
+            "plugin", "update", "demoa",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_a2),
+            "--sig", str(sig_a2_by_b),
+            "--wheel-dir", str(wdir_a2),
+            "--allow-signer-change", f"{auth_a_fpr}:{auth_b_fpr}",
+            "--json",
+        ],
+        env=env_xdg,
+    )
+    assert r_rotate.returncode == 0, r_rotate.stderr
+    assert json.loads(r_rotate.stdout)["signer_changed"] is True
+
+    # M8: Historical verify refuses future --as-of and refuses unpinned manifest!
+    r_future = _run_cli(
+        [
+            "plugin", "verify",
+            "--site-dir", str(site_root),
+            "--historical",
+            "--as-of", format_rfc3339_utc(utc_now() + timedelta(hours=2)),
+        ]
+    )
+    assert r_future.returncode == 1 and "must not be in the future" in r_future.stderr
+
+    # L2: Manifest with validity > max_validity_days (default 365) -> REFUSED!
+    man_long = _write_manifest(
+        tmp_path / "mlong.json",
+        name="demoa",
+        kind="frontend",
+        dist="demo-a",
+        version="1.1.0",
+        entry_point="demo_a:VALUE",
+        wheel_filename=whl_a2.name,
+        wheel_sha256=sha_a2,
+        release_seq=3,
+        issued_at=utc_now() - timedelta(minutes=1),
+        expires_at=utc_now() + timedelta(days=500),
+    )
+    sig_long = _gpg_detach_sign(auth_b_h, man_long, tmp_path / "mlong.json.asc")
+    r_long = _run_cli(
+        [
+            "plugin", "update", "demoa",
+            "--site-dir", str(site_root),
+            "--manifest", str(man_long),
+            "--sig", str(sig_long),
+            "--wheel-dir", str(wdir_a2),
+        ],
+        env=env_xdg,
+    )
+    assert r_long.returncode == 1 and "max_validity_days" in r_long.stderr
+
+    # L4: Revocation downgrade (hard -> soft) refused without --allow-downgrade!
+    r_rev_h = _run_cli(
+        ["plugin", "trust", "revoke", auth_a_fpr, "--site-dir", str(site_root), "--mode", "hard", "--reason", "compromised"]
+    )
+    assert r_rev_h.returncode == 0, r_rev_h.stderr
+    r_rev_down = _run_cli(
+        ["plugin", "trust", "revoke", auth_a_fpr, "--site-dir", str(site_root), "--mode", "soft", "--reason", "oops"]
+    )
+    assert r_rev_down.returncode == 1 and "refusing to downgrade" in r_rev_down.stderr
+
+    # L5: Compound PEP 508 marker `python_version >= "3" or extra == "dev"` is ACTIVE -> missing dep REFUSED!
+    l5_dir = tmp_path / "l5"
+    l5_dir.mkdir()
+    l5_whl, l5_sha = _build_wheel(
+        l5_dir,
+        dist="marker-trick",
+        version="1.0.0",
+        files={"marker_trick/__init__.py": b"X=1\n"},
+        requires_dist=['sneaky-dep>=1.0; python_version >= "3" or extra == "dev"'],
+        entry_points_txt="[tendcf.frontends]\nmarkertrick = marker_trick:X\n",
+    )
+    l5_man = load_release_manifest(
+        _write_manifest(
+            tmp_path / "l5.json",
+            name="markertrick",
+            kind="frontend",
+            dist="marker-trick",
+            version="1.0.0",
+            entry_point="marker_trick:X",
+            wheel_filename=l5_whl.name,
+            wheel_sha256=l5_sha,
+        )
+    )
+    with pytest.raises(PluginEnvError, match="incomplete transitive dependency closure"):
+        verify_release_wheels(l5_man, l5_dir)
+
+    # L6: Top-level binary extension `tendcf.abi3.so` -> REFUSED!
+    l6_dir = tmp_path / "l6"
+    l6_dir.mkdir()
+    l6_whl, l6_sha = _build_wheel(
+        l6_dir,
+        dist="so-trick",
+        version="1.0.0",
+        files={"tendcf.abi3.so": b"ELF"},
+    )
+    with pytest.raises(PluginEnvError, match="dependency-confusion"):
+        verify_wheel_artifact(
+            l6_whl,
+            expected_filename=l6_whl.name,
+            expected_sha256=l6_sha,
+            expected_distribution="so-trick",
+            expected_version="1.0.0",
+            is_plugin_wheel=False,
+        )
+
+    # M3.3: Removing root anchor immediately makes `tendcf plugin verify` fail for pinned out-of-tree plugins!
+    r_rm_anc = _run_cli(["plugin", "trust", "remove-anchor", root_fpr, "--site-dir", str(site_root)])
+    assert r_rm_anc.returncode == 0, r_rm_anc.stderr
+    r_ver_unreach = _run_cli(["plugin", "verify", "--site-dir", str(site_root), "--json"])
+    assert r_ver_unreach.returncode == 1
+    assert any("no trust anchors" in f or "no longer reachable" in f for f in json.loads(r_ver_unreach.stdout)["findings"])

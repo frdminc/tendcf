@@ -57,6 +57,7 @@ from .plugins import (
     in_tree_tendcf_for_file,
     load_configured_plugin,
     load_plugin,
+    plugin_env_import_context,
 )
 from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, validate_site_model
 from .workspace import (
@@ -294,13 +295,25 @@ def cmd_compile(args: argparse.Namespace) -> int:
             return 2
 
     # Resolve optional site-private plugins.toml (explicit --plugins-config, else workspace/site plugins.toml if present).
+    # L9: under --check-releasable, refuse --plugins-config outside the resolved site/workspace private directory.
     plugins_cfg: SitePluginsConfig | None = None
     plugins_site_root: Path | None = None
     try:
         if args.plugins_config is not None:
             cfg_p = Path(args.plugins_config).expanduser()
+            if args.check_releasable:
+                expected_site_root = workspace.private_dir if workspace is not None else (
+                    site.resolve(strict=False) if site is not None else None
+                )
+                if expected_site_root is None or cfg_p.resolve(strict=False).parent != expected_site_root:
+                    print(
+                        "tendcf: REFUSED: --check-releasable forbids --plugins-config outside the resolved "
+                        "site-private directory",
+                        file=sys.stderr,
+                    )
+                    return 1
             plugins_cfg = load_site_plugins_config(cfg_p, allow_missing=False)
-            plugins_site_root = workspace.private_dir if workspace is not None else cfg_p.parent
+            plugins_site_root = workspace.private_dir if workspace is not None else cfg_p.parent.resolve(strict=False)
         elif workspace is not None and (
             (workspace.private_dir / "plugins.toml").exists()
             or (workspace.private_dir / "plugins.toml").is_symlink()
@@ -311,8 +324,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
             (site / "plugins.toml").exists() or (site / "plugins.toml").is_symlink()
         ):
             plugins_cfg = load_site_plugins_config(site / "plugins.toml", allow_missing=False)
-            plugins_site_root = site
-    except PluginManifestError as exc:
+            plugins_site_root = site.resolve(strict=False)
+    except (PluginManifestError, OSError) as exc:
         print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -322,7 +335,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
         resolved_plugin_env = Path(args.plugin_env).expanduser()
     elif plugins_cfg is not None and workspace is not None:
         resolved_plugin_env = default_plugin_env_dir(
-            workspace.state_dir, workspace.site_slug, plugins_cfg.plugin_set_digest()
+            workspace.state_dir,
+            workspace.site_slug,
+            plugins_cfg.plugin_set_digest(site_root=plugins_site_root),
         )
 
     if frontend_name not in STATIC_PLUGIN_TABLE["frontend"] and plugins_cfg is None:
@@ -346,20 +361,33 @@ def cmd_compile(args: argparse.Namespace) -> int:
                 site_root=plugins_site_root,
                 check_releasable=args.check_releasable,
             )
-            if not hasattr(frontend_obj, "load_site_model") and callable(frontend_obj):
-                frontend_obj = frontend_obj()
-            if not hasattr(frontend_obj, "load_site_model"):
-                raise PluginError(
-                    f"frontend plugin {frontend_name!r} does not expose load_site_model(services, roles, launchd_writers)"
+            pin_rec = plugins_cfg.get_plugin("frontend", frontend_name) if plugins_cfg is not None else None
+            if pin_rec is not None and pin_rec.source == "out-of-tree" and resolved_plugin_env is not None:
+                with plugin_env_import_context(resolved_plugin_env.resolve(strict=True)):
+                    if not hasattr(frontend_obj, "load_site_model") and callable(frontend_obj):
+                        frontend_obj = frontend_obj()
+                    if not hasattr(frontend_obj, "load_site_model"):
+                        raise PluginError(
+                            f"frontend plugin {frontend_name!r} does not expose load_site_model(services, roles, launchd_writers)"
+                        )
+                    model: SiteModel = frontend_obj.load_site_model(
+                        paths["services"], paths["roles"], paths["launchd_writers"]
+                    )
+            else:
+                if not hasattr(frontend_obj, "load_site_model") and callable(frontend_obj):
+                    frontend_obj = frontend_obj()
+                if not hasattr(frontend_obj, "load_site_model"):
+                    raise PluginError(
+                        f"frontend plugin {frontend_name!r} does not expose load_site_model(services, roles, launchd_writers)"
+                    )
+                model = frontend_obj.load_site_model(
+                    paths["services"], paths["roles"], paths["launchd_writers"]
                 )
-            model: SiteModel = frontend_obj.load_site_model(
-                paths["services"], paths["roles"], paths["launchd_writers"]
-            )
         else:
             model = yaml_plugin.load_site_model(
                 paths["services"], paths["roles"], paths["launchd_writers"]
             )
-    except (SiteModelError, PluginError, PluginEnvError) as exc:
+    except (SiteModelError, PluginError, PluginEnvError, PluginManifestError, OSError) as exc:
         print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -603,11 +631,20 @@ def cmd_import(args: argparse.Namespace) -> int:
 
     # Importers follow the exact same activation rule as frontends (D46 §4 step 4):
     # an importer runs ONLY if site-private plugins.toml explicitly names and pins it.
+    # Note: `external_import.without_ai` governs external Nix/Guile recipe imports (§4 item 5,
+    # Step 6), distinct from one-shot tool-migration importer plugins (§3).
     try:
         site_root: Path | None = None
         site_slug: str | None = None
         if args.plugins_config is not None:
             cfg_path = Path(args.plugins_config).expanduser()
+            if args.check_releasable:
+                print(
+                    "tendcf: REFUSED: --check-releasable forbids --plugins-config override; "
+                    "use --site-dir or --site-name/--workspace so plugins.toml comes from site-private",
+                    file=sys.stderr,
+                )
+                return 1
             site_root = Path(args.site_dir).expanduser() if args.site_dir else cfg_path.parent
             site_slug = site_root.name
         elif args.site_dir is not None:
@@ -636,7 +673,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         resolved_plugin_env = Path(args.plugin_env).expanduser()
     elif site_slug is not None:
         resolved_plugin_env = default_plugin_env_dir(
-            state_dir(), site_slug, plugins_cfg.plugin_set_digest()
+            state_dir(), site_slug, plugins_cfg.plugin_set_digest(site_root=site_root)
         )
 
     try:
@@ -651,15 +688,27 @@ def cmd_import(args: argparse.Namespace) -> int:
         )
         src_path = Path(args.source).expanduser()
         out_dir = Path(args.output_dir).expanduser()
-        if hasattr(importer_obj, "import_site"):
-            result = importer_obj.import_site(src_path, out_dir)
-        elif callable(importer_obj):
-            result = importer_obj(src_path, out_dir)
+        pin_rec = plugins_cfg.get_plugin("importer", args.importer)
+        if pin_rec is not None and pin_rec.source == "out-of-tree" and resolved_plugin_env is not None:
+            with plugin_env_import_context(resolved_plugin_env.resolve(strict=True)):
+                if hasattr(importer_obj, "import_site"):
+                    result = importer_obj.import_site(src_path, out_dir)
+                elif callable(importer_obj):
+                    result = importer_obj(src_path, out_dir)
+                else:
+                    raise PluginError(
+                        f"importer plugin {args.importer!r} is neither callable nor exposes import_site(source, output_dir)"
+                    )
         else:
-            raise PluginError(
-                f"importer plugin {args.importer!r} is neither callable nor exposes import_site(source, output_dir)"
-            )
-    except (PluginError, PluginEnvError) as exc:
+            if hasattr(importer_obj, "import_site"):
+                result = importer_obj.import_site(src_path, out_dir)
+            elif callable(importer_obj):
+                result = importer_obj(src_path, out_dir)
+            else:
+                raise PluginError(
+                    f"importer plugin {args.importer!r} is neither callable nor exposes import_site(source, output_dir)"
+                )
+    except (PluginError, PluginEnvError, PluginManifestError, OSError) as exc:
         print(f"tendcf: REFUSED: {exc}", file=sys.stderr)
         return 1
 
@@ -674,6 +723,7 @@ def cmd_import(args: argparse.Namespace) -> int:
             sys.stdout,
             indent=2,
             sort_keys=True,
+            default=str,
         )
         sys.stdout.write("\n")
     else:
