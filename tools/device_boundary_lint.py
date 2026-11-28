@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Enforce tendcf's structural device boundary and static-plugin-table invariants (D46 Step 4).
+"""Enforce tendcf's structural device boundary and static-plugin-table invariants (D46 Step 4 + #47).
 
 Pure stdlib (`python3 -I -S` compatible). Implements `docs/architecture/plugin-layout.md`
-§4 ("The device boundary is structural, not a convention") and 2026-11-14 operator ruling
-Smaller 5 (static in-tree import table only; no entry-point discovery):
+§4 ("The device boundary is structural, not a convention") and 2026-11-28 operator rulings
+for #47 (lifting Smaller 5's out-of-tree discovery deferral while keeping built-in plugins
+in `STATIC_PLUGIN_TABLE` and banning `importlib.metadata` everywhere so out-of-tree discovery
+must use our non-deduplicating isolated-env `*.dist-info` scanner):
 
 1. No leftover `bin/` directory, wrapper, or symlink at repository root.
 2. No symlinked subdirectories or `.py` files anywhere under `tools/`,
@@ -22,12 +24,14 @@ Smaller 5 (static in-tree import table only; no entry-point discovery):
 4. Every Python file under `compiler/tendcf/`, `compiler/scripts/`, `plugins/`,
    and `contrib/` (if present):
    - Never imports `importlib.metadata` or `pkg_resources`, and never invokes
-     or accesses `entry_points` / `importlib.metadata` (out-of-tree discovery
-     is deferred until #47).
+     or accesses `entry_points` / `importlib.metadata` (built-in plugins use
+     `STATIC_PLUGIN_TABLE`, and out-of-tree plugins in #47 are discovered via
+     our non-deduplicating isolated-env `*.dist-info` scanner in
+     `compiler/tendcf/plugin_env.py`, never `importlib.metadata.entry_points()`).
 5. `compiler/pyproject.toml`:
    - Declares package name `tendcf`, CLI script `tendcf`, no `nix2cf` alias in
-     `scripts` or `gui-scripts`, ZERO `[project.entry-points]` tables, and
-     never lists `"entry-points"` in `project.dynamic`.
+     `scripts` or `gui-scripts`, ZERO `[project.entry-points]` tables (built-ins
+     are never entry points), and never lists `"entry-points"` in `project.dynamic`.
 6. Every `PluginSpec(...)` call in `compiler/tendcf/plugins.py` must supply a
    constant string `relpath` ending in `.py` that resolves without symlinks
    to a regular file strictly under `plugins/`.

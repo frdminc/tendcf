@@ -1,41 +1,44 @@
-"""Static in-tree plugin import table and verified realpath loader (D46 Step 4).
+"""Plugin import table, verified realpath loader, and pinned out-of-tree loader (D46 Step 4 + #47).
 
-Implements `docs/architecture/plugin-layout.md` §3–§4 (decision D-a, amended by
-2026-11-14 operator ruling Smaller 5):
+Implements `docs/architecture/plugin-layout.md` §3–§4 (decision D-a + 2026-11-28 #47 rulings):
 
-1. Every in-tree plugin (frontends, supervisor renderers, importers) is listed
-   in `STATIC_PLUGIN_TABLE` — NEVER discovered through
-   `importlib.metadata.entry_points()` (out-of-tree entry-point discovery is
-   deferred until a user needs one and out-of-tree plugins can be pinned, #47).
-2. Before executing any plugin module, `resolve_plugin_path()` resolves the
-   verified tendcf root and `plugins/` directory, walks every path component
-   under `plugins/` refusing any symlink (`os.lstat`) or traversal segment,
-   and verifies the resolved file is a regular file strictly inside
-   `<resolved_root>/plugins/`.
-3. `load_plugin()` opens the verified path with `O_RDONLY | O_NOFOLLOW |
-   O_NONBLOCK`, verifies `S_ISREG(fstat)`, reads source bytes directly from
-   that file descriptor, compiles and executes them into a fresh module
-   registered in `sys.modules` BEFORE execution — bypassing `__pycache__/*.pyc`
-   completely and eliminating leaf symlink TOCTOU.
+1. Every built-in in-tree plugin (frontends, supervisor renderers, importers) lives in
+   `STATIC_PLUGIN_TABLE` — NEVER discovered through `importlib.metadata.entry_points()`.
+   Supervisor renderers remain in-tree only; there is no public `tendcf.supervisors` group.
+2. Before executing any in-tree (`plugins/`) or `contrib/` plugin module, `resolve_plugin_path()`
+   / `resolve_contrib_plugin_path()` walks every path component refusing any symlink (`os.lstat`)
+   or traversal segment, and `exec_verified_source_module()` opens the leaf with
+   `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, verifies `S_ISREG(fstat)`, and compiles/execs source
+   bytes directly from the fd (bypassing `__pycache__/*.pyc` and leaf symlink TOCTOU).
+3. Out-of-tree plugins (`tendcf.frontends` and `tendcf.importers`, unlocked by #47) load ONLY
+   when explicitly pinned in site-private `plugins.toml` (`source = "out-of-tree"`), unexpired,
+   not revoked under the site's revocation policy, and verified inside an isolated plugin
+   environment via our non-deduplicating `*.dist-info` scanner (`plugin_env.py`).
 """
 
 from __future__ import annotations
 
 import errno
 import hashlib
+import importlib
 import importlib.machinery
 import os
 import stat
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Any
 
+# Note: plugin_manifest / plugin_env / plugin_wot are imported lazily inside out-of-tree
+# loader functions to avoid circular imports (plugin_manifest imports RESERVED_PLUGIN_NAMES
+# and STATIC_PLUGIN_TABLE from this module).
+
 
 class PluginError(Exception):
-    """A plugin lookup, containment check, or module load failed closed."""
+    """A plugin lookup, containment check, trust/pin check, or module load failed closed."""
 
 
 @dataclass(frozen=True)
@@ -101,8 +104,7 @@ STATIC_PLUGIN_TABLE: Mapping[str, Mapping[str, PluginSpec]] = MappingProxyType(
     }
 )
 
-# Built-in plugin names reserved against impersonation if third-party entry
-# points are ever revived (#47).
+# Built-in plugin names reserved against impersonation by out-of-tree or contrib plugins.
 RESERVED_PLUGIN_NAMES: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "frontend": frozenset({"yaml", "nix", "nix2cf", "guix"}),
@@ -192,63 +194,78 @@ def get_plugin_spec(kind: str, name: str) -> PluginSpec:
     return table[name]
 
 
-def _verify_containment_path(resolved_root: Path, relpath: str) -> Path:
-    """Walk `relpath` under `resolved_root/plugins/`, refusing symlinks and escapes."""
+def _verify_subdir_containment_path(resolved_root: Path, top_dir: str, relpath: str) -> Path:
+    """Walk `relpath` strictly under `<resolved_root>/<top_dir>/`, refusing symlinks and escapes."""
     if not relpath or relpath.startswith("/") or "\x00" in relpath:
-        raise PluginError(f"invalid static plugin relative path: {relpath!r}")
+        raise PluginError(f"invalid {top_dir} plugin relative path: {relpath!r}")
     parts = relpath.split("/")
     if any(p in ("", ".", "..") for p in parts):
-        raise PluginError(f"unsafe traversal component in static plugin path: {relpath!r}")
-    if parts[0] != "plugins" or len(parts) < 2 or not parts[-1].endswith(".py"):
-        raise PluginError(f"static plugin path must be a .py file under 'plugins/': {relpath!r}")
+        raise PluginError(f"unsafe traversal component in {top_dir} plugin path: {relpath!r}")
+    if parts[0] != top_dir or len(parts) < 2 or not parts[-1].endswith(".py"):
+        raise PluginError(f"{top_dir} plugin path must be a .py file under '{top_dir}/': {relpath!r}")
 
-    plugins_dir = resolved_root / "plugins"
+    base_dir = resolved_root / top_dir
     try:
-        st_plugins = os.lstat(plugins_dir)
+        st_base = os.lstat(base_dir)
     except OSError as exc:
-        raise PluginError(f"plugins directory missing under {resolved_root}: {exc}") from exc
-    if stat.S_ISLNK(st_plugins.st_mode) or not stat.S_ISDIR(st_plugins.st_mode):
-        raise PluginError(f"plugins directory must be a real non-symlink directory: {plugins_dir}")
+        raise PluginError(f"{top_dir} directory missing under {resolved_root}: {exc}") from exc
+    if stat.S_ISLNK(st_base.st_mode) or not stat.S_ISDIR(st_base.st_mode):
+        raise PluginError(f"{top_dir} directory must be a real non-symlink directory: {base_dir}")
 
     try:
-        resolved_plugins = plugins_dir.resolve(strict=True)
+        resolved_base = base_dir.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise PluginError(f"cannot resolve plugins directory {plugins_dir}: {exc}") from exc
-    if resolved_plugins.parent != resolved_root or resolved_plugins.name != "plugins":
+        raise PluginError(f"cannot resolve {top_dir} directory {base_dir}: {exc}") from exc
+    if resolved_base.parent != resolved_root or resolved_base.name != top_dir:
         raise PluginError(
-            f"plugins directory {plugins_dir} resolves outside verified tendcf root {resolved_root}: {resolved_plugins}"
+            f"{top_dir} directory {base_dir} resolves outside verified tendcf root {resolved_root}: {resolved_base}"
         )
 
-    # Walk every directory component and leaf under plugins/, rejecting any symlink.
-    cur = resolved_plugins
+    cur = resolved_base
     for idx, part in enumerate(parts[1:]):
         is_leaf = idx == len(parts[1:]) - 1
         cur = cur / part
         try:
             st = os.lstat(cur)
         except OSError as exc:
-            raise PluginError(f"in-tree plugin path missing ({relpath}): {cur}: {exc}") from exc
+            raise PluginError(f"{top_dir} plugin path missing ({relpath}): {cur}: {exc}") from exc
         if stat.S_ISLNK(st.st_mode):
             raise PluginError(
-                f"in-tree plugin path component is a symlink (refused; must be real in-tree file): {cur}"
+                f"{top_dir} plugin path component is a symlink (refused; must be real in-tree file): {cur}"
             )
         if is_leaf:
             if not stat.S_ISREG(st.st_mode):
-                raise PluginError(f"in-tree plugin is not a regular file: {cur}")
+                raise PluginError(f"{top_dir} plugin is not a regular file: {cur}")
         else:
             if not stat.S_ISDIR(st.st_mode):
-                raise PluginError(f"in-tree plugin directory component is not a directory: {cur}")
+                raise PluginError(f"{top_dir} plugin directory component is not a directory: {cur}")
 
     try:
         resolved_file = cur.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise PluginError(f"cannot resolve in-tree plugin {cur}: {exc}") from exc
+        raise PluginError(f"cannot resolve {top_dir} plugin {cur}: {exc}") from exc
 
-    if not resolved_file.is_relative_to(resolved_plugins) or resolved_file == resolved_plugins:
+    if not resolved_file.is_relative_to(resolved_base) or resolved_file == resolved_base:
         raise PluginError(
-            f"in-tree plugin {cur} resolves outside {resolved_plugins}: {resolved_file}"
+            f"{top_dir} plugin {cur} resolves outside {resolved_base}: {resolved_file}"
         )
     return resolved_file
+
+
+def _resolve_verified_root(tendcf_root: Path | None, *, label: str) -> Path:
+    root = tendcf_root if tendcf_root is not None else in_tree_tendcf_root()
+    if root is None:
+        raise PluginError(f"cannot locate verified in-tree tendcf checkout to load {label}")
+    try:
+        st_root = os.lstat(root)
+    except OSError as exc:
+        raise PluginError(f"cannot inspect tendcf root {root}: {exc}") from exc
+    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
+        raise PluginError(f"tendcf root must be a real non-symlink directory: {root}")
+    try:
+        return root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PluginError(f"cannot resolve tendcf root {root}: {exc}") from exc
 
 
 def resolve_plugin_path(
@@ -259,24 +276,27 @@ def resolve_plugin_path(
 ) -> tuple[PluginSpec, Path]:
     """Resolve and verify an in-tree plugin's canonical file path BEFORE execution."""
     spec = get_plugin_spec(kind, name)
-    root = tendcf_root if tendcf_root is not None else in_tree_tendcf_root()
-    if root is None:
-        raise PluginError(
-            f"cannot locate verified in-tree tendcf checkout to load {kind} plugin {name!r}"
-        )
-    try:
-        st_root = os.lstat(root)
-    except OSError as exc:
-        raise PluginError(f"cannot inspect tendcf root {root}: {exc}") from exc
-    if stat.S_ISLNK(st_root.st_mode) or not stat.S_ISDIR(st_root.st_mode):
-        raise PluginError(f"tendcf root must be a real non-symlink directory: {root}")
-    try:
-        resolved_root = root.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise PluginError(f"cannot resolve tendcf root {root}: {exc}") from exc
-
-    resolved_file = _verify_containment_path(resolved_root, spec.relpath)
+    resolved_root = _resolve_verified_root(tendcf_root, label=f"{kind} plugin {name!r}")
+    resolved_file = _verify_subdir_containment_path(resolved_root, "plugins", spec.relpath)
     return spec, resolved_file
+
+
+def resolve_contrib_plugin_path(
+    kind: str,
+    name: str,
+    relpath: str,
+    *,
+    tendcf_root: Path | None = None,
+) -> Path:
+    """Resolve and verify a site-named in-tree `contrib/` plugin's canonical path BEFORE execution."""
+    if kind not in ("frontend", "importer"):
+        raise PluginError(
+            f"contrib plugin kind {kind!r} is forbidden (supervisor renderers are in-tree plugins/ only)"
+        )
+    if name in RESERVED_PLUGIN_NAMES.get(kind, frozenset()):
+        raise PluginError(f"contrib {kind} plugin name {name!r} is reserved for built-in plugins")
+    resolved_root = _resolve_verified_root(tendcf_root, label=f"contrib {kind} plugin {name!r}")
+    return _verify_subdir_containment_path(resolved_root, "contrib", relpath)
 
 
 def exec_verified_source_module(module_name: str, resolved_file: Path) -> ModuleType:
@@ -371,6 +391,227 @@ def load_plugin(
 
     _LOADED_MODULES[cache_key] = module
     return module
+
+
+def load_contrib_plugin(
+    kind: str,
+    name: str,
+    relpath: str,
+    *,
+    tendcf_root: Path | None = None,
+) -> Any:
+    """Verify realpath containment under `<tendcf_root>/contrib/` and load a named contrib plugin."""
+    resolved_file = resolve_contrib_plugin_path(kind, name, relpath, tendcf_root=tendcf_root)
+    cache_key = (f"contrib:{kind}", name, str(resolved_file))
+    cached = _LOADED_MODULES.get(cache_key)
+    if cached is not None:
+        return cached
+
+    path_tag = hashlib.sha256(str(resolved_file).encode("utf-8")).hexdigest()[:12]
+    module_name = f"tendcf_contrib_{kind}_{name.replace('-', '_')}_{path_tag}"
+    module = exec_verified_source_module(module_name, resolved_file)
+
+    mod_kind = getattr(module, "PLUGIN_KIND", None)
+    mod_name = getattr(module, "PLUGIN_NAME", None)
+    if mod_kind != kind or mod_name != name:
+        sys.modules.pop(module_name, None)
+        raise PluginError(
+            f"contrib plugin {resolved_file} declared PLUGIN_KIND={mod_kind!r}, "
+            f"PLUGIN_NAME={mod_name!r}; expected ({kind!r}, {name!r})"
+        )
+
+    _LOADED_MODULES[cache_key] = module
+    return module
+
+
+def load_out_of_tree_plugin(
+    kind: str,
+    name: str,
+    *,
+    config: Any,  # SitePluginsConfig
+    plugin_env: Path,
+    tendcf_root: Path | None = None,
+    site_root: Path | None = None,
+    check_releasable: bool = False,
+    now: datetime | None = None,
+) -> Any:
+    """Load an explicitly pinned out-of-tree `frontend` or `importer` plugin from an isolated env.
+
+    Enforces:
+    - Supervisor renderers are never loadable out-of-tree.
+    - Built-in names are reserved and unconditionally refused.
+    - Exact pin must exist in `plugins.toml` (`source = "out-of-tree"`).
+    - Signer key must not be revoked (hard or soft) and manifest must not be expired (`expires_at > now`).
+    - Isolated `plugin_env` passes full symlink/startup-hook/receipt/RECORD/non-dedup dist-info checks.
+    - Loaded module resolves strictly inside `plugin_env` (never ambient `site-packages` or `tendcf`).
+    """
+    from .plugin_env import PluginEnvError, discover_env_entry_points
+    from .plugin_manifest import (
+        ALLOWED_ENTRY_POINT_GROUPS,
+        normalize_dist_name,
+        parse_rfc3339_utc,
+        utc_now,
+    )
+    from .plugin_wot import PluginTrustError, evaluate_revocation_policy
+
+    if kind not in ("frontend", "importer"):
+        raise PluginError(
+            f"out-of-tree plugin kind {kind!r} is forbidden (supervisor renderers are in-tree only)"
+        )
+    if name in RESERVED_PLUGIN_NAMES.get(kind, frozenset()):
+        raise PluginError(
+            f"out-of-tree {kind} plugin name {name!r} is reserved for built-in tendcf plugins"
+        )
+
+    pin = config.get_plugin(kind, name)
+    if pin is None or pin.source != "out-of-tree":
+        raise PluginError(
+            f"out-of-tree {kind} plugin {name!r} is not pinned in site-private plugins.toml"
+        )
+
+    current_time = now if now is not None else utc_now()
+    expires_dt = parse_rfc3339_utc(pin.expires_at, label="pin.expires_at")
+    if current_time >= expires_dt:
+        raise PluginError(
+            f"out-of-tree {kind} plugin {name!r} pin expired at {pin.expires_at} "
+            "(anti-freeze protection; refresh with `tendcf plugin update`)"
+        )
+
+    try:
+        evaluate_revocation_policy(
+            pin.signer_fingerprint,
+            config.trust,
+            historical=False,
+            as_of=current_time,
+        )
+    except PluginTrustError as exc:
+        raise PluginError(str(exc)) from exc
+
+    try:
+        discovered = discover_env_entry_points(
+            plugin_env,
+            config=config,
+            tendcf_root=tendcf_root,
+            site_root=site_root,
+            check_releasable=check_releasable,
+        )
+    except PluginEnvError as exc:
+        raise PluginError(str(exc)) from exc
+
+    group = ALLOWED_ENTRY_POINT_GROUPS[kind]
+    ep = discovered.get(group, {}).get(name)
+    if ep is None:
+        raise PluginError(
+            f"pinned out-of-tree {kind} plugin {name!r} not found in isolated plugin env {plugin_env} "
+            f"(group [{group}])"
+        )
+    if normalize_dist_name(ep.distribution) != normalize_dist_name(pin.distribution) or ep.version != pin.version:
+        raise PluginError(
+            f"out-of-tree plugin {name!r} mismatch: env has {ep.distribution}=={ep.version}, "
+            f"plugins.toml pins {pin.distribution}=={pin.version}"
+        )
+    if ep.value != pin.entry_point:
+        raise PluginError(
+            f"out-of-tree plugin {name!r} entry_point mismatch: env has {ep.value!r}, "
+            f"plugins.toml pins {pin.entry_point!r}"
+        )
+
+    mod_name, _, attr_path = ep.value.partition(":")
+    resolved_env = plugin_env.resolve(strict=True)
+    env_str = str(resolved_env)
+
+    # Import strictly with `resolved_env` at front of sys.path, refusing any module whose
+    # resolved __file__ does not live strictly inside `resolved_env`.
+    top_pkg = mod_name.split(".", 1)[0]
+    if top_pkg in ("tendcf", "nix2cf"):
+        raise PluginError(f"out-of-tree plugin entry point {ep.value!r} attempts to shadow {top_pkg!r}")
+
+    saved_path = list(sys.path)
+    # Remove any prior cached copy of this plugin module loaded from a different directory.
+    prior_mod = sys.modules.get(mod_name)
+    if prior_mod is not None:
+        prior_file = getattr(prior_mod, "__file__", None)
+        if not prior_file or not Path(prior_file).resolve().is_relative_to(resolved_env):
+            for k in [m for m in list(sys.modules) if m == top_pkg or m.startswith(top_pkg + ".")]:
+                sys.modules.pop(k, None)
+
+    sys.path.insert(0, env_str)
+    importlib.invalidate_caches()
+    try:
+        mod = importlib.import_module(mod_name)
+    except Exception as exc:
+        raise PluginError(f"failed to import out-of-tree plugin module {mod_name!r}: {exc}") from exc
+    finally:
+        sys.path[:] = saved_path
+
+    mod_file = getattr(mod, "__file__", None)
+    if not isinstance(mod_file, str):
+        raise PluginError(f"out-of-tree plugin module {mod_name!r} has no __file__ (refused)")
+    resolved_mod_file = Path(mod_file).resolve(strict=True)
+    if not resolved_mod_file.is_relative_to(resolved_env):
+        raise PluginError(
+            f"out-of-tree plugin module {mod_name!r} loaded from {resolved_mod_file}, "
+            f"outside isolated plugin env {resolved_env} (ambient shadowing refused)"
+        )
+
+    obj: Any = mod
+    for part in attr_path.split("."):
+        if not hasattr(obj, part):
+            raise PluginError(
+                f"out-of-tree plugin {name!r}: entry point {ep.value!r} missing attribute {part!r}"
+            )
+        obj = getattr(obj, part)
+    return obj
+
+
+def load_configured_plugin(
+    kind: str,
+    name: str,
+    *,
+    config: Any | None = None,
+    plugin_env: Path | None = None,
+    tendcf_root: Path | None = None,
+    site_root: Path | None = None,
+    check_releasable: bool = False,
+    now: datetime | None = None,
+) -> Any:
+    """Resolve and load a `frontend` or `importer` plugin respecting `plugins.toml` activation rules.
+
+    - If `config` is `None`: loads built-in in-tree plugins from `STATIC_PLUGIN_TABLE` only.
+    - If `config` is provided: enforces Activation step 3 ("only named plugins are loaded"):
+      the plugin must be named in `plugins.toml` as `in-tree`, `contrib`, or `out-of-tree`.
+    """
+    if kind == "supervisor":
+        return load_plugin("supervisor", name, tendcf_root=tendcf_root)
+
+    if config is None:
+        return load_plugin(kind, name, tendcf_root=tendcf_root)
+
+    pin = config.get_plugin(kind, name)
+    if pin is None:
+        raise PluginError(
+            f"{kind} plugin {name!r} is not named in site-private plugins.toml "
+            "(D46 activation rule: only explicitly named plugins may load)"
+        )
+    if pin.source == "in-tree":
+        return load_plugin(kind, name, tendcf_root=tendcf_root)
+    if pin.source == "contrib":
+        assert pin.relpath is not None
+        return load_contrib_plugin(kind, name, pin.relpath, tendcf_root=tendcf_root)
+    if plugin_env is None:
+        raise PluginError(
+            f"out-of-tree {kind} plugin {name!r} requires an isolated --plugin-env directory"
+        )
+    return load_out_of_tree_plugin(
+        kind,
+        name,
+        config=config,
+        plugin_env=plugin_env,
+        tendcf_root=tendcf_root,
+        site_root=site_root,
+        check_releasable=check_releasable,
+        now=now,
+    )
 
 
 def clear_plugin_cache() -> None:

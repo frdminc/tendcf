@@ -47,10 +47,15 @@ from typing import Any
 
 from . import __version__
 from .compile import SUPERVISORS, CompileError, HostSpec, compile_host
+from .plugin_cli import register_plugin_subparser
+from .plugin_env import PluginEnvError, default_plugin_env_dir
+from .plugin_manifest import PluginManifestError, SitePluginsConfig, load_site_plugins_config
 from .plugins import (
+    STATIC_PLUGIN_TABLE,
     PluginError,
     exec_verified_source_module,
     in_tree_tendcf_for_file,
+    load_configured_plugin,
     load_plugin,
 )
 from .sitemodel import SITE_FILES, Schemas, SiteModel, SiteModelError, validate_site_model
@@ -63,6 +68,7 @@ from .workspace import (
     refuse_release_if_tainted,
     resolve_site_input_dir,
     resolve_workspace,
+    state_dir,
 )
 
 
@@ -160,6 +166,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
         ("--tendcf", args.tendcf),
         ("--output", args.output),
         ("--device-trust", args.device_trust),
+        ("--frontend", args.frontend),
+        ("--plugins-config", args.plugins_config),
+        ("--plugin-env", args.plugin_env),
     ):
         if val is not None and not str(val).strip():
             print(f"tendcf: ERROR: {flag} must not be empty", file=sys.stderr)
@@ -284,13 +293,73 @@ def cmd_compile(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # Resolve optional site-private plugins.toml (explicit --plugins-config, else workspace/site plugins.toml if present).
+    plugins_cfg: SitePluginsConfig | None = None
+    plugins_site_root: Path | None = None
+    try:
+        if args.plugins_config is not None:
+            cfg_p = Path(args.plugins_config).expanduser()
+            plugins_cfg = load_site_plugins_config(cfg_p, allow_missing=False)
+            plugins_site_root = workspace.private_dir if workspace is not None else cfg_p.parent
+        elif workspace is not None and (
+            (workspace.private_dir / "plugins.toml").exists()
+            or (workspace.private_dir / "plugins.toml").is_symlink()
+        ):
+            plugins_cfg = load_site_plugins_config(workspace.private_dir / "plugins.toml", allow_missing=False)
+            plugins_site_root = workspace.private_dir
+        elif site is not None and (
+            (site / "plugins.toml").exists() or (site / "plugins.toml").is_symlink()
+        ):
+            plugins_cfg = load_site_plugins_config(site / "plugins.toml", allow_missing=False)
+            plugins_site_root = site
+    except PluginManifestError as exc:
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    frontend_name = args.frontend or "yaml"
+    resolved_plugin_env: Path | None = None
+    if args.plugin_env is not None:
+        resolved_plugin_env = Path(args.plugin_env).expanduser()
+    elif plugins_cfg is not None and workspace is not None:
+        resolved_plugin_env = default_plugin_env_dir(
+            workspace.state_dir, workspace.site_slug, plugins_cfg.plugin_set_digest()
+        )
+
+    if frontend_name not in STATIC_PLUGIN_TABLE["frontend"] and plugins_cfg is None:
+        print(
+            f"tendcf: REFUSED: frontend plugin {frontend_name!r} is not a built-in in-tree plugin "
+            "and no site-private plugins.toml was provided (pass --plugins-config or use a workspace with plugins.toml)",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         yaml_plugin = load_plugin("frontend", "yaml", tendcf_root=plugin_root)
-        model: SiteModel = yaml_plugin.load_site_model(
-            paths["services"], paths["roles"], paths["launchd_writers"]
-        )
         trust_doc = yaml_plugin.load_document(Path(args.device_trust))
-    except (SiteModelError, PluginError) as exc:
+        if plugins_cfg is not None or frontend_name != "yaml":
+            frontend_obj = load_configured_plugin(
+                "frontend",
+                frontend_name,
+                config=plugins_cfg,
+                plugin_env=resolved_plugin_env,
+                tendcf_root=plugin_root,
+                site_root=plugins_site_root,
+                check_releasable=args.check_releasable,
+            )
+            if not hasattr(frontend_obj, "load_site_model") and callable(frontend_obj):
+                frontend_obj = frontend_obj()
+            if not hasattr(frontend_obj, "load_site_model"):
+                raise PluginError(
+                    f"frontend plugin {frontend_name!r} does not expose load_site_model(services, roles, launchd_writers)"
+                )
+            model: SiteModel = frontend_obj.load_site_model(
+                paths["services"], paths["roles"], paths["launchd_writers"]
+            )
+        else:
+            model = yaml_plugin.load_site_model(
+                paths["services"], paths["roles"], paths["launchd_writers"]
+            )
+    except (SiteModelError, PluginError, PluginEnvError) as exc:
         print(f"tendcf: ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -492,6 +561,126 @@ def cmd_eval_nix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    """Run a site-named importer plugin (in-tree, contrib, or pinned out-of-tree)."""
+    for flag, val in (
+        ("--importer", args.importer),
+        ("--source", args.source),
+        ("--output-dir", args.output_dir),
+        ("--site-dir", args.site_dir),
+        ("--plugins-config", args.plugins_config),
+        ("--plugin-env", args.plugin_env),
+        ("--tendcf", args.tendcf),
+    ):
+        if val is not None and not str(val).strip():
+            print(f"tendcf: ERROR: {flag} must not be empty", file=sys.stderr)
+            return 2
+
+    if args.check_releasable:
+        if args.tendcf is not None:
+            print(
+                "tendcf: REFUSED: --check-releasable forbids --tendcf override",
+                file=sys.stderr,
+            )
+            return 1
+        if "TENDCF_DIR" in os.environ:
+            print(
+                "tendcf: REFUSED: --check-releasable forbids TENDCF_DIR environment override",
+                file=sys.stderr,
+            )
+            return 1
+        tendcf = _in_tree_tendcf()
+        if tendcf is None:
+            print(
+                "tendcf: REFUSED: --check-releasable requires running from a verified in-tree tendcf checkout",
+                file=sys.stderr,
+            )
+            return 1
+        plugin_root = tendcf
+    else:
+        tendcf = _tendcf_dir(args.tendcf)
+        plugin_root = _resolve_dev_plugin_root(tendcf)
+
+    # Importers follow the exact same activation rule as frontends (D46 §4 step 4):
+    # an importer runs ONLY if site-private plugins.toml explicitly names and pins it.
+    try:
+        site_root: Path | None = None
+        site_slug: str | None = None
+        if args.plugins_config is not None:
+            cfg_path = Path(args.plugins_config).expanduser()
+            site_root = Path(args.site_dir).expanduser() if args.site_dir else cfg_path.parent
+            site_slug = site_root.name
+        elif args.site_dir is not None:
+            site_root = Path(args.site_dir).expanduser().resolve(strict=True)
+            cfg_path = site_root / "plugins.toml"
+            site_slug = site_root.name
+        elif args.site_name is not None or args.ops_root is not None or args.workspace or "TENDCF_SITE" in os.environ:
+            ws = resolve_workspace(ops_root=args.ops_root, site_name=args.site_name)
+            site_root = ws.private_dir
+            cfg_path = ws.private_dir / "plugins.toml"
+            site_slug = ws.site_slug
+        else:
+            print(
+                "tendcf: REFUSED: importer execution requires site-private plugins.toml "
+                "(--plugins-config, --site-dir, or --site-name/--workspace)",
+                file=sys.stderr,
+            )
+            return 1
+        plugins_cfg = load_site_plugins_config(cfg_path, allow_missing=False)
+    except (PluginManifestError, WorkspaceError, OSError) as exc:
+        print(f"tendcf: ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    resolved_plugin_env: Path | None = None
+    if args.plugin_env is not None:
+        resolved_plugin_env = Path(args.plugin_env).expanduser()
+    elif site_slug is not None:
+        resolved_plugin_env = default_plugin_env_dir(
+            state_dir(), site_slug, plugins_cfg.plugin_set_digest()
+        )
+
+    try:
+        importer_obj = load_configured_plugin(
+            "importer",
+            args.importer,
+            config=plugins_cfg,
+            plugin_env=resolved_plugin_env,
+            tendcf_root=plugin_root,
+            site_root=site_root,
+            check_releasable=args.check_releasable,
+        )
+        src_path = Path(args.source).expanduser()
+        out_dir = Path(args.output_dir).expanduser()
+        if hasattr(importer_obj, "import_site"):
+            result = importer_obj.import_site(src_path, out_dir)
+        elif callable(importer_obj):
+            result = importer_obj(src_path, out_dir)
+        else:
+            raise PluginError(
+                f"importer plugin {args.importer!r} is neither callable nor exposes import_site(source, output_dir)"
+            )
+    except (PluginError, PluginEnvError) as exc:
+        print(f"tendcf: REFUSED: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(
+            {
+                "importer": args.importer,
+                "source": str(Path(args.source).expanduser()),
+                "output_dir": str(Path(args.output_dir).expanduser()),
+                "result": result,
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(f"imported via {args.importer!r} -> {args.output_dir}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tendcf", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"tendcf {__version__}")
@@ -554,6 +743,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--roles")
     c.add_argument("--launchd-writers", dest="launchd_writers")
     c.add_argument("--tendcf", help="tendcf checkout (schemas + projector); default $TENDCF_DIR, else the enclosing tendcf checkout (forbidden with --check-releasable)")
+    c.add_argument("--frontend", default="yaml", help="frontend plugin name (default: 'yaml'; out-of-tree frontends must be pinned in site-private plugins.toml)")
+    c.add_argument("--plugins-config", dest="plugins_config", help="explicit site-private plugins.toml (default: <site-private>/plugins.toml if present)")
+    c.add_argument("--plugin-env", dest="plugin_env", help="isolated plugin environment directory for pinned out-of-tree plugins")
     c.add_argument("--project", action="store_true", help="print the projector's host_specific.json instead of the goal file")
     c.add_argument("-o", "--output")
     c.set_defaults(func=cmd_compile)
@@ -602,6 +794,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="allowed recipe directory passed to nix-instantiate -I (default: parent directory of FILE)",
     )
     e.set_defaults(func=cmd_eval_nix)
+
+    imp = sub.add_parser("import", help="run a site-pinned importer plugin (in-tree, contrib, or out-of-tree)")
+    imp.add_argument("--importer", required=True, help="importer plugin name (must be named in site-private plugins.toml)")
+    imp.add_argument("--source", required=True, help="source configuration path to import")
+    imp.add_argument("--output-dir", dest="output_dir", required=True, help="output directory for generated Site Model files")
+    imp.add_argument("--site-dir", dest="site_dir", help="explicit site-private directory holding plugins.toml")
+    imp.add_argument("--plugins-config", dest="plugins_config", help="explicit site-private plugins.toml path")
+    imp.add_argument("--ops-root", dest="ops_root", help="ops workspace root")
+    imp.add_argument("--site-name", dest="site_name", help="site slug in ops workspace")
+    imp.add_argument("--workspace", action="store_true", help="resolve site-private from ops workspace")
+    imp.add_argument("--plugin-env", dest="plugin_env", help="isolated plugin environment directory")
+    imp.add_argument("--tendcf", help="tendcf checkout path (forbidden with --check-releasable)")
+    imp.add_argument("--check-releasable", dest="check_releasable", action="store_true", help="enforce release-mode isolation checks")
+    imp.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    imp.set_defaults(func=cmd_import)
+
+    register_plugin_subparser(sub)
     return parser
 
 

@@ -37,6 +37,15 @@
 > stands; it takes effect only if both conditions are met (a user needs
 > one, and out-of-tree plugins can be pinned).
 
+> **Amended 2026-11-28 (operator rulings, issue [#47](https://github.com/frdminc/tendcf/issues/47), lifting Smaller 5 deferral):**
+> Out-of-tree plugin trust, pinning, and discovery (`tendcf.frontends`, `tendcf.importers`) are now implemented in `compiler/tendcf/{plugin_manifest,plugin_wot,plugin_env,plugin_cli,plugins}.py`:
+> 1. **Offline site-private keyring & revocation semantics:** OpenPGP keys and revocations live strictly offline inside site-private (`plugins.toml` + `plugins/keyring/`, no live keyserver or WKD fetches). Revocations support `soft` (blocks `add`/`update` and current releases while permitting `--historical --as-of <pre-revocation>` rebuild verification with a warning) and `hard` (blocks all verification including historical rebuilds).
+> 2. **Bounded Web of Trust:** Default `max_depth = 1` (site root trust anchors plus introducers they certify via OpenPGP trust signatures, configurable `0..2`, with configurable `full_threshold` and `marginal_threshold`; `role = "direct"` anchors may sign plugins directly but cannot introduce third parties).
+> 3. **Signed release manifest & pluggable offline backend:** Each out-of-tree plugin ships a canonical JSON `plugin-release.json` + detached ASCII-armored `plugin-release.json.asc` binding the plugin `.whl` SHA-256, full transitive wheel-only dependency closure SHA-256s, monotonic `release_seq` (anti-rollback), and `expires_at` (anti-freeze). Verified offline via Sequoia `sq`/`sq-wot` when installed (preferred under `backend = "auto"`) with isolated ephemeral-`GNUPGHOME` GnuPG `gpg --trust-model pgp` fallback.
+> 4. **Pre-install wheel verification & isolated plugin env:** Wheels only (no sdists, no `.pth`/`sitecustomize.py`/`usercustomize.py`, full `.dist-info/RECORD` SHA-256 verification, `Requires-Dist` closure completeness, and `tendcf`/`nix2cf` dependency-confusion refusal), extracted via pure-Python `zipfile` strictly into an isolated plugin environment disjoint from `sys.prefix`, `tendcf/`, and `tools/`.
+> 5. **Non-deduplicating discovery & `contrib/`:** Out-of-tree entry points are scanned directly from `*.dist-info/entry_points.txt` inside the isolated plugin environment with zero `importlib.metadata` deduplication (`importlib.metadata` remains banned across the repo by `tools/device_boundary_lint.py`; built-in plugins stay in `STATIC_PLUGIN_TABLE`; supervisor renderers remain in-tree only). In-tree `contrib/` plugins inherit the verified `tendcf` git pin (no separate OpenPGP signature required; still explicitly named in `plugins.toml` and verified symlink-free under `contrib/`).
+> 6. **CLI & privileged-change digest:** `tendcf plugin {ls,inspect,add,update,remove,verify,trust}` manages `plugins.toml` atomically with `--json` output and emits RFC 8785 `plugin_set_digest` (`privileged_change` / `requires_ceremony_marker` for Gate 5). `tendcf compile --frontend` and `tendcf import --importer` enforce `plugins.toml` activation rules.
+
 ## 1. The decision
 
 1. `frdminc/nix2cf`, the compiler, folds into `frdminc/tendcf` with its
